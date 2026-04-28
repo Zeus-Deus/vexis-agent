@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vexis-agent"
+version = "0.0.0"
+description = "Telegram-to-Claude-Code bridge daemon for controlling an Omarchy desktop from a phone."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "python-telegram-bot>=21.0",
+    "python-dotenv>=1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["brains*", "transports*", "tools*", "core*"]
