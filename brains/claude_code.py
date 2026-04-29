@@ -32,6 +32,11 @@ class BrainTimeoutError(BrainError):
     pass
 
 
+class SessionLost(BrainError):
+    """Raised when --resume fails because Claude Code can't find the session.
+    The session has been rotated; the user's message was not processed."""
+
+
 class ClaudeCodeBrain:
     def __init__(
         self, workspace: Path, session: SessionStore, timeout_seconds: int
@@ -83,6 +88,19 @@ class ClaudeCodeBrain:
 
         if proc.returncode != 0:
             err = stderr.decode(errors="replace").strip()
+            # Claude Code's wording has varied across versions; substring
+            # match is more robust than pinning an exact string.
+            if self._session.is_initialized() and "No conversation found" in err:
+                old_uuid = self._session.get()
+                new_uuid = self._session.rotate()
+                log.warning(
+                    "Claude Code lost session %s; rotated to %s",
+                    old_uuid,
+                    new_uuid,
+                )
+                raise SessionLost(
+                    "Claude Code session was lost. Rotated to new session."
+                )
             raise BrainError(
                 f"claude -p exited {proc.returncode}: {err or '(no stderr)'}"
             )

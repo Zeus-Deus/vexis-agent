@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 _TYPING_REFRESH_SECONDS = 4
 _MAX_CHUNK = 4000
 _VOICE_ECHO_PREFIX = "🎙️ "
+_VOICE_BRAIN_TAG = "[transcribed voice memo] "
 _TRANSCRIPTION_EMPTY = "⚠️ Couldn't hear anything in that. Try again?"
 _TRANSCRIPTION_FAILED = "⚠️ Couldn't transcribe that. Logs have details."
 
@@ -153,7 +154,9 @@ class TelegramTransport:
                 parse_mode=None,
             )
 
-            reply = await self._handler.handle(user.id, transcription)
+            reply = await self._handler.handle(
+                user.id, f"{_VOICE_BRAIN_TAG}{transcription}"
+            )
             if reply is None:
                 return
             for chunk in split_for_telegram(reply):

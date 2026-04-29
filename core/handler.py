@@ -6,12 +6,17 @@ import asyncio
 import logging
 
 from brains.base import Brain
+from brains.claude_code import SessionLost
 from core.auth import is_allowed
 from core.session import SessionStore
 
 log = logging.getLogger(__name__)
 
 _BRAIN_ERROR = "⚠️ Something broke. Logs have details."
+_SESSION_LOST = (
+    "⚠️ Couldn't resume the previous conversation. "
+    "Starting fresh — please send your message again."
+)
 _EMPTY_RESPONSE = "(empty response)"
 _NEW_SESSION_OK = "Started a new conversation."
 
@@ -33,6 +38,8 @@ class MessageHandler:
         async with self._lock:
             try:
                 reply = await self._brain.respond(text)
+            except SessionLost:
+                return _SESSION_LOST
             except Exception:
                 log.exception("Brain call failed")
                 return _BRAIN_ERROR
