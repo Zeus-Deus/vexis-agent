@@ -23,7 +23,7 @@ async def _run() -> None:
     config = load_config()
     setup_logging(config.log_level)
 
-    for cmd in ("claude", "voxtype", "ffmpeg"):
+    for cmd in ("claude", "voxtype", "ffmpeg", "grim", "hyprctl", "jq"):
         if shutil.which(cmd) is None:
             raise RuntimeError(f"`{cmd}` CLI not found on PATH")
 
@@ -36,6 +36,14 @@ async def _run() -> None:
             "SOUL.md not found at %s. Using default personality. "
             "Create the file to customize.",
             soul_path,
+        )
+
+    capabilities_path = Path(__file__).resolve().parent / "CAPABILITIES.md"
+    if not capabilities_path.is_file():
+        log.warning(
+            "CAPABILITIES.md missing from project root (%s). "
+            "Vexis won't know which tools are available.",
+            capabilities_path,
         )
 
     sessions = SessionStore(state_path=state_dir() / "session.json")

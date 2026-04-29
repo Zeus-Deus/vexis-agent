@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ from telegram.ext import (
 from core.auth import is_allowed
 from core.handler import MessageHandler
 from core.sessions import SessionInfo
+from tools.desktop import CaptureError, capture_desktop
 from tools.voxtype import TranscriptionEmpty, TranscriptionError, transcribe_audio
 
 log = logging.getLogger(__name__)
@@ -35,6 +37,7 @@ _TRANSCRIPTION_FAILED = "⚠️ Couldn't transcribe that. Logs have details."
 _DELETE_CONFIRM_WINDOW = timedelta(seconds=60)
 _CB_DATA_MAX_BYTES = 64
 _HIDDEN_NOTE = "(Some sessions hidden — type the name directly to use them.)"
+_SCREENSHOT_PATH_RE = re.compile(r"(?<![\w/])/tmp/vexis-screenshot-\d+\.png")
 
 
 def split_for_telegram(text: str, max_len: int = _MAX_CHUNK) -> list[str]:
@@ -62,6 +65,24 @@ def _build_button_rows(
         label = f"→ {s.name}" if s.is_active else s.name
         rows.append([InlineKeyboardButton(text=label, callback_data=data)])
     return rows, hidden
+
+
+def _extract_screenshot_paths(text: str) -> tuple[list[Path], str]:
+    """Pull every `/tmp/vexis-screenshot-*.png` path out of `text`.
+
+    Returns the list of unique paths (in first-seen order) and the cleaned
+    text with each match replaced by the placeholder ``[screenshot]`` so the
+    surrounding prose still reads naturally.
+    """
+    seen: list[Path] = []
+    seen_set: set[str] = set()
+    for match in _SCREENSHOT_PATH_RE.findall(text):
+        if match in seen_set:
+            continue
+        seen_set.add(match)
+        seen.append(Path(match))
+    cleaned = _SCREENSHOT_PATH_RE.sub("[screenshot]", text)
+    return seen, cleaned
 
 
 def _greedy_join(parts: list[str], sep: str, max_len: int) -> list[str]:
@@ -107,6 +128,7 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("rename", self._on_rename))
         self._app.add_handler(CommandHandler("delete", self._on_delete))
         self._app.add_handler(CommandHandler("confirm_delete", self._on_confirm_delete))
+        self._app.add_handler(CommandHandler("screenshot", self._on_screenshot))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
 
     async def _on_text(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -131,8 +153,7 @@ class TelegramTransport:
         if reply is None:
             return
 
-        for chunk in split_for_telegram(reply):
-            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=None)
+        await self._send_brain_reply(bot, chat_id, reply)
 
     async def _on_clear(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
@@ -342,8 +363,7 @@ class TelegramTransport:
             )
             if reply is None:
                 return
-            for chunk in split_for_telegram(reply):
-                await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=None)
+            await self._send_brain_reply(bot, chat_id, reply)
         finally:
             if typing_task is not None:
                 typing_task.cancel()
@@ -352,6 +372,50 @@ class TelegramTransport:
                 except asyncio.CancelledError:
                     pass
             ogg_path.unlink(missing_ok=True)
+
+    async def _on_screenshot(
+        self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /screenshot from user_id=%s", user.id)
+            return
+        try:
+            result = await capture_desktop()
+        except CaptureError as exc:
+            log.warning("/screenshot failed: %s", exc)
+            await msg.reply_text(f"⚠️ Screenshot failed: {exc}")
+            return
+        try:
+            with result.image_path.open("rb") as fh:
+                await msg.reply_photo(photo=fh, caption=result.summary or None)
+        finally:
+            result.image_path.unlink(missing_ok=True)
+
+    async def _send_brain_reply(self, bot, chat_id: int, reply: str) -> None:
+        """Send a brain response, extracting and forwarding any screenshot
+        paths it referenced as photos before the text body."""
+        paths, cleaned = _extract_screenshot_paths(reply)
+        for path in paths:
+            try:
+                if not path.is_file():
+                    log.warning("Brain referenced missing screenshot %s", path)
+                    continue
+                with path.open("rb") as fh:
+                    await bot.send_photo(chat_id=chat_id, photo=fh)
+            except Exception:
+                log.exception("Failed to forward screenshot %s", path)
+            finally:
+                path.unlink(missing_ok=True)
+
+        text = cleaned.strip()
+        if not text:
+            return
+        for chunk in split_for_telegram(text):
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=None)
 
     @staticmethod
     async def _keep_typing(bot, chat_id: int) -> None:

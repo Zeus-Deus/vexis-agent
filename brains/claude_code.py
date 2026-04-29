@@ -15,6 +15,8 @@ from core.sessions import SessionStore
 
 log = logging.getLogger(__name__)
 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 DISALLOWED_TOOLS: list[str] = []  # All tools enabled in Step 6
 
 DEFAULT_SOUL = (
@@ -45,6 +47,22 @@ def _sentence_around(text: str, start: int, end: int) -> str:
     m = _SENTENCE_END.search(text, end)
     right = m.start() + 1 if m else len(text)
     return text[left:right]
+
+
+def _read_markdown(path: Path) -> str | None:
+    """Read a UTF-8 markdown file. Missing file is fine (returns None);
+    unreadable / non-UTF-8 file logs a warning and also returns None."""
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        log.warning("Could not read %s: %s", path, exc)
+        return None
+    except UnicodeDecodeError as exc:
+        log.warning("%s is not valid UTF-8: %s", path, exc)
+        return None
+    return content or None
 
 
 def audit_destructive_mentions(response: str) -> Iterator[tuple[str, bool]]:
@@ -83,18 +101,10 @@ class ClaudeCodeBrain:
         self._timeout = timeout_seconds
 
     def _read_soul(self) -> str | None:
-        soul_path = self._workspace / "SOUL.md"
-        try:
-            content = soul_path.read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            log.warning("Could not read SOUL.md at %s: %s", soul_path, exc)
-            return None
-        except UnicodeDecodeError as exc:
-            log.warning("SOUL.md at %s is not valid UTF-8: %s", soul_path, exc)
-            return None
-        return content or None
+        return _read_markdown(self._workspace / "SOUL.md")
+
+    def _read_capabilities(self) -> str | None:
+        return _read_markdown(_PROJECT_ROOT / "CAPABILITIES.md")
 
     async def respond(self, message: str) -> str:
         session_id = self._session.get()
@@ -105,6 +115,8 @@ class ClaudeCodeBrain:
             session_flag = ["--session-id", session_id]
 
         soul = self._read_soul() or DEFAULT_SOUL
+        capabilities = self._read_capabilities()
+        system_prompt = f"{soul}\n\n{capabilities}" if capabilities else soul
 
         argv = [
             "claude",
@@ -112,7 +124,7 @@ class ClaudeCodeBrain:
             message,
             *session_flag,
             "--append-system-prompt",
-            soul,
+            system_prompt,
         ]
         if DISALLOWED_TOOLS:
             argv += ["--disallowedTools", *DISALLOWED_TOOLS]
