@@ -13,7 +13,7 @@ from core.config import load_config
 from core.handler import MessageHandler
 from core.logging import setup_logging
 from core.paths import state_dir, workspace_dir
-from core.session import SessionStore
+from core.sessions import SessionStore
 from transports.telegram import TelegramTransport
 
 log = logging.getLogger(__name__)
@@ -30,15 +30,15 @@ async def _run() -> None:
     workspace: Path = workspace_dir(config.workspace)
     log.info("Workspace resolved to %s", workspace)
 
-    session = SessionStore(state_path=state_dir() / "session.json")
+    sessions = SessionStore(state_path=state_dir() / "session.json")
     brain = ClaudeCodeBrain(
         workspace=workspace,
-        session=session,
+        session=sessions,
         timeout_seconds=config.claude_timeout_seconds,
     )
     handler = MessageHandler(
         brain=brain,
-        session=session,
+        sessions=sessions,
         allowed_user_id=config.telegram_allowed_user_id,
     )
     transport = TelegramTransport(

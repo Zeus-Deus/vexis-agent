@@ -8,7 +8,7 @@ import os
 import signal
 from pathlib import Path
 
-from core.session import SessionStore
+from core.sessions import SessionStore
 
 log = logging.getLogger(__name__)
 

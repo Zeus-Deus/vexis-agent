@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telegram import Update
@@ -29,6 +30,7 @@ _VOICE_ECHO_PREFIX = "🎙️ "
 _VOICE_BRAIN_TAG = "[transcribed voice memo] "
 _TRANSCRIPTION_EMPTY = "⚠️ Couldn't hear anything in that. Try again?"
 _TRANSCRIPTION_FAILED = "⚠️ Couldn't transcribe that. Logs have details."
+_DELETE_CONFIRM_WINDOW = timedelta(seconds=60)
 
 
 def split_for_telegram(text: str, max_len: int = _MAX_CHUNK) -> list[str]:
@@ -69,12 +71,21 @@ class TelegramTransport:
     ) -> None:
         self._handler = handler
         self._allowed_user_id = allowed_user_id
+        # Telegram bot commands can't contain hyphens, so /confirm-delete from
+        # the spec becomes /confirm_delete here.
+        self._pending_deletes: dict[str, datetime] = {}
         self._app = Application.builder().token(token).build()
         self._app.add_handler(
             PtbMessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text)
         )
         self._app.add_handler(PtbMessageHandler(filters.VOICE, self._on_voice))
         self._app.add_handler(CommandHandler("clear", self._on_clear))
+        self._app.add_handler(CommandHandler("new", self._on_new))
+        self._app.add_handler(CommandHandler("switch", self._on_switch))
+        self._app.add_handler(CommandHandler("sessions", self._on_sessions))
+        self._app.add_handler(CommandHandler("rename", self._on_rename))
+        self._app.add_handler(CommandHandler("delete", self._on_delete))
+        self._app.add_handler(CommandHandler("confirm_delete", self._on_confirm_delete))
 
     async def _on_text(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
@@ -106,10 +117,112 @@ class TelegramTransport:
         user = update.effective_user
         if msg is None or user is None:
             return
+        self._pending_deletes.clear()
         reply = await self._handler.handle_clear(user.id)
         if reply is None:
             return
-        await msg.get_bot().send_message(chat_id=msg.chat_id, text=reply, parse_mode=None)
+        await msg.get_bot().send_message(
+            chat_id=msg.chat_id, text=reply, parse_mode=None
+        )
+
+    async def _on_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        self._pending_deletes.clear()
+        args = ctx.args or []
+        if len(args) > 1:
+            await msg.reply_text("Usage: /new [name]")
+            return
+        reply = await self._handler.handle_new(user.id, args[0] if args else None)
+        if reply is not None:
+            await msg.reply_text(reply)
+
+    async def _on_switch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        self._pending_deletes.clear()
+        args = ctx.args or []
+        if len(args) != 1:
+            await msg.reply_text("Usage: /switch <name>")
+            return
+        reply = await self._handler.handle_switch(user.id, args[0])
+        if reply is not None:
+            await msg.reply_text(reply)
+
+    async def _on_sessions(
+        self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        self._pending_deletes.clear()
+        reply = await self._handler.handle_sessions(user.id)
+        if reply is not None:
+            await msg.reply_text(reply)
+
+    async def _on_rename(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        self._pending_deletes.clear()
+        args = ctx.args or []
+        if len(args) != 2:
+            await msg.reply_text("Usage: /rename <old> <new>")
+            return
+        reply = await self._handler.handle_rename(user.id, args[0], args[1])
+        if reply is not None:
+            await msg.reply_text(reply)
+
+    async def _on_delete(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /delete from user_id=%s", user.id)
+            return
+        args = ctx.args or []
+        if len(args) != 1:
+            await msg.reply_text("Usage: /delete <name>")
+            return
+        name = args[0]
+        self._pending_deletes[name] = (
+            datetime.now(timezone.utc) + _DELETE_CONFIRM_WINDOW
+        )
+        await msg.reply_text(
+            f"Are you sure you want to delete '{name}'? "
+            f"Send /confirm_delete {name} within 60s to confirm."
+        )
+
+    async def _on_confirm_delete(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /confirm_delete from user_id=%s", user.id)
+            return
+        args = ctx.args or []
+        if len(args) != 1:
+            await msg.reply_text("Usage: /confirm_delete <name>")
+            return
+        name = args[0]
+        expiry = self._pending_deletes.pop(name, None)
+        now = datetime.now(timezone.utc)
+        if expiry is None or expiry <= now:
+            await msg.reply_text(f"No pending deletion for '{name}'.")
+            return
+        reply = await self._handler.handle_delete(user.id, name)
+        if reply is not None:
+            await msg.reply_text(reply)
 
     async def _on_voice(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
