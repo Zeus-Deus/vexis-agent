@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import signal
 import tempfile
 import time
 from pathlib import Path
+
+from core.subprocess import run
 
 log = logging.getLogger(__name__)
 
@@ -35,12 +35,21 @@ async def transcribe_audio(audio_path: Path) -> str:
 
     try:
         ffmpeg_argv = [
-            "ffmpeg", "-y", "-i", str(audio_path),
-            "-ar", "16000", "-ac", "1", "-f", "wav", str(wav_path),
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(audio_path),
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-f",
+            "wav",
+            str(wav_path),
         ]
-        await _run("ffmpeg", ffmpeg_argv, FFMPEG_TIMEOUT_SECONDS)
+        await _run_or_raise("ffmpeg", ffmpeg_argv, FFMPEG_TIMEOUT_SECONDS)
 
-        stdout = await _run(
+        stdout = await _run_or_raise(
             "voxtype",
             ["voxtype", "--quiet", "transcribe", str(wav_path)],
             TRANSCRIBE_TIMEOUT_SECONDS,
@@ -63,49 +72,14 @@ async def transcribe_audio(audio_path: Path) -> str:
     return text
 
 
-async def _run(name: str, argv: list[str], timeout: int) -> bytes:
-    """Run a subprocess in its own process group; raise TranscriptionError on
-    timeout/non-zero. Returns captured stdout bytes."""
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-    )
+async def _run_or_raise(name: str, argv: list[str], timeout: int) -> bytes:
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        rc, stdout, stderr = await run(name, argv, timeout)
     except asyncio.TimeoutError as exc:
-        await _kill_group(proc)
         raise TranscriptionError(f"{name} timed out after {timeout}s") from exc
 
     log.debug("%s stderr: %s", name, stderr.decode(errors="replace"))
-    if proc.returncode != 0:
+    if rc != 0:
         err = stderr.decode(errors="replace").strip()
-        raise TranscriptionError(
-            f"{name} exited {proc.returncode}: {err or '(no stderr)'}"
-        )
+        raise TranscriptionError(f"{name} exited {rc}: {err or '(no stderr)'}")
     return stdout
-
-
-async def _kill_group(proc: asyncio.subprocess.Process) -> None:
-    if proc.returncode is not None:
-        return
-    try:
-        pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
-        return
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=5)
-    except asyncio.TimeoutError:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            log.error("subprocess (pid=%s) ignored SIGKILL", proc.pid)

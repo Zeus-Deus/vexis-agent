@@ -53,3 +53,60 @@ between components.
 
 If omarchy-kb returns nothing useful for your query, say so — don't
 fabricate an answer.
+
+## Desktop control
+
+You can control the user's mouse, keyboard, and Hyprland windows.
+Use the right tool for each job.
+
+### Window management — prefer hyprctl
+
+Always use `hyprctl dispatch` for window/workspace operations. It's
+faster, more reliable, and matches the user's actual keybindings.
+
+    ~/projects/vexis-agent/scripts/vexis-dispatch "workspace 3"
+    ~/projects/vexis-agent/scripts/vexis-dispatch "focuswindow class:^(brave-browser)$"
+    ~/projects/vexis-agent/scripts/vexis-dispatch "togglefloating"
+    ~/projects/vexis-agent/scripts/vexis-dispatch "killactive"
+    ~/projects/vexis-agent/scripts/vexis-dispatch "exec [workspace 2 silent] kitty"
+
+The user's actual bindings (Super+1..0 for workspaces, Super+W to
+close, Super+T to float, Super+F for fullscreen, Super+arrows for
+focus) are in `~/.local/share/omarchy/default/hypr/bindings/tiling-v2.conf`.
+Dispatcher names you use should match those bindings — the user's
+muscle memory expects the same dispatchers.
+
+### Typing text — use wtype, not ydotool
+
+For typing arbitrary text:
+
+    ~/projects/vexis-agent/scripts/vexis-type "hello, sir"
+    ~/projects/vexis-agent/scripts/vexis-type "user@example.com"
+
+`wtype` respects the active keyboard layout and handles UTF-8.
+Don't use ydotool for typing — it produces wrong characters for
+symbols and non-US layouts.
+
+### Mouse and key chords — use ydotool
+
+For clicking and modifier-key combinations:
+
+    ~/projects/vexis-agent/scripts/vexis-click --button left
+    ~/projects/vexis-agent/scripts/vexis-click --button right --count 2
+    ~/projects/vexis-agent/scripts/vexis-key KEY_LEFTCTRL KEY_C
+    ~/projects/vexis-agent/scripts/vexis-key KEY_LEFTALT KEY_TAB
+
+### Focus race condition — wait after focus changes
+
+If you change focus and then type, the keystrokes may land on the
+wrong window because focus hasn't settled. Always poll for focus
+between operations:
+
+    ~/projects/vexis-agent/scripts/vexis-dispatch "focuswindow class:^(brave-browser)$"
+    ~/projects/vexis-agent/scripts/vexis-focus-wait "brave-browser" --timeout 2
+    ~/projects/vexis-agent/scripts/vexis-type "hello"
+
+### Hyprland docs
+
+When you need a dispatcher you don't know, query omarchy-kb. Don't
+guess.

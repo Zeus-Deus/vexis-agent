@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -23,9 +24,27 @@ async def _run() -> None:
     config = load_config()
     setup_logging(config.log_level)
 
-    for cmd in ("claude", "voxtype", "ffmpeg", "grim", "hyprctl", "jq"):
+    for cmd in (
+        "claude",
+        "voxtype",
+        "ffmpeg",
+        "grim",
+        "hyprctl",
+        "jq",
+        "ydotool",
+        "wtype",
+    ):
         if shutil.which(cmd) is None:
             raise RuntimeError(f"`{cmd}` CLI not found on PATH")
+
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    socket = Path(runtime) / ".ydotool_socket"
+    if not socket.exists():
+        log.warning(
+            "ydotool socket not found at %s; mouse/keyboard actuation will fail "
+            "until ydotool.service is running",
+            socket,
+        )
 
     workspace: Path = workspace_dir(config.workspace)
     log.info("Workspace resolved to %s", workspace)

@@ -9,12 +9,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
-import signal
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from core.subprocess import run
 
 log = logging.getLogger(__name__)
 
@@ -244,45 +244,12 @@ def _s(n: int) -> str:
 
 
 async def _run(argv: list[str], timeout: int) -> bytes:
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-    )
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        rc, stdout, stderr = await run(argv[0], argv, timeout)
     except asyncio.TimeoutError as exc:
-        await _kill_group(proc)
         raise CaptureError(f"{argv[0]} timed out after {timeout}s") from exc
 
-    if proc.returncode != 0:
+    if rc != 0:
         err = stderr.decode(errors="replace").strip()
-        raise CaptureError(
-            f"{argv[0]} exited {proc.returncode}: {err or '(no stderr)'}"
-        )
+        raise CaptureError(f"{argv[0]} exited {rc}: {err or '(no stderr)'}")
     return stdout
-
-
-async def _kill_group(proc: asyncio.subprocess.Process) -> None:
-    if proc.returncode is not None:
-        return
-    try:
-        pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
-        return
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=3)
-    except asyncio.TimeoutError:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=3)
-        except asyncio.TimeoutError:
-            log.error("subprocess (pid=%s) ignored SIGKILL", proc.pid)
