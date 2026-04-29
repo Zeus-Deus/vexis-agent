@@ -13,7 +13,6 @@ class Config:
     telegram_bot_token: str
     telegram_allowed_user_id: int
     workspace: str
-    claude_timeout_seconds: int
     log_level: str
 
 
@@ -38,20 +37,11 @@ def load_config() -> Config:
 
     workspace = os.environ.get("VEXIS_WORKSPACE", "~/vexis-workspace").strip()
 
-    raw_timeout = os.environ.get("CLAUDE_TIMEOUT_SECONDS", "300").strip()
-    try:
-        timeout = int(raw_timeout)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"CLAUDE_TIMEOUT_SECONDS must be an integer, got: {raw_timeout!r}"
-        ) from exc
-
     log_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
 
     return Config(
         telegram_bot_token=token,
         telegram_allowed_user_id=user_id,
         workspace=workspace,
-        claude_timeout_seconds=timeout,
         log_level=log_level,
     )

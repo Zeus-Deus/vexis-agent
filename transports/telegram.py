@@ -9,7 +9,12 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand as TelegramBotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -21,7 +26,9 @@ from telegram.ext import (
 )
 
 from core.auth import is_allowed
+from core.commands import COMMANDS
 from core.handler import MessageHandler
+from core.running_tasks import RunningTasks
 from core.sessions import SessionInfo
 from tools.desktop import CaptureError, capture_desktop
 from tools.voxtype import TranscriptionEmpty, TranscriptionError, transcribe_audio
@@ -40,6 +47,8 @@ _DELETE_CONFIRM_WINDOW = timedelta(seconds=60)
 _CB_DATA_MAX_BYTES = 64
 _HIDDEN_NOTE = "(Some sessions hidden — type the name directly to use them.)"
 _SCREENSHOT_PATH_RE = re.compile(r"(?<![\w/])/tmp/vexis-screenshot-\d+\.png")
+_CANCEL_OK = "Cancelled, sir. What next?"
+_NOTHING_TO_CANCEL = "Nothing to cancel — I'm not working on anything right now."
 
 
 def split_for_telegram(text: str, max_len: int = _MAX_CHUNK) -> list[str]:
@@ -111,14 +120,23 @@ def _greedy_join(parts: list[str], sep: str, max_len: int) -> list[str]:
 
 class TelegramTransport:
     def __init__(
-        self, token: str, handler: MessageHandler, allowed_user_id: int
+        self,
+        token: str,
+        handler: MessageHandler,
+        running_tasks: RunningTasks,
+        allowed_user_id: int,
     ) -> None:
         self._handler = handler
+        self._running_tasks = running_tasks
         self._allowed_user_id = allowed_user_id
         # Telegram bot commands can't contain hyphens, so /confirm-delete from
         # the spec becomes /confirm_delete here.
         self._pending_deletes: dict[str, datetime] = {}
-        self._app = Application.builder().token(token).build()
+        # concurrent_updates(True) is load-bearing for /cancel: PTB's default
+        # serializes every update through one task, so a /cancel sent while
+        # a brain call is in flight queues behind it for up to 30 minutes
+        # and the user's "Cancelled, sir" reply never arrives in time.
+        self._app = Application.builder().token(token).concurrent_updates(True).build()
         self._app.add_handler(
             PtbMessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text)
         )
@@ -131,6 +149,7 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("delete", self._on_delete))
         self._app.add_handler(CommandHandler("confirm_delete", self._on_confirm_delete))
         self._app.add_handler(CommandHandler("screenshot", self._on_screenshot))
+        self._app.add_handler(CommandHandler("cancel", self._on_cancel))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
 
     async def _on_text(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -144,7 +163,7 @@ class TelegramTransport:
 
         typing_task = asyncio.create_task(self._keep_typing(bot, chat_id))
         try:
-            reply = await self._handler.handle(user.id, msg.text)
+            reply = await self._handler.handle(user.id, chat_id, msg.text)
         finally:
             typing_task.cancel()
             try:
@@ -371,7 +390,7 @@ class TelegramTransport:
             )
 
             reply = await self._handler.handle(
-                user.id, f"{_VOICE_BRAIN_TAG}{transcription}"
+                user.id, chat_id, f"{_VOICE_BRAIN_TAG}{transcription}"
             )
             if reply is None:
                 return
@@ -384,6 +403,19 @@ class TelegramTransport:
                 except asyncio.CancelledError:
                     pass
             ogg_path.unlink(missing_ok=True)
+
+    async def _on_cancel(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /cancel from user_id=%s", user.id)
+            return
+        log.info("Received /cancel from chat %d", msg.chat_id)
+        cancelled = await self._running_tasks.cancel(msg.chat_id)
+        log.info("Cancel result for chat %d: %s", msg.chat_id, cancelled)
+        await msg.reply_text(_CANCEL_OK if cancelled else _NOTHING_TO_CANCEL)
 
     async def _on_screenshot(
         self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE
@@ -440,6 +472,7 @@ class TelegramTransport:
 
     async def run(self) -> None:
         await self._app.initialize()
+        await _register_commands(self._app)
         await self._app.start()
         await self._app.updater.start_polling()
         log.info("Telegram polling started")
@@ -449,3 +482,21 @@ class TelegramTransport:
             await self._app.updater.stop()
             await self._app.stop()
             await self._app.shutdown()
+
+
+async def _register_commands(application: Application) -> None:
+    """Mirror the canonical COMMANDS list to Telegram's slash menu.
+
+    Failure here (network error, bad token, API hiccup) must not block
+    daemon startup — the menu would just stay stale until the next
+    successful restart.
+    """
+    bot_commands = [
+        TelegramBotCommand(cmd.command, cmd.description) for cmd in COMMANDS
+    ]
+    try:
+        await application.bot.set_my_commands(bot_commands)
+    except Exception as exc:
+        log.warning("Could not register Telegram commands: %s", exc)
+        return
+    log.info("Registered %d Telegram commands with Bot API", len(bot_commands))

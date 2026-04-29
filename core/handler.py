@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 
 from brains.base import Brain
-from brains.claude_code import SessionLost
+from brains.claude_code import BrainCancelled, BrainTimeoutError, SessionLost
 from core.auth import is_allowed
+from core.running_tasks import TaskAlreadyRunning
 from core.sessions import SessionInfo, SessionStore
 
 log = logging.getLogger(__name__)
@@ -17,6 +17,14 @@ _BRAIN_ERROR = "⚠️ Something broke. Logs have details."
 _SESSION_LOST = (
     "⚠️ Couldn't resume the previous conversation. "
     "Starting fresh — please send your message again."
+)
+_BRAIN_TIMEOUT = (
+    "Sir, that ran past my 30-minute ceiling. Either I got stuck or the "
+    "task was bigger than I expected. Tell me what to do — retry, "
+    "rephrase, or stop?"
+)
+_ALREADY_RUNNING = (
+    "Still working on the previous one, sir. Send /cancel if you want to redirect."
 )
 _EMPTY_RESPONSE = "(empty response)"
 _CLEAR_OK = "Conversation cleared."
@@ -29,21 +37,27 @@ class MessageHandler:
         self._brain = brain
         self._sessions = sessions
         self._allowed_user_id = allowed_user_id
-        self._lock = asyncio.Lock()
 
-    async def handle(self, user_id: int, text: str) -> str | None:
+    async def handle(self, user_id: int, chat_id: int, text: str) -> str | None:
         if not is_allowed(user_id, self._allowed_user_id):
             log.warning("Rejected message from user_id=%s", user_id)
             return None
 
-        async with self._lock:
-            try:
-                reply = await self._brain.respond(text)
-            except SessionLost:
-                return _SESSION_LOST
-            except Exception:
-                log.exception("Brain call failed")
-                return _BRAIN_ERROR
+        try:
+            reply = await self._brain.respond(text, chat_id)
+        except TaskAlreadyRunning:
+            return _ALREADY_RUNNING
+        except BrainCancelled:
+            # /cancel handler already replied; nothing more to send.
+            return None
+        except BrainTimeoutError:
+            log.warning("Brain timed out for chat_id=%s", chat_id)
+            return _BRAIN_TIMEOUT
+        except SessionLost:
+            return _SESSION_LOST
+        except Exception:
+            log.exception("Brain call failed")
+            return _BRAIN_ERROR
 
         return reply.strip() or _EMPTY_RESPONSE
 

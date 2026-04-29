@@ -10,12 +10,16 @@ import signal
 from collections.abc import Iterator
 from pathlib import Path
 
+from core.running_tasks import RunningTasks
 from core.safety import DESTRUCTIVE_PATTERNS
 from core.sessions import SessionStore
 
 log = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# 30 min — generous for long multi-step work, hard ceiling for runaway calls.
+BRAIN_TIMEOUT_SECONDS = 1800
 
 DISALLOWED_TOOLS: list[str] = []  # All tools enabled in Step 6
 
@@ -87,6 +91,10 @@ class BrainTimeoutError(BrainError):
     pass
 
 
+class BrainCancelled(BrainError):
+    """Raised when the brain subprocess was cancelled via /cancel."""
+
+
 class SessionLost(BrainError):
     """Raised when --resume fails because Claude Code can't find the session.
     The session has been rotated; the user's message was not processed."""
@@ -94,11 +102,14 @@ class SessionLost(BrainError):
 
 class ClaudeCodeBrain:
     def __init__(
-        self, workspace: Path, session: SessionStore, timeout_seconds: int
+        self,
+        workspace: Path,
+        session: SessionStore,
+        running_tasks: RunningTasks,
     ) -> None:
         self._workspace = workspace
         self._session = session
-        self._timeout = timeout_seconds
+        self._running_tasks = running_tasks
 
     def _read_soul(self) -> str | None:
         return _read_markdown(self._workspace / "SOUL.md")
@@ -106,7 +117,8 @@ class ClaudeCodeBrain:
     def _read_capabilities(self) -> str | None:
         return _read_markdown(_PROJECT_ROOT / "CAPABILITIES.md")
 
-    async def respond(self, message: str) -> str:
+    async def respond(self, message: str, chat_id: int) -> str:
+        log.info("Brain.respond starting for chat %d", chat_id)
         session_id = self._session.get()
         # First call pins the UUID with --session-id; subsequent calls resume it.
         if self._session.is_initialized():
@@ -140,42 +152,67 @@ class ClaudeCodeBrain:
             self._workspace,
         )
 
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(self._workspace),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-
+        # Reserve before spawning so a /cancel arriving while claude -p is
+        # starting up is captured by the slot and surfaced via attach() →
+        # False below — closes the spawn-vs-register race.
+        reservation = await self._running_tasks.reserve(chat_id)
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=self._timeout
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(self._workspace),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
-        except asyncio.TimeoutError as exc:
-            await self._kill_group(proc)
-            raise BrainTimeoutError(
-                f"claude -p timed out after {self._timeout}s"
-            ) from exc
+            log.info("Brain spawned PID %d for chat %d", proc.pid, chat_id)
 
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip()
-            # Claude Code's wording has varied across versions; substring
-            # match is more robust than pinning an exact string.
-            if self._session.is_initialized() and "No conversation found" in err:
-                old_uuid = self._session.get()
-                new_uuid = self._session.rotate()
-                log.warning(
-                    "Claude Code lost session %s; rotated to %s",
-                    old_uuid,
-                    new_uuid,
+            attached = await self._running_tasks.attach(reservation, proc)
+            if not attached:
+                log.info(
+                    "Brain raising BrainCancelled for chat %d "
+                    "(cancel during reservation window)",
+                    chat_id,
                 )
-                raise SessionLost(
-                    "Claude Code session was lost. Rotated to new session."
+                await self._kill_group(proc)
+                raise BrainCancelled("brain subprocess cancelled via /cancel")
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=BRAIN_TIMEOUT_SECONDS
                 )
-            raise BrainError(
-                f"claude -p exited {proc.returncode}: {err or '(no stderr)'}"
-            )
+            except asyncio.TimeoutError as exc:
+                await self._kill_group(proc)
+                raise BrainTimeoutError(
+                    f"claude -p timed out after {BRAIN_TIMEOUT_SECONDS}s"
+                ) from exc
+
+            if self._running_tasks.was_cancelled(chat_id):
+                log.info(
+                    "Brain raising BrainCancelled for chat %d (proc killed)",
+                    chat_id,
+                )
+                raise BrainCancelled("brain subprocess cancelled via /cancel")
+
+            if proc.returncode != 0:
+                err = stderr.decode(errors="replace").strip()
+                # Claude Code's wording has varied across versions; substring
+                # match is more robust than pinning an exact string.
+                if self._session.is_initialized() and "No conversation found" in err:
+                    old_uuid = self._session.get()
+                    new_uuid = self._session.rotate()
+                    log.warning(
+                        "Claude Code lost session %s; rotated to %s",
+                        old_uuid,
+                        new_uuid,
+                    )
+                    raise SessionLost(
+                        "Claude Code session was lost. Rotated to new session."
+                    )
+                raise BrainError(
+                    f"claude -p exited {proc.returncode}: {err or '(no stderr)'}"
+                )
+        finally:
+            await self._running_tasks.unregister(chat_id)
 
         # Mark only after a successful exit so a failed first call doesn't
         # leave us thinking the UUID is live.
@@ -187,6 +224,7 @@ class ClaudeCodeBrain:
                 log.info("Vexis confirmed before destructive: %s", reason)
             else:
                 log.info("Vexis ran without confirm: %s", reason)
+        log.info("Brain.respond completed for chat %d", chat_id)
         return response
 
     @staticmethod

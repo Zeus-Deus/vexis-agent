@@ -14,6 +14,7 @@ from core.config import load_config
 from core.handler import MessageHandler
 from core.logging import setup_logging
 from core.paths import state_dir, workspace_dir
+from core.running_tasks import RunningTasks
 from core.sessions import SessionStore
 from transports.telegram import TelegramTransport
 
@@ -70,10 +71,11 @@ async def _run() -> None:
         )
 
     sessions = SessionStore(state_path=state_dir() / "session.json")
+    running_tasks = RunningTasks()
     brain = ClaudeCodeBrain(
         workspace=workspace,
         session=sessions,
-        timeout_seconds=config.claude_timeout_seconds,
+        running_tasks=running_tasks,
     )
     handler = MessageHandler(
         brain=brain,
@@ -83,6 +85,7 @@ async def _run() -> None:
     transport = TelegramTransport(
         token=config.telegram_bot_token,
         handler=handler,
+        running_tasks=running_tasks,
         allowed_user_id=config.telegram_allowed_user_id,
     )
 
