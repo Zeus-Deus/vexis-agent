@@ -30,6 +30,14 @@ async def _run() -> None:
     workspace: Path = workspace_dir(config.workspace)
     log.info("Workspace resolved to %s", workspace)
 
+    soul_path = workspace / "SOUL.md"
+    if not soul_path.exists():
+        log.info(
+            "SOUL.md not found at %s. Using default personality. "
+            "Create the file to customize.",
+            soul_path,
+        )
+
     sessions = SessionStore(state_path=state_dir() / "session.json")
     brain = ClaudeCodeBrain(
         workspace=workspace,

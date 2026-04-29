@@ -5,23 +5,60 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import signal
+from collections.abc import Iterator
 from pathlib import Path
 
+from core.safety import DESTRUCTIVE_PATTERNS
 from core.sessions import SessionStore
 
 log = logging.getLogger(__name__)
 
-DISALLOWED_TOOLS = [
-    "Bash",
-    "Edit",
-    "Write",
-    "Read",
-    "Grep",
-    "Glob",
-    "WebFetch",
-    "Task",
-]
+DISALLOWED_TOOLS: list[str] = []  # All tools enabled in Step 6
+
+DEFAULT_SOUL = (
+    "You are Vexis, the user's personal agent. Be concise, truth-seeking, "
+    "and genuinely useful. Never invent information; admit uncertainty. "
+    "Address the user as 'sir' occasionally where it fits."
+)
+
+# Phrases that suggest Vexis is asking permission rather than reporting
+# execution. Heuristic for dogfooding signal only — the model decides what
+# to run; this just classifies the textual reply.
+_ASKING_RE = re.compile(
+    r"\b(should|shall|may|do you want|want me|would you like|"
+    r"okay to|ok to|confirm|before I|about to|going to|"
+    r"plan(ning)? to|ready to|may I|is it ok|is that ok)\b",
+    re.IGNORECASE,
+)
+# Sentence terminator: ., !, ? followed by whitespace/EOS, or a newline.
+# Bounding the asking-language scan to a single sentence prevents a `?` in
+# one sentence from misclassifying a destructive mention in the next.
+_SENTENCE_END = re.compile(r"[.!?](?:\s+|$)|\n+")
+
+
+def _sentence_around(text: str, start: int, end: int) -> str:
+    left = 0
+    for m in _SENTENCE_END.finditer(text, 0, start):
+        left = m.end()
+    m = _SENTENCE_END.search(text, end)
+    right = m.start() + 1 if m else len(text)
+    return text[left:right]
+
+
+def audit_destructive_mentions(response: str) -> Iterator[tuple[str, bool]]:
+    """Yield (reason, asked_first) for each destructive pattern hit in response.
+
+    asked_first is True when the enclosing sentence contains a question mark
+    or asking-language, suggesting Vexis sought confirmation rather than
+    reporting after the fact. False = appears to have run it.
+    """
+    for pattern, reason in DESTRUCTIVE_PATTERNS:
+        for match in pattern.finditer(response):
+            sentence = _sentence_around(response, *match.span())
+            asked = "?" in sentence or bool(_ASKING_RE.search(sentence))
+            yield reason, asked
 
 
 class BrainError(RuntimeError):
@@ -45,6 +82,20 @@ class ClaudeCodeBrain:
         self._session = session
         self._timeout = timeout_seconds
 
+    def _read_soul(self) -> str | None:
+        soul_path = self._workspace / "SOUL.md"
+        try:
+            content = soul_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            log.warning("Could not read SOUL.md at %s: %s", soul_path, exc)
+            return None
+        except UnicodeDecodeError as exc:
+            log.warning("SOUL.md at %s is not valid UTF-8: %s", soul_path, exc)
+            return None
+        return content or None
+
     async def respond(self, message: str) -> str:
         session_id = self._session.get()
         # First call pins the UUID with --session-id; subsequent calls resume it.
@@ -53,14 +104,23 @@ class ClaudeCodeBrain:
         else:
             session_flag = ["--session-id", session_id]
 
+        soul = self._read_soul() or DEFAULT_SOUL
+
         argv = [
             "claude",
             "-p",
             message,
             *session_flag,
-            "--disallowedTools",
-            *DISALLOWED_TOOLS,
+            "--append-system-prompt",
+            soul,
         ]
+        if DISALLOWED_TOOLS:
+            argv += ["--disallowedTools", *DISALLOWED_TOOLS]
+        # bypassPermissions: required when running headless (-p) with tools
+        # enabled. Otherwise Claude Code would try to prompt interactively
+        # for each tool use and the call would hang. Step 6.5 will add a
+        # PreToolUse hook that consults core.safety for hard enforcement.
+        argv += ["--permission-mode", "bypassPermissions"]
         log.debug(
             "Spawning claude -p (%s=%s, cwd=%s)",
             session_flag[0],
@@ -109,7 +169,13 @@ class ClaudeCodeBrain:
         # leave us thinking the UUID is live.
         if not self._session.is_initialized():
             self._session.mark_initialized()
-        return stdout.decode(errors="replace").strip()
+        response = stdout.decode(errors="replace").strip()
+        for reason, asked in audit_destructive_mentions(response):
+            if asked:
+                log.info("Vexis confirmed before destructive: %s", reason)
+            else:
+                log.info("Vexis ran without confirm: %s", reason)
+        return response
 
     @staticmethod
     async def _kill_group(proc: asyncio.subprocess.Process) -> None:

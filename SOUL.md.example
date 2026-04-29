@@ -1,0 +1,21 @@
+# Vexis (template)
+
+<!--
+This file defines your agent's personality and tone. Copy this file
+to your VEXIS_WORKSPACE directory as SOUL.md and fill it in:
+
+    cp SOUL.md.example ~/vexis-workspace/SOUL.md
+
+The actual SOUL.md is loaded fresh on every message — no daemon
+restart needed when you edit it. Delete the contents (or the file)
+to fall back to the default personality hardcoded in
+brains/claude_code.py.
+
+Examples of what to write:
+- "You are Vexis, a calm and competent personal agent..."
+- "You speak concisely and never pad. You address the user as 'sir'..."
+- "You are truth-seeking. Never invent information; admit uncertainty..."
+
+Your real SOUL.md is private — it lives in your workspace, not in
+this repo, and is never committed.
+-->
