@@ -37,5 +37,6 @@ COMMANDS: tuple[BotCommand, ...] = (
     BotCommand("delete", "Delete a session"),
     BotCommand("clear", "Clear current session's history"),
     BotCommand("screenshot", "Take a screenshot of the focused monitor"),
-    BotCommand("cancel", "Stop the current task"),
+    BotCommand("tasks", "List background tasks"),
+    BotCommand("cancel", "Stop the current task or a named background task"),
 )

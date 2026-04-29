@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from brains.base import Brain
 from brains.claude_code import BrainCancelled, BrainTimeoutError, SessionLost
 from core.auth import is_allowed
+from core.notify import ContextNote, Notifier
 from core.running_tasks import TaskAlreadyRunning
 from core.sessions import SessionInfo, SessionStore
 
@@ -32,19 +33,32 @@ _CLEAR_OK = "Conversation cleared."
 
 class MessageHandler:
     def __init__(
-        self, brain: Brain, sessions: SessionStore, allowed_user_id: int
+        self,
+        brain: Brain,
+        sessions: SessionStore,
+        allowed_user_id: int,
+        *,
+        notifier: Notifier | None = None,
     ) -> None:
         self._brain = brain
         self._sessions = sessions
         self._allowed_user_id = allowed_user_id
+        # The notifier owns the per-chat context buffer. We consume from
+        # it at the start of every brain turn so events that fired since
+        # the last reply (background task completions, daemon-restart
+        # warnings) become visible to claude -p as a [SYSTEM CONTEXT]
+        # block prepended to the user's message.
+        self._notifier = notifier
 
     async def handle(self, user_id: int, chat_id: int, text: str) -> str | None:
         if not is_allowed(user_id, self._allowed_user_id):
             log.warning("Rejected message from user_id=%s", user_id)
             return None
 
+        message = await self._inject_context(chat_id, text)
+
         try:
-            reply = await self._brain.respond(text, chat_id)
+            reply = await self._brain.respond(message, chat_id)
         except TaskAlreadyRunning:
             return _ALREADY_RUNNING
         except BrainCancelled:
@@ -60,6 +74,25 @@ class MessageHandler:
             return _BRAIN_ERROR
 
         return reply.strip() or _EMPTY_RESPONSE
+
+    async def _inject_context(self, chat_id: int, text: str) -> str:
+        """Prepend any pending system notes to the user's message.
+
+        Notes are buffered by the notifier as side effects of background
+        events (task completions, restart warnings) and consumed atomically
+        here. If the buffer is empty the message is returned unchanged.
+        """
+        if self._notifier is None:
+            return text
+        notes = await self._notifier.consume_context(chat_id)
+        if not notes:
+            return text
+        log.info(
+            "Injecting %d system context note(s) into chat %d brain turn",
+            len(notes),
+            chat_id,
+        )
+        return _format_with_context(notes, text)
 
     async def handle_clear(self, user_id: int) -> str | None:
         if not is_allowed(user_id, self._allowed_user_id):
@@ -128,6 +161,30 @@ class MessageHandler:
             return f"No session named {name}."
         log.info("Deleted session '%s'", name)
         return f"Deleted {name}"
+
+
+_SYSTEM_CONTEXT_HEADER = "[SYSTEM CONTEXT — events since your last reply]"
+_USER_MESSAGE_HEADER = "[USER MESSAGE]"
+
+
+def _format_with_context(notes: list[ContextNote], user_text: str) -> str:
+    """Render the [SYSTEM CONTEXT] / [USER MESSAGE] envelope for the brain.
+
+    Each note becomes one bullet line: ``- HH:MM <text>``. Multi-line
+    note bodies have their continuation lines indented under the bullet
+    so the structure stays readable to both the brain and a human
+    inspecting the log.
+    """
+    lines: list[str] = []
+    for note in notes:
+        local_time = note.timestamp.astimezone().strftime("%H:%M")
+        body_lines = note.text.splitlines() or [""]
+        first, *rest = body_lines
+        lines.append(f"- {local_time} {first}")
+        for cont in rest:
+            lines.append(f"  {cont}")
+    block = "\n".join((_SYSTEM_CONTEXT_HEADER, *lines))
+    return f"{block}\n\n{_USER_MESSAGE_HEADER}\n{user_text}"
 
 
 def _format_sessions(infos: list[SessionInfo]) -> str:

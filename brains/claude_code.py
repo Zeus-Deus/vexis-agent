@@ -69,6 +69,19 @@ def _read_markdown(path: Path) -> str | None:
     return content or None
 
 
+def build_system_prompt(workspace: Path) -> str:
+    """Compose the SOUL+CAPABILITIES system prompt fed to claude -p.
+
+    Re-reads from disk on every call so SOUL.md edits take effect on the
+    next spawn without restarting the daemon. Used by the foreground
+    brain and by background tasks — both should ask claude -p to be the
+    same Vexis.
+    """
+    soul = _read_markdown(workspace / "SOUL.md") or DEFAULT_SOUL
+    capabilities = _read_markdown(_PROJECT_ROOT / "CAPABILITIES.md")
+    return f"{soul}\n\n{capabilities}" if capabilities else soul
+
+
 def audit_destructive_mentions(response: str) -> Iterator[tuple[str, bool]]:
     """Yield (reason, asked_first) for each destructive pattern hit in response.
 
@@ -111,12 +124,6 @@ class ClaudeCodeBrain:
         self._session = session
         self._running_tasks = running_tasks
 
-    def _read_soul(self) -> str | None:
-        return _read_markdown(self._workspace / "SOUL.md")
-
-    def _read_capabilities(self) -> str | None:
-        return _read_markdown(_PROJECT_ROOT / "CAPABILITIES.md")
-
     async def respond(self, message: str, chat_id: int) -> str:
         log.info("Brain.respond starting for chat %d", chat_id)
         session_id = self._session.get()
@@ -126,9 +133,7 @@ class ClaudeCodeBrain:
         else:
             session_flag = ["--session-id", session_id]
 
-        soul = self._read_soul() or DEFAULT_SOUL
-        capabilities = self._read_capabilities()
-        system_prompt = f"{soul}\n\n{capabilities}" if capabilities else soul
+        system_prompt = build_system_prompt(self._workspace)
 
         argv = [
             "claude",
@@ -156,6 +161,9 @@ class ClaudeCodeBrain:
         # starting up is captured by the slot and surfaced via attach() →
         # False below — closes the spawn-vs-register race.
         reservation = await self._running_tasks.reserve(chat_id)
+        # Propagate chat_id to spawned tools (vexis-bg etc.) so they can
+        # route notifications back to the right Telegram conversation.
+        env = {**os.environ, "VEXIS_CHAT_ID": str(chat_id)}
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -163,6 +171,7 @@ class ClaudeCodeBrain:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
+                env=env,
             )
             log.info("Brain spawned PID %d for chat %d", proc.pid, chat_id)
 

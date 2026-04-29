@@ -26,8 +26,14 @@ from telegram.ext import (
 )
 
 from core.auth import is_allowed
+from core.background_tasks import (
+    BackgroundTasks,
+    TaskNotFound,
+    TaskStatus,
+)
 from core.commands import COMMANDS
 from core.handler import MessageHandler
+from core.notify import Notifier
 from core.running_tasks import RunningTasks
 from core.sessions import SessionInfo
 from tools.desktop import CaptureError, capture_desktop
@@ -49,6 +55,11 @@ _HIDDEN_NOTE = "(Some sessions hidden — type the name directly to use them.)"
 _SCREENSHOT_PATH_RE = re.compile(r"(?<![\w/])/tmp/vexis-screenshot-\d+\.png")
 _CANCEL_OK = "Cancelled, sir. What next?"
 _NOTHING_TO_CANCEL = "Nothing to cancel — I'm not working on anything right now."
+_NO_BG_TASKS = "No background tasks running."
+_DAEMON_RESTART_LOST = (
+    "Sir, when the daemon restarted, background task `{name}` didn't survive. "
+    "Want me to relaunch it?"
+)
 
 
 def split_for_telegram(text: str, max_len: int = _MAX_CHUNK) -> list[str]:
@@ -125,9 +136,13 @@ class TelegramTransport:
         handler: MessageHandler,
         running_tasks: RunningTasks,
         allowed_user_id: int,
+        background_tasks: BackgroundTasks,
+        notifier: Notifier,
     ) -> None:
         self._handler = handler
         self._running_tasks = running_tasks
+        self._background_tasks = background_tasks
+        self._notifier = notifier
         self._allowed_user_id = allowed_user_id
         # Telegram bot commands can't contain hyphens, so /confirm-delete from
         # the spec becomes /confirm_delete here.
@@ -150,6 +165,7 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("confirm_delete", self._on_confirm_delete))
         self._app.add_handler(CommandHandler("screenshot", self._on_screenshot))
         self._app.add_handler(CommandHandler("cancel", self._on_cancel))
+        self._app.add_handler(CommandHandler("tasks", self._on_tasks))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
 
     async def _on_text(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -404,7 +420,7 @@ class TelegramTransport:
                     pass
             ogg_path.unlink(missing_ok=True)
 
-    async def _on_cancel(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _on_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
         user = update.effective_user
         if msg is None or user is None:
@@ -412,10 +428,38 @@ class TelegramTransport:
         if not is_allowed(user.id, self._allowed_user_id):
             log.warning("Rejected /cancel from user_id=%s", user.id)
             return
-        log.info("Received /cancel from chat %d", msg.chat_id)
+        args = ctx.args or []
+        if len(args) > 1:
+            await msg.reply_text("Usage: /cancel [name]")
+            return
+        if args:
+            name = args[0]
+            log.info("Received /cancel %s (background) from chat %d", name, msg.chat_id)
+            try:
+                cancelled = await self._background_tasks.cancel(name)
+            except TaskNotFound:
+                await msg.reply_text(f"No background task named '{name}'.")
+                return
+            if cancelled:
+                await msg.reply_text(f"Cancelled background task `{name}`.")
+            else:
+                await msg.reply_text(f"Task `{name}` isn't running anymore.")
+            return
+        log.info("Received /cancel (foreground) from chat %d", msg.chat_id)
         cancelled = await self._running_tasks.cancel(msg.chat_id)
         log.info("Cancel result for chat %d: %s", msg.chat_id, cancelled)
         await msg.reply_text(_CANCEL_OK if cancelled else _NOTHING_TO_CANCEL)
+
+    async def _on_tasks(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /tasks from user_id=%s", user.id)
+            return
+        summary = await self._background_tasks.status_summary()
+        await msg.reply_text(_format_tasks(summary))
 
     async def _on_screenshot(
         self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE
@@ -473,6 +517,14 @@ class TelegramTransport:
     async def run(self) -> None:
         await self._app.initialize()
         await _register_commands(self._app)
+        # Bind the notifier to the freshly-initialised PTB application
+        # and route background-task completions through it. Lost-task
+        # warnings from the previous daemon restart fire before polling
+        # opens so they're queued in both Telegram and the brain context
+        # buffer for the user's first reply of this session.
+        self._notifier.bind_app(self._app)
+        self._background_tasks.set_notify(self._notifier.send)
+        await self._notify_lost_tasks()
         await self._app.start()
         await self._app.updater.start_polling()
         log.info("Telegram polling started")
@@ -482,6 +534,79 @@ class TelegramTransport:
             await self._app.updater.stop()
             await self._app.stop()
             await self._app.shutdown()
+
+    async def _notify_lost_tasks(self) -> None:
+        try:
+            lost = await self._background_tasks.detect_lost_from_previous_run()
+        except Exception:
+            log.exception("Lost-task detection failed during startup")
+            return
+        for entry in lost:
+            try:
+                await self._notifier.send(
+                    entry["chat_id"], _DAEMON_RESTART_LOST.format(name=entry["name"])
+                )
+            except Exception:
+                log.exception(
+                    "Failed to send daemon-restart notice for task '%s'",
+                    entry.get("name"),
+                )
+
+
+def _format_tasks(tasks: list[dict]) -> str:
+    """Render the /tasks reply: running first, then recently finished."""
+    if not tasks:
+        return _NO_BG_TASKS
+    now = datetime.now(timezone.utc)
+    running: list[str] = []
+    finished: list[str] = []
+    for task in tasks:
+        name = task["name"]
+        status = task["status"]
+        if status in (TaskStatus.RUNNING.value, TaskStatus.PENDING.value):
+            spawned = _parse_iso(task.get("spawned_at"))
+            age = _short_duration(now - spawned) if spawned else "?"
+            running.append(f"  {name} — running {age}")
+            continue
+        finished_at = _parse_iso(task.get("finished_at"))
+        age = _short_duration(now - finished_at) if finished_at else "?"
+        if status == TaskStatus.FINISHED.value:
+            label = "success"
+        elif status == TaskStatus.FAILED.value:
+            label = f"failed (exit {task.get('exit_code')})"
+        elif status == TaskStatus.CANCELLED.value:
+            label = "cancelled"
+        else:
+            label = status
+        finished.append(f"  {name} — finished {age} ago, {label}")
+    sections: list[str] = []
+    if running:
+        sections.append("Running:\n" + "\n".join(running))
+    if finished:
+        sections.append("Recently finished (last hour):\n" + "\n".join(finished))
+    return "\n\n".join(sections) if sections else _NO_BG_TASKS
+
+
+def _parse_iso(value) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _short_duration(td: timedelta) -> str:
+    seconds = max(0, int(td.total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if minutes:
+        return f"{hours}h{minutes}m"
+    return f"{hours}h"
 
 
 async def _register_commands(application: Application) -> None:
