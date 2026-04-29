@@ -81,6 +81,12 @@ class MessageHandler:
             return None
         return _format_sessions(self._sessions.list())
 
+    def sessions_for(self, user_id: int) -> list[SessionInfo] | None:
+        if not is_allowed(user_id, self._allowed_user_id):
+            log.warning("Rejected session-list-for from user_id=%s", user_id)
+            return None
+        return self._sessions.list()
+
     async def handle_rename(self, user_id: int, old: str, new: str) -> str | None:
         if not is_allowed(user_id, self._allowed_user_id):
             log.warning("Rejected /rename from user_id=%s", user_id)

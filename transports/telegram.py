@@ -8,10 +8,11 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler as PtbMessageHandler,
@@ -20,6 +21,7 @@ from telegram.ext import (
 
 from core.auth import is_allowed
 from core.handler import MessageHandler
+from core.sessions import SessionInfo
 from tools.voxtype import TranscriptionEmpty, TranscriptionError, transcribe_audio
 
 log = logging.getLogger(__name__)
@@ -31,6 +33,8 @@ _VOICE_BRAIN_TAG = "[transcribed voice memo] "
 _TRANSCRIPTION_EMPTY = "⚠️ Couldn't hear anything in that. Try again?"
 _TRANSCRIPTION_FAILED = "⚠️ Couldn't transcribe that. Logs have details."
 _DELETE_CONFIRM_WINDOW = timedelta(seconds=60)
+_CB_DATA_MAX_BYTES = 64
+_HIDDEN_NOTE = "(Some sessions hidden — type the name directly to use them.)"
 
 
 def split_for_telegram(text: str, max_len: int = _MAX_CHUNK) -> list[str]:
@@ -41,6 +45,23 @@ def split_for_telegram(text: str, max_len: int = _MAX_CHUNK) -> list[str]:
         if sep in text:
             return _greedy_join(text.split(sep), sep, max_len)
     return [text[i : i + max_len] for i in range(0, len(text), max_len)]
+
+
+def _build_button_rows(
+    sessions: list[SessionInfo], action: str, *, skip_active: bool
+) -> tuple[list[list[InlineKeyboardButton]], bool]:
+    rows: list[list[InlineKeyboardButton]] = []
+    hidden = False
+    for s in sessions:
+        if skip_active and s.is_active:
+            continue
+        data = f"{action}:{s.name}"
+        if len(data.encode("utf-8")) > _CB_DATA_MAX_BYTES:
+            hidden = True
+            continue
+        label = f"→ {s.name}" if s.is_active else s.name
+        rows.append([InlineKeyboardButton(text=label, callback_data=data)])
+    return rows, hidden
 
 
 def _greedy_join(parts: list[str], sep: str, max_len: int) -> list[str]:
@@ -86,6 +107,7 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("rename", self._on_rename))
         self._app.add_handler(CommandHandler("delete", self._on_delete))
         self._app.add_handler(CommandHandler("confirm_delete", self._on_confirm_delete))
+        self._app.add_handler(CallbackQueryHandler(self._on_callback))
 
     async def _on_text(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
@@ -146,12 +168,24 @@ class TelegramTransport:
             return
         self._pending_deletes.clear()
         args = ctx.args or []
-        if len(args) != 1:
-            await msg.reply_text("Usage: /switch <name>")
+        if len(args) > 1:
+            await msg.reply_text("Usage: /switch [name]")
             return
-        reply = await self._handler.handle_switch(user.id, args[0])
-        if reply is not None:
-            await msg.reply_text(reply)
+        if args:
+            reply = await self._handler.handle_switch(user.id, args[0])
+            if reply is not None:
+                await msg.reply_text(reply)
+            return
+        sessions = self._handler.sessions_for(user.id)
+        if sessions is None:
+            return
+        if len(sessions) <= 1:
+            await msg.reply_text("Only one session exists. Nothing to switch to.")
+            return
+        ordered = sorted(sessions, key=lambda s: s.created_at, reverse=True)
+        rows, hidden = _build_button_rows(ordered, "switch", skip_active=False)
+        text = "Pick a session:" + (f"\n{_HIDDEN_NOTE}" if hidden else "")
+        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
     async def _on_sessions(
         self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE
@@ -188,17 +222,53 @@ class TelegramTransport:
             log.warning("Rejected /delete from user_id=%s", user.id)
             return
         args = ctx.args or []
-        if len(args) != 1:
-            await msg.reply_text("Usage: /delete <name>")
+        if len(args) > 1:
+            await msg.reply_text("Usage: /delete [name]")
             return
-        name = args[0]
+        if args:
+            await msg.reply_text(self._arm_delete_confirmation(args[0]))
+            return
+        sessions = self._handler.sessions_for(user.id)
+        if sessions is None:
+            return
+        ordered = sorted(sessions, key=lambda s: s.created_at, reverse=True)
+        rows, hidden = _build_button_rows(ordered, "delete", skip_active=True)
+        if not rows:
+            await msg.reply_text("No sessions can be deleted right now.")
+            return
+        text = "Pick a session to delete:" + (f"\n{_HIDDEN_NOTE}" if hidden else "")
+        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+    def _arm_delete_confirmation(self, name: str) -> str:
         self._pending_deletes[name] = (
             datetime.now(timezone.utc) + _DELETE_CONFIRM_WINDOW
         )
-        await msg.reply_text(
+        return (
             f"Are you sure you want to delete '{name}'? "
             f"Send /confirm_delete {name} within 60s to confirm."
         )
+
+    async def _on_callback(
+        self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        query = update.callback_query
+        if query is None or query.from_user is None or query.data is None:
+            return
+        user_id = query.from_user.id
+        if not is_allowed(user_id, self._allowed_user_id):
+            log.warning("Rejected callback from user_id=%s", user_id)
+            return
+        await query.answer()
+        action, _, name = query.data.partition(":")
+        if action == "switch":
+            self._pending_deletes.clear()
+            reply = await self._handler.handle_switch(user_id, name)
+        elif action == "delete":
+            reply = self._arm_delete_confirmation(name)
+        else:
+            return
+        if reply is not None:
+            await query.edit_message_text(reply)
 
     async def _on_confirm_delete(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE

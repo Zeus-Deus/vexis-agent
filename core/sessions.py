@@ -39,7 +39,8 @@ def _validate_name(name: str) -> None:
 
 
 def _gen_name(taken: set[str]) -> str:
-    base = _utcnow().strftime(_AUTO_NAME_FMT)
+    # Local time for the human-facing name; created_at storage stays UTC.
+    base = datetime.now().astimezone().strftime(_AUTO_NAME_FMT)
     if base not in taken:
         return base
     for n in range(2, _MAX_AUTO_SUFFIX + 1):
