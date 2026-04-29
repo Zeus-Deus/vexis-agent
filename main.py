@@ -37,6 +37,10 @@ async def _run() -> None:
         if shutil.which(cmd) is None:
             raise RuntimeError(f"`{cmd}` CLI not found on PATH")
 
+    for cmd in ("tailscale",):
+        if shutil.which(cmd) is None:
+            log.warning("`%s` not found on PATH; live streaming unavailable", cmd)
+
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     socket = Path(runtime) / ".ydotool_socket"
     if not socket.exists():
