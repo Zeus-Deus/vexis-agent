@@ -34,6 +34,8 @@ _VOICE_ECHO_PREFIX = "🎙️ "
 _VOICE_BRAIN_TAG = "[transcribed voice memo] "
 _TRANSCRIPTION_EMPTY = "⚠️ Couldn't hear anything in that. Try again?"
 _TRANSCRIPTION_FAILED = "⚠️ Couldn't transcribe that. Logs have details."
+_VOICE_TOO_SHORT = "That voice memo was too short to transcribe."
+_MIN_VOICE_DURATION_SECONDS = 1
 _DELETE_CONFIRM_WINDOW = timedelta(seconds=60)
 _CB_DATA_MAX_BYTES = 64
 _HIDDEN_NOTE = "(Some sessions hidden — type the name directly to use them.)"
@@ -322,6 +324,16 @@ class TelegramTransport:
             return
         if not is_allowed(user.id, self._allowed_user_id):
             log.warning("Rejected voice memo from user_id=%s", user.id)
+            return
+
+        if msg.voice.duration < _MIN_VOICE_DURATION_SECONDS:
+            log.info(
+                "Skipping %ds voice memo from user_id=%s (under %ds threshold)",
+                msg.voice.duration,
+                user.id,
+                _MIN_VOICE_DURATION_SECONDS,
+            )
+            await msg.reply_text(_VOICE_TOO_SHORT)
             return
 
         chat_id = msg.chat_id
