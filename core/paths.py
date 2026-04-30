@@ -36,3 +36,17 @@ def data_dir() -> Path:
 def config_dir() -> Path:
     """Reserved for Step 4+. `$XDG_CONFIG_HOME/vexis-agent`."""
     return _xdg("XDG_CONFIG_HOME", Path.home() / ".config")
+
+
+def runtime_dir() -> Path:
+    """Ephemeral runtime files (control socket, status files, locks).
+
+    Defaults to `$XDG_RUNTIME_DIR/vexis-agent` falling back to
+    `/run/user/<uid>/vexis-agent`. Tmpfs on most distros, so suitable
+    for high-frequency small writes (e.g. brain status updates).
+    """
+    raw = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(raw).expanduser() if raw else Path(f"/run/user/{os.getuid()}")
+    path = base / _APP
+    path.mkdir(parents=True, exist_ok=True)
+    return path

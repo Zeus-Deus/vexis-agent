@@ -9,7 +9,6 @@ from brains.base import Brain
 from brains.claude_code import BrainCancelled, BrainTimeoutError, SessionLost
 from core.auth import is_allowed
 from core.notify import ContextNote, Notifier
-from core.running_tasks import TaskAlreadyRunning
 from core.sessions import SessionInfo, SessionStore
 
 log = logging.getLogger(__name__)
@@ -23,9 +22,6 @@ _BRAIN_TIMEOUT = (
     "Sir, that ran past my 30-minute ceiling. Either I got stuck or the "
     "task was bigger than I expected. Tell me what to do — retry, "
     "rephrase, or stop?"
-)
-_ALREADY_RUNNING = (
-    "Still working on the previous one, sir. Send /cancel if you want to redirect."
 )
 _EMPTY_RESPONSE = "(empty response)"
 _CLEAR_OK = "Conversation cleared."
@@ -59,8 +55,6 @@ class MessageHandler:
 
         try:
             reply = await self._brain.respond(message, chat_id)
-        except TaskAlreadyRunning:
-            return _ALREADY_RUNNING
         except BrainCancelled:
             # /cancel handler already replied; nothing more to send.
             return None

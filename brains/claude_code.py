@@ -1,8 +1,16 @@
-"""Subprocess wrapper around `claude -p` with persistent session id."""
+"""Subprocess wrapper around `claude -p` with persistent session id.
+
+Output is parsed as `--output-format stream-json` so we can emit a
+per-chat status file as tool events arrive (powers /status). Input is
+still passed text-format on argv — we don't need streaming-input
+queueing here since the application-level queue (core/running_tasks)
+already handles follow-up messages.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -13,6 +21,7 @@ from pathlib import Path
 from core.running_tasks import RunningTasks
 from core.safety import DESTRUCTIVE_PATTERNS
 from core.sessions import SessionStore
+from core.status import StatusFile, extract_tool_target
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +91,54 @@ def build_system_prompt(workspace: Path) -> str:
     return f"{soul}\n\n{capabilities}" if capabilities else soul
 
 
+async def _read_stream_events(
+    stream: asyncio.StreamReader | None, status_file: StatusFile
+) -> str:
+    """Consume the brain's stream-json stdout, updating ``status_file``
+    on every tool_use event and returning the assistant's final text.
+
+    The final text is the ``result`` field of the ``result`` event
+    Claude Code emits last. Malformed lines are logged and skipped so a
+    single corrupt event can't break the whole turn — historically
+    rare but we shouldn't lose a real reply over one bad line.
+    """
+    final_text = ""
+    if stream is None:
+        return final_text
+    while True:
+        try:
+            line = await stream.readline()
+        except Exception:
+            log.warning("brain stream readline raised", exc_info=True)
+            break
+        if not line:
+            break
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        if kind == "assistant":
+            content = event.get("message", {}).get("content") or []
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") != "tool_use":
+                    continue
+                name = block.get("name") or "Tool"
+                target = extract_tool_target(name, block.get("input") or {})
+                status_file.record_tool(name, target)
+        elif kind == "result":
+            result_text = event.get("result")
+            if isinstance(result_text, str):
+                final_text = result_text
+    return final_text
+
+
 def audit_destructive_mentions(response: str) -> Iterator[tuple[str, bool]]:
     """Yield (reason, asked_first) for each destructive pattern hit in response.
 
@@ -142,6 +199,12 @@ class ClaudeCodeBrain:
             *session_flag,
             "--append-system-prompt",
             system_prompt,
+            # stream-json output gives us tool_use events in real time
+            # for the /status command. --verbose is required by Claude
+            # Code whenever -p is paired with --output-format stream-json.
+            "--output-format",
+            "stream-json",
+            "--verbose",
         ]
         if DISALLOWED_TOOLS:
             argv += ["--disallowedTools", *DISALLOWED_TOOLS]
@@ -164,6 +227,12 @@ class ClaudeCodeBrain:
         # Propagate chat_id to spawned tools (vexis-bg etc.) so they can
         # route notifications back to the right Telegram conversation.
         env = {**os.environ, "VEXIS_CHAT_ID": str(chat_id)}
+
+        status_file = StatusFile(chat_id)
+        status_file.start()
+
+        final_text = ""
+        stderr_bytes = b""
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -185,15 +254,39 @@ class ClaudeCodeBrain:
                 await self._kill_group(proc)
                 raise BrainCancelled("brain subprocess cancelled via /cancel")
 
+            # Drain stdout/stderr concurrently with proc.wait(). We can't
+            # use proc.communicate() here because that blocks until exit,
+            # which would mean status updates only arrive *after* the
+            # brain finishes — useless for /status. Concurrent reading
+            # also keeps the OS pipe buffer from filling and stalling
+            # the subprocess on long outputs.
+            stdout_task = asyncio.create_task(
+                _read_stream_events(proc.stdout, status_file)
+            )
+            stderr_task = asyncio.create_task(proc.stderr.read())
+
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=BRAIN_TIMEOUT_SECONDS
-                )
+                await asyncio.wait_for(proc.wait(), timeout=BRAIN_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as exc:
                 await self._kill_group(proc)
+                # Let readers reach EOF after the kill so we don't leak tasks.
+                await asyncio.gather(
+                    stdout_task, stderr_task, return_exceptions=True
+                )
                 raise BrainTimeoutError(
                     f"claude -p timed out after {BRAIN_TIMEOUT_SECONDS}s"
                 ) from exc
+
+            try:
+                final_text = await stdout_task
+            except Exception:
+                log.exception("Brain stdout reader failed for chat %d", chat_id)
+                final_text = ""
+            try:
+                stderr_bytes = await stderr_task
+            except Exception:
+                log.exception("Brain stderr reader failed for chat %d", chat_id)
+                stderr_bytes = b""
 
             if self._running_tasks.was_cancelled(chat_id):
                 log.info(
@@ -203,7 +296,7 @@ class ClaudeCodeBrain:
                 raise BrainCancelled("brain subprocess cancelled via /cancel")
 
             if proc.returncode != 0:
-                err = stderr.decode(errors="replace").strip()
+                err = stderr_bytes.decode(errors="replace").strip()
                 # Claude Code's wording has varied across versions; substring
                 # match is more robust than pinning an exact string.
                 if self._session.is_initialized() and "No conversation found" in err:
@@ -221,13 +314,14 @@ class ClaudeCodeBrain:
                     f"claude -p exited {proc.returncode}: {err or '(no stderr)'}"
                 )
         finally:
+            status_file.delete()
             await self._running_tasks.unregister(chat_id)
 
         # Mark only after a successful exit so a failed first call doesn't
         # leave us thinking the UUID is live.
         if not self._session.is_initialized():
             self._session.mark_initialized()
-        response = stdout.decode(errors="replace").strip()
+        response = (final_text or "").strip()
         for reason, asked in audit_destructive_mentions(response):
             if asked:
                 log.info("Vexis confirmed before destructive: %s", reason)

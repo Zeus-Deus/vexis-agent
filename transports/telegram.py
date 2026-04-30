@@ -37,6 +37,7 @@ from core.handler import MessageHandler
 from core.notify import Notifier
 from core.running_tasks import RunningTasks
 from core.sessions import SessionInfo
+from core.status import StatusSnapshot, cleanup_all as cleanup_status_files, read_status
 from tools.desktop import CaptureError, capture_desktop
 from tools.voxtype import TranscriptionEmpty, TranscriptionError, transcribe_audio
 
@@ -46,6 +47,11 @@ _TYPING_REFRESH_SECONDS = 4
 _MAX_CHUNK = 4000
 _VOICE_ECHO_PREFIX = "🎙️ "
 _VOICE_BRAIN_TAG = "[transcribed voice memo] "
+_PICKING_UP_PREFIX = "Picking up: "
+_PICKING_UP_PREVIEW_LEN = 40
+_PICKING_UP_FALLBACK = "(empty)"
+_INCOMING_IMAGE_PREFIX_RE = re.compile(r"^\[user sent image: [^\]]+\]\s*")
+_DRAIN_TURN_BROKE = "⚠️ Something broke handling that. Logs have details."
 _TRANSCRIPTION_EMPTY = "⚠️ Couldn't hear anything in that. Try again?"
 _TRANSCRIPTION_FAILED = "⚠️ Couldn't transcribe that. Logs have details."
 _VOICE_TOO_SHORT = "That voice memo was too short to transcribe."
@@ -61,6 +67,24 @@ _INCOMING_PHOTO_CLEANUP_INTERVAL_SECONDS = 600
 _INCOMING_BRAIN_PREFIX = "[user sent image: {path}]"
 _CANCEL_OK = "Cancelled, sir. What next?"
 _NOTHING_TO_CANCEL = "Nothing to cancel — I'm not working on anything right now."
+_STATUS_IDLE = "Nothing running, sir."
+_STATUS_NO_TOOLS_YET = "No tool activity yet."
+
+# Verbs for rendering the most-recent tool_use event in /status. Tools
+# absent from this map fall back to "used <ToolName>".
+_TOOL_VERB: dict[str, str] = {
+    "Edit": "edited",
+    "MultiEdit": "edited",
+    "NotebookEdit": "edited",
+    "Write": "wrote",
+    "Read": "read",
+    "Bash": "ran",
+    "Task": "delegated",
+    "Glob": "searched for",
+    "Grep": "searched for",
+    "WebFetch": "fetched",
+    "WebSearch": "searched the web for",
+}
 _NO_BG_TASKS = "No background tasks running."
 _DAEMON_RESTART_LOST = (
     "Sir, when the daemon restarted, background task `{name}` didn't survive. "
@@ -98,6 +122,30 @@ def _build_button_rows(
 def _build_incoming_photo_path() -> Path:
     """Allocate a fresh /tmp path for an inbound Telegram photo."""
     return _INCOMING_PHOTO_DIR / f"vexis-incoming-{uuid.uuid4().hex}.png"
+
+
+def _make_pickup_preview(text: str, max_len: int = _PICKING_UP_PREVIEW_LEN) -> str:
+    """Render a short preview of a queued message for the 'Picking up:' ack.
+
+    Strips the internal routing prefixes used for voice/photo so the user
+    sees something they recognise from what they sent (echoed voice text,
+    a 📷 marker for an image) rather than the synthetic ``[user sent
+    image: /tmp/...]`` form.
+    """
+    cleaned = text
+    if cleaned.startswith(_VOICE_BRAIN_TAG):
+        cleaned = _VOICE_ECHO_PREFIX + cleaned[len(_VOICE_BRAIN_TAG) :]
+    else:
+        match = _INCOMING_IMAGE_PREFIX_RE.match(cleaned)
+        if match:
+            rest = cleaned[match.end() :].strip()
+            cleaned = f"📷 {rest}" if rest else "📷"
+    cleaned = cleaned.strip().replace("\n", " ")
+    if not cleaned:
+        return _PICKING_UP_FALLBACK
+    if len(cleaned) > max_len:
+        return cleaned[:max_len].rstrip() + "…"
+    return cleaned
 
 
 def _format_incoming_image_message(image_path: Path, caption: str | None) -> str:
@@ -213,6 +261,7 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("screenshot", self._on_screenshot))
         self._app.add_handler(CommandHandler("cancel", self._on_cancel))
         self._app.add_handler(CommandHandler("tasks", self._on_tasks))
+        self._app.add_handler(CommandHandler("status", self._on_status))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
 
     async def _on_text(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -220,24 +269,94 @@ class TelegramTransport:
         user = update.effective_user
         if msg is None or user is None or msg.text is None:
             return
+        await self._dispatch_to_brain(msg.get_bot(), msg.chat_id, user.id, msg.text)
 
-        chat_id = msg.chat_id
-        bot = msg.get_bot()
+    async def _dispatch_to_brain(
+        self, bot, chat_id: int, user_id: int, text: str
+    ) -> None:
+        """Submit a message to the brain.
+
+        If a drain loop is already processing this chat, the message is
+        appended to its queue silently — the user gets a "Picking up:"
+        ack when the drain reaches it. Otherwise we claim the chat and
+        run the drain loop ourselves until the queue is empty.
+        """
+        if not is_allowed(user_id, self._allowed_user_id):
+            log.warning("Rejected message from user_id=%s", user_id)
+            return
+
+        if not await self._running_tasks.claim(chat_id):
+            await self._running_tasks.enqueue(chat_id, user_id, text)
+            return
 
         typing_task = asyncio.create_task(self._keep_typing(bot, chat_id))
         try:
-            reply = await self._handler.handle(user.id, chat_id, msg.text)
+            await self._drain_chat(bot, chat_id, user_id, text)
         finally:
             typing_task.cancel()
             try:
                 await typing_task
             except asyncio.CancelledError:
                 pass
+            # Belt-and-suspenders: if _drain_chat aborted via an
+            # unexpected exception before its own pop_or_release ran,
+            # the chat would stay permanently "claimed" and the user
+            # would never get another reply without a daemon restart.
+            # force_release_drain is a no-op when the drain released
+            # cleanly, and logs at warning level when it had to force.
+            await self._running_tasks.force_release_drain(chat_id)
 
-        if reply is None:
-            return
+    async def _drain_chat(
+        self, bot, chat_id: int, user_id: int, first_text: str
+    ) -> None:
+        """Process one message after another for chat_id until the queue
+        empties or /cancel flags the drain. The caller must already hold
+        the drain claim; this method releases it on exit.
 
-        await self._send_brain_reply(bot, chat_id, reply)
+        Each turn's brain call and reply send are wrapped individually,
+        so a single broken turn (handler raising, Telegram send failing)
+        logs and surfaces an error reply but does not kill the drain —
+        queued follow-ups still run.
+        """
+        text = first_text
+        is_first = True
+        while True:
+            if not is_first:
+                preview = _make_pickup_preview(text)
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"{_PICKING_UP_PREFIX}{preview}",
+                        parse_mode=None,
+                    )
+                except Exception:
+                    log.exception("Failed to send pickup ack for chat %s", chat_id)
+            try:
+                reply = await self._handler.handle(user_id, chat_id, text)
+            except Exception:
+                log.exception(
+                    "Drain turn raised unexpectedly for chat %s", chat_id
+                )
+                reply = _DRAIN_TURN_BROKE
+            if reply is not None:
+                try:
+                    await self._send_brain_reply(bot, chat_id, reply)
+                except Exception:
+                    log.exception(
+                        "Failed to send brain reply for chat %s", chat_id
+                    )
+            next_msg = await self._running_tasks.pop_or_release(chat_id)
+            if next_msg is None:
+                # If pop_or_release released because /cancel fired and a
+                # follow-up message landed *during* the cancel cleanup,
+                # those items are still in the queue. Reclaim and keep
+                # draining so they don't get silently lost.
+                next_msg = await self._running_tasks.take_over_if_pending(chat_id)
+                if next_msg is None:
+                    return
+            text = next_msg.text
+            user_id = next_msg.user_id
+            is_first = False
 
     async def _on_clear(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
@@ -426,6 +545,7 @@ class TelegramTransport:
         fd.close()
 
         typing_task: asyncio.Task[None] | None = None
+        transcription: str | None = None
         try:
             tg_file = await msg.voice.get_file()
             await tg_file.download_to_drive(custom_path=ogg_path)
@@ -451,13 +571,6 @@ class TelegramTransport:
                 text=f"{_VOICE_ECHO_PREFIX}{transcription}",
                 parse_mode=None,
             )
-
-            reply = await self._handler.handle(
-                user.id, chat_id, f"{_VOICE_BRAIN_TAG}{transcription}"
-            )
-            if reply is None:
-                return
-            await self._send_brain_reply(bot, chat_id, reply)
         finally:
             if typing_task is not None:
                 typing_task.cancel()
@@ -466,6 +579,12 @@ class TelegramTransport:
                 except asyncio.CancelledError:
                     pass
             ogg_path.unlink(missing_ok=True)
+
+        if transcription is None:
+            return
+        await self._dispatch_to_brain(
+            bot, chat_id, user.id, f"{_VOICE_BRAIN_TAG}{transcription}"
+        )
 
     async def _on_photo(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
@@ -484,22 +603,10 @@ class TelegramTransport:
         photo = msg.photo[-1]
         image_path = _build_incoming_photo_path()
 
-        typing_task = asyncio.create_task(self._keep_typing(bot, chat_id))
-        try:
-            tg_file = await photo.get_file()
-            await tg_file.download_to_drive(custom_path=image_path)
-            synthetic = _format_incoming_image_message(image_path, msg.caption)
-            reply = await self._handler.handle(user.id, chat_id, synthetic)
-        finally:
-            typing_task.cancel()
-            try:
-                await typing_task
-            except asyncio.CancelledError:
-                pass
-
-        if reply is None:
-            return
-        await self._send_brain_reply(bot, chat_id, reply)
+        tg_file = await photo.get_file()
+        await tg_file.download_to_drive(custom_path=image_path)
+        synthetic = _format_incoming_image_message(image_path, msg.caption)
+        await self._dispatch_to_brain(bot, chat_id, user.id, synthetic)
 
     async def _on_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
@@ -541,6 +648,31 @@ class TelegramTransport:
             return
         summary = await self._background_tasks.status_summary()
         await msg.reply_text(_format_tasks(summary))
+
+    async def _on_status(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Read-only window into the running brain.
+
+        Reads the per-chat status file (written by the brain as it
+        processes stream-json tool events) plus the running-tasks
+        queue depth and last-idle timestamp, and replies with a short
+        summary. Touches no shared mutable state — safe to call while
+        a drain is mid-flight.
+        """
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /status from user_id=%s", user.id)
+            return
+        chat_id = msg.chat_id
+        snapshot = read_status(chat_id)
+        queue_depth = self._running_tasks.queue_depth(chat_id)
+        last_idle = self._running_tasks.last_idle_at(chat_id)
+        reply = _format_status_reply(
+            snapshot, queue_depth, last_idle, datetime.now(timezone.utc)
+        )
+        await msg.reply_text(reply)
 
     async def _on_screenshot(
         self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE
@@ -598,6 +730,15 @@ class TelegramTransport:
     async def run(self) -> None:
         await self._app.initialize()
         await _register_commands(self._app)
+        # Sweep status files left behind by a previous daemon's brain
+        # that exited via SIGKILL (its finally never ran). Without this
+        # /status would show stale "Working for 3 days" data forever.
+        try:
+            removed = cleanup_status_files()
+            if removed:
+                log.info("Swept %d stale status file(s) at startup", removed)
+        except Exception:
+            log.exception("Status-file cleanup failed at startup")
         # Bind the notifier to the freshly-initialised PTB application
         # and route background-task completions through it. Lost-task
         # warnings from the previous daemon restart fire before polling
@@ -706,6 +847,67 @@ def _short_duration(td: timedelta) -> str:
     if minutes:
         return f"{hours}h{minutes}m"
     return f"{hours}h"
+
+
+def _format_status_duration(td: timedelta) -> str:
+    """Render a duration the way /status wants it.
+
+    < 60s → "8s"; 60s–1h → "4m 12s" (seconds dropped if zero);
+    ≥ 1h → "1h 4m" (minutes dropped if zero). Negative input clamps
+    to zero so a clock skew can't produce gibberish.
+    """
+    secs = max(0, int(td.total_seconds()))
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        m, s = divmod(secs, 60)
+        return f"{m}m {s}s" if s else f"{m}m"
+    h, rem = divmod(secs, 3600)
+    m = rem // 60
+    return f"{h}h {m}m" if m else f"{h}h"
+
+
+def _format_last_action(tool: str | None, target: str | None) -> str | None:
+    """Render the 'Last action: ...' line, or None to omit it."""
+    if tool is None:
+        return None
+    verb = _TOOL_VERB.get(tool)
+    if target and verb:
+        return f"Last action: {verb} `{target}`"
+    if target:
+        return f"Last action: used {tool} on `{target}`"
+    return f"Last action: {tool}"
+
+
+def _format_status_reply(
+    snapshot: StatusSnapshot | None,
+    queue_depth: int,
+    last_idle_at: datetime | None,
+    now: datetime,
+) -> str:
+    """Compose the user-visible /status reply.
+
+    Pure function: takes the three pieces of state /status reads and
+    returns the formatted string. Easy to unit-test and avoids
+    interleaving formatting concerns with the I/O in ``_on_status``.
+    """
+    if snapshot is not None:
+        lines = [f"Working for {_format_status_duration(now - snapshot.started_at)}."]
+        if snapshot.tool_count > 0:
+            action_line = _format_last_action(
+                snapshot.last_tool, snapshot.last_target
+            )
+            if action_line is not None:
+                lines.append(action_line)
+            lines.append(f"Tools used: {snapshot.tool_count}")
+        else:
+            lines[0] = lines[0].rstrip(".") + ". " + _STATUS_NO_TOOLS_YET
+        if queue_depth > 0:
+            lines.append(f"Queued follow-ups: {queue_depth}")
+        return "\n".join(lines)
+    if last_idle_at is not None:
+        return f"{_STATUS_IDLE} Idle for {_format_status_duration(now - last_idle_at)}."
+    return _STATUS_IDLE
 
 
 async def _register_commands(application: Application) -> None:
