@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import tempfile
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -53,6 +54,11 @@ _DELETE_CONFIRM_WINDOW = timedelta(seconds=60)
 _CB_DATA_MAX_BYTES = 64
 _HIDDEN_NOTE = "(Some sessions hidden — type the name directly to use them.)"
 _SCREENSHOT_PATH_RE = re.compile(r"(?<![\w/])/tmp/vexis-screenshot-\d+\.png")
+_INCOMING_PHOTO_DIR = Path("/tmp")
+_INCOMING_PHOTO_GLOB = "vexis-incoming-*.png"
+_INCOMING_PHOTO_MAX_AGE = timedelta(hours=1)
+_INCOMING_PHOTO_CLEANUP_INTERVAL_SECONDS = 600
+_INCOMING_BRAIN_PREFIX = "[user sent image: {path}]"
 _CANCEL_OK = "Cancelled, sir. What next?"
 _NOTHING_TO_CANCEL = "Nothing to cancel — I'm not working on anything right now."
 _NO_BG_TASKS = "No background tasks running."
@@ -87,6 +93,46 @@ def _build_button_rows(
         label = f"→ {s.name}" if s.is_active else s.name
         rows.append([InlineKeyboardButton(text=label, callback_data=data)])
     return rows, hidden
+
+
+def _build_incoming_photo_path() -> Path:
+    """Allocate a fresh /tmp path for an inbound Telegram photo."""
+    return _INCOMING_PHOTO_DIR / f"vexis-incoming-{uuid.uuid4().hex}.png"
+
+
+def _format_incoming_image_message(image_path: Path, caption: str | None) -> str:
+    """Build the synthetic brain message for an inbound image."""
+    prefix = _INCOMING_BRAIN_PREFIX.format(path=image_path)
+    body = (caption or "").strip()
+    if body:
+        return f"{prefix} {body}"
+    return prefix
+
+
+def _cleanup_incoming_images(
+    now: datetime,
+    *,
+    directory: Path = _INCOMING_PHOTO_DIR,
+    max_age: timedelta = _INCOMING_PHOTO_MAX_AGE,
+) -> int:
+    """Delete vexis-incoming-*.png files older than max_age. Returns count removed."""
+    removed = 0
+    for path in directory.glob(_INCOMING_PHOTO_GLOB):
+        try:
+            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        except FileNotFoundError:
+            continue
+        if now - mtime <= max_age:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            log.exception("Failed to clean up incoming image %s", path)
+            continue
+        removed += 1
+    return removed
 
 
 def _extract_screenshot_paths(text: str) -> tuple[list[Path], str]:
@@ -156,6 +202,7 @@ class TelegramTransport:
             PtbMessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text)
         )
         self._app.add_handler(PtbMessageHandler(filters.VOICE, self._on_voice))
+        self._app.add_handler(PtbMessageHandler(filters.PHOTO, self._on_photo))
         self._app.add_handler(CommandHandler("clear", self._on_clear))
         self._app.add_handler(CommandHandler("new", self._on_new))
         self._app.add_handler(CommandHandler("switch", self._on_switch))
@@ -420,6 +467,40 @@ class TelegramTransport:
                     pass
             ogg_path.unlink(missing_ok=True)
 
+    async def _on_photo(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None or not msg.photo:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected photo from user_id=%s", user.id)
+            return
+
+        chat_id = msg.chat_id
+        bot = msg.get_bot()
+
+        # PhotoSize tuples are sorted small → large; the last one is the
+        # highest-resolution variant Telegram has on file.
+        photo = msg.photo[-1]
+        image_path = _build_incoming_photo_path()
+
+        typing_task = asyncio.create_task(self._keep_typing(bot, chat_id))
+        try:
+            tg_file = await photo.get_file()
+            await tg_file.download_to_drive(custom_path=image_path)
+            synthetic = _format_incoming_image_message(image_path, msg.caption)
+            reply = await self._handler.handle(user.id, chat_id, synthetic)
+        finally:
+            typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
+
+        if reply is None:
+            return
+        await self._send_brain_reply(bot, chat_id, reply)
+
     async def _on_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
         user = update.effective_user
@@ -528,9 +609,15 @@ class TelegramTransport:
         await self._app.start()
         await self._app.updater.start_polling()
         log.info("Telegram polling started")
+        cleanup_task = asyncio.create_task(_incoming_image_cleanup_loop())
         try:
             await asyncio.Event().wait()
         finally:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
             await self._app.updater.stop()
             await self._app.stop()
             await self._app.shutdown()
@@ -551,6 +638,18 @@ class TelegramTransport:
                     "Failed to send daemon-restart notice for task '%s'",
                     entry.get("name"),
                 )
+
+
+async def _incoming_image_cleanup_loop() -> None:
+    """Sweep stale /tmp/vexis-incoming-*.png files every 10 minutes."""
+    while True:
+        try:
+            removed = _cleanup_incoming_images(datetime.now(timezone.utc))
+            if removed:
+                log.info("Cleaned up %d expired incoming image(s)", removed)
+        except Exception:
+            log.exception("Incoming-image cleanup failed")
+        await asyncio.sleep(_INCOMING_PHOTO_CLEANUP_INTERVAL_SECONDS)
 
 
 def _format_tasks(tasks: list[dict]) -> str:
