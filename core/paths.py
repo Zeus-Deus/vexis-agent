@@ -50,3 +50,50 @@ def runtime_dir() -> Path:
     path = base / _APP
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def vexis_dir() -> Path:
+    """Operational state (config, curator state, logs). Literal `~/.vexis/`.
+
+    Intentionally NOT XDG-based — by design this is a single-user
+    private directory that's never gitted, sitting alongside the
+    workspace at `~/vexis-workspace/` (which IS gittable). The split
+    lets the user version-control their agent's brain (memories,
+    skills, SOUL) without leaking secrets or per-machine state.
+    """
+    path = Path.home() / ".vexis"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def memories_dir(workspace: Path) -> Path:
+    """`<workspace>/memories/` — gittable. Holds MEMORY.md and USER.md."""
+    path = workspace / "memories"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def skills_dir(workspace: Path) -> Path:
+    """`<workspace>/skills/` — gittable. Holds SKILL.md trees + telemetry."""
+    path = workspace / "skills"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def curator_state_path() -> Path:
+    """`~/.vexis/curator/state.json`. Holds last_run_at + paused flag.
+
+    Parent dir is created lazily; the state file itself is created on
+    first save. Returning a Path even when missing lets the curator
+    check existence without an extra ``exists()`` round-trip.
+    """
+    parent = vexis_dir() / "curator"
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent / "state.json"
+
+
+def curator_logs_dir() -> Path:
+    """`~/.vexis/logs/curator/`. Holds per-run REPORT.md / run.json subdirs."""
+    path = vexis_dir() / "logs" / "curator"
+    path.mkdir(parents=True, exist_ok=True)
+    return path

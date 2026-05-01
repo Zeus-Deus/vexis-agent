@@ -33,6 +33,7 @@ from core.background_tasks import (
     TaskStatus,
 )
 from core.commands import COMMANDS
+from core.curator import CuratorController
 from core.handler import MessageHandler
 from core.notify import Notifier
 from core.running_tasks import RunningTasks
@@ -232,12 +233,14 @@ class TelegramTransport:
         allowed_user_id: int,
         background_tasks: BackgroundTasks,
         notifier: Notifier,
+        curator: "CuratorController | None" = None,
     ) -> None:
         self._handler = handler
         self._running_tasks = running_tasks
         self._background_tasks = background_tasks
         self._notifier = notifier
         self._allowed_user_id = allowed_user_id
+        self._curator = curator
         # Telegram bot commands can't contain hyphens, so /confirm-delete from
         # the spec becomes /confirm_delete here.
         self._pending_deletes: dict[str, datetime] = {}
@@ -262,6 +265,9 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("cancel", self._on_cancel))
         self._app.add_handler(CommandHandler("tasks", self._on_tasks))
         self._app.add_handler(CommandHandler("status", self._on_status))
+        self._app.add_handler(CommandHandler("pin", self._on_pin))
+        self._app.add_handler(CommandHandler("unpin", self._on_unpin))
+        self._app.add_handler(CommandHandler("curator", self._on_curator))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
 
     async def _on_text(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -673,6 +679,56 @@ class TelegramTransport:
             snapshot, queue_depth, last_idle, datetime.now(timezone.utc)
         )
         await msg.reply_text(reply)
+
+    async def _on_pin(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        args = ctx.args or []
+        if len(args) != 1:
+            await msg.reply_text("Usage: /pin <skill-name>")
+            return
+        reply = await self._handler.handle_pin(user.id, args[0])
+        if reply is not None:
+            await msg.reply_text(reply)
+
+    async def _on_unpin(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        args = ctx.args or []
+        if len(args) != 1:
+            await msg.reply_text("Usage: /unpin <skill-name>")
+            return
+        reply = await self._handler.handle_unpin(user.id, args[0])
+        if reply is not None:
+            await msg.reply_text(reply)
+
+    async def _on_curator(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Stub — wired up in the curator task. Keeping the handler
+        registered so the slash menu is honest about supporting it."""
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /curator from user_id=%s", user.id)
+            return
+        if self._curator is None:
+            await msg.reply_text("Curator not initialised yet.")
+            return
+        args = ctx.args or []
+        sub = args[0] if args else "status"
+        rest = args[1:]
+        try:
+            reply = await self._curator.handle_telegram(sub, rest)
+        except Exception:
+            log.exception("/curator handler failed")
+            reply = "⚠️ Curator command failed; check the logs."
+        if reply is not None:
+            await msg.reply_text(reply)
 
     async def _on_screenshot(
         self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE

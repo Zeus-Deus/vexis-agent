@@ -40,4 +40,7 @@ COMMANDS: tuple[BotCommand, ...] = (
     BotCommand("tasks", "List background tasks"),
     BotCommand("status", "Show what I'm currently working on"),
     BotCommand("cancel", "Stop the current task or a named background task"),
+    BotCommand("pin", "Protect a skill from curator and skill_manage edits"),
+    BotCommand("unpin", "Allow edits to a previously pinned skill"),
+    BotCommand("curator", "Curator status / pause / resume / run / restore"),
 )

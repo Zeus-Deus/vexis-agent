@@ -18,9 +18,12 @@ import signal
 from collections.abc import Iterator
 from pathlib import Path
 
+from core.memory import MemoryStore
+from core.paths import memories_dir, skills_dir
 from core.running_tasks import RunningTasks
 from core.safety import DESTRUCTIVE_PATTERNS
 from core.sessions import SessionStore
+from core.skills import build_skills_index_block
 from core.status import StatusFile, extract_tool_target
 
 log = logging.getLogger(__name__)
@@ -29,6 +32,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # 30 min — generous for long multi-step work, hard ceiling for runaway calls.
 BRAIN_TIMEOUT_SECONDS = 1800
+
+# How many session UUIDs to cache system prompts for. Each entry is
+# small (a few KB), but rotations accrete over a long-running daemon
+# so we cap to keep memory bounded. FIFO eviction is fine — we only
+# care about the active session's cache being warm.
+_SYSTEM_PROMPT_CACHE_MAX = 16
 
 DISALLOWED_TOOLS: list[str] = []  # All tools enabled in Step 6
 
@@ -79,16 +88,40 @@ def _read_markdown(path: Path) -> str | None:
 
 
 def build_system_prompt(workspace: Path) -> str:
-    """Compose the SOUL+CAPABILITIES system prompt fed to claude -p.
+    """Compose the system prompt fed to claude -p.
 
-    Re-reads from disk on every call so SOUL.md edits take effect on the
-    next spawn without restarting the daemon. Used by the foreground
-    brain and by background tasks — both should ask claude -p to be the
-    same Vexis.
+    Layers (top → bottom): SOUL.md (or default), CAPABILITIES.md,
+    MEMORY.md block, USER.md block, skills index. Each layer is
+    independent and dropped if empty. Re-reads from disk on every
+    call so file edits take effect on the next spawn without
+    restarting the daemon — the foreground brain caches the result
+    per session UUID for prefix-cache stability (see
+    ``ClaudeCodeBrain._system_prompt_for``); background tasks call
+    this directly and naturally get a fresh snapshot per spawn.
     """
     soul = _read_markdown(workspace / "SOUL.md") or DEFAULT_SOUL
     capabilities = _read_markdown(_PROJECT_ROOT / "CAPABILITIES.md")
-    return f"{soul}\n\n{capabilities}" if capabilities else soul
+    parts: list[str] = [soul]
+    if capabilities:
+        parts.append(capabilities)
+
+    # Memory blocks — agent notes first, user profile second. Empty
+    # blocks return None and are dropped here.
+    memory_store = MemoryStore(memories_dir(workspace))
+    mem_block = memory_store.format_for_system_prompt("memory")
+    if mem_block:
+        parts.append(mem_block)
+    user_block = memory_store.format_for_system_prompt("user")
+    if user_block:
+        parts.append(user_block)
+
+    # Skills index — last so it sits next to where the model is most
+    # likely to consult it (right before the conversation starts).
+    skills_block = build_skills_index_block(skills_dir(workspace))
+    if skills_block:
+        parts.append(skills_block)
+
+    return "\n\n".join(parts)
 
 
 async def _read_stream_events(
@@ -180,6 +213,31 @@ class ClaudeCodeBrain:
         self._workspace = workspace
         self._session = session
         self._running_tasks = running_tasks
+        # Per-session frozen snapshot. The system prompt MUST be
+        # byte-identical across all turns of one Claude session for
+        # Anthropic's prefix cache to hit. We key by session UUID
+        # because that's what claude -p uses to identify a resumable
+        # conversation; rotating the UUID (via /clear, /new, /switch,
+        # or a SessionLost recovery) naturally invalidates the cache
+        # entry without explicit eviction. Mid-session memory/skills
+        # writes mutate disk but are NOT visible to this cache —
+        # by design, see CAPABILITIES.md for the model-facing
+        # documentation of this trap.
+        self._system_prompt_cache: dict[str, str] = {}
+
+    def _system_prompt_for(self, session_uuid: str) -> str:
+        cached = self._system_prompt_cache.get(session_uuid)
+        if cached is not None:
+            return cached
+        prompt = build_system_prompt(self._workspace)
+        # FIFO trim: dicts preserve insertion order in Python 3.7+, so
+        # the first key is always the oldest. Cap is a safety net for
+        # long-running daemons that accumulate many session rotations.
+        if len(self._system_prompt_cache) >= _SYSTEM_PROMPT_CACHE_MAX:
+            oldest = next(iter(self._system_prompt_cache))
+            del self._system_prompt_cache[oldest]
+        self._system_prompt_cache[session_uuid] = prompt
+        return prompt
 
     async def respond(self, message: str, chat_id: int) -> str:
         log.info("Brain.respond starting for chat %d", chat_id)
@@ -190,7 +248,7 @@ class ClaudeCodeBrain:
         else:
             session_flag = ["--session-id", session_id]
 
-        system_prompt = build_system_prompt(self._workspace)
+        system_prompt = self._system_prompt_for(session_id)
 
         argv = [
             "claude",

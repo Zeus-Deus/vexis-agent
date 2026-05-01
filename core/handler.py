@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 from brains.base import Brain
 from brains.claude_code import BrainCancelled, BrainTimeoutError, SessionLost
 from core.auth import is_allowed
 from core.notify import ContextNote, Notifier
+from core.paths import skills_dir
 from core.sessions import SessionInfo, SessionStore
+from core.skills import PinStore, archived_skill_names
 
 log = logging.getLogger(__name__)
 
@@ -35,10 +38,12 @@ class MessageHandler:
         allowed_user_id: int,
         *,
         notifier: Notifier | None = None,
+        workspace: Path | None = None,
     ) -> None:
         self._brain = brain
         self._sessions = sessions
         self._allowed_user_id = allowed_user_id
+        self._workspace = workspace
         # The notifier owns the per-chat context buffer. We consume from
         # it at the start of every brain turn so events that fired since
         # the last reply (background task completions, daemon-restart
@@ -155,6 +160,51 @@ class MessageHandler:
             return f"No session named {name}."
         log.info("Deleted session '%s'", name)
         return f"Deleted {name}"
+
+    # ---------- skill pinning ----------
+
+    def _pin_store(self) -> PinStore | None:
+        """PinStore for the configured workspace, or None if the handler
+        was constructed without a workspace path (test fixtures)."""
+        if self._workspace is None:
+            return None
+        return PinStore(skills_dir(self._workspace))
+
+    async def handle_pin(self, user_id: int, name: str) -> str | None:
+        if not is_allowed(user_id, self._allowed_user_id):
+            log.warning("Rejected /pin from user_id=%s", user_id)
+            return None
+        if not name:
+            return "Usage: /pin <skill-name>"
+        store = self._pin_store()
+        if store is None:
+            return "⚠️ Pinning unavailable: no workspace configured."
+        added = store.pin(name)
+        if not added:
+            return f"Skill '{name}' was already pinned."
+        log.info("Pinned skill '%s'", name)
+        return f"Pinned `{name}`. The curator and skill edits will leave it alone."
+
+    async def handle_unpin(self, user_id: int, name: str) -> str | None:
+        if not is_allowed(user_id, self._allowed_user_id):
+            log.warning("Rejected /unpin from user_id=%s", user_id)
+            return None
+        if not name:
+            return "Usage: /unpin <skill-name>"
+        store = self._pin_store()
+        if store is None:
+            return "⚠️ Pinning unavailable: no workspace configured."
+        removed = store.unpin(name)
+        if not removed:
+            return f"Skill '{name}' is not pinned."
+        log.info("Unpinned skill '%s'", name)
+        return f"Unpinned `{name}`."
+
+    def archived_skill_names(self) -> list[str]:
+        """Used by /curator restore to list candidates."""
+        if self._workspace is None:
+            return []
+        return archived_skill_names(skills_dir(self._workspace))
 
 
 _SYSTEM_CONTEXT_HEADER = "[SYSTEM CONTEXT — events since your last reply]"

@@ -19,6 +19,7 @@ from core.background_tasks import (
 )
 from core.config import load_config
 from core.control_socket import ControlSocket, default_socket_path
+from core.curator import CuratorController
 from core.handler import MessageHandler
 from core.logging import setup_logging
 from core.notify import Notifier
@@ -106,7 +107,9 @@ async def _run() -> None:
         sessions=sessions,
         allowed_user_id=config.telegram_allowed_user_id,
         notifier=notifier,
+        workspace=workspace,
     )
+    curator = CuratorController(workspace=workspace, notifier=notifier)
     transport = TelegramTransport(
         token=config.telegram_bot_token,
         handler=handler,
@@ -114,13 +117,16 @@ async def _run() -> None:
         allowed_user_id=config.telegram_allowed_user_id,
         background_tasks=background_tasks,
         notifier=notifier,
+        curator=curator,
     )
 
     log.info("Vexis-Agent starting")
     await control_socket.start()
+    curator.start(asyncio.get_running_loop())
     try:
         await transport.run()
     finally:
+        curator.stop()
         await control_socket.stop()
         await background_tasks.shutdown()
 
