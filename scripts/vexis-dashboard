@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Build the dashboard frontend if missing, then print the URL Vexis
+# would have given you over Telegram. Useful for running the dashboard
+# locally during development without sending yourself a /dashboard ack.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+WEB_DIR="$PROJECT_DIR/web"
+DIST_DIR="$WEB_DIR/dist"
+TOKEN_FILE="${HOME}/.vexis/dashboard_token"
+
+cd "$PROJECT_DIR"
+
+if [ ! -f "$DIST_DIR/index.html" ]; then
+    echo "→ web/dist/ missing; building frontend (one-time per check-out)"
+    if [ ! -d "$WEB_DIR/node_modules" ]; then
+        echo "→ installing npm deps"
+        (cd "$WEB_DIR" && npm install --silent)
+    fi
+    (cd "$WEB_DIR" && npm run build)
+fi
+
+if [ ! -f "$TOKEN_FILE" ]; then
+    cat <<EOF >&2
+The daemon doesn't appear to be running — no dashboard token at:
+  $TOKEN_FILE
+Start vexis-agent first; the token is written when the dashboard binds.
+EOF
+    exit 1
+fi
+
+token="$(cat "$TOKEN_FILE")"
+port="${VEXIS_DASHBOARD_PORT:-8766}"
+
+dns="$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // ""' | sed 's/\.$//')"
+
+cat <<EOF
+Local URL:
+  http://127.0.0.1:${port}/?token=${token}
+
+Tailscale URL (if Tailscale Serve is configured):
+  https://${dns:-<host>.<tailnet>.ts.net}/?token=${token}
+
+Tip: in Telegram, /dashboard returns the Tailscale form directly.
+EOF

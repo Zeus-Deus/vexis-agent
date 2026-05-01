@@ -10,6 +10,11 @@ venv-python
 dist/
 build/
 
+# Node / frontend
+node_modules/
+.vite/
+*.tsbuildinfo
+
 # Secrets
 .env
 

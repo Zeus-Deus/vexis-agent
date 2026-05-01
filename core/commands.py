@@ -43,4 +43,5 @@ COMMANDS: tuple[BotCommand, ...] = (
     BotCommand("pin", "Protect a skill from curator and skill_manage edits"),
     BotCommand("unpin", "Allow edits to a previously pinned skill"),
     BotCommand("curator", "Curator status / pause / resume / run / restore"),
+    BotCommand("dashboard", "Open the web dashboard (Tailscale URL + token)"),
 )

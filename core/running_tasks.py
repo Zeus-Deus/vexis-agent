@@ -369,6 +369,30 @@ class RunningTasks:
         Used by /status to render 'Idle for Xm'."""
         return self._last_idle.get(chat_id)
 
+    async def snapshot(self) -> list[dict]:
+        """Active chats and their current state, for the dashboard.
+
+        Returns one entry per chat that has any state at all (drain
+        owned, queued items, or a slot reserved). Read under the lock
+        so we never expose a half-mutated _ChatState. The dashboard
+        reads this every refresh; cost is O(chats) which in practice
+        is at most one or two."""
+        async with self._lock:
+            out: list[dict] = []
+            for chat_id, state in self._chats.items():
+                slot = state.slot
+                out.append(
+                    {
+                        "chat_id": chat_id,
+                        "drain_active": state.drain_active,
+                        "queue_depth": len(state.queue),
+                        "slot_reserved": slot is not None,
+                        "slot_pid": (slot.proc.pid if slot and slot.proc else None),
+                        "cancelled": slot.cancelled if slot is not None else False,
+                    }
+                )
+            return out
+
     def was_cancelled(self, chat_id: int) -> bool:
         """True if cancel() flagged the current slot. Cleared when the
         slot is unregistered."""

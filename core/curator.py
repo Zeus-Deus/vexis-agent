@@ -711,16 +711,9 @@ class CuratorController:
     async def _run_async(self) -> str:
         """Kick off run_curator on a worker thread without blocking the
         Telegram event loop."""
-
-        def _run() -> RunSummary:
-            return self._run_once() or RunSummary(
-                folder=Path("/dev/null"),
-                phase1=Phase1Result(),
-                phase2=Phase2Result(error="busy"),
-            )
-
-        loop = asyncio.get_running_loop()
-        summary = await loop.run_in_executor(None, _run)
+        summary = await self.run_now()
+        if summary is None:
+            return "Curator is already running. Try /curator status."
         return (
             f"Curator finished. Report: {summary.folder}. "
             f"Phase 1: archived={summary.phase1.archived}, "
@@ -728,6 +721,24 @@ class CuratorController:
             f"reactivated={summary.phase1.reactivated}. "
             f"Phase 2 ran={summary.phase2.ran}."
         )
+
+    async def run_now(self) -> RunSummary | None:
+        """Force a curator pass on demand, returning the structured summary.
+
+        Returns ``None`` if a pass was already in flight (the busy lock
+        is held). Used by both the Telegram ``/curator run`` handler and
+        the web dashboard's force-run button so they share one busy
+        guard and produce one report per pass.
+        """
+        if self._busy.locked():
+            return None
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._run_once)
+
+    def is_running(self) -> bool:
+        """True if a curator pass is currently in flight (daemon-thread
+        tick or a forced run from Telegram/dashboard)."""
+        return self._busy.locked()
 
     def _status_text(self) -> str:
         state = load_state()

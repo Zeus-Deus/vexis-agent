@@ -1,0 +1,162 @@
+@import "tailwindcss";
+
+/* Self-hosted typography. We don't pull from Google Fonts because the
+   dashboard runs on a private tailnet and shouldn't depend on a public
+   CDN. @fontsource ships the .woff2 files into the bundle. */
+@import "@fontsource-variable/ibm-plex-sans";
+@import "@fontsource-variable/jetbrains-mono";
+
+/* ---------------------------------------------------------------------
+   Design tokens. The aesthetic direction is "warm CRT" — a refined
+   dark theme with a single warm-amber accent and explicit mono/sans
+   typography pairing. NOT pure black; the base color has a faint warm
+   undertone so cards lift cleanly without needing heavy borders.
+   --------------------------------------------------------------------- */
+
+@theme {
+  --font-sans: "IBM Plex Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo,
+    Consolas, monospace;
+
+  --color-base: #0e0d0c;
+  --color-surface: #16140f;
+  --color-surface-2: #1d1a14;
+  --color-border: #2a261d;
+  --color-border-strong: #3e3624;
+  --color-fg: #e8e3d8;
+  --color-fg-2: #aea799;
+  --color-fg-dim: #6e695e;
+
+  /* Single warm-amber accent. Adjusted for sufficient contrast against
+     the dark base while staying perceptually warm rather than orange. */
+  --color-accent: #d49344;
+  --color-accent-2: #a06d2c;
+  --color-accent-fg: #16110a;
+
+  /* Status palette: stays grayscale + accent for "current/active" only.
+     state-stale and state-archived are intentionally just dim greys. */
+  --color-state-active: var(--color-accent);
+  --color-state-stale: #8a8175;
+  --color-state-archived: #5e5950;
+
+  --color-warn: #d4ad64;
+  --color-error: #c66e6e;
+}
+
+/* Base layer overrides. Body uses sans for chrome. Tabular figures
+   everywhere so timestamps and counters don't dance when the UI updates. */
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+  body {
+    font-family: var(--font-sans);
+    font-feature-settings: "ss01", "cv01", "cv02", "cv03";
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: var(--color-base);
+    color: var(--color-fg);
+    /* Subtle radial atmosphere so the eye finds the centre instead of
+       reading the whole canvas as a flat sheet. ~10% intensity, no
+       distraction at content scale. */
+    background-image:
+      radial-gradient(1200px 600px at 50% -10%, rgba(212, 147, 68, 0.06), transparent 70%),
+      radial-gradient(800px 400px at 90% 110%, rgba(212, 147, 68, 0.04), transparent 60%);
+    background-attachment: fixed;
+  }
+  *::selection {
+    background: rgba(212, 147, 68, 0.35);
+    color: #fff5e0;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-border-strong);
+    border-radius: 0;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-fg-dim);
+  }
+}
+
+/* Reusable utilities --------------------------------------------------- */
+@layer utilities {
+  .font-data {
+    font-family: var(--font-mono);
+    font-feature-settings: "calt", "tnum";
+  }
+  .uppercase-tight {
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-weight: 500;
+  }
+  .hairline {
+    border: 1px solid var(--color-border);
+  }
+  .hairline-strong {
+    border: 1px solid var(--color-border-strong);
+  }
+  /* The double-rule fence used in MEMORY.md headers. Inline as a CSS
+     pattern so we don't need to ship the literal "═" characters in
+     the JSX — they'd mis-render on systems without box-drawing fonts
+     installed. */
+  .hr-double {
+    border: 0;
+    height: 3px;
+    background:
+      linear-gradient(
+        to bottom,
+        var(--color-border-strong) 0,
+        var(--color-border-strong) 1px,
+        transparent 1px,
+        transparent 2px,
+        var(--color-border-strong) 2px,
+        var(--color-border-strong) 3px
+      );
+  }
+  /* Shimmer for the "loading" skeleton states. Slow enough to read as
+     activity, not flicker. */
+  @keyframes vexis-pulse {
+    0%, 100% {
+      opacity: 0.55;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  .animate-pulse-slow {
+    animation: vexis-pulse 2.4s ease-in-out infinite;
+  }
+  /* Page-load reveal: a single staggered fade so the four pages don't
+     all pop at once on first paint. Lifted across rows via inline
+     animation-delay set in JSX. */
+  @keyframes vexis-rise {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  .anim-rise {
+    animation: vexis-rise 0.45s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .anim-rise,
+    .animate-pulse-slow {
+      animation: none !important;
+    }
+    .anim-rise {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}

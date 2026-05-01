@@ -26,6 +26,7 @@ from core.notify import Notifier
 from core.paths import state_dir, workspace_dir
 from core.running_tasks import RunningTasks
 from core.sessions import SessionStore
+from core.web_server import DEFAULT_DASHBOARD_PORT, DashboardConfig, WebDashboard
 from transports.telegram import TelegramTransport
 
 log = logging.getLogger(__name__)
@@ -110,6 +111,20 @@ async def _run() -> None:
         workspace=workspace,
     )
     curator = CuratorController(workspace=workspace, notifier=notifier)
+
+    dashboard_port = _dashboard_port_from_env()
+    dashboard = WebDashboard(
+        workspace=workspace,
+        sessions=sessions,
+        running_tasks=running_tasks,
+        background_tasks=background_tasks,
+        curator=curator,
+        config=DashboardConfig(
+            port=dashboard_port,
+            web_dist=Path(__file__).resolve().parent / "web" / "dist",
+        ),
+    )
+
     transport = TelegramTransport(
         token=config.telegram_bot_token,
         handler=handler,
@@ -118,17 +133,43 @@ async def _run() -> None:
         background_tasks=background_tasks,
         notifier=notifier,
         curator=curator,
+        dashboard=dashboard,
     )
 
     log.info("Vexis-Agent starting")
     await control_socket.start()
+    await dashboard.start()
     curator.start(asyncio.get_running_loop())
     try:
         await transport.run()
     finally:
         curator.stop()
+        await dashboard.stop()
         await control_socket.stop()
         await background_tasks.shutdown()
+
+
+def _dashboard_port_from_env() -> int:
+    raw = os.environ.get("VEXIS_DASHBOARD_PORT")
+    if not raw:
+        return DEFAULT_DASHBOARD_PORT
+    try:
+        port = int(raw)
+    except ValueError:
+        log.warning(
+            "Ignoring VEXIS_DASHBOARD_PORT=%r (not an int); using default %d",
+            raw,
+            DEFAULT_DASHBOARD_PORT,
+        )
+        return DEFAULT_DASHBOARD_PORT
+    if port <= 0 or port > 65535:
+        log.warning(
+            "Ignoring VEXIS_DASHBOARD_PORT=%d (out of range); using default %d",
+            port,
+            DEFAULT_DASHBOARD_PORT,
+        )
+        return DEFAULT_DASHBOARD_PORT
+    return port
 
 
 def _build_dispatch(bg: BackgroundTasks):

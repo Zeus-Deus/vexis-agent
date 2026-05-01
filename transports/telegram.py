@@ -39,6 +39,7 @@ from core.notify import Notifier
 from core.running_tasks import RunningTasks
 from core.sessions import SessionInfo
 from core.status import StatusSnapshot, cleanup_all as cleanup_status_files, read_status
+from core.web_server import WebDashboard
 from tools.desktop import CaptureError, capture_desktop
 from tools.voxtype import TranscriptionEmpty, TranscriptionError, transcribe_audio
 
@@ -234,6 +235,7 @@ class TelegramTransport:
         background_tasks: BackgroundTasks,
         notifier: Notifier,
         curator: "CuratorController | None" = None,
+        dashboard: "WebDashboard | None" = None,
     ) -> None:
         self._handler = handler
         self._running_tasks = running_tasks
@@ -241,6 +243,7 @@ class TelegramTransport:
         self._notifier = notifier
         self._allowed_user_id = allowed_user_id
         self._curator = curator
+        self._dashboard = dashboard
         # Telegram bot commands can't contain hyphens, so /confirm-delete from
         # the spec becomes /confirm_delete here.
         self._pending_deletes: dict[str, datetime] = {}
@@ -268,6 +271,7 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("pin", self._on_pin))
         self._app.add_handler(CommandHandler("unpin", self._on_unpin))
         self._app.add_handler(CommandHandler("curator", self._on_curator))
+        self._app.add_handler(CommandHandler("dashboard", self._on_dashboard))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
 
     async def _on_text(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -729,6 +733,36 @@ class TelegramTransport:
             reply = "⚠️ Curator command failed; check the logs."
         if reply is not None:
             await msg.reply_text(reply)
+
+    async def _on_dashboard(
+        self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Reply with the dashboard URL plus current token.
+
+        The token-in-URL pattern is acceptable here because the only
+        people who can reach the dashboard host are on the user's
+        tailnet, same security model as the livestream URL surfaced by
+        the brain. The token rotates on every daemon restart, so old
+        URLs from a previous session stop working automatically.
+        """
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /dashboard from user_id=%s", user.id)
+            return
+        if self._dashboard is None:
+            await msg.reply_text("Dashboard not initialised.")
+            return
+        url = self._dashboard.url or self._dashboard.local_url
+        token = self._dashboard.token
+        sep = "&" if "?" in url else "?"
+        full = f"{url}{sep}token={token}"
+        if self._dashboard.url is None:
+            full += "\n\nNote: Tailscale Serve mapping unavailable; "
+            full += "this URL only resolves on this host."
+        await msg.reply_text(full)
 
     async def _on_screenshot(
         self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE

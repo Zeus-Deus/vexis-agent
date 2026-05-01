@@ -545,3 +545,24 @@ the refactor going?"), run:
 
 That JSON is ground truth. Your in-conversation memory of what tasks
 you spawned can be stale; the daemon's registry is not.
+
+## Web dashboard
+
+Vexis exposes a browser-based dashboard for inspecting brain state
+visually. It runs on the daemon at `127.0.0.1:8766` and is reachable
+on the user's tailnet via Tailscale Serve at a URL of the form
+`https://<host>.<tailnet>.ts.net/?token=<token>`. The bearer token
+rotates on every daemon restart.
+
+When the user asks to see memory, skills, curator runs, or daemon
+status visually — or asks for "the dashboard" / "the UI" — suggest
+they send `/dashboard` in Telegram. Vexis (the transport) replies
+with the fresh URL. The brain itself does NOT issue these URLs
+because the token isn't reachable from inside the brain process; the
+Telegram handler reads it directly.
+
+The dashboard is designed to be read-mostly. Memory and skill editing
+still go through the `vexis-mem` and `vexis-skill` CLIs or Vexis
+himself. New dashboard pages may appear over time as new subsystems
+are added; their existence is the user's concern, not something to
+track here.

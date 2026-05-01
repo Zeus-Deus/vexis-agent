@@ -1,0 +1,102 @@
+// Thin HTTP client over /api/v1. All calls require the bearer token;
+// 401 responses bubble up so the UI can drop back to the no-token state.
+
+import type {
+  CuratorRunDetail,
+  CuratorState,
+  MemoryState,
+  SkillBody,
+  SkillsState,
+  StatusState,
+} from "./types";
+
+const API_BASE = "/api/v1";
+
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+export class TokenInvalidError extends ApiError {
+  constructor() {
+    super(401, "token rejected");
+  }
+}
+
+interface FetchOptions {
+  method?: "GET" | "POST";
+  body?: unknown;
+}
+
+async function call<T>(
+  token: string,
+  path: string,
+  opts: FetchOptions = {},
+): Promise<T> {
+  const init: RequestInit = {
+    method: opts.method ?? "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+  };
+  if (opts.body !== undefined) init.body = JSON.stringify(opts.body);
+
+  const resp = await fetch(`${API_BASE}${path}`, init);
+  if (resp.status === 401) {
+    throw new TokenInvalidError();
+  }
+  if (!resp.ok) {
+    let detail = "";
+    try {
+      const j = await resp.json();
+      detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j);
+    } catch {
+      detail = await resp.text().catch(() => "");
+    }
+    throw new ApiError(resp.status, detail || resp.statusText);
+  }
+  return resp.json() as Promise<T>;
+}
+
+export const api = {
+  memory: (token: string) => call<MemoryState>(token, "/memory"),
+  skills: (token: string) => call<SkillsState>(token, "/skills"),
+  skillBody: (token: string, name: string) =>
+    call<SkillBody>(token, `/skills/${encodeURIComponent(name)}`),
+  pinSkill: (token: string, name: string) =>
+    call<{ ok: boolean; pinned: boolean; changed: boolean }>(
+      token,
+      `/skills/${encodeURIComponent(name)}/pin`,
+      { method: "POST" },
+    ),
+  unpinSkill: (token: string, name: string) =>
+    call<{ ok: boolean; pinned: boolean; changed: boolean }>(
+      token,
+      `/skills/${encodeURIComponent(name)}/unpin`,
+      { method: "POST" },
+    ),
+  restoreSkill: (token: string, name: string) =>
+    call<{ ok: boolean; message: string }>(
+      token,
+      `/skills/${encodeURIComponent(name)}/restore`,
+      { method: "POST" },
+    ),
+  curator: (token: string) => call<CuratorState>(token, "/curator"),
+  curatorRun: (token: string, folder: string) =>
+    call<CuratorRunDetail>(
+      token,
+      `/curator/runs/${encodeURIComponent(folder)}`,
+    ),
+  forceCuratorRun: (token: string) =>
+    call<{
+      ok: boolean;
+      folder: string;
+      phase1: { archived: number; marked_stale: number; reactivated: number };
+      phase2: { ran: boolean; archived_names: string[]; created_names: string[] };
+    }>(token, "/curator/run", { method: "POST" }),
+  status: (token: string) => call<StatusState>(token, "/status"),
+};
