@@ -38,6 +38,8 @@ DEFAULT_CURATOR_INTERVAL_HOURS = 168
 DEFAULT_CURATOR_MIN_IDLE_HOURS = 2
 DEFAULT_CURATOR_STALE_AFTER_DAYS = 30
 DEFAULT_CURATOR_ARCHIVE_AFTER_DAYS = 90
+DEFAULT_BROWSER_INACTIVITY_TIMEOUT_SECONDS = 120
+DEFAULT_BROWSER_ACTION_TIMEOUT_SECONDS = 120
 
 
 def _config_path() -> Path:
@@ -120,3 +122,53 @@ def curator_archive_after_days() -> int:
         _section("curator").get("archive_after_days"),
         DEFAULT_CURATOR_ARCHIVE_AFTER_DAYS,
     )
+
+
+def _str_or_none(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def browser_profiles_dir() -> str | None:
+    return _str_or_none(_section("browser").get("profiles_dir"))
+
+
+def browser_default_profile() -> str | None:
+    return _str_or_none(_section("browser").get("default_profile"))
+
+
+def browser_headless() -> bool:
+    raw = _section("browser").get("headless", False)
+    return bool(raw)
+
+
+def browser_inactivity_timeout_seconds() -> int:
+    return _int_or_default(
+        _section("browser").get("inactivity_timeout_seconds"),
+        DEFAULT_BROWSER_INACTIVITY_TIMEOUT_SECONDS,
+        minimum=10,
+    )
+
+
+def browser_action_timeout_seconds() -> int:
+    return _int_or_default(
+        _section("browser").get("action_timeout_seconds"),
+        DEFAULT_BROWSER_ACTION_TIMEOUT_SECONDS,
+        minimum=5,
+    )
+
+
+def browser_chromium_path() -> str | None:
+    return _str_or_none(_section("browser").get("chromium_path"))
+
+
+def browser_cdp_url() -> str | None:
+    """When set, attach to a user-launched Chrome instead of spawning one.
+
+    Example value: ``http://localhost:9222``. The user is responsible
+    for launching Chrome with ``--remote-debugging-port=9222`` and
+    keeping it alive; Vexis will not kill the externally-launched
+    process on shutdown.
+    """
+    return _str_or_none(_section("browser").get("cdp_url"))

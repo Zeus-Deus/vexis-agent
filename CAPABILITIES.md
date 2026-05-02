@@ -566,3 +566,123 @@ still go through the `vexis-mem` and `vexis-skill` CLIs or Vexis
 himself. New dashboard pages may appear over time as new subsystems
 are added; their existence is the user's concern, not something to
 track here.
+
+## Web browsing — fallback layer, not first reach
+
+You can drive a real Chromium window via `vexis-browse`. Each
+subcommand returns one JSON line. The browser is a **fallback**: try
+these alternatives first whenever they exist for the target service.
+
+1. **A dedicated MCP server** (e.g. omarchy-kb, GitHub MCP if installed,
+   any Linear/Slack/Drive MCP). Faster, structured, no DOM rot.
+2. **A CLI** via Bash: `gh`, `git`, `curl`, `jq`, anything that returns
+   plain text. Plain-text endpoints (`.md`, `.txt`, `.json`, `.yaml`,
+   raw GitHub content, documented APIs) should never go through the
+   browser — overkill and an order of magnitude slower.
+3. **Web browsing.** Last resort. Reach for it when the target is a
+   web-only product with no API, when login state forces a real
+   session, or when the user explicitly asked you to "go to a website
+   and do X."
+
+### The session
+
+Vexis owns a single Chromium session per daemon process. It's launched
+lazily on the first `navigate`, kept alive across your turns, and
+recycled after 2 minutes of inactivity. Login state, cookies, and
+local storage all live in `~/.vexis/browser-profiles/default/` and
+**survive daemon restarts** — once the user logs into a site once
+(through the headed window), you stay logged in for future sessions.
+
+If the user asks you to use a service you've never logged into,
+acknowledge that the first navigation will land on a login page and
+they may need to complete it manually in the browser window before
+you can continue.
+
+### Subcommands
+
+    ~/projects/vexis-agent/scripts/vexis-browse navigate https://example.com
+
+Navigates and returns `{ok, url, title, snapshot, element_count}`. The
+inline `snapshot` is the same DSL `snapshot` returns — there's usually
+no need to call `snapshot` immediately after `navigate`.
+
+    ~/projects/vexis-agent/scripts/vexis-browse snapshot
+
+Returns `{ok, snapshot, url, title, element_count}`. The DSL is
+tab-indented `[index]<tag attr=val />`:
+
+    [33]<div />
+        User form
+        [35]<input type=text placeholder=Enter name />
+        *[38]<button aria-label=Submit form />
+            Submit
+
+`*[index]` marks elements that are new since the previous snapshot —
+useful for spotting loaded content, modals, or new form fields. The
+diff is per-tab and resets on `navigate`/`back`/tab-switch, so the
+first snapshot on a fresh page never has markers; they only appear
+when the same page mutates between snapshots. The integer `index`
+is the stable identifier you pass to `click` and `type`.
+
+    ~/projects/vexis-agent/scripts/vexis-browse click 38
+    ~/projects/vexis-agent/scripts/vexis-browse type 35 "user@example.com"
+    ~/projects/vexis-agent/scripts/vexis-browse type 35 "extra" --no-clear
+    ~/projects/vexis-agent/scripts/vexis-browse press Enter
+    ~/projects/vexis-agent/scripts/vexis-browse press Control+L
+    ~/projects/vexis-agent/scripts/vexis-browse back
+    ~/projects/vexis-agent/scripts/vexis-browse scroll down
+    ~/projects/vexis-agent/scripts/vexis-browse scroll up --pages 2
+    ~/projects/vexis-agent/scripts/vexis-browse screenshot
+    ~/projects/vexis-agent/scripts/vexis-browse screenshot --full-page
+
+`type` clears the field by default. Pass `--no-clear` to append. `press`
+takes a key chord using browser-style names (`Enter`, `Tab`, `Escape`,
+`Control+L`, `Shift+Tab`). `scroll` defaults to one page; pass
+`--pages 0.5` for half a page or `--pages 10` to jump to the top/bottom.
+
+`screenshot` saves a PNG to `~/vexis-workspace/browser/screenshots/`
+and returns `{ok, path, image_base64, mime_type}`. The path is the
+durable reference — use the `Read` tool on it to actually look at
+the image. `image_base64` is included for harnesses that consume
+inline image content blocks; you can ignore it. `--full-page`
+captures the entire scrollable page rather than just the viewport.
+
+### Stale-index hint
+
+When the page changes mid-action (a click triggers a re-render), the
+old `index` may not exist anymore. Vexis will return:
+
+    {"ok": true, "snapshot_stale": true, "suggestion": "Element index is no longer valid; call browser_snapshot to refresh."}
+
+Treat this as "snapshot, then retry." Not an error — your action
+didn't fail, the index just expired.
+
+### Errors
+
+Failures return `{"ok": false, "error": "...", "hint": "..."}` with a
+plain-English description. The `hint` field, when present, is your
+recommended next step. Nothing here retries automatically; if a
+navigation fails you decide whether to try again, switch tactics, or
+report to the user.
+
+### When NOT to browse
+
+- Reading public docs/READMEs/JSON: use `curl` + `jq`, not the browser.
+- Anything you can do via a CLI tool already on PATH: use the CLI.
+- Searching the web for a fact: tell the user you don't have a
+  search-engine MCP and ask if they want one set up. Don't navigate to
+  google.com and try to scrape results.
+- Tasks the user hasn't asked you to do in a browser specifically —
+  if they say "what does this URL return", `curl` is the answer.
+
+### Attaching to the user's own Chrome (escape hatch)
+
+If a site blocks the Vexis-managed Chromium (bot detection,
+fingerprinting, or just wanting Vexis to use a real logged-in
+browser), the user can launch real Chrome themselves with
+`--remote-debugging-port=9222` and set `[browser].cdp_url =
+"http://localhost:9222"` in `~/.vexis/config.yaml`. After a daemon
+restart, Vexis attaches to that Chrome instead of spawning its own.
+In that mode the daemon never kills Chrome on shutdown — the user
+owns the lifecycle. You don't need to do anything different at the
+tool layer; the same `vexis-browse` subcommands drive both modes.

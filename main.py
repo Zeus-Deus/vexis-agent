@@ -27,6 +27,7 @@ from core.paths import state_dir, workspace_dir
 from core.running_tasks import RunningTasks
 from core.sessions import SessionStore
 from core.web_server import DEFAULT_DASHBOARD_PORT, DashboardConfig, WebDashboard
+from tools.browser import BrowserTools, get_manager as get_browser_manager
 from transports.telegram import TelegramTransport
 
 log = logging.getLogger(__name__)
@@ -93,9 +94,11 @@ async def _run() -> None:
         workspace=workspace,
         system_prompt_provider=lambda: build_system_prompt(workspace),
     )
+    browser_manager = get_browser_manager()
+    browser_tools = BrowserTools(browser_manager, workspace)
     control_socket = ControlSocket(
         default_socket_path(),
-        _build_dispatch(background_tasks),
+        _build_dispatch(background_tasks, browser_tools),
     )
 
     brain = ClaudeCodeBrain(
@@ -147,6 +150,7 @@ async def _run() -> None:
         await dashboard.stop()
         await control_socket.stop()
         await background_tasks.shutdown()
+        await browser_manager.stop()
 
 
 def _dashboard_port_from_env() -> int:
@@ -172,12 +176,12 @@ def _dashboard_port_from_env() -> int:
     return port
 
 
-def _build_dispatch(bg: BackgroundTasks):
-    """Wire control-socket ops to BackgroundTasks methods.
+def _build_dispatch(bg: BackgroundTasks, browser: BrowserTools):
+    """Wire control-socket ops to in-daemon singletons.
 
     The dispatcher is intentionally exhaustive — adding a new op here is
-    the same effort as adding a new bg method, and unknown ops return a
-    structured error rather than silently 200ing.
+    the same effort as adding a new bg/browser method, and unknown ops
+    return a structured error rather than silently 200ing.
     """
 
     async def dispatch(op: str, args: dict) -> dict:
@@ -256,6 +260,59 @@ def _build_dispatch(bg: BackgroundTasks):
             except TaskNotFound as exc:
                 return {"ok": False, "error": str(exc), "kind": "TaskNotFound"}
             return {"ok": True, "result": {"text": text}}
+        if op == "browser_navigate":
+            url = args.get("url", "")
+            return await browser.navigate(url if isinstance(url, str) else "")
+        if op == "browser_snapshot":
+            return await browser.snapshot(bool(args.get("full", False)))
+        if op == "browser_click":
+            try:
+                index = int(args.get("index"))
+            except (TypeError, ValueError):
+                return {
+                    "ok": False,
+                    "error": "'index' must be an integer",
+                    "kind": "BadRequest",
+                }
+            return await browser.click(index)
+        if op == "browser_type":
+            try:
+                index = int(args.get("index"))
+            except (TypeError, ValueError):
+                return {
+                    "ok": False,
+                    "error": "'index' must be an integer",
+                    "kind": "BadRequest",
+                }
+            text = args.get("text", "")
+            if not isinstance(text, str):
+                return {
+                    "ok": False,
+                    "error": "'text' must be a string",
+                    "kind": "BadRequest",
+                }
+            clear = bool(args.get("clear", True))
+            return await browser.type(index, text, clear)
+        if op == "browser_press":
+            key = args.get("key", "")
+            return await browser.press(key if isinstance(key, str) else "")
+        if op == "browser_back":
+            return await browser.back()
+        if op == "browser_scroll":
+            direction = args.get("direction", "")
+            if not isinstance(direction, str):
+                direction = ""
+            try:
+                pages = float(args.get("pages", 1.0))
+            except (TypeError, ValueError):
+                return {
+                    "ok": False,
+                    "error": "'pages' must be a number",
+                    "kind": "BadRequest",
+                }
+            return await browser.scroll(direction, pages)
+        if op == "browser_screenshot":
+            return await browser.screenshot(bool(args.get("full_page", False)))
         return {"ok": False, "error": f"unknown op '{op}'", "kind": "BadRequest"}
 
     return dispatch
