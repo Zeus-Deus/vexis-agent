@@ -23,6 +23,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timezone
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
 
@@ -31,6 +32,7 @@ from browser_use import BrowserSession  # noqa: E402
 from tools.browser.profile import (  # noqa: E402
     build_profile,
     cdp_url,
+    headless,
     inactivity_timeout_seconds,
 )
 
@@ -53,6 +55,11 @@ class SessionManager:
         # launched Chrome via CDP. In that mode we never kill the
         # process and skip the idle sweep — the user owns lifecycle.
         self._attached_to_cdp = False
+        # Wall-clock counterparts of _last_activity (monotonic). The
+        # monotonic value drives the inactivity sweep; the wall-clock
+        # value powers the dashboard's "X minutes ago" rendering.
+        self._started_at_wall: datetime | None = None
+        self._last_activity_at_wall: datetime | None = None
 
     @property
     def action_lock(self) -> asyncio.Lock:
@@ -74,7 +81,9 @@ class SessionManager:
                 await session.start()
                 self._session = session
                 self._attached_to_cdp = attaching
+                self._started_at_wall = datetime.now(timezone.utc)
             self._last_activity = time.monotonic()
+            self._last_activity_at_wall = datetime.now(timezone.utc)
             # Don't run the inactivity sweep when attached: the user
             # owns the Chrome process and we shouldn't be poking at
             # its lifecycle from a timer.
@@ -86,9 +95,36 @@ class SessionManager:
 
     def mark_activity(self) -> None:
         self._last_activity = time.monotonic()
+        self._last_activity_at_wall = datetime.now(timezone.utc)
 
     def is_running(self) -> bool:
         return self._session is not None
+
+    def state_for_dashboard(self) -> dict:
+        """Lifecycle snapshot for ``WebDashboard``. Pure read, no I/O."""
+        if self._session is None:
+            return {
+                "state": "not_started",
+                "started_at": None,
+                "last_activity_at": None,
+                "attached_to_cdp": False,
+                "headless": headless(),
+            }
+        return {
+            "state": "running",
+            "started_at": (
+                self._started_at_wall.isoformat()
+                if self._started_at_wall is not None
+                else None
+            ),
+            "last_activity_at": (
+                self._last_activity_at_wall.isoformat()
+                if self._last_activity_at_wall is not None
+                else None
+            ),
+            "attached_to_cdp": self._attached_to_cdp,
+            "headless": headless(),
+        }
 
     async def stop(self) -> None:
         """Tear down the live session, if any. Idempotent.
@@ -103,6 +139,8 @@ class SessionManager:
             attached = self._attached_to_cdp
             self._session = None
             self._attached_to_cdp = False
+            self._started_at_wall = None
+            self._last_activity_at_wall = None
         sweeper = self._sweeper
         self._sweeper = None
         if sweeper is not None and not sweeper.done():
@@ -121,6 +159,10 @@ class SessionManager:
                     log.info("[browser] session killed")
             except Exception:
                 log.exception("[browser] error tearing down session")
+        # Reset _stopping so a subsequent get() re-arms the sweep loop.
+        # Without this, a recycle-then-reopen sequence (e.g. via the
+        # dashboard) leaves the new session without an inactivity sweep.
+        self._stopping = False
 
     async def _sweep_loop(self) -> None:
         # Read inactivity_timeout each tick so test harnesses (and

@@ -567,6 +567,31 @@ himself. New dashboard pages may appear over time as new subsystems
 are added; their existence is the user's concern, not something to
 track here.
 
+The dashboard has a **Browser** tab that surfaces the live state of
+the `vexis-browse` session: running/idle, current URL and title,
+profile size, cookie count, the last 10 navigations, the last 5
+screenshots, and the resolved `[browser]` config. Two action buttons
+are exposed:
+
+- **Open about:blank** — if no session is running, this lazy-launches
+  Chromium and lands on `about:blank`. **If a session IS already
+  running, this navigates the existing window to `about:blank`,
+  replacing whatever page was loaded.** The user understands this is
+  the cost; you should mention it explicitly if you notice the user
+  click it mid-task ("sir, that will replace the current page in the
+  same window — proceed?"). The intended use is "open a window I can
+  log into manually," not "open a fresh tab."
+- **Recycle session** — graceful kill of the running Chromium (or CDP
+  detach if attached). Cookies and localStorage stay on disk in
+  `~/.vexis/browser-profiles/default/`; only in-flight page state is
+  lost. Confirms once before firing.
+
+Profile size is sampled at most once every 30 seconds (a full walk of
+the ~60 MB profile dir is cheap but not free), so the UI labels it
+"as of <relative time>." Cookie count is an unauthenticated SQLite
+row count from the Cookies db — values are never read, only the
+total.
+
 ## Web browsing — fallback layer, not first reach
 
 You can drive a real Chromium window via `vexis-browse`. Each

@@ -5,14 +5,16 @@ import { MemoryPage } from "./pages/MemoryPage";
 import { SkillsPage } from "./pages/SkillsPage";
 import { CuratorPage } from "./pages/CuratorPage";
 import { StatusPage } from "./pages/StatusPage";
+import { BrowserPage } from "./pages/BrowserPage";
 
-type TabId = "memory" | "skills" | "curator" | "status";
+type TabId = "memory" | "skills" | "curator" | "status" | "browser";
 
 const TABS: TabDef[] = [
   { id: "memory", label: "Memory", glyph: "§" },
   { id: "skills", label: "Skills", glyph: "◇" },
   { id: "curator", label: "Curator", glyph: "◆" },
   { id: "status", label: "Status", glyph: "●" },
+  { id: "browser", label: "Browser", glyph: "◐" },
 ];
 
 const HASH_TO_TAB: Record<string, TabId> = {
@@ -20,6 +22,7 @@ const HASH_TO_TAB: Record<string, TabId> = {
   "#skills": "skills",
   "#curator": "curator",
   "#status": "status",
+  "#browser": "browser",
 };
 
 function readTabFromHash(): TabId {
@@ -73,6 +76,9 @@ export function App() {
         {tab === "status" && (
           <StatusPage token={token} onAuthFail={handleAuthFail} />
         )}
+        {tab === "browser" && (
+          <BrowserPage token={token} onAuthFail={handleAuthFail} />
+        )}
       </main>
       <Footer />
     </div>
@@ -123,9 +129,9 @@ function Footer() {
   return (
     <footer className="border-t border-[var(--color-border)] mt-auto">
       <div className="max-w-[1400px] w-full mx-auto px-5 py-3 flex items-baseline gap-4 font-data text-[10px] text-[var(--color-fg-dim)] uppercase tracking-widest">
-        <span>read-only · with three actions</span>
+        <span>read-only · with five actions</span>
         <span className="ml-auto">
-          mem · skills · curator · status
+          mem · skills · curator · status · browser
         </span>
       </div>
     </footer>

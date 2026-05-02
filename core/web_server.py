@@ -29,7 +29,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import secrets
+import sqlite3
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -67,11 +71,19 @@ from core.skills import (
     restore_skill,
 )
 from core.subprocess import run as run_subprocess
+from core import yaml_config
 from core.yaml_config import (
     curator_archive_after_days,
     curator_enabled,
     curator_interval_hours,
     curator_stale_after_days,
+)
+from tools.browser import BrowserTools
+from tools.browser.profile import (
+    default_profile_name as browser_default_profile_name,
+    profile_dir as browser_profile_dir,
+    profiles_dir as browser_profiles_dir,
+    screenshots_dir as browser_screenshots_dir,
 )
 
 log = logging.getLogger(__name__)
@@ -91,6 +103,22 @@ STATUS_LOG_LINES = 100
 
 # How many curator runs to surface on the curator page (most recent first).
 CURATOR_RUN_HISTORY_LIMIT = 50
+
+# How many recent screenshots to surface on the browser page.
+BROWSER_SCREENSHOT_LIMIT = 5
+
+# Profile-size cache TTL. Walking 60+ MB of Chromium profile every poll
+# tick is wasteful; once every 30 s is plenty given the size doesn't
+# change at second resolution. The UI surfaces "as of <ts>" so the user
+# knows it isn't perfectly live.
+BROWSER_PROFILE_SIZE_TTL_SECONDS = 30.0
+
+# Allowed shape of screenshot filenames. ``BrowserTools.screenshot``
+# writes ``<ts>.png`` where ``<ts>`` is ``YYYYMMDDTHHMMSSZ`` — uppercase
+# letters and digits only. The pattern below rejects any path
+# separator, dot-dot, or otherwise unexpected character so the file
+# response can never reach outside the screenshots dir.
+_BROWSER_SCREENSHOT_NAME_RE = re.compile(r"^[A-Z0-9]+\.png$")
 
 
 class DashboardConfig:
@@ -132,6 +160,7 @@ class WebDashboard:
         running_tasks: RunningTasks,
         background_tasks: BackgroundTasks,
         curator: CuratorController | None,
+        browser: BrowserTools,
         config: DashboardConfig,
     ) -> None:
         self._workspace = workspace
@@ -139,6 +168,7 @@ class WebDashboard:
         self._running_tasks = running_tasks
         self._background_tasks = background_tasks
         self._curator = curator
+        self._browser = browser
         self._config = config
 
         # Issue a fresh token immediately so the Telegram /dashboard
@@ -150,6 +180,10 @@ class WebDashboard:
         self._tailscale_dns: str | None = None
         self._server: uvicorn.Server | None = None
         self._serve_task: asyncio.Task[None] | None = None
+
+        # Profile-size cache. The walk is the only piece of the browser
+        # payload that costs real I/O; everything else is in-memory.
+        self._profile_size_cache: tuple[float, int, str] | None = None
 
         self._app = self._build_app()
 
@@ -395,6 +429,36 @@ class WebDashboard:
         @app.get("/api/v1/status", dependencies=[Depends(_require_auth)])
         async def get_status() -> dict:
             return await self._status_payload()
+
+        @app.get("/api/v1/browser", dependencies=[Depends(_require_auth)])
+        async def get_browser() -> dict:
+            return self._browser_payload()
+
+        @app.get(
+            "/api/v1/browser/screenshot/{name}",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_browser_screenshot(name: str) -> FileResponse:
+            return self._browser_screenshot_response(name)
+
+        @app.post(
+            "/api/v1/browser/open-blank",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_browser_open_blank() -> dict:
+            # Reuses the exact codepath the control socket dispatches
+            # for ``browser_navigate about:blank`` — same lazy-launch
+            # behavior, same session reuse if one is already running.
+            return await self._browser.navigate("about:blank")
+
+        @app.post(
+            "/api/v1/browser/recycle",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_browser_recycle() -> dict:
+            was_running = self._browser.manager.is_running()
+            await self._browser.manager.stop()
+            return {"ok": True, "was_running": was_running}
 
         # ----- frontend bootstrap -----
 
@@ -650,6 +714,95 @@ class WebDashboard:
             "log_lines": log_lines,
         }
 
+    def _browser_payload(self) -> dict:
+        manager = self._browser.manager
+        session_state = manager.state_for_dashboard()
+        page_state = self._browser.state_for_dashboard()
+
+        attach_mode = "cdp-attach" if session_state["attached_to_cdp"] else "owned-chromium"
+        cdp_url = yaml_config.browser_cdp_url()
+
+        profile_path = browser_profile_dir()
+        size_bytes, size_at = self._browser_profile_size(profile_path)
+        cookie_count = _count_cookies(profile_path)
+
+        return {
+            "session": {
+                "state": session_state["state"],
+                "current_url": page_state["current_url"],
+                "current_title": page_state["current_title"],
+                "started_at": session_state["started_at"],
+                "last_activity_at": session_state["last_activity_at"],
+                "headless": session_state["headless"],
+                "attach_mode": attach_mode,
+            },
+            "profile": {
+                "path": str(profile_path),
+                "exists": profile_path.is_dir(),
+                "size_bytes": size_bytes,
+                "size_as_of": size_at,
+                "cookie_count": cookie_count,
+            },
+            "recent_navigations": page_state["recent_navigations"],
+            "recent_screenshots": _list_recent_screenshots(
+                browser_screenshots_dir(self._workspace),
+                BROWSER_SCREENSHOT_LIMIT,
+            ),
+            "config": {
+                "profiles_dir": str(browser_profiles_dir()),
+                "default_profile": browser_default_profile_name(),
+                "headless": yaml_config.browser_headless(),
+                "inactivity_timeout_seconds": (
+                    yaml_config.browser_inactivity_timeout_seconds()
+                ),
+                "action_timeout_seconds": (
+                    yaml_config.browser_action_timeout_seconds()
+                ),
+                "chromium_path": yaml_config.browser_chromium_path(),
+                "cdp_url": cdp_url,
+                "screenshot_include_base64": (
+                    yaml_config.browser_screenshot_include_base64()
+                ),
+            },
+        }
+
+    def _browser_profile_size(self, profile_path: Path) -> tuple[int | None, str | None]:
+        """Walk the profile dir, with a 30-second cache.
+
+        Returns (size_bytes, iso_timestamp). Both are None when the
+        directory doesn't exist (CDP-attach with no Vexis profile, or
+        before the first session). The timestamp is what the UI labels
+        ``as of`` so the user knows it's not perfectly live.
+        """
+        if not profile_path.is_dir():
+            return None, None
+        now = time.monotonic()
+        cached = self._profile_size_cache
+        if cached is not None:
+            cached_at, cached_size, cached_iso = cached
+            if now - cached_at < BROWSER_PROFILE_SIZE_TTL_SECONDS:
+                return cached_size, cached_iso
+        size = _walk_dir_size(profile_path)
+        iso = datetime.now(timezone.utc).isoformat()
+        self._profile_size_cache = (now, size, iso)
+        return size, iso
+
+    def _browser_screenshot_response(self, name: str) -> FileResponse:
+        if not _BROWSER_SCREENSHOT_NAME_RE.match(name):
+            raise HTTPException(400, "invalid screenshot filename")
+        screenshots = browser_screenshots_dir(self._workspace).resolve()
+        candidate = (screenshots / name).resolve()
+        # Defense in depth — even though the regex blocks separators,
+        # follow the resolved path and confirm it stays inside the
+        # screenshots dir before reading.
+        try:
+            candidate.relative_to(screenshots)
+        except ValueError as exc:
+            raise HTTPException(400, "invalid screenshot path") from exc
+        if not candidate.is_file():
+            raise HTTPException(404, "screenshot not found")
+        return FileResponse(candidate, media_type="image/png")
+
     # ----- Tailscale Serve plumbing -------------------------------------
 
     async def _configure_tailscale(self) -> None:
@@ -728,6 +881,91 @@ async def _tailscale_dns() -> str:
     if not dns:
         raise _TailscaleError("tailscale returned no DNSName for this node")
     return dns
+
+
+def _walk_dir_size(root: Path) -> int:
+    """Sum ``st_size`` recursively under ``root``. Best-effort.
+
+    Files we can't stat (transient deletes, permission issues) are
+    silently skipped. The Chromium profile mutates while we walk; the
+    result is approximate, which is fine for a "size on disk" line on
+    a dashboard refreshed every 30 seconds.
+    """
+    total = 0
+    stack: list[Path] = [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat().st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def _count_cookies(profile_path: Path) -> int | None:
+    """Read row count from the Chromium Cookies SQLite file.
+
+    One try/except wraps everything: path resolution, sqlite connect,
+    query. Newer Chromium uses ``Default/Network/Cookies``; older
+    versions used ``Default/Cookies``. We try both. Any failure (file
+    missing, schema change, lock contention, permission, ...) returns
+    ``None`` and the UI renders ``—``. Discriminating failure modes
+    is not useful — it's a count, either we got one or we didn't.
+    """
+    try:
+        candidates = [
+            profile_path / "Default" / "Network" / "Cookies",
+            profile_path / "Default" / "Cookies",
+        ]
+        cookie_db = next((c for c in candidates if c.is_file()), None)
+        if cookie_db is None:
+            return None
+        # Read-only URI plus immutable=1 so SQLite doesn't try to acquire
+        # a write lock on a file Chromium may have open.
+        uri = f"file:{cookie_db}?mode=ro&immutable=1"
+        with sqlite3.connect(uri, uri=True, timeout=0.5) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM cookies").fetchone()
+        return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _list_recent_screenshots(directory: Path, limit: int) -> list[dict]:
+    """Newest-first list of ``{filename, size_bytes, mtime}`` entries."""
+    if not directory.is_dir():
+        return []
+    entries: list[tuple[float, str, int]] = []
+    try:
+        with os.scandir(directory) as it:
+            for entry in it:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if not entry.name.lower().endswith(".png"):
+                    continue
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, entry.name, st.st_size))
+    except OSError:
+        return []
+    entries.sort(key=lambda row: row[0], reverse=True)
+    return [
+        {
+            "filename": name,
+            "size_bytes": size,
+            "mtime": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+        }
+        for mtime, name, size in entries[:limit]
+    ]
 
 
 def _archived_description(skills_root: Path, name: str) -> str:

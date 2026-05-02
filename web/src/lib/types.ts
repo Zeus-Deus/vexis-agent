@@ -130,3 +130,51 @@ export interface StatusState {
   background_tasks: BackgroundTaskSummary[];
   log_lines: LogLine[];
 }
+
+export interface BrowserSessionInfo {
+  state: "running" | "idle" | "not_started";
+  current_url: string | null;
+  current_title: string | null;
+  started_at: string | null;
+  last_activity_at: string | null;
+  headless: boolean;
+  attach_mode: "owned-chromium" | "cdp-attach";
+}
+
+export interface BrowserProfileInfo {
+  path: string;
+  exists: boolean;
+  size_bytes: number | null;
+  size_as_of: string | null;
+  cookie_count: number | null;
+}
+
+export interface BrowserNavigationEntry {
+  url: string;
+  at: string;
+}
+
+export interface BrowserScreenshotEntry {
+  filename: string;
+  size_bytes: number;
+  mtime: string;
+}
+
+export interface BrowserConfigSnapshot {
+  profiles_dir: string;
+  default_profile: string;
+  headless: boolean;
+  inactivity_timeout_seconds: number;
+  action_timeout_seconds: number;
+  chromium_path: string | null;
+  cdp_url: string | null;
+  screenshot_include_base64: boolean;
+}
+
+export interface BrowserState {
+  session: BrowserSessionInfo;
+  profile: BrowserProfileInfo;
+  recent_navigations: BrowserNavigationEntry[];
+  recent_screenshots: BrowserScreenshotEntry[];
+  config: BrowserConfigSnapshot;
+}

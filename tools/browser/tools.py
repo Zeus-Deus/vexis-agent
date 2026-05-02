@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,8 @@ from tools.browser.session import SessionManager
 
 log = logging.getLogger(__name__)
 
+_RECENT_NAVIGATIONS_MAX = 10
+
 
 class BrowserTools:
     """Daemon-side implementation of the browser_* control-socket ops."""
@@ -50,17 +53,54 @@ class BrowserTools:
         self._manager = manager
         self._tools = Tools()
         self._workspace = workspace
+        # Cached page metadata, refreshed on every action that returns a
+        # snapshot. The dashboard reads these without touching the live
+        # session — that way an inspection request can't race with a
+        # click in flight.
+        self._current_url: str | None = None
+        self._current_title: str | None = None
+        # Recent URL ring buffer. Append on successful navigate/back;
+        # newest entry first when serialized. The deque enforces the
+        # cap automatically.
+        self._recent_navigations: deque[dict[str, str]] = deque(
+            maxlen=_RECENT_NAVIGATIONS_MAX
+        )
+
+    @property
+    def manager(self) -> SessionManager:
+        """Expose the underlying SessionManager (used by the dashboard)."""
+        return self._manager
+
+    def state_for_dashboard(self) -> dict[str, Any]:
+        """Cached page metadata for ``WebDashboard``. Pure read, no I/O.
+
+        Once the session is gone (idle sweep, manual recycle), the cached
+        URL/title describe a page that no longer exists — so they're
+        suppressed even though the values still sit in this instance.
+        Recent navigations stay; they're history, not live state.
+        """
+        running = self._manager.is_running()
+        return {
+            "current_url": self._current_url if running else None,
+            "current_title": self._current_title if running else None,
+            "recent_navigations": list(reversed(self._recent_navigations)),
+        }
 
     async def navigate(self, url: str) -> dict[str, Any]:
         if not isinstance(url, str) or not url.strip():
             return error_payload("missing or empty 'url'")
-        return await self._run_action(
+        target = url.strip()
+        result = await self._run_action(
             "navigate",
             lambda session: self._tools.navigate(
-                url=url.strip(), browser_session=session
+                url=target, browser_session=session
             ),
             include_snapshot=True,
         )
+        if result.get("ok"):
+            self._update_current_page(result)
+            self._record_navigation(result.get("url") or target)
+        return result
 
     async def snapshot(self, full: bool = False) -> dict[str, Any]:
         # ``full`` is accepted for forward-compat with the v1 spec but
@@ -81,6 +121,7 @@ class BrowserTools:
             log.exception("[browser] snapshot failed")
             return normalize_exception(exc, action="browser_snapshot")
         self._manager.mark_activity()
+        self._update_current_page(snap)
         return {"ok": True, **snap}
 
     async def click(self, index: int) -> dict[str, Any]:
@@ -119,11 +160,17 @@ class BrowserTools:
         )
 
     async def back(self) -> dict[str, Any]:
-        return await self._run_action(
+        result = await self._run_action(
             "back",
             lambda session: self._tools.go_back(browser_session=session),
             include_url=True,
         )
+        if result.get("ok"):
+            self._update_current_page(result)
+            url = result.get("url")
+            if url:
+                self._record_navigation(url)
+        return result
 
     async def scroll(self, direction: str, pages: float = 1.0) -> dict[str, Any]:
         if direction not in ("up", "down"):
@@ -255,3 +302,21 @@ class BrowserTools:
             except Exception:
                 extra["url"] = ""
         return {"ok": True, **extra}
+
+    def _update_current_page(self, result: dict[str, Any]) -> None:
+        url = result.get("url")
+        if isinstance(url, str) and url:
+            self._current_url = url
+        title = result.get("title")
+        if isinstance(title, str):
+            self._current_title = title or None
+
+    def _record_navigation(self, url: str) -> None:
+        if not url:
+            return
+        self._recent_navigations.append(
+            {
+                "url": url,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+        )

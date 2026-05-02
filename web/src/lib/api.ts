@@ -2,6 +2,7 @@
 // 401 responses bubble up so the UI can drop back to the no-token state.
 
 import type {
+  BrowserState,
   CuratorRunDetail,
   CuratorState,
   MemoryState,
@@ -99,4 +100,25 @@ export const api = {
       phase2: { ran: boolean; archived_names: string[]; created_names: string[] };
     }>(token, "/curator/run", { method: "POST" }),
   status: (token: string) => call<StatusState>(token, "/status"),
+  browser: (token: string) => call<BrowserState>(token, "/browser"),
+  browserOpenBlank: (token: string) =>
+    call<{ ok: boolean; url?: string; error?: string; hint?: string }>(
+      token,
+      "/browser/open-blank",
+      { method: "POST" },
+    ),
+  browserRecycle: (token: string) =>
+    call<{ ok: boolean; was_running: boolean }>(token, "/browser/recycle", {
+      method: "POST",
+    }),
 };
+
+// Build a screenshot URL with the bearer carried as a query parameter.
+// The auth dependency on the dashboard accepts ?token= as a fallback,
+// which lets <img src="..."> and click-to-open-fullsize anchors work
+// without rewriting how the rest of the dashboard handles auth.
+export function browserScreenshotUrl(token: string, filename: string): string {
+  return `/api/v1/browser/screenshot/${encodeURIComponent(
+    filename,
+  )}?token=${encodeURIComponent(token)}`;
+}

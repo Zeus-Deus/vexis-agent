@@ -34,6 +34,24 @@ export function formatNumber(n: number): string {
   return n.toLocaleString();
 }
 
+// Binary-prefix bytes formatter. 1024-based, one decimal, terse units.
+// Used for the browser-tab profile size and screenshot tile metadata —
+// kept here next to the other formatters so it stays one import away.
+export function formatBytes(bytes: number | null | undefined): string {
+  if (bytes === null || bytes === undefined || Number.isNaN(bytes)) return "—";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  // One decimal up through GB; drop the decimal once values get large.
+  const precision = value >= 100 ? 0 : 1;
+  return `${value.toFixed(precision)} ${units[unit]}`;
+}
+
 export function clampPercent(n: number): number {
   return Math.max(0, Math.min(100, Math.round(n)));
 }
