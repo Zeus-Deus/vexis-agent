@@ -62,6 +62,14 @@ _DELETE_CONFIRM_WINDOW = timedelta(seconds=60)
 _CB_DATA_MAX_BYTES = 64
 _HIDDEN_NOTE = "(Some sessions hidden — type the name directly to use them.)"
 _SCREENSHOT_PATH_RE = re.compile(r"(?<![\w/])/tmp/vexis-screenshot-\d+\.png")
+# Browser screenshots land in the user's workspace at
+# ``<workspace>/browser/screenshots/<ts>.png`` where ``<ts>`` is the
+# fixed UTC stamp ``YYYYMMDDTHHMMSSZ``. We anchor on the suffix
+# ``/browser/screenshots/<ts>.png`` so the regex doesn't bake in a
+# specific workspace location.
+_BROWSER_SCREENSHOT_PATH_RE = re.compile(
+    r"(?<![\w])(?:/[\w.-]+)+/browser/screenshots/\d{8}T\d{6}Z\.png"
+)
 _INCOMING_PHOTO_DIR = Path("/tmp")
 _INCOMING_PHOTO_GLOB = "vexis-incoming-*.png"
 _INCOMING_PHOTO_MAX_AGE = timedelta(hours=1)
@@ -186,21 +194,37 @@ def _cleanup_incoming_images(
 
 
 def _extract_screenshot_paths(text: str) -> tuple[list[Path], str]:
-    """Pull every `/tmp/vexis-screenshot-*.png` path out of `text`.
+    """Pull every screenshot path out of `text`.
 
-    Returns the list of unique paths (in first-seen order) and the cleaned
-    text with each match replaced by the placeholder ``[screenshot]`` so the
-    surrounding prose still reads naturally.
+    Recognises two flavours:
+
+    - ``/tmp/vexis-screenshot-<n>.png`` — desktop captures from
+      vexis-look. Ephemeral; deleted after send.
+    - ``<workspace>/browser/screenshots/<ts>.png`` — captures from
+      vexis-browse screenshot. Archived; left on disk after send so
+      the brain (or the user) can re-reference them later.
+
+    Returns the list of unique paths (in first-seen order) and the
+    cleaned text with each match replaced by the placeholder
+    ``[screenshot]`` so the surrounding prose still reads naturally.
     """
     seen: list[Path] = []
     seen_set: set[str] = set()
-    for match in _SCREENSHOT_PATH_RE.findall(text):
-        if match in seen_set:
-            continue
-        seen_set.add(match)
-        seen.append(Path(match))
+    for pattern in (_SCREENSHOT_PATH_RE, _BROWSER_SCREENSHOT_PATH_RE):
+        for match in pattern.findall(text):
+            if match in seen_set:
+                continue
+            seen_set.add(match)
+            seen.append(Path(match))
     cleaned = _SCREENSHOT_PATH_RE.sub("[screenshot]", text)
+    cleaned = _BROWSER_SCREENSHOT_PATH_RE.sub("[screenshot]", cleaned)
     return seen, cleaned
+
+
+def _is_ephemeral_screenshot(path: Path) -> bool:
+    """``/tmp/...`` captures are deleted after send; workspace
+    screenshots are archived for later reference."""
+    return path.parent == Path("/tmp")
 
 
 def _greedy_join(parts: list[str], sep: str, max_len: int) -> list[str]:
@@ -791,6 +815,7 @@ class TelegramTransport:
         paths it referenced as photos before the text body."""
         paths, cleaned = _extract_screenshot_paths(reply)
         for path in paths:
+            ephemeral = _is_ephemeral_screenshot(path)
             try:
                 if not path.is_file():
                     log.warning("Brain referenced missing screenshot %s", path)
@@ -800,7 +825,8 @@ class TelegramTransport:
             except Exception:
                 log.exception("Failed to forward screenshot %s", path)
             finally:
-                path.unlink(missing_ok=True)
+                if ephemeral:
+                    path.unlink(missing_ok=True)
 
         text = cleaned.strip()
         if not text:

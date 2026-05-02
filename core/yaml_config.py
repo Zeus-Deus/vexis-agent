@@ -172,3 +172,15 @@ def browser_cdp_url() -> str | None:
     process on shutdown.
     """
     return _str_or_none(_section("browser").get("cdp_url"))
+
+
+def browser_screenshot_include_base64() -> bool:
+    """Whether ``vexis-browse screenshot`` includes ``image_base64`` by
+    default. Off because most harnesses (including Claude Code) read
+    the image via the file path with the Read tool, and a multi-MB
+    base64 line breaks asyncio.StreamReader's default buffer when it
+    rides through the brain's stream-json output. CLI callers can opt
+    in per-call with ``--include-base64``.
+    """
+    raw = _section("browser").get("screenshot_include_base64", False)
+    return bool(raw)

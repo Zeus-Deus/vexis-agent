@@ -115,8 +115,14 @@ def _cmd_scroll(direction: str, pages: float) -> int:
     )
 
 
-def _cmd_screenshot(full_page: bool) -> int:
-    return _print_and_exit(_send("browser_screenshot", {"full_page": full_page}))
+def _cmd_screenshot(full_page: bool, include_base64: bool) -> int:
+    args: dict = {"full_page": full_page}
+    # Only forward when explicitly set; daemon falls back to its
+    # config default (``[browser].screenshot_include_base64``) when
+    # the key is absent.
+    if include_base64:
+        args["include_base64"] = True
+    return _print_and_exit(_send("browser_screenshot", args))
 
 
 def main() -> int:
@@ -173,13 +179,21 @@ def main() -> int:
         "screenshot",
         help=(
             "Save a PNG screenshot to ~/vexis-workspace/browser/screenshots/"
-            " and return its path + base64."
+            " and return its path."
         ),
     )
     p_screenshot.add_argument(
         "--full-page",
         action="store_true",
         help="Capture the entire scrollable page (default: viewport only).",
+    )
+    p_screenshot.add_argument(
+        "--include-base64",
+        action="store_true",
+        help=(
+            "Also include the PNG bytes as base64 in the JSON response. "
+            "Off by default — most consumers read the file via the path."
+        ),
     )
 
     args = parser.parse_args()
@@ -198,7 +212,7 @@ def main() -> int:
     if args.cmd == "scroll":
         return _cmd_scroll(args.direction, args.pages)
     if args.cmd == "screenshot":
-        return _cmd_screenshot(args.full_page)
+        return _cmd_screenshot(args.full_page, args.include_base64)
     return 2
 
 

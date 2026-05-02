@@ -35,6 +35,8 @@ from tools.browser.errors import (
     normalize_exception,
     stale_index_payload,
 )
+from core import yaml_config
+
 from tools.browser.profile import action_timeout_seconds, screenshots_dir
 from tools.browser.session import SessionManager
 
@@ -140,7 +142,22 @@ class BrowserTools:
             ),
         )
 
-    async def screenshot(self, full_page: bool = False) -> dict[str, Any]:
+    async def screenshot(
+        self,
+        full_page: bool = False,
+        include_base64: bool | None = None,
+    ) -> dict[str, Any]:
+        """Save a PNG to ``<workspace>/browser/screenshots/<ts>.png``.
+
+        ``image_base64`` is OPT-IN: omitted by default to keep the JSON
+        line under the brain's stream buffer. A 4 MB base64 string in a
+        single stream-json line crashes the asyncio StreamReader unless
+        it's been bumped — and even then, the brain doesn't use it
+        (the path + Read tool is the canonical image flow). Pass
+        ``include_base64=True`` (CLI: ``--include-base64``) when the
+        consumer actually needs the bytes inline. Default tracks
+        ``yaml_config.browser_screenshot_include_base64()``.
+        """
         try:
             session = await self._manager.get()
         except Exception as exc:
@@ -164,10 +181,10 @@ class BrowserTools:
                 raw = base64.b64decode(data)
             except (ValueError, TypeError):
                 return error_payload("screenshot returned a non-base64 string")
-            b64 = data
+            b64: str | None = data
         else:
             raw = bytes(data)
-            b64 = base64.b64encode(raw).decode("ascii")
+            b64 = None
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         out_dir = screenshots_dir(self._workspace)
         path = out_dir / f"{ts}.png"
@@ -175,12 +192,19 @@ class BrowserTools:
             path.write_bytes(raw)
         except OSError as exc:
             return error_payload(f"could not write screenshot: {exc}")
-        return {
+        if include_base64 is None:
+            include_base64 = yaml_config.browser_screenshot_include_base64()
+        payload: dict[str, Any] = {
             "ok": True,
             "path": str(path),
-            "image_base64": b64,
+            "size_bytes": len(raw),
             "mime_type": "image/png",
         }
+        if include_base64:
+            if b64 is None:
+                b64 = base64.b64encode(raw).decode("ascii")
+            payload["image_base64"] = b64
+        return payload
 
     async def _run_action(
         self,

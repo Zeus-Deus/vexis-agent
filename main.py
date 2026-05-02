@@ -312,7 +312,14 @@ def _build_dispatch(bg: BackgroundTasks, browser: BrowserTools):
                 }
             return await browser.scroll(direction, pages)
         if op == "browser_screenshot":
-            return await browser.screenshot(bool(args.get("full_page", False)))
+            include_b64_raw = args.get("include_base64")
+            include_b64 = (
+                bool(include_b64_raw) if include_b64_raw is not None else None
+            )
+            return await browser.screenshot(
+                bool(args.get("full_page", False)),
+                include_base64=include_b64,
+            )
         return {"ok": False, "error": f"unknown op '{op}'", "kind": "BadRequest"}
 
     return dispatch

@@ -33,6 +33,17 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # 30 min — generous for long multi-step work, hard ceiling for runaway calls.
 BRAIN_TIMEOUT_SECONDS = 1800
 
+# StreamReader buffer for the brain's stdout. claude -p's stream-json
+# emits one JSON object per line, and a single line can carry a
+# multi-megabyte tool result (e.g. a base64-encoded screenshot). The
+# asyncio default of 64 KiB makes readline raise LimitOverrunError on
+# lines longer than that — the stream then dies and the brain process
+# hangs without ever firing a result event. 32 MiB covers the largest
+# realistic tool payload we'll see (full-page screenshots top out
+# around 4 MB base64); cheap because we only ever hold one line in
+# the buffer at a time.
+_BRAIN_STREAM_LIMIT_BYTES = 32 * 1024 * 1024
+
 # How many session UUIDs to cache system prompts for. Each entry is
 # small (a few KB), but rotations accrete over a long-running daemon
 # so we cap to keep memory bounded. FIFO eviction is fine — we only
@@ -299,6 +310,7 @@ class ClaudeCodeBrain:
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
                 env=env,
+                limit=_BRAIN_STREAM_LIMIT_BYTES,
             )
             log.info("Brain spawned PID %d for chat %d", proc.pid, chat_id)
 

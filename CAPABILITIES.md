@@ -641,11 +641,17 @@ takes a key chord using browser-style names (`Enter`, `Tab`, `Escape`,
 `--pages 0.5` for half a page or `--pages 10` to jump to the top/bottom.
 
 `screenshot` saves a PNG to `~/vexis-workspace/browser/screenshots/`
-and returns `{ok, path, image_base64, mime_type}`. The path is the
-durable reference — use the `Read` tool on it to actually look at
-the image. `image_base64` is included for harnesses that consume
-inline image content blocks; you can ignore it. `--full-page`
-captures the entire scrollable page rather than just the viewport.
+and returns `{ok, path, size_bytes, mime_type}`. **Just include the
+path verbatim in your reply** — the Telegram transport detects
+`<workspace>/browser/screenshots/<ts>.png` and sends the file as a
+photo before the text body, then strips the path from the prose.
+The file stays on disk after sending so you (or the user) can
+re-reference it later. Use the `Read` tool on the path if you need
+to look at the image yourself. `--full-page` captures the entire
+scrollable page rather than just the viewport. `image_base64` is
+opt-in via `--include-base64`; off by default because the brain's
+stream-json buffer can't carry multi-megabyte lines and the path
+is the canonical image-handoff anyway.
 
 ### Stale-index hint
 
