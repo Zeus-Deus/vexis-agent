@@ -97,3 +97,23 @@ def curator_logs_dir() -> Path:
     path = vexis_dir() / "logs" / "curator"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def learning_state_path() -> Path:
+    """`~/.vexis/learning/reviewed.json`. Per-session reviewed records.
+
+    Sidecar `state.json` next to it (in the same directory) holds
+    daemon-level state (paused, last_tick_at). The split keeps the
+    high-write per-session file separate from the rarely-mutated
+    daemon flags.
+    """
+    parent = vexis_dir() / "learning"
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent / "reviewed.json"
+
+
+def learning_logs_dir() -> Path:
+    """`~/.vexis/logs/learning/`. Per-tick run reports."""
+    path = vexis_dir() / "logs" / "learning"
+    path.mkdir(parents=True, exist_ok=True)
+    return path

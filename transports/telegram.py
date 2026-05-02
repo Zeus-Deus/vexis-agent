@@ -35,6 +35,7 @@ from core.background_tasks import (
 )
 from core.commands import COMMANDS
 from core.curator import CuratorController
+from core.learning_curator import LearningController
 from core.handler import MessageHandler
 from core.notify import Notifier
 from core.running_tasks import RunningTasks
@@ -285,6 +286,7 @@ class TelegramTransport:
         background_tasks: BackgroundTasks,
         notifier: Notifier,
         curator: "CuratorController | None" = None,
+        learning_curator: "LearningController | None" = None,
         dashboard: "WebDashboard | None" = None,
     ) -> None:
         self._handler = handler
@@ -293,6 +295,7 @@ class TelegramTransport:
         self._notifier = notifier
         self._allowed_user_id = allowed_user_id
         self._curator = curator
+        self._learning_curator = learning_curator
         self._dashboard = dashboard
         # Telegram bot commands can't contain hyphens, so /confirm-delete from
         # the spec becomes /confirm_delete here.
@@ -321,6 +324,7 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("pin", self._on_pin))
         self._app.add_handler(CommandHandler("unpin", self._on_unpin))
         self._app.add_handler(CommandHandler("curator", self._on_curator))
+        self._app.add_handler(CommandHandler("learning", self._on_learning))
         self._app.add_handler(CommandHandler("dashboard", self._on_dashboard))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
 
@@ -781,6 +785,33 @@ class TelegramTransport:
         except Exception:
             log.exception("/curator handler failed")
             reply = "⚠️ Curator command failed; check the logs."
+        if reply is not None:
+            await msg.reply_text(reply)
+
+    async def _on_learning(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Dispatch /learning [status|pause|resume|run] to the
+        LearningController. Mirrors ``_on_curator``: keep the slash
+        registration honest by always replying, but degrade gracefully
+        if the controller hasn't been wired in (e.g. older daemon
+        instance restoring state)."""
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /learning from user_id=%s", user.id)
+            return
+        if self._learning_curator is None:
+            await msg.reply_text("Learning curator not initialised yet.")
+            return
+        args = ctx.args or []
+        sub = args[0] if args else "status"
+        rest = args[1:]
+        try:
+            reply = await self._learning_curator.handle_telegram(sub, rest)
+        except Exception:
+            log.exception("/learning handler failed")
+            reply = "⚠️ Learning curator command failed; check the logs."
         if reply is not None:
             await msg.reply_text(reply)
 

@@ -40,6 +40,11 @@ DEFAULT_CURATOR_STALE_AFTER_DAYS = 30
 DEFAULT_CURATOR_ARCHIVE_AFTER_DAYS = 90
 DEFAULT_BROWSER_INACTIVITY_TIMEOUT_SECONDS = 120
 DEFAULT_BROWSER_ACTION_TIMEOUT_SECONDS = 120
+DEFAULT_LEARNING_TICK_INTERVAL_MINUTES = 5
+DEFAULT_LEARNING_IDLE_THRESHOLD_MINUTES = 25
+DEFAULT_LEARNING_FAILURE_COOLDOWN_HOURS = 1
+DEFAULT_LEARNING_MAX_ENTRIES_PER_SESSION = 2
+DEFAULT_LEARNING_MAX_ENTRY_CHARS = 280
 
 
 def _config_path() -> Path:
@@ -172,6 +177,63 @@ def browser_cdp_url() -> str | None:
     process on shutdown.
     """
     return _str_or_none(_section("browser").get("cdp_url"))
+
+
+def learning_enabled() -> bool:
+    raw = _section("learning").get("enabled", True)
+    return bool(raw)
+
+
+def learning_tick_interval_minutes() -> int:
+    return _int_or_default(
+        _section("learning").get("tick_interval_minutes"),
+        DEFAULT_LEARNING_TICK_INTERVAL_MINUTES,
+        minimum=1,
+    )
+
+
+def learning_idle_threshold_minutes() -> int:
+    return _int_or_default(
+        _section("learning").get("idle_threshold_minutes"),
+        DEFAULT_LEARNING_IDLE_THRESHOLD_MINUTES,
+        minimum=1,
+    )
+
+
+def learning_failure_cooldown_hours() -> int:
+    return _int_or_default(
+        _section("learning").get("failure_cooldown_hours"),
+        DEFAULT_LEARNING_FAILURE_COOLDOWN_HOURS,
+        minimum=0,
+    )
+
+
+def learning_shadow_mode() -> bool:
+    """Default True until the eval (§7.4) and one-week soak give a green-light.
+
+    When True, the curator writes proposed entries to MEMORY-SHADOW.md
+    (a non-injected file the user reviews). When False, writes go to
+    MEMORY.md and land in every future session's system prompt — so
+    flipping this is the live-mode switch.
+    """
+    raw = _section("learning").get("shadow_mode", True)
+    return bool(raw)
+
+
+def learning_max_entries_per_session() -> int:
+    return _int_or_default(
+        _section("learning").get("max_entries_per_session"),
+        DEFAULT_LEARNING_MAX_ENTRIES_PER_SESSION,
+        minimum=1,
+    )
+
+
+def learning_max_entry_chars() -> int:
+    return _int_or_default(
+        _section("learning").get("max_entry_chars"),
+        DEFAULT_LEARNING_MAX_ENTRY_CHARS,
+        minimum=32,
+    )
 
 
 def browser_screenshot_include_base64() -> bool:

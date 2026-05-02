@@ -21,6 +21,7 @@ from core.config import load_config
 from core.control_socket import ControlSocket, default_socket_path
 from core.curator import CuratorController
 from core.handler import MessageHandler
+from core.learning_curator import LearningController
 from core.logging import setup_logging
 from core.notify import Notifier
 from core.paths import state_dir, workspace_dir
@@ -114,6 +115,7 @@ async def _run() -> None:
         workspace=workspace,
     )
     curator = CuratorController(workspace=workspace, notifier=notifier)
+    learning_curator = LearningController(workspace=workspace, notifier=notifier)
 
     dashboard_port = _dashboard_port_from_env()
     dashboard = WebDashboard(
@@ -137,6 +139,7 @@ async def _run() -> None:
         background_tasks=background_tasks,
         notifier=notifier,
         curator=curator,
+        learning_curator=learning_curator,
         dashboard=dashboard,
     )
 
@@ -144,9 +147,11 @@ async def _run() -> None:
     await control_socket.start()
     await dashboard.start()
     curator.start(asyncio.get_running_loop())
+    learning_curator.start(asyncio.get_running_loop())
     try:
         await transport.run()
     finally:
+        learning_curator.stop()
         curator.stop()
         await dashboard.stop()
         await control_socket.stop()
