@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from PIL import Image, UnidentifiedImageError
 from telegram import (
     BotCommand as TelegramBotCommand,
     InlineKeyboardButton,
@@ -225,6 +226,31 @@ def _is_ephemeral_screenshot(path: Path) -> bool:
     """``/tmp/...`` captures are deleted after send; workspace
     screenshots are archived for later reference."""
     return path.parent == Path("/tmp")
+
+
+# Telegram's Bot API caps photo uploads at 10000px in either
+# dimension. Full-page browser screenshots of long pages routinely
+# blow past this, so we fall back to send_document (no dimension
+# cap, 50 MB file ceiling). Same upload mechanism, the image still
+# appears inline in the chat — just rendered as a file attachment.
+# The check is purely dimensional; nothing here is keyed on URL,
+# domain, or which page produced the image.
+_TELEGRAM_PHOTO_MAX_DIM = 10000
+
+
+def _photo_too_large_for_telegram(path: Path) -> bool:
+    """True when ``path`` exceeds Telegram's 10000px-per-dimension
+    photo cap and should be sent via send_document instead. Purely
+    dimensional — same predicate for any image, any source.
+    """
+    try:
+        with Image.open(path) as img:
+            width, height = img.size
+    except (UnidentifiedImageError, OSError, ValueError):
+        # Can't read dimensions — let the existing send_photo path
+        # surface whatever the real error is.
+        return False
+    return width > _TELEGRAM_PHOTO_MAX_DIM or height > _TELEGRAM_PHOTO_MAX_DIM
 
 
 def _greedy_join(parts: list[str], sep: str, max_len: int) -> list[str]:
@@ -820,8 +846,19 @@ class TelegramTransport:
                 if not path.is_file():
                     log.warning("Brain referenced missing screenshot %s", path)
                     continue
+                oversize = _photo_too_large_for_telegram(path)
                 with path.open("rb") as fh:
-                    await bot.send_photo(chat_id=chat_id, photo=fh)
+                    if oversize:
+                        log.info(
+                            "Sending %s as document (exceeds Telegram photo "
+                            "dimension cap)",
+                            path.name,
+                        )
+                        await bot.send_document(
+                            chat_id=chat_id, document=fh, filename=path.name
+                        )
+                    else:
+                        await bot.send_photo(chat_id=chat_id, photo=fh)
             except Exception:
                 log.exception("Failed to forward screenshot %s", path)
             finally:
