@@ -1022,6 +1022,377 @@ def test_audit_text_surfaces_recent_dedup_count(env, monkeypatch):
     assert "3 candidate(s) skipped" in audit
 
 
+# --------------------------------------------------------------------
+# METRIC (audit A2 deferred): tier distribution surface
+#
+# /learning audit aggregates by_tier counts from run.json across the
+# last N ticks so we can see "did S1 actually get picked or stay at
+# 0?" — the metric the v2-hermes-verification audit named as the
+# trigger for deferring A2 (LLM cannot read SKILL.md bodies → S1
+# patches systematically lose to S2/S3 fallback).
+# --------------------------------------------------------------------
+
+
+def test_recent_tier_distribution_aggregates_by_tier_unit(env, monkeypatch):
+    """Direct unit test of the aggregation helper."""
+    workspace = env
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+
+    summary1 = lc.WriteSummary(written=2, by_tier={"S2": 1, "MEM": 1})
+    summary2 = lc.WriteSummary(written=2, by_tier={"S2": 1, "S3": 1})
+    summary3 = lc.WriteSummary(written=1, by_tier={"USER": 1})
+
+    def stub_with(s):
+        def _stub(workspace, meta):
+            return ("stub", s)
+        return _stub
+
+    _stage_session(workspace, "tick-a", "2026-05-02T10:00:00Z")
+    LearningController(workspace=workspace, review_fn=stub_with(summary1)).run_now()
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=12))
+    _stage_session(workspace, "tick-b", "2026-05-02T11:30:00Z")
+    LearningController(workspace=workspace, review_fn=stub_with(summary2)).run_now()
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=13))
+    _stage_session(workspace, "tick-c", "2026-05-02T12:30:00Z")
+    LearningController(workspace=workspace, review_fn=stub_with(summary3)).run_now()
+
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=14))
+    controller = LearningController(workspace=workspace, review_fn=_stub_review_fn)
+    counts, scanned = controller._recent_tier_distribution(window_ticks=72)
+    assert scanned == 3
+    assert counts == {"S2": 2, "MEM": 1, "S3": 1, "USER": 1}
+    # No S1 picked — stays absent from the dict.
+    assert "S1" not in counts
+
+
+def test_audit_text_surfaces_tier_distribution(env, monkeypatch):
+    """The audit surface renders S1/S2/S3/MEM/USER counts in stable
+    order so a soak-week reader can scan for the S1=0 signal at a
+    glance."""
+    workspace = env
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+
+    summary = lc.WriteSummary(written=3, by_tier={"S2": 2, "MEM": 1})
+
+    def stub(workspace, meta):
+        return ("stub", summary)
+
+    _stage_session(workspace, "tick-a", "2026-05-02T10:00:00Z")
+    LearningController(workspace=workspace, review_fn=stub).run_now()
+
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=12))
+    audit = LearningController(
+        workspace=workspace, review_fn=_stub_review_fn,
+    )._audit_text()
+    assert "Tier distribution" in audit
+    assert "S1=0" in audit
+    assert "S2=2" in audit
+    assert "S3=0" in audit
+    assert "MEM=1" in audit
+    assert "USER=0" in audit
+    assert "3 writes" in audit
+
+
+def test_audit_text_flags_s1_zero_when_procedural_volume_is_high(env, monkeypatch):
+    """When ≥5 procedural writes have landed and S1 is still at 0,
+    surface the audit-A2 warning so the user knows the deferred
+    two-pass-review fix is empirically warranted."""
+    workspace = env
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+
+    # 6 procedural writes across 3 ticks, all S2/S3 — no S1.
+    s1 = lc.WriteSummary(written=2, by_tier={"S2": 1, "S3": 1})
+    s2 = lc.WriteSummary(written=2, by_tier={"S2": 2})
+    s3 = lc.WriteSummary(written=2, by_tier={"S3": 2})
+
+    def stub_with(s):
+        def _stub(workspace, meta):
+            return ("stub", s)
+        return _stub
+
+    _stage_session(workspace, "tick-a", "2026-05-02T10:00:00Z")
+    LearningController(workspace=workspace, review_fn=stub_with(s1)).run_now()
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=12))
+    _stage_session(workspace, "tick-b", "2026-05-02T11:30:00Z")
+    LearningController(workspace=workspace, review_fn=stub_with(s2)).run_now()
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=13))
+    _stage_session(workspace, "tick-c", "2026-05-02T12:30:00Z")
+    LearningController(workspace=workspace, review_fn=stub_with(s3)).run_now()
+
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=14))
+    audit = LearningController(
+        workspace=workspace, review_fn=_stub_review_fn,
+    )._audit_text()
+    assert "S1 at 0" in audit
+    assert "two-pass review" in audit
+    assert "v2-hermes-verification" in audit
+
+
+def test_audit_text_does_not_flag_s1_zero_when_volume_is_low(env, monkeypatch):
+    """The S1=0 warning must NOT fire on small samples — too noisy.
+    Threshold is ≥5 procedural writes; below that we wait for more
+    data before flagging."""
+    workspace = env
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+
+    # Only 2 procedural writes — below the warning threshold.
+    summary = lc.WriteSummary(written=2, by_tier={"S2": 1, "S3": 1})
+
+    def stub(workspace, meta):
+        return ("stub", summary)
+
+    _stage_session(workspace, "tick-a", "2026-05-02T10:00:00Z")
+    LearningController(workspace=workspace, review_fn=stub).run_now()
+
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=12))
+    audit = LearningController(
+        workspace=workspace, review_fn=_stub_review_fn,
+    )._audit_text()
+    # Distribution surfaces, but warning does not:
+    assert "Tier distribution" in audit
+    assert "S1 at 0" not in audit
+
+
+def test_run_json_persists_by_tier_for_aggregation(env, monkeypatch):
+    """Schema check: run.json's summary.by_tier is what the aggregation
+    helper reads. Confirm the field is round-tripped through the tick
+    report so future readers (dashboards, scripts/) can rely on it."""
+    workspace = env
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+
+    summary = lc.WriteSummary(written=1, by_tier={"S3": 1, "MEM": 0})
+
+    def stub(workspace, meta):
+        return ("stub", summary)
+
+    _stage_session(workspace, "tick-a", "2026-05-02T10:00:00Z")
+    LearningController(workspace=workspace, review_fn=stub).run_now()
+
+    from core.paths import learning_logs_dir
+    tick_dirs = sorted(learning_logs_dir().iterdir())
+    assert len(tick_dirs) == 1
+    payload = json.loads((tick_dirs[0] / "run.json").read_text(encoding="utf-8"))
+    by_tier = payload["summary"]["by_tier"]
+    assert by_tier.get("S3") == 1
+    # by_tier keys are strings — defensive check for downstream
+    # consumers that key on the schema.
+    assert all(isinstance(k, str) for k in by_tier.keys())
+
+
+# --------------------------------------------------------------------
+# C2: in-process IDENTITY substring-overlap gate
+#
+# When the LLM doesn't emit ``target.user_claim_alias`` but the
+# proposed claim text overlaps an existing queue claim (substring
+# match either direction), the dispatcher folds the new occurrence
+# into the existing claim rather than splitting the queue across
+# paraphrases. Mirrors the SITUATIONAL exact-evidence dedup gate in
+# ``learning_review._check_evidence_overlap``.
+# --------------------------------------------------------------------
+
+
+def test_check_claim_overlap_unit():
+    """Direct unit test of the substring gate in both directions plus
+    the no-overlap case.
+
+    Note: the gate is strict substring (no punctuation normalization),
+    matching the behavior of ``_check_evidence_overlap`` in
+    learning_review.py. A trailing period on one side and not the
+    other will NOT match — paraphrases differing in punctuation
+    fall through to fresh insertion. The underlying assumption is
+    that LLM-emitted claim text is consistent enough (and the
+    ``target.user_claim_alias`` path remains for explicit aliases).
+    """
+    existing = [
+        "User prefers terse responses to direct questions",
+        "User runs Vexis on Hetzner",
+    ]
+    # New claim is a substring of an existing one → match the longer:
+    assert lc._check_claim_overlap(
+        "User prefers terse responses", existing
+    ) == "User prefers terse responses to direct questions"
+    # New claim contains an existing one → also match:
+    assert lc._check_claim_overlap(
+        "User runs Vexis on Hetzner behind Tailscale", existing
+    ) == "User runs Vexis on Hetzner"
+    # No overlap → None:
+    assert lc._check_claim_overlap(
+        "User works in Python primarily.", existing
+    ) is None
+    # Empty inputs → None:
+    assert lc._check_claim_overlap("", existing) is None
+    assert lc._check_claim_overlap("anything", []) is None
+    # Exact-equal returns the matched text (caller may use it for
+    # logging even when add_occurrence's dict-key collision would
+    # also handle the dedup):
+    assert lc._check_claim_overlap(
+        "User runs Vexis on Hetzner", existing
+    ) == "User runs Vexis on Hetzner"
+
+
+def test_dispatcher_identity_overlap_gate_collapses_paraphrase_shorter_to_longer(env):
+    """LLM didn't emit user_claim_alias; new claim is a substring of
+    an existing queue claim. C2 gate folds the second occurrence into
+    the existing accumulator so the threshold counts both sessions
+    against the same claim."""
+    workspace = env
+    longer = {
+        "class": "IDENTITY",
+        "lesson": "User prefers terse responses to direct factual questions.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+    }
+    lc._write_verified(workspace, _make_review_output_with([longer]),
+                       meta=_meta("sess-1"), shadow=True)
+    # Second session emits a shorter paraphrase — substring of the first.
+    shorter = {
+        "class": "IDENTITY",
+        "lesson": "User prefers terse responses",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+    }
+    lc._write_verified(workspace, _make_review_output_with([shorter]),
+                       meta=_meta("sess-2"), shadow=True)
+    from core.user_candidates import UserCandidateStore
+    from core.paths import user_candidates_path
+    queue = UserCandidateStore(user_candidates_path()).list_all()
+    # Single accumulator under the longer (existing) claim text:
+    assert len(queue) == 1, (
+        f"overlap gate should fold paraphrases; got {[c.claim for c in queue]}"
+    )
+    assert queue[0].claim == longer["lesson"]
+    # Threshold met (2 distinct sessions) → promoted to USER-SHADOW.md.
+    user_shadow = workspace / "memories" / "USER-SHADOW.md"
+    assert user_shadow.exists()
+    assert longer["lesson"] in user_shadow.read_text(encoding="utf-8")
+
+
+def test_dispatcher_identity_overlap_gate_collapses_paraphrase_longer_to_shorter(env):
+    """Reverse direction: existing queue claim is the shorter form;
+    new claim contains it. The gate is bidirectional — fold into the
+    existing accumulator regardless of which is the substring of
+    which."""
+    workspace = env
+    shorter = {
+        "class": "IDENTITY",
+        "lesson": "User prefers terse responses",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+    }
+    lc._write_verified(workspace, _make_review_output_with([shorter]),
+                       meta=_meta("sess-1"), shadow=True)
+    longer = {
+        "class": "IDENTITY",
+        "lesson": "User prefers terse responses to direct factual questions.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+    }
+    lc._write_verified(workspace, _make_review_output_with([longer]),
+                       meta=_meta("sess-2"), shadow=True)
+    from core.user_candidates import UserCandidateStore
+    from core.paths import user_candidates_path
+    queue = UserCandidateStore(user_candidates_path()).list_all()
+    # Single accumulator under the SHORTER (existing) claim text —
+    # the gate folds into whichever was already in the queue:
+    assert len(queue) == 1
+    assert queue[0].claim == shorter["lesson"]
+
+
+def test_dispatcher_identity_overlap_gate_audit_message(env):
+    """The audit trail in MEMORY-SHADOW.md distinguishes overlap-gate
+    aliasing from LLM-emitted aliasing so the user can spot when the
+    LLM is producing paraphrases the gate is folding (signal: tune
+    the prompt's alias instructions)."""
+    workspace = env
+    first = {
+        "class": "IDENTITY",
+        "lesson": "User prefers concise responses for direct questions.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+    }
+    lc._write_verified(workspace, _make_review_output_with([first]),
+                       meta=_meta("sess-1"), shadow=True)
+    paraphrase = {
+        "class": "IDENTITY",
+        "lesson": "User prefers concise responses",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+    }
+    lc._write_verified(workspace, _make_review_output_with([paraphrase]),
+                       meta=_meta("sess-2"), shadow=True)
+    audit = (workspace / "memories" / "MEMORY-SHADOW.md").read_text(encoding="utf-8")
+    # Promoted on the second observation (threshold met via the gate):
+    assert "promoted to USER-SHADOW.md" in audit
+
+
+def test_dispatcher_identity_no_overlap_creates_separate_claims(env):
+    """Two genuinely-distinct IDENTITY claims must NOT collapse into
+    one queue entry — the overlap gate is a sieve, not a wall."""
+    workspace = env
+    a = {
+        "class": "IDENTITY",
+        "lesson": "User prefers terse responses.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+    }
+    b = {
+        "class": "IDENTITY",
+        "lesson": "User works primarily in Python and TypeScript.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+    }
+    lc._write_verified(workspace, _make_review_output_with([a]),
+                       meta=_meta("sess-1"), shadow=True)
+    lc._write_verified(workspace, _make_review_output_with([b]),
+                       meta=_meta("sess-2"), shadow=True)
+    from core.user_candidates import UserCandidateStore
+    from core.paths import user_candidates_path
+    queue = UserCandidateStore(user_candidates_path()).list_all()
+    assert len(queue) == 2
+    assert {c.claim for c in queue} == {a["lesson"], b["lesson"]}
+    # Neither got promoted (each has only 1 session):
+    user_shadow = workspace / "memories" / "USER-SHADOW.md"
+    assert not user_shadow.exists()
+
+
+def test_dispatcher_identity_overlap_does_not_override_explicit_alias(env):
+    """When the LLM explicitly sets target.user_claim_alias, the
+    overlap gate is bypassed — the explicit alias is canonical. This
+    preserves the LLM's judgment when it picked a specific alias
+    target rather than letting the substring gate second-guess it."""
+    workspace = env
+    a = {
+        "class": "IDENTITY",
+        "lesson": "User prefers concise responses.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+    }
+    lc._write_verified(workspace, _make_review_output_with([a]),
+                       meta=_meta("sess-1"), shadow=True)
+    # The LLM emits an explicit alias whose text DIFFERS from any
+    # substring overlap candidate. Substring gate must not fire —
+    # explicit alias wins.
+    aliased = {
+        "class": "IDENTITY",
+        "lesson": "User prefers concise responses",  # would substring-match
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+        "target": {
+            "user_claim_alias": "User prefers concise responses.",
+        },
+    }
+    lc._write_verified(workspace, _make_review_output_with([aliased]),
+                       meta=_meta("sess-2"), shadow=True)
+    from core.user_candidates import UserCandidateStore
+    from core.paths import user_candidates_path
+    queue = UserCandidateStore(user_candidates_path()).list_all()
+    # One claim, threshold met, promoted (the alias won):
+    assert len(queue) == 1
+    assert queue[0].claim == a["lesson"]
+    user_shadow = workspace / "memories" / "USER-SHADOW.md"
+    assert user_shadow.exists()
+
+
 def test_dispatcher_identity_alias_to_unknown_claim_falls_back_to_fresh(env):
     """If the LLM hallucinates an alias target that doesn't exist in
     the queue, the dispatcher falls back to fresh insertion under

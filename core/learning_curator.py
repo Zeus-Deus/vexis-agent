@@ -678,6 +678,50 @@ class _IdentityRouteResult:
     promoted: bool = False
 
 
+def _check_claim_overlap(
+    candidate_claim: str, existing_claims: list[str]
+) -> str | None:
+    """Bidirectional substring match between ``candidate_claim`` and
+    each entry in ``existing_claims``. Returns the matched existing
+    claim text, or None on miss.
+
+    Mirrors the shape of ``_check_evidence_overlap`` in
+    ``core/learning_review.py``: belt-and-suspenders dedup that runs
+    in-process when the LLM didn't set ``target.user_claim_alias``.
+    Two near-equivalent claims under different wording would
+    otherwise accumulate as separate queue entries; the overlap gate
+    folds the new occurrence into whichever existing claim it
+    overlaps with so the threshold accumulates correctly.
+
+    Bidirectional intent:
+      (a) candidate is more specific than an existing claim
+          ("User prefers terse responses to direct questions"
+          contains "User prefers terse responses") → alias to the
+          shorter existing claim,
+      (b) candidate is less specific than an existing claim
+          ("User prefers terse responses" is contained in
+          "User prefers terse responses to direct questions") →
+          alias to the longer existing claim.
+    Either way the new occurrence joins an existing accumulator
+    rather than splitting the queue.
+    """
+    needle = candidate_claim.strip()
+    if not needle:
+        return None
+    for existing in existing_claims:
+        existing_stripped = existing.strip()
+        if not existing_stripped:
+            continue
+        if existing_stripped == needle:
+            # Exact match is already handled by add_occurrence's
+            # dict-key collision; surfacing it here lets callers log
+            # it explicitly without a separate special case.
+            return existing_stripped
+        if needle in existing_stripped or existing_stripped in needle:
+            return existing_stripped
+    return None
+
+
 def _route_identity(
     workspace: Path,
     lesson: dict,
@@ -688,13 +732,24 @@ def _route_identity(
     """Add the IDENTITY observation to the queue and promote if
     the cross-session threshold is met.
 
-    Aliasing: if the lesson's ``target.user_claim_alias`` is set,
-    the dispatcher records this session's occurrence against the
-    EXISTING claim (the alias text). The verifier already checked
-    that ``target.user_claim_alias`` is non-empty when present —
-    here we additionally check that the alias claim actually exists
-    in the queue. If it doesn't, we fall back to treating the lesson
-    as a fresh claim under its own text, with a note in the audit.
+    Aliasing — three paths, in priority order:
+
+      1. **LLM-emitted alias**: ``target.user_claim_alias`` set by
+         the review fork. The verifier already checked it's a
+         non-empty string; here we confirm the alias target really
+         exists in the queue. If the LLM hallucinated, we fall
+         through to path 2.
+
+      2. **In-process overlap match (C2 fix)**: the LLM didn't
+         emit an alias, but the proposed claim text has a
+         bidirectional substring overlap with an existing queue
+         claim. ``_check_claim_overlap`` finds the match;
+         occurrences fold into the existing claim rather than
+         splitting the queue across paraphrases. Mirrors
+         ``_check_evidence_overlap`` for SITUATIONAL/MEMORY.md.
+
+      3. **Fresh insert**: the proposed claim is genuinely new.
+         Creates a new queue entry under its own text.
     """
     store = UserCandidateStore(user_candidates_path())
     target = lesson.get("target") if isinstance(lesson.get("target"), dict) else None
@@ -716,7 +771,24 @@ def _route_identity(
             )
             alias_for = None
 
-    claim_text = alias_for if alias_for is not None else str(lesson.get("lesson", ""))
+    proposed_claim = str(lesson.get("lesson", ""))
+    overlap_match: str | None = None
+    if alias_for is None and proposed_claim.strip():
+        # C2 fix: in-process overlap gate. Snapshot the queue's
+        # existing claim texts and check if the proposed claim
+        # collapses into any of them. Skip when the LLM already
+        # emitted an explicit alias — that path is canonical and
+        # the overlap gate is the fallback for when the LLM didn't.
+        existing_claims = [c.claim for c in store.list_all()]
+        overlap_match = _check_claim_overlap(proposed_claim, existing_claims)
+        if overlap_match is not None and overlap_match != proposed_claim:
+            log.info(
+                "IDENTITY in-process overlap match: %r → existing claim %r",
+                proposed_claim[:80], overlap_match[:80],
+            )
+            alias_for = overlap_match
+
+    claim_text = alias_for if alias_for is not None else proposed_claim
     if not claim_text.strip():
         return _IdentityRouteResult(
             False, "skipped: empty claim text after alias resolution"
@@ -733,7 +805,15 @@ def _route_identity(
     ))
     if not store.eligible_for_promotion(claim_text):
         msg_parts: list[str] = []
-        if alias_for is not None:
+        if overlap_match is not None and overlap_match != proposed_claim:
+            # In-process overlap gate fired (C2 fix). Surface this
+            # explicitly in the audit so the user can spot when the
+            # LLM is producing paraphrases the gate is folding.
+            msg_parts.append(
+                f"overlap-aliased to existing claim "
+                f"({distinct} session(s))"
+            )
+        elif alias_for is not None:
             msg_parts.append(f"aliased to existing claim ({distinct} session(s))")
         else:
             msg_parts.append(f"queued ({distinct}/{DEFAULT_PROMOTION_THRESHOLD} session(s))")
@@ -1463,6 +1543,50 @@ class LearningController:
                 f"{recent_dedup} candidate(s) skipped as duplicates."
             )
 
+        # ----- Tier distribution (audit A2 deferred-fix instrument) -----
+        # Aggregate by_tier counts from run.json across the last N
+        # ticks. Surfaces "did S1 actually get picked, or is it stuck
+        # at 0?" — the metric the v2-hermes-verification audit named
+        # as the signal for whether the deferred two-pass-review fix
+        # is needed. If S1 stays at 0 over a soak week, the LLM is
+        # systematically falling back to S2/S3 because it can't see
+        # SKILL.md bodies; we'd then lift the A2 fix into v3.
+        tier_counts, tier_ticks = self._recent_tier_distribution(window_ticks=72)
+        if tier_ticks > 0:
+            lines.append("")
+            ordered_keys = ("S1", "S2", "S3", "MEM", "USER")
+            total = sum(tier_counts.values())
+            if total == 0:
+                lines.append(
+                    f"Tier distribution (last {tier_ticks} tick reports): "
+                    f"no writes yet."
+                )
+            else:
+                parts = []
+                for k in ordered_keys:
+                    n = tier_counts.get(k, 0)
+                    parts.append(f"{k}={n}")
+                # Surface any tiers we didn't enumerate explicitly
+                # (defensive — keeps the audit honest if a future
+                # tier name lands without an audit update).
+                for k in sorted(set(tier_counts) - set(ordered_keys)):
+                    parts.append(f"{k}={tier_counts[k]}")
+                lines.append(
+                    f"Tier distribution (last {tier_ticks} tick reports, "
+                    f"{total} writes): {', '.join(parts)}"
+                )
+                # Flag the audit-A2 signal when S1 stays at 0 with
+                # non-trivial PROCEDURAL volume — the curator is
+                # avoiding patches and minting S2/S3 instead.
+                s1 = tier_counts.get("S1", 0)
+                s_total = sum(tier_counts.get(k, 0) for k in ("S1", "S2", "S3"))
+                if s1 == 0 and s_total >= 5:
+                    lines.append(
+                        f"  ⚠ S1 at 0 across {s_total} procedural writes — "
+                        f"see v2-hermes-verification.md A2 (LLM cannot see "
+                        f"SKILL.md bodies; consider two-pass review)."
+                    )
+
         return "\n".join(lines) if lines else "Nothing to audit yet."
 
     def _scan_curator_skills(self) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
@@ -1527,6 +1651,56 @@ class LearningController:
             if isinstance(summary, dict):
                 total += int(summary.get("dedup_skipped", 0) or 0)
         return total, scanned
+
+    def _recent_tier_distribution(
+        self, *, window_ticks: int
+    ) -> tuple[dict[str, int], int]:
+        """Aggregate ``summary.by_tier`` counts across the most recent
+        ``window_ticks`` tick-report run.json files. Returns
+        ``({tier: count, ...}, ticks_actually_scanned)``.
+
+        Implementation mirrors ``_recent_dedup_skips`` — same iteration
+        shape, same JSON-parse tolerance. The schema is already
+        comprehensive (``summary.to_dict()`` includes ``by_tier``);
+        no run.json schema change required.
+
+        Used by ``_audit_text`` to surface the S1/S2/S3/MEM/USER
+        distribution; specifically named in v2-hermes-verification.md
+        as the metric for whether the deferred A2 fix becomes
+        v3 follow-up (S1 stuck at 0 → two-pass-review needed).
+        """
+        logs_root = learning_logs_dir()
+        if not logs_root.exists():
+            return {}, 0
+        tick_dirs = sorted(
+            (p for p in logs_root.iterdir() if p.is_dir()),
+            key=lambda p: p.name,
+            reverse=True,
+        )[:window_ticks]
+        totals: dict[str, int] = {}
+        scanned = 0
+        for d in tick_dirs:
+            run_json = d / "run.json"
+            try:
+                payload = json.loads(run_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            scanned += 1
+            summary = payload.get("summary") if isinstance(payload, dict) else None
+            if not isinstance(summary, dict):
+                continue
+            by_tier = summary.get("by_tier")
+            if not isinstance(by_tier, dict):
+                continue
+            for tier, count in by_tier.items():
+                if not isinstance(tier, str):
+                    continue
+                try:
+                    n = int(count)
+                except (TypeError, ValueError):
+                    continue
+                totals[tier] = totals.get(tier, 0) + n
+        return totals, scanned
 
     def _status_text(self) -> str:
         state = _load_daemon_state()

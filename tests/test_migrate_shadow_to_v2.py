@@ -415,6 +415,76 @@ def test_apply_identity_inserts_with_synthetic_prefill(env):
     assert "migration:v1-007:b" in candidate.distinct_session_uuids()
 
 
+def test_apply_identity_threat_scanner_blocks_religion(env):
+    """B2 fix: migration's _apply_identity must run the same
+    USER.md-specific threat scanner the curator hot path runs in
+    _validate_lesson. A migration plan that hand-classifies a
+    religion claim as IDENTITY must NOT be allowed to ride into the
+    queue and on into USER.md via the synthetic 2-occurrence
+    prefill."""
+    row = mig.PlanRow(
+        index=1,
+        entry=mig.ShadowEntry(
+            raw="",
+            lesson="User is a Christian and prays daily.",
+            scope="religion",
+            evidence="I go to church on Sundays",
+            learned_date="2026-05-02",
+        ),
+        decision="IDENTITY",
+    )
+    summary = mig.apply_plan(env, [row])
+    assert not summary.ok
+    msg = summary.results[0].message.lower()
+    assert "user.md threat scanner" in msg
+    assert "religion" in msg
+    # Queue is empty: the row was refused before any add_occurrence.
+    queue = UserCandidateStore(user_candidates_path()).list_all()
+    assert queue == []
+
+
+def test_apply_identity_threat_scanner_blocks_named_third_party(env):
+    """Migration plans that promote a third-party-named claim to
+    IDENTITY get refused at _apply_identity — same defense as the
+    curator hot path."""
+    row = mig.PlanRow(
+        index=2,
+        entry=mig.ShadowEntry(
+            raw="",
+            lesson="User's wife Sarah prefers Italian food.",
+            scope="dining preferences",
+            evidence="my wife and I had Italian last night",
+            learned_date="2026-05-02",
+        ),
+        decision="IDENTITY",
+    )
+    summary = mig.apply_plan(env, [row])
+    assert not summary.ok
+    assert "named-third-party" in summary.results[0].message
+    assert UserCandidateStore(user_candidates_path()).list_all() == []
+
+
+def test_apply_identity_threat_scanner_passes_benign(env):
+    """Benign IDENTITY content still passes the scanner — the gate is
+    a sieve, not a wall. Without this regression check, a too-broad
+    pattern could silently block all migrations."""
+    row = mig.PlanRow(
+        index=3,
+        entry=mig.ShadowEntry(
+            raw="",
+            lesson="User prefers concise answers without preamble.",
+            scope="communication style",
+            evidence="just give me the answer",
+            learned_date="2026-05-02",
+        ),
+        decision="IDENTITY",
+    )
+    summary = mig.apply_plan(env, [row])
+    assert summary.ok
+    queue = UserCandidateStore(user_candidates_path()).list_all()
+    assert len(queue) == 1
+
+
 def test_apply_identity_already_promoted_is_no_op(env):
     """Re-running apply over a claim that's already promoted skips
     the insert — defends against double-prefill on idempotent retry."""

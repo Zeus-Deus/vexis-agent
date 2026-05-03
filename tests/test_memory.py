@@ -183,3 +183,121 @@ def test_list_entries_dedup_on_load(tmp_path: Path):
     store = MemoryStore(tmp_path)
     entries = store.list_entries("memory")
     assert entries == ["dup", "other"]
+
+
+# --------------------------------------------------------------------
+# B2: USER.md-target threat scanner extension
+#
+# The base 12-pattern scanner runs on every write regardless of
+# target. The USER.md-specific extension (religion / politics /
+# sexuality / self-harm / mental-health / named third parties) must
+# fire ONLY when target=="user", and must catch content that the
+# base scanner would let through.
+# --------------------------------------------------------------------
+
+
+def test_threat_scan_user_target_blocks_religion():
+    """target=user activates the religion/faith pattern set."""
+    assert _scan_for_threats(
+        "User is a Christian and prays daily.", target="user"
+    ) is not None
+
+
+def test_threat_scan_memory_target_allows_religion():
+    """target=memory does NOT run the USER.md extension. SITUATIONAL/
+    PROCEDURAL content can mention religion-class terms in their
+    body without rejection (the curator steers correctly via the
+    classification prompt)."""
+    assert _scan_for_threats(
+        "User is a Christian and prays daily.", target="memory"
+    ) is None
+    assert _scan_for_threats(
+        "User is a Christian and prays daily."  # default = memory
+    ) is None
+
+
+def test_threat_scan_user_target_blocks_politics():
+    assert _scan_for_threats(
+        "User leans conservative on most issues.", target="user"
+    ) is not None
+
+
+def test_threat_scan_user_target_blocks_sexuality():
+    assert _scan_for_threats(
+        "User is bisexual and uses they/them pronouns.", target="user"
+    ) is not None
+
+
+def test_threat_scan_user_target_blocks_named_third_party():
+    """The third-party scanner with allowlist post-filter fires on
+    USER.md writes — content like 'User's wife Sarah' must be
+    rejected, but 'User uses Linux' must pass (allowlist guard)."""
+    assert _scan_for_threats(
+        "User's wife Sarah prefers Italian food.", target="user"
+    ) is not None
+    assert _scan_for_threats(
+        "User uses Linux on a Hetzner box.", target="user"
+    ) is None
+
+
+def test_threat_scan_user_target_blocks_self_harm():
+    assert _scan_for_threats(
+        "User mentioned suicidal thoughts during the session.",
+        target="user",
+    ) is not None
+
+
+def test_threat_scan_user_target_passes_benign():
+    assert _scan_for_threats(
+        "User prefers concise responses for direct factual questions.",
+        target="user",
+    ) is None
+
+
+def test_memorystore_add_user_blocks_religion(tmp_path: Path):
+    """End-to-end: MemoryStore.add(target='user') runs the extended
+    scanner. This is the load-bearing fix for B2 — non-curator paths
+    that go through MemoryStore (migration script, future hand-CLI)
+    cannot bypass the USER.md-specific patterns."""
+    s = MemoryStore(tmp_path)
+    out = s.add("user", "User is a Muslim and prays five times a day")
+    assert isinstance(out, MemoryError_)
+    assert "Blocked" in out.message
+    assert "user:religion" in out.message
+
+
+def test_memorystore_add_memory_does_not_run_user_scanner(tmp_path: Path):
+    """The same content that's blocked for target=user must NOT be
+    blocked for target=memory — the extension is target-conditional,
+    and SITUATIONAL/PROCEDURAL writes that happen to mention these
+    classes of words shouldn't be over-rejected."""
+    s = MemoryStore(tmp_path)
+    out = s.add("memory", "User is a Muslim and prays five times a day")
+    assert isinstance(out, MemorySuccess), (
+        f"target=memory should not run user-specific scanner; got {out}"
+    )
+
+
+def test_memorystore_add_user_blocks_named_third_party(tmp_path: Path):
+    s = MemoryStore(tmp_path)
+    out = s.add("user", "User's husband David prefers Vim over Emacs")
+    assert isinstance(out, MemoryError_)
+    assert "user:named-third-party" in out.message
+
+
+def test_memorystore_add_user_passes_benign(tmp_path: Path):
+    s = MemoryStore(tmp_path)
+    out = s.add("user", "User prefers terse responses for direct questions")
+    assert isinstance(out, MemorySuccess)
+
+
+def test_memorystore_replace_user_target_runs_extended_scanner(tmp_path: Path):
+    """Replace path mirrors the add path: extended scanner fires on
+    new content when target=user."""
+    s = MemoryStore(tmp_path)
+    s.add("user", "User prefers concise responses")
+    out = s.replace(
+        "user", "concise responses", "User is a Catholic who prays daily"
+    )
+    assert isinstance(out, MemoryError_)
+    assert "user:religion" in out.message

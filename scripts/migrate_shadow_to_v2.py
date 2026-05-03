@@ -60,6 +60,7 @@ from pathlib import Path
 # Allow `scripts/migrate_shadow_to_v2.py` to import from the project.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core.learning_review import _scan_lesson_for_sensitive_content  # noqa: E402
 from core.learning_writes import (  # noqa: E402
     stage_new_skill,
     stage_skill_patch,
@@ -625,7 +626,25 @@ def _apply_identity(workspace: Path, row: PlanRow) -> ApplyResult:
     anchored now. Each carries a distinct synthetic UUID
     (``migration:v1-<index>:a`` / ``...:b``) so the distinct-count
     bumps to 2 and the next eligible session triggers promotion.
+
+    Threat-scanner gate (audit B2 fix): the curator hot path runs
+    ``_scan_lesson_for_sensitive_content`` inside ``_validate_lesson``
+    before any IDENTITY-class write decision. Migration bypassed
+    that scan because it inserts directly into the queue without
+    going through the curator. We mirror the curator's check here
+    on the entry's ``lesson + scope`` with ``target_file="user"``
+    so religion / politics / sexuality / self-harm / third-party-name
+    content cannot ride a human migration plan into USER.md via the
+    queue's synthetic prefill.
     """
+    sensitive = _scan_lesson_for_sensitive_content(
+        row.entry.lesson, row.entry.scope, target_file="user",
+    )
+    if sensitive:
+        return ApplyResult(
+            row.index, row.decision, False,
+            f"USER.md threat scanner refused: {sensitive}",
+        )
     store = UserCandidateStore(user_candidates_path())
     claim = row.entry.lesson
     # Don't overwrite an already-promoted claim.

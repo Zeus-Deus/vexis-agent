@@ -100,8 +100,20 @@ _INVISIBLE_CHARS: frozenset[str] = frozenset(
 )
 
 
-def _scan_for_threats(content: str) -> str | None:
-    """Return a refusal reason if content looks malicious; None otherwise."""
+def _scan_for_threats(content: str, *, target: str | None = None) -> str | None:
+    """Return a refusal reason if content looks malicious; None otherwise.
+
+    ``target`` selects whether the USER.md-specific extension fires:
+      - ``None`` (default) or ``"memory"``: base 12 patterns +
+        invisible-unicode only. Used for MEMORY.md writes.
+      - ``"user"``: base set PLUS the religion/politics/sexuality/
+        self-harm/third-party patterns from
+        ``core.identity_threat``. Used for USER.md writes — these
+        patterns fire here (not just inside the curator's
+        ``_validate_lesson``) so non-curator paths (migration script,
+        future hand-CLI, anything else calling
+        ``MemoryStore.add(target='user')``) get the same coverage.
+    """
     for ch in content:
         if ch in _INVISIBLE_CHARS:
             return (
@@ -111,6 +123,13 @@ def _scan_for_threats(content: str) -> str | None:
     for pattern, pid in _THREAT_PATTERNS:
         if pattern.search(content):
             return f"content matches threat pattern '{pid}'"
+    if target == "user":
+        # Local import keeps memory.py importable without dragging in
+        # the identity-threat patterns when only MEMORY.md is in play.
+        from core.identity_threat import scan_user_identity_content
+        user_pid = scan_user_identity_content(content)
+        if user_pid:
+            return f"content matches USER.md threat pattern '{user_pid}'"
     return None
 
 
@@ -267,7 +286,7 @@ class MemoryStore:
         content = content.strip()
         if not content:
             return MemoryError_("content is empty")
-        threat = _scan_for_threats(content)
+        threat = _scan_for_threats(content, target=target)
         if threat:
             return MemoryError_(
                 f"Blocked: {threat}. Memory entries are injected into the "
@@ -314,7 +333,7 @@ class MemoryStore:
             return MemoryError_("old_text is empty")
         if not content:
             return MemoryError_("content is empty")
-        threat = _scan_for_threats(content)
+        threat = _scan_for_threats(content, target=target)
         if threat:
             return MemoryError_(
                 f"Blocked: {threat}. Memory entries are injected into the "
