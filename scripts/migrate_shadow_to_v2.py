@@ -577,6 +577,30 @@ def _apply_s2(workspace: Path, row: PlanRow) -> ApplyResult:
 
 
 def _apply_s3(workspace: Path, row: PlanRow) -> ApplyResult:
+    # TODO(idempotence-bug): the module docstring promises
+    # ``--apply`` is idempotent ("re-running ... is a no-op per
+    # entry, each apply step checks for the staged file's existence
+    # first"), but ``stage_new_skill`` from core/learning_writes.py
+    # is collision-strict — it returns an error when the staged dir
+    # already exists, with NO regard for whether the existing
+    # content matches what we'd write. So re-running --apply on an
+    # already-applied plan fails on every prior-success S3 entry,
+    # even though the on-disk content is identical to what we'd
+    # write again. Surfaced 2026-05-03 during the first real
+    # migration: 11 prior successes all flipped to failures on
+    # second-run.
+    #
+    # Fix shape (NOT implemented; left for the next migration
+    # cycle): before calling ``stage_new_skill``, check whether the
+    # staged dir already exists AND its SKILL.md content matches
+    # the body we're about to write. If both true → return ok=True
+    # with message "skipped (already applied, identical content)".
+    # If staged exists but content differs → still error (the user
+    # has hand-edited and we shouldn't overwrite). Same treatment
+    # belongs in ``_apply_s2`` for support files. The collision-
+    # strict behavior in stage_new_skill itself stays as-is — that's
+    # the right default for the curator's own writes; only the
+    # migration-script wrapper needs the idempotent-overlay.
     skill_name = row.arg
     if not skill_name:
         return ApplyResult(

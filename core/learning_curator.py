@@ -439,7 +439,38 @@ def _append_user_shadow_entry(workspace: Path, content: str) -> None:
 
 def _append_to_shadow_file(path: Path, content: str) -> None:
     """Shared §-delimited-append + atomic-write helper for both
-    shadow files. Same pattern, two destinations."""
+    shadow files. Same pattern, two destinations.
+
+    TODO(shadow-truncation-bug): observed 2026-05-03 during the v2
+    live flip. MEMORY-SHADOW.md went from 14,351 bytes (28 v1
+    entries) to 748 bytes (1 v2 entry) sometime between snapshot
+    and ~14:54. The append path is supposed to read existing →
+    concat with delimiter → atomic temp+rename, which should
+    preserve prior content. Either:
+      (a) a read-then-write race where two threads/processes
+          read the empty/stale state and the last writer's tiny
+          contents won (no fcntl.flock here unlike MemoryStore;
+          ReviewedStore-style locking would fix this);
+      (b) the read happened against a missing/empty file at the
+          moment of write — possibly a TOCTOU between path.exists()
+          and path.read_text(), or another process briefly removed
+          the file between checks; or
+      (c) some other code path (yet unidentified) wrote a fresh
+          file from scratch — needs a grep audit of any open(...,
+          'w') against MEMORY-SHADOW.md / USER-SHADOW.md targets.
+    The lost v1 content is preserved (single-entry fragment) at
+    ~/vexis-workspace/memories/MEMORY-SHADOW.archived-2026-05-03.md
+    for forensic reference. The migrated lessons are intact in the
+    live skill tree; only the v1 alternative-wording variants are
+    permanently lost.
+
+    Fix shape (NOT implemented; left for next investigation):
+    add fcntl.flock on a sidecar ``.lock`` file mirroring the
+    MemoryStore / ReviewedStore pattern, plus a defensive read-
+    after-rename check that confirms the new file size >= old. If
+    size shrunk, restore from a temp backup the writer kept of
+    pre-mutation contents.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     existing = existing.rstrip("\n")
