@@ -33,3 +33,22 @@ This is a transport layer in front of Claude Code, not a new agent. Telegram in,
 4. tailnet-serve + omarchy-kb tools.
 5. Screenshot tool (read-only).
 6. Input tool + safety scaffolding.
+
+## Learning curator
+
+A background daemon reviews finished sessions and routes any lesson
+found to the right durable store by class:
+
+- **PROCEDURAL** (workflow / how-to rules) → a skill under
+  `<workspace>/skills/` (patch existing, add support file, or
+  create new umbrella).
+- **IDENTITY** (durable preferences about how the user wants Vexis
+  to behave) → `USER.md`, but only after the same claim has appeared
+  in ≥2 distinct sessions within 30 days (queue at
+  `~/.vexis/learning/user_candidates.json`).
+- **SITUATIONAL** (environment / setup facts) → `MEMORY.md`, with
+  exact-evidence dedup against existing entries.
+- **VOLATILE** (one-shot or temporary) → dropped.
+
+Pinned skills are read-only to the curator. Full design and routing
+prompts: `.plans/learning-curator-v2-research.md`.

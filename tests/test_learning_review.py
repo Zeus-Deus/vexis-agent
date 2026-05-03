@@ -267,41 +267,46 @@ def _ok_msgs() -> list[TranscriptMessage]:
     return [_msg("user", "filter to upcoming items only please")]
 
 
-def test_validate_lesson_full_pass():
-    cand = {
+def _ok_situational() -> dict:
+    """A v2-shape SITUATIONAL candidate that should pass cleanly.
+
+    Used as the baseline for validator tests that aren't exercising
+    procedural-tier shape (those build their own PROCEDURAL/S{1,2,3}
+    candidates). SITUATIONAL is the simplest valid v2 shape — no tier,
+    no target — so it isolates field-level checks.
+    """
+    return {
+        "class": "SITUATIONAL",
         "lesson": "L" * 50,
         "evidence": "filter to upcoming items only please",
         "scope": "time-bound listings",
     }
-    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+
+
+def test_validate_lesson_full_pass():
+    ok, reason = _validate_lesson(_ok_situational(), _ok_msgs(), max_chars=280)
     assert ok is True
     assert reason == ""
 
 
 def test_validate_lesson_missing_lesson():
-    cand = {"evidence": "x", "scope": "y"}
+    cand = {"class": "SITUATIONAL", "evidence": "x", "scope": "y"}
     ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
     assert ok is False
     assert "lesson" in reason
 
 
 def test_validate_lesson_oversize_lesson():
-    cand = {
-        "lesson": "x" * 281,
-        "evidence": "filter to upcoming items only please",
-        "scope": "y",
-    }
+    cand = _ok_situational()
+    cand["lesson"] = "x" * 281
     ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
     assert ok is False
     assert "exceeds" in reason
 
 
 def test_validate_lesson_evidence_not_in_session():
-    cand = {
-        "lesson": "valid lesson",
-        "evidence": "phrase that never appeared in any user message",
-        "scope": "x",
-    }
+    cand = _ok_situational()
+    cand["evidence"] = "phrase that never appeared in any user message"
     ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
     assert ok is False
     assert "verbatim" in reason
@@ -313,25 +318,636 @@ def test_validate_lesson_non_dict():
 
 
 # --------------------------------------------------------------------
+# Day 1 v2: classification + tier + target shape validation
+# --------------------------------------------------------------------
+
+
+def test_validate_lesson_missing_class_rejected():
+    """v2 makes class REQUIRED. v1-shape candidates without it must
+    fail cleanly so we don't silently mix v1/v2 outputs."""
+    cand = _ok_situational()
+    del cand["class"]
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+    assert "class" in reason
+
+
+def test_validate_lesson_invalid_class_rejected():
+    cand = _ok_situational()
+    cand["class"] = "MIXED"  # not one of the four enum values
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+    assert "class" in reason
+
+
+def test_validate_lesson_volatile_dropped():
+    """VOLATILE candidates are dropped — the prompt forbids them but
+    if the LLM emits one anyway we reject defensively."""
+    cand = _ok_situational()
+    cand["class"] = "VOLATILE"
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+    assert "VOLATILE" in reason
+
+
+def test_validate_lesson_identity_no_tier_no_target():
+    """IDENTITY candidates do not carry tier/target; if either appears,
+    it indicates the LLM mis-classified or mis-shaped its output."""
+    cand = _ok_situational()
+    cand["class"] = "IDENTITY"
+    cand["tier"] = "S1"  # bogus — IDENTITY shouldn't carry a tier
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+    assert "tier" in reason or "target" in reason
+
+
+# --------------------------------------------------------------------
+# Day 3: IDENTITY target.user_claim_alias shape validation
+# --------------------------------------------------------------------
+
+
+def test_validate_identity_no_target_passes():
+    """IDENTITY without target = fresh claim insertion."""
+    cand = _ok_situational()
+    cand["class"] = "IDENTITY"
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is True, reason
+
+
+def test_validate_identity_with_alias_target_passes():
+    """IDENTITY with target = {user_claim_alias: "..."} is the
+    Day 3 alias path."""
+    cand = _ok_situational()
+    cand["class"] = "IDENTITY"
+    cand["target"] = {"user_claim_alias": "User prefers concise answers."}
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is True, reason
+
+
+def test_validate_identity_target_with_extra_keys_rejected():
+    """target may only carry user_claim_alias for IDENTITY — extras
+    indicate the LLM mistakenly produced a procedural shape."""
+    cand = _ok_situational()
+    cand["class"] = "IDENTITY"
+    cand["target"] = {
+        "user_claim_alias": "User prefers concise answers.",
+        "skill_name": "stray",  # not allowed for IDENTITY
+    }
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+    assert "extra keys" in reason.lower() or "skill_name" in reason
+
+
+def test_validate_identity_target_empty_alias_rejected():
+    cand = _ok_situational()
+    cand["class"] = "IDENTITY"
+    cand["target"] = {"user_claim_alias": "   "}
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+
+
+def test_validate_identity_target_non_dict_rejected():
+    cand = _ok_situational()
+    cand["class"] = "IDENTITY"
+    cand["target"] = "not a dict"
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+
+
+def test_validate_situational_target_still_rejected():
+    """SITUATIONAL still must not carry tier or target — only
+    PROCEDURAL and IDENTITY can carry them."""
+    cand = _ok_situational()
+    cand["target"] = {"user_claim_alias": "x"}  # SITUATIONAL by default
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+
+
+# --------------------------------------------------------------------
+# Day 3: extended threat scanner (USER.md target)
+# --------------------------------------------------------------------
+
+
+def test_scanner_user_target_catches_religion():
+    from core.learning_review import _scan_lesson_for_sensitive_content
+    pid = _scan_lesson_for_sensitive_content(
+        "User is a Christian and prays daily.",
+        "religion",
+        target_file="user",
+    )
+    assert pid is not None
+    assert pid.startswith("user:religion")
+
+
+def test_scanner_user_target_catches_politics():
+    from core.learning_review import _scan_lesson_for_sensitive_content
+    pid = _scan_lesson_for_sensitive_content(
+        "User leans conservative on most issues.",
+        "political views",
+        target_file="user",
+    )
+    assert pid is not None
+    assert pid.startswith("user:politics")
+
+
+def test_scanner_user_target_catches_sexuality():
+    from core.learning_review import _scan_lesson_for_sensitive_content
+    pid = _scan_lesson_for_sensitive_content(
+        "User is bisexual and uses they/them pronouns.",
+        "identity",
+        target_file="user",
+    )
+    assert pid is not None
+    assert pid.startswith("user:sexuality")
+
+
+def test_scanner_user_target_catches_named_third_party():
+    from core.learning_review import _scan_lesson_for_sensitive_content
+    pid = _scan_lesson_for_sensitive_content(
+        "User's girlfriend Sarah prefers Italian food.",
+        "preferences",
+        target_file="user",
+    )
+    assert pid is not None
+    assert pid.startswith("user:named-third-party")
+
+
+# --------------------------------------------------------------------
+# Day 3.5: adversarial coverage for the named-third-party scanner.
+# This is the LOAD-BEARING safety check — it must work for every
+# adversarial case the user listed plus a few extras that came up
+# during design.
+# --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "label,text",
+    [
+        ("possessive-relational",
+         "User's wife Sarah prefers terse answers"),
+        ("subject-on-team",
+         "Sarah on the team uses Vim"),
+        ("interaction-with-the-named",
+         "User had a meeting with the Sarah Team Lead"),
+        ("user-transitive-mentioned",
+         "User mentioned Sarah in passing"),
+        ("user-transitive-emailed",
+         "User emailed Sarah yesterday about the proposal"),
+        ("user-married-to",
+         "User is married to David and they live in Berlin"),
+        ("subject-action-verb",
+         "Sarah said the deploy succeeded"),
+        ("interaction-call",
+         "User had a call with Marcus about contract terms"),
+        ("possessive-tech-lead",
+         "User's tech lead Maria prefers code reviews early"),
+        ("possessive-team-lead",
+         "User's team lead Diego runs tight standups"),
+        ("interaction-chat-with",
+         "User chatted with Olivia about the rollout"),
+        ("interaction-spoke-to",
+         "User spoke to Henry on Tuesday"),
+    ],
+)
+def test_named_third_party_rejects(label, text):
+    """Every adversarial case the user named PLUS a handful of
+    grammatical variants get rejected. These are the load-bearing
+    safety checks for USER.md — failure here means a real third
+    party could be promoted into the user's identity profile."""
+    from core.learning_review import _check_named_third_party
+    result = _check_named_third_party(text)
+    assert result == "user:named-third-party", (
+        f"adversarial case {label!r} should reject but didn't: {text!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "label,text",
+    [
+        ("self-named",
+         "User is named John"),
+        ("works-for-org",
+         "User works for Anthropic"),
+        ("uses-tech",
+         "User uses Linux on a Hetzner box behind Tailscale"),
+        ("self-preference",
+         "User prefers terse responses for direct factual questions"),
+        ("self-language",
+         "User works in Python and TypeScript primarily"),
+        ("org-as-subject",
+         "Anthropic releases Claude updates monthly"),
+        ("weekday-token",
+         "User asks for status updates on Monday mornings"),
+        ("month-token",
+         "User starts new projects every January"),
+        ("product-as-subject-via-org",
+         "Postgres handles the workload fine for User"),
+        ("vexis-self-reference",
+         "Vexis writes to MEMORY.md when User adds notes"),
+    ],
+)
+def test_named_third_party_allows(label, text):
+    """Cases that look superficially like third-party mentions but
+    are actually self-reference, organizations, technologies, or
+    weekday/month tokens. The allowlist post-filter must let these
+    through — false positives erode trust in the scanner."""
+    from core.learning_review import _check_named_third_party
+    result = _check_named_third_party(text)
+    assert result is None, (
+        f"non-third-party case {label!r} false-positive'd: "
+        f"{text!r} → {result!r}"
+    )
+
+
+def test_named_third_party_allowlist_design_decision():
+    """Document the allowlist design: weekdays, months, common orgs,
+    and known technologies are explicitly NOT person names. The list
+    is intentionally short — false positives in the allowlist are
+    cheap (a real Anthropic/Linux mention slips through) compared to
+    false negatives (a real third party gets immortalized in
+    USER.md). Add to the allowlist only when a real false positive
+    is observed in production."""
+    from core.learning_review import _NON_PERSON_CAPITALIZED
+    # Sanity: the most-common false-positive sources are present.
+    assert "Anthropic" in _NON_PERSON_CAPITALIZED
+    assert "Linux" in _NON_PERSON_CAPITALIZED
+    assert "Hetzner" in _NON_PERSON_CAPITALIZED
+    assert "Monday" in _NON_PERSON_CAPITALIZED
+    assert "Vim" in _NON_PERSON_CAPITALIZED
+    # Self-reference tokens:
+    assert "User" in _NON_PERSON_CAPITALIZED
+    assert "Vexis" in _NON_PERSON_CAPITALIZED
+
+
+def test_named_third_party_decision_user_mentioned_sarah():
+    """Documented decision for the ambiguous case the user flagged:
+    'User mentioned Sarah in passing' → REJECTED.
+
+    Reasoning: any explicit third-party name in an IDENTITY lesson
+    is high-risk. The verb 'mentioned' is transitive with Sarah as
+    the named object — even if benign in spirit, immortalizing the
+    name in USER.md is harder to undo than dropping the candidate.
+    The LLM will produce another non-naming candidate next session
+    if this preference is real.
+    """
+    from core.learning_review import _check_named_third_party
+    assert _check_named_third_party("User mentioned Sarah in passing") == \
+        "user:named-third-party"
+
+
+def test_named_third_party_via_scanner_target_file_user():
+    """End-to-end: an adversarial case routed through the full
+    scanner with target_file=user must reject."""
+    from core.learning_review import _scan_lesson_for_sensitive_content
+    pid = _scan_lesson_for_sensitive_content(
+        "Sarah on the team uses Vim",
+        "team workflow notes",
+        target_file="user",
+    )
+    assert pid is not None
+    assert pid.startswith("user:named-third-party")
+
+
+def test_named_third_party_via_scanner_target_file_memory_does_not_fire():
+    """target_file=memory does NOT run the third-party scanner —
+    that's reserved for IDENTITY classifications routing to
+    USER.md. SITUATIONAL/PROCEDURAL candidates can name third
+    parties in their lesson text without rejection (the LLM steers
+    correctly via prompt classification)."""
+    from core.learning_review import _scan_lesson_for_sensitive_content
+    pid = _scan_lesson_for_sensitive_content(
+        "Sarah on the team uses Vim",
+        "team workflow notes",
+        target_file="memory",
+    )
+    assert pid is None
+
+
+def test_scanner_user_target_catches_self_harm():
+    from core.learning_review import _scan_lesson_for_sensitive_content
+    pid = _scan_lesson_for_sensitive_content(
+        "User has been suicidal in the past.",
+        "wellbeing",
+        target_file="user",
+    )
+    assert pid is not None
+    assert pid.startswith("user:self-harm")
+
+
+def test_scanner_user_target_catches_mental_health():
+    from core.learning_review import _scan_lesson_for_sensitive_content
+    pid = _scan_lesson_for_sensitive_content(
+        "User struggles with depression.",
+        "wellbeing",
+        target_file="user",
+    )
+    assert pid is not None
+    assert pid.startswith("user:mental-health")
+
+
+def test_scanner_memory_target_skips_user_md_patterns():
+    """USER.md-specific patterns must NOT fire for SITUATIONAL/MEMORY
+    candidates — those go through the base scanner only. (Religion/
+    politics in MEMORY.md is questionable but defensible — not the
+    learning curator's job to police.)"""
+    from core.learning_review import _scan_lesson_for_sensitive_content
+    # This would fire for target_file="user" — confirm it does NOT
+    # fire for the default memory target.
+    pid = _scan_lesson_for_sensitive_content(
+        "User is a Christian and prays daily.",
+        "religion",
+        target_file="memory",
+    )
+    assert pid is None
+
+
+def test_scanner_user_target_still_runs_base_set():
+    """USER.md scanner is layered ON TOP OF the base set — medical/
+    legal/financial patterns still fire when target_file=user."""
+    from core.learning_review import _scan_lesson_for_sensitive_content
+    pid = _scan_lesson_for_sensitive_content(
+        "Recommend antibiotic dosage based on user weight.",
+        "medical",
+        target_file="user",
+    )
+    assert pid is not None
+    assert pid.startswith("medical")
+
+
+def test_validate_identity_lesson_with_named_third_party_rejected():
+    """End-to-end: an IDENTITY lesson naming a third party gets
+    rejected at validate time via the USER.md scanner stack."""
+    msgs = [_msg("user", "yeah my girlfriend Sarah likes pasta")]
+    cand = {
+        "class": "IDENTITY",
+        "lesson": "User's girlfriend Sarah prefers Italian food.",
+        "evidence": "yeah my girlfriend Sarah likes pasta",
+        "scope": "personal preferences",
+    }
+    ok, reason = _validate_lesson(cand, msgs, max_chars=280)
+    assert ok is False
+    assert "sensitive" in reason.lower()
+    assert "named-third-party" in reason.lower()
+
+
+def test_validate_situational_lesson_with_third_party_passes():
+    """Same lesson under SITUATIONAL classification does NOT fire
+    the USER.md scanner — wouldn't normally happen because the LLM
+    classifies correctly, but the scanner-target split is by class
+    not by lesson content."""
+    msgs = [_msg("user", "yeah my girlfriend Sarah likes pasta")]
+    cand = {
+        "class": "SITUATIONAL",
+        "lesson": "User's girlfriend Sarah prefers Italian food.",
+        "evidence": "yeah my girlfriend Sarah likes pasta",
+        "scope": "x",
+    }
+    ok, reason = _validate_lesson(cand, msgs, max_chars=280)
+    # Note: this passes — the SITUATIONAL scanner doesn't include the
+    # USER.md-specific patterns. The defense for this content type is
+    # the LLM classifying correctly (which the prompt steers toward).
+    assert ok is True, reason
+
+
+# --------------------------------------------------------------------
+# Day 3: USER candidate queue renderer + prompt section
+# --------------------------------------------------------------------
+
+
+def test_render_user_candidate_queue_empty(monkeypatch, tmp_path):
+    """When the queue file is empty/missing, render an explicit
+    empty-state placeholder."""
+    from core.learning_review import _render_user_candidate_queue
+    queue_file = tmp_path / "user_candidates.json"
+    monkeypatch.setattr(
+        "core.learning_review.user_candidates_path", lambda: queue_file
+    )
+    out = _render_user_candidate_queue()
+    assert "no pending or promoted USER claims yet" in out
+
+
+def test_render_user_candidate_queue_lists_pending_and_promoted(monkeypatch, tmp_path):
+    """The queue rendering shows both pending and promoted claims with
+    their session counts and a [promoted] marker for the latter."""
+    from core.learning_review import _render_user_candidate_queue
+    from core.user_candidates import UserCandidateStore
+    queue_file = tmp_path / "user_candidates.json"
+    monkeypatch.setattr(
+        "core.learning_review.user_candidates_path", lambda: queue_file
+    )
+    store = UserCandidateStore(queue_file)
+    store.add_occurrence("Pending claim.", "sess-1", "ev")
+    store.add_occurrence("Promoted claim.", "sess-1", "ev")
+    store.add_occurrence("Promoted claim.", "sess-2", "ev")
+    store.mark_promoted("Promoted claim.")
+    out = _render_user_candidate_queue()
+    assert '"Pending claim."' in out
+    assert '"Promoted claim."' in out
+    # Pending shows 1 session, promoted shows 2:
+    assert "1 session(s)" in out
+    assert "2 session(s)" in out
+    assert "[promoted]" in out
+
+
+def test_build_review_prompt_includes_user_queue_section():
+    """The Day 3 prompt section must be present in the rendered
+    prompt so the LLM knows about the alias path."""
+    from core.learning_review import _build_review_prompt
+    prompt = _build_review_prompt(
+        "transcript",
+        user_queue_text="1. \"Existing claim.\" (1 session(s))",
+    )
+    assert "USER candidate queue" in prompt
+    assert "alias path for IDENTITY claims" in prompt
+    assert "user_claim_alias" in prompt
+    assert "1. \"Existing claim.\" (1 session(s))" in prompt
+
+
+def test_build_review_prompt_v2_day3_sections_present():
+    """Sanity check: all three v2 context-block markers get rendered."""
+    from core.learning_review import _build_review_prompt
+    prompt = _build_review_prompt("x")
+    assert "<skill-index>" in prompt
+    assert "<existing-memory>" in prompt
+    assert "<user-candidates>" in prompt
+    # And no markers leaked through:
+    assert "{{SKILL_INDEX}}" not in prompt
+    assert "{{EXISTING_MEMORY}}" not in prompt
+    assert "{{USER_CANDIDATE_QUEUE}}" not in prompt
+
+
+def test_validate_lesson_procedural_s1_full_pass():
+    cand = {
+        "class": "PROCEDURAL",
+        "lesson": "When listing time-bound options, filter ahead of now.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "time-bound listings",
+        "tier": "S1",
+        "target": {
+            "skill_name": "communication-style",
+            "patch_old_string": "## Some heading\nexisting text",
+            "patch_new_string": "## Some heading\nupdated text",
+        },
+    }
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is True, f"expected pass; got {reason!r}"
+
+
+def test_validate_lesson_procedural_s1_missing_patch_strings():
+    cand = {
+        "class": "PROCEDURAL",
+        "lesson": "L",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+        "tier": "S1",
+        "target": {"skill_name": "some-skill"},  # missing patch_*
+    }
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+    assert "patch_old_string" in reason or "patch_new_string" in reason
+
+
+def test_validate_lesson_procedural_s2_full_pass():
+    cand = {
+        "class": "PROCEDURAL",
+        "lesson": "When working with bge-m3 on Dutch corpora, query in Dutch.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "multilingual RAG",
+        "tier": "S2",
+        "target": {
+            "skill_name": "multilingual-rag",
+            "support_file_path": "references/dutch-bge-m3.md",
+            "support_file_content": "# Dutch + bge-m3 notes\n…",
+        },
+    }
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is True, f"expected pass; got {reason!r}"
+
+
+def test_validate_lesson_procedural_s2_invalid_subdir():
+    cand = {
+        "class": "PROCEDURAL",
+        "lesson": "L",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+        "tier": "S2",
+        "target": {
+            "skill_name": "some-skill",
+            "support_file_path": "secrets/leak.md",  # bad subdir
+            "support_file_content": "x",
+        },
+    }
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+    assert "references/" in reason or "templates/" in reason or "scripts/" in reason
+
+
+def test_validate_lesson_procedural_s3_full_pass():
+    cand = {
+        "class": "PROCEDURAL",
+        "lesson": "When listing time-bound options, filter ahead of now.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "time-bound listings",
+        "tier": "S3",
+        "target": {
+            "skill_name": "time-bound-listings",
+            "new_skill_body": (
+                "---\n"
+                "name: time-bound-listings\n"
+                "description: Filter time-bound options.\n"
+                "origin: learning-curator\n"
+                "---\n\n"
+                "# Body\n"
+            ),
+        },
+    }
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is True, f"expected pass; got {reason!r}"
+
+
+def test_validate_lesson_procedural_s3_missing_origin_tag():
+    """S3 must include origin: learning-curator in frontmatter so the
+    audit trail is preserved (per §3.7 #3 of the v2 research doc)."""
+    cand = {
+        "class": "PROCEDURAL",
+        "lesson": "L",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+        "tier": "S3",
+        "target": {
+            "skill_name": "new-skill",
+            "new_skill_body": (
+                "---\nname: new-skill\ndescription: x.\n---\n\nBody\n"
+                # missing 'origin: learning-curator'
+            ),
+        },
+    }
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+    assert "origin" in reason
+
+
+def test_validate_lesson_procedural_invalid_tier():
+    cand = {
+        "class": "PROCEDURAL",
+        "lesson": "L",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+        "tier": "S4",  # not a valid tier
+        "target": {"skill_name": "x"},
+    }
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+    assert "tier" in reason
+
+
+def test_validate_lesson_procedural_missing_target():
+    cand = {
+        "class": "PROCEDURAL",
+        "lesson": "L",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+        "tier": "S3",
+        # missing target entirely
+    }
+    ok, reason = _validate_lesson(cand, _ok_msgs(), max_chars=280)
+    assert ok is False
+    assert "target" in reason
+
+
+# --------------------------------------------------------------------
 # run_review — success and failure paths via mocked spawn
 # --------------------------------------------------------------------
 
 
-def test_run_review_happy_path_one_lesson():
+def test_run_review_happy_path_one_lesson(tmp_path):
     msgs = [
         _msg("user", "list movies tonight"),
         _msg("assistant", "[movies including past ones]"),
         _msg("user", "you included past showings, filter to upcoming"),
         _msg("assistant", "fixed"),
     ]
+    # v2 candidate: PROCEDURAL → S3 (no existing skills in tmp_path,
+    # so the LLM picks S3). Workspace is tmp_path so the skill
+    # discovery + memory dedup look at empty trees.
     response = (
-        '[{"lesson": "When listing time-bound options, filter to '
+        '[{'
+        '"class": "PROCEDURAL", '
+        '"lesson": "When listing time-bound options, filter to '
         'entries still ahead of the current time.", '
         '"evidence": "you included past showings, filter to upcoming", '
-        '"scope": "time-bound listings"}]'
+        '"scope": "time-bound listings", '
+        '"tier": "S3", '
+        '"target": {'
+        '"skill_name": "time-bound-listings", '
+        '"new_skill_body": "---\\nname: time-bound-listings\\n'
+        'description: Filter time-bound options.\\n'
+        'origin: learning-curator\\n---\\n\\nBody\\n"'
+        '}'
+        '}]'
     )
     spawn, captured = _spawn_returning(response)
-    output = run_review(Path("/tmp"), _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
 
     assert output.error is None
     assert output.nothing_to_save is False
@@ -339,6 +955,8 @@ def test_run_review_happy_path_one_lesson():
     assert len(output.verified_lessons) == 1
     assert len(output.rejected) == 0
     assert "When listing" in output.verified_lessons[0]["lesson"]
+    assert output.verified_lessons[0]["class"] == "PROCEDURAL"
+    assert output.verified_lessons[0]["tier"] == "S3"
 
     # Subprocess argv looks right:
     assert captured["argv"][0] == "claude"
@@ -347,90 +965,121 @@ def test_run_review_happy_path_one_lesson():
     assert captured["env"][RECURSION_ENV_VAR] == "1"
     # No --resume: review session must stay isolated:
     assert "--resume" not in captured["argv"]
+    # The v2 prompt context blocks are present in the prompt:
+    prompt = captured["argv"][2]
+    assert "<skill-index>" in prompt
+    assert "<existing-memory>" in prompt
+    assert "Classification — required before output" in prompt
 
 
-def test_run_review_nothing_to_save():
+def test_run_review_nothing_to_save(tmp_path):
     msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
     spawn, _ = _spawn_returning("Nothing to save.")
-    output = run_review(Path("/tmp"), _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
     assert output.nothing_to_save is True
     assert output.verified_lessons == []
     assert output.error is None
 
 
-def test_run_review_evidence_verification_rejects():
+def test_run_review_evidence_verification_rejects(tmp_path):
     """Model invents a verbatim quote that isn't in the transcript."""
     msgs = [_msg("user", "one real user message")]
     response = (
-        '[{"lesson": "L", '
+        '[{"class": "SITUATIONAL", "lesson": "L", '
         '"evidence": "this string never appears in any user message", '
         '"scope": "S"}]'
     )
     spawn, _ = _spawn_returning(response)
-    output = run_review(Path("/tmp"), _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
     assert len(output.parsed_lessons) == 1
     assert len(output.verified_lessons) == 0
     assert len(output.rejected) == 1
     assert "verbatim" in output.rejected[0][1]
 
 
-def test_run_review_caps_at_max_entries(monkeypatch):
+def test_run_review_caps_at_max_entries(tmp_path, monkeypatch):
     monkeypatch.setattr(lr, "learning_max_entries_per_session", lambda: 2)
     msgs = [_msg("user", "user phrase 1"), _msg("user", "user phrase 2"),
             _msg("user", "user phrase 3")]
     response = (
         '['
-        '{"lesson": "A", "evidence": "user phrase 1", "scope": "X"},'
-        '{"lesson": "B", "evidence": "user phrase 2", "scope": "Y"},'
-        '{"lesson": "C", "evidence": "user phrase 3", "scope": "Z"}'
+        '{"class": "SITUATIONAL", "lesson": "A", "evidence": "user phrase 1", "scope": "X"},'
+        '{"class": "SITUATIONAL", "lesson": "B", "evidence": "user phrase 2", "scope": "Y"},'
+        '{"class": "SITUATIONAL", "lesson": "C", "evidence": "user phrase 3", "scope": "Z"}'
         ']'
     )
     spawn, _ = _spawn_returning(response)
-    output = run_review(Path("/tmp"), _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
     assert len(output.verified_lessons) == 2
     # The third one ends up rejected with the cap reason:
     assert len(output.rejected) == 1
     assert "cap" in output.rejected[0][1]
 
 
-def test_run_review_subprocess_nonzero_exit():
+def test_run_review_max_1_s3_per_session(tmp_path, monkeypatch):
+    """Per §3.7 #7 of the v2 research: at most one S3 (new-umbrella)
+    lesson per reviewed session — the second is rejected with a
+    cap reason. Other tier slots remain available."""
+    monkeypatch.setattr(lr, "learning_max_entries_per_session", lambda: 2)
+    msgs = [_msg("user", "user phrase 1"), _msg("user", "user phrase 2")]
+    response = (
+        '['
+        '{"class": "PROCEDURAL", "lesson": "A", "evidence": "user phrase 1", '
+        ' "scope": "X", "tier": "S3", '
+        ' "target": {"skill_name": "skill-one", "new_skill_body": '
+        '   "---\\nname: skill-one\\ndescription: D.\\norigin: learning-curator\\n---\\nB"}},'
+        '{"class": "PROCEDURAL", "lesson": "B", "evidence": "user phrase 2", '
+        ' "scope": "Y", "tier": "S3", '
+        ' "target": {"skill_name": "skill-two", "new_skill_body": '
+        '   "---\\nname: skill-two\\ndescription: D.\\norigin: learning-curator\\n---\\nB"}}'
+        ']'
+    )
+    spawn, _ = _spawn_returning(response)
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    assert len(output.verified_lessons) == 1
+    assert output.verified_lessons[0]["target"]["skill_name"] == "skill-one"
+    assert len(output.rejected) == 1
+    assert "S3-create cap" in output.rejected[0][1]
+
+
+def test_run_review_subprocess_nonzero_exit(tmp_path):
     spawn, _ = _spawn_returning("oops", returncode=1, stderr="claude failed")
-    output = run_review(Path("/tmp"), _meta(), [_msg("user", "hi")], spawn=spawn)
+    output = run_review(tmp_path, _meta(), [_msg("user", "hi")], spawn=spawn)
     assert output.error is not None
     assert "exited 1" in output.error
 
 
-def test_run_review_unparseable_response():
+def test_run_review_unparseable_response(tmp_path):
     spawn, _ = _spawn_returning("complete garbage with no JSON")
-    output = run_review(Path("/tmp"), _meta(), [_msg("user", "hi")], spawn=spawn)
+    output = run_review(tmp_path, _meta(), [_msg("user", "hi")], spawn=spawn)
     assert output.error is not None
     assert "could not parse" in output.error
 
 
-def test_run_review_timeout():
+def test_run_review_timeout(tmp_path):
     def spawn(argv, env):
         raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
-    output = run_review(Path("/tmp"), _meta(), [_msg("user", "hi")], spawn=spawn)
+    output = run_review(tmp_path, _meta(), [_msg("user", "hi")], spawn=spawn)
     assert output.error is not None
     assert "timed out" in output.error
 
 
-def test_run_review_spawn_oserror():
+def test_run_review_spawn_oserror(tmp_path):
     def spawn(argv, env):
         raise FileNotFoundError("claude not on PATH")
-    output = run_review(Path("/tmp"), _meta(), [_msg("user", "hi")], spawn=spawn)
+    output = run_review(tmp_path, _meta(), [_msg("user", "hi")], spawn=spawn)
     assert output.error is not None
     assert "spawn failed" in output.error
 
 
-def test_run_review_logs_large_transcript_warning(caplog):
+def test_run_review_logs_large_transcript_warning(tmp_path, caplog):
     """Audit catch (Day 2 user-flagged): if the transcript is large
     we MUST log a warning, never silently truncate."""
     big_text = "x" * (LARGE_TRANSCRIPT_WARN_CHARS + 100)
     msgs = [_msg("user", big_text)]
     spawn, _ = _spawn_returning("Nothing to save.")
     with caplog.at_level(logging.WARNING):
-        run_review(Path("/tmp"), _meta(), msgs, spawn=spawn)
+        run_review(tmp_path, _meta(), msgs, spawn=spawn)
     matched = [r for r in caplog.records
                if "large transcript" in r.getMessage()]
     assert len(matched) == 1, f"expected one warning, got {len(matched)}"
@@ -524,6 +1173,7 @@ def test_sensitive_scan_evidence_not_scanned():
     that triggering a reject."""
     msgs = [_msg("user", "my doctor prescribed me an antibiotic for the infection")]
     cand = {
+        "class": "SITUATIONAL",
         "lesson": "When the user describes a routine doctor visit, "
                   "follow up with whether they need help logging it.",
         "evidence": "my doctor prescribed me an antibiotic for the infection",
@@ -538,6 +1188,7 @@ def test_sensitive_scan_evidence_not_scanned():
 def test_validate_lesson_rejects_sensitive_content():
     msgs = [_msg("user", "what dosage should I take")]
     cand = {
+        "class": "SITUATIONAL",
         "lesson": "Recommend antibiotic dosage based on user weight",
         "evidence": "what dosage should I take",
         "scope": "medical advice for user",
@@ -552,7 +1203,7 @@ def test_validate_lesson_rejects_sensitive_content():
 # --------------------------------------------------------------------
 
 
-def test_run_review_declines_oversized_transcript():
+def test_run_review_declines_oversized_transcript(tmp_path):
     """At >200K chars we don't even spawn the LLM; we set
     declined_too_large and return. This advances last_reviewed_at
     via the controller's success path."""
@@ -568,7 +1219,7 @@ def test_run_review_declines_oversized_transcript():
                                           stderr=b'')
         return cp
 
-    output = run_review(Path("/tmp"), _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
 
     assert output.declined_too_large is True
     assert output.error is None
@@ -579,7 +1230,7 @@ def test_run_review_declines_oversized_transcript():
     assert spawn_called["called"] is False
 
 
-def test_run_review_just_below_decline_threshold_runs(monkeypatch):
+def test_run_review_just_below_decline_threshold_runs(tmp_path):
     """Right at the threshold, we still send the transcript."""
     from core.learning_review import LEARNING_TRANSCRIPT_DECLINE_CHARS
     # Aim for transcript chars below the threshold. The formatter
@@ -587,6 +1238,203 @@ def test_run_review_just_below_decline_threshold_runs(monkeypatch):
     text = "y" * (LEARNING_TRANSCRIPT_DECLINE_CHARS - 5_000)
     msgs = [_msg("user", text)]
     spawn, _ = _spawn_returning("Nothing to save.")
-    output = run_review(Path("/tmp"), _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
     assert output.declined_too_large is False
     assert output.nothing_to_save is True
+
+
+# --------------------------------------------------------------------
+# Day 1 v2: skill index + existing memory rendering
+# --------------------------------------------------------------------
+
+
+def test_render_skill_index_empty_tree(tmp_path):
+    """When no skills exist, the index renders an explicit S3-fallback
+    hint rather than an empty block."""
+    from core.learning_review import _render_skill_index
+    out = _render_skill_index(tmp_path / "skills")
+    assert "no skills exist yet" in out
+    assert "S3" in out
+
+
+def test_render_skill_index_lists_active_skills(tmp_path):
+    """A populated tree renders one bullet per skill with the 1-line
+    description from frontmatter."""
+    from core.learning_review import _render_skill_index
+    skills_root = tmp_path / "skills"
+    (skills_root / "alpha-skill").mkdir(parents=True)
+    (skills_root / "alpha-skill" / "SKILL.md").write_text(
+        "---\nname: alpha-skill\ndescription: First test skill.\n---\n\nBody\n",
+        encoding="utf-8",
+    )
+    (skills_root / "beta-skill").mkdir(parents=True)
+    (skills_root / "beta-skill" / "SKILL.md").write_text(
+        "---\nname: beta-skill\ndescription: Second test skill.\n---\n\nBody\n",
+        encoding="utf-8",
+    )
+    out = _render_skill_index(skills_root)
+    assert "alpha-skill" in out
+    assert "beta-skill" in out
+    assert "First test skill." in out
+
+
+def test_render_skill_index_marks_pinned_read_only(tmp_path):
+    """Pinned skills must carry the (pinned, read-only) suffix so the
+    LLM doesn't propose S1/S2 against them. They must STILL appear in
+    the index so S3 collisions are avoided."""
+    from core.learning_review import _render_skill_index
+    from core.skills import PinStore
+    skills_root = tmp_path / "skills"
+    (skills_root / "free-skill").mkdir(parents=True)
+    (skills_root / "free-skill" / "SKILL.md").write_text(
+        "---\nname: free-skill\ndescription: D.\n---\n\nB\n",
+        encoding="utf-8",
+    )
+    (skills_root / "pinned-skill").mkdir(parents=True)
+    (skills_root / "pinned-skill" / "SKILL.md").write_text(
+        "---\nname: pinned-skill\ndescription: D.\n---\n\nB\n",
+        encoding="utf-8",
+    )
+    PinStore(skills_root).pin("pinned-skill")
+    out = _render_skill_index(skills_root)
+    # Both must appear (S3 collision avoidance):
+    assert "free-skill" in out
+    assert "pinned-skill" in out
+    # Only pinned gets the marker:
+    pinned_line = [ln for ln in out.split("\n") if "pinned-skill" in ln][0]
+    free_line = [ln for ln in out.split("\n") if "free-skill" in ln and "pinned-skill" not in ln][0]
+    assert "(pinned, read-only)" in pinned_line
+    assert "(pinned, read-only)" not in free_line
+
+
+def test_build_review_prompt_explains_pinned_marker():
+    """The prompt must explain what (pinned, read-only) means so the
+    LLM doesn't propose patches against pinned skills."""
+    from core.learning_review import _build_review_prompt
+    prompt = _build_review_prompt("transcript")
+    assert "(pinned, read-only)" in prompt
+    # The rule against patching pinned (text wraps over multiple
+    # lines in the constant; check the unambiguous fragments):
+    assert "cannot be patched" in prompt
+    assert "Do NOT propose" in prompt
+    # Whitespace-tolerant check that S1/S2 against pinned is forbidden:
+    import re
+    assert re.search(r"propose\s+S1\s+or\s+S2\s+against\s+a\s+pinned\s+skill", prompt)
+
+
+def test_render_existing_memory_empty_files(tmp_path):
+    from core.learning_review import _render_existing_memory
+    out = _render_existing_memory(tmp_path)
+    assert out == "(no existing entries)"
+
+
+def test_render_existing_memory_combines_live_and_shadow(tmp_path):
+    """The dedup view spans both MEMORY.md and MEMORY-SHADOW.md so the
+    LLM can avoid duplicating either."""
+    from core.learning_review import _render_existing_memory
+    memdir = tmp_path / "memories"
+    memdir.mkdir()
+    (memdir / "MEMORY.md").write_text(
+        "live entry one\n§\nlive entry two\n", encoding="utf-8",
+    )
+    (memdir / "MEMORY-SHADOW.md").write_text(
+        "[learned 2026-05-02] shadow entry\n  Scope: x\n  Evidence: y\n",
+        encoding="utf-8",
+    )
+    out = _render_existing_memory(tmp_path)
+    assert "live entry one" in out
+    assert "live entry two" in out
+    assert "[learned 2026-05-02] shadow entry" in out
+
+
+def test_check_evidence_overlap_substring_hit():
+    from core.learning_review import _check_evidence_overlap
+    existing = ["[learned 2026-05-02] X\n  Evidence: filter to upcoming items only please"]
+    hit, idx = _check_evidence_overlap("filter to upcoming items only please", existing)
+    assert hit is True
+    assert idx == 1
+
+
+def test_check_evidence_overlap_reverse_substring_hit():
+    """Bidirectional: if a new long candidate quote contains an old
+    short evidence string, that's still a hit."""
+    from core.learning_review import _check_evidence_overlap
+    existing = ["short stored entry"]
+    # New candidate evidence is a longer message that contains the old entry verbatim.
+    hit, idx = _check_evidence_overlap(
+        "verbose user message that includes short stored entry as a fragment",
+        existing,
+    )
+    assert hit is True
+    assert idx == 1
+
+
+def test_check_evidence_overlap_miss():
+    from core.learning_review import _check_evidence_overlap
+    existing = ["completely unrelated content"]
+    hit, idx = _check_evidence_overlap("the new candidate evidence", existing)
+    assert hit is False
+    assert idx is None
+
+
+def test_check_evidence_overlap_empty_inputs():
+    from core.learning_review import _check_evidence_overlap
+    assert _check_evidence_overlap("", ["x"]) == (False, None)
+    assert _check_evidence_overlap("x", []) == (False, None)
+
+
+def test_run_review_situational_dedup_skip(tmp_path):
+    """SITUATIONAL candidate whose evidence overlaps an existing
+    MEMORY.md entry is dropped with a dedup reason — not silently
+    duplicated."""
+    memdir = tmp_path / "memories"
+    memdir.mkdir()
+    (memdir / "MEMORY.md").write_text(
+        "[learned 2026-05-02] User runs Vexis on Hetzner VPS at 203.0.113.42\n"
+        "  Scope: env\n"
+        "  Evidence: yeah this is still on the Hetzner box at 203.0.113.42",
+        encoding="utf-8",
+    )
+    msgs = [_msg("user", "yeah this is still on the Hetzner box at 203.0.113.42")]
+    response = (
+        '[{"class": "SITUATIONAL", '
+        '"lesson": "User runs Vexis on Hetzner VPS at 203.0.113.42.", '
+        '"evidence": "yeah this is still on the Hetzner box at 203.0.113.42", '
+        '"scope": "environment"}]'
+    )
+    spawn, _ = _spawn_returning(response)
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    assert len(output.parsed_lessons) == 1
+    assert len(output.verified_lessons) == 0
+    assert len(output.rejected) == 1
+    assert "deduped" in output.rejected[0][1]
+
+
+def test_build_review_prompt_substitutes_skill_index_and_memory():
+    from core.learning_review import _build_review_prompt
+    prompt = _build_review_prompt(
+        "transcript here",
+        skill_index_text="- skill-foo: foo skill",
+        existing_memory_text="1. existing entry",
+    )
+    assert "- skill-foo: foo skill" in prompt
+    assert "1. existing entry" in prompt
+    # Markers must not leak through:
+    assert "{{SKILL_INDEX}}" not in prompt
+    assert "{{EXISTING_MEMORY}}" not in prompt
+
+
+def test_build_review_prompt_v2_sections_present():
+    """The new v2 prompt sections must be present in the rendered
+    prompt — these guard against accidental section removal."""
+    from core.learning_review import _build_review_prompt
+    prompt = _build_review_prompt("x")
+    assert "Classification — required before output" in prompt
+    assert "PROCEDURAL" in prompt and "IDENTITY" in prompt
+    assert "SITUATIONAL" in prompt and "VOLATILE" in prompt
+    assert "Procedural lessons → skill tier order" in prompt
+    assert "S1." in prompt and "S2." in prompt and "S3." in prompt
+    assert "Existing skills you can patch" in prompt
+    assert "Existing memory entries — avoid duplicates" in prompt
+    assert "origin: learning-curator" in prompt
+    assert "max-1" in prompt or "at MOST one S3" in prompt

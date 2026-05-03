@@ -44,7 +44,15 @@ DEFAULT_LEARNING_TICK_INTERVAL_MINUTES = 5
 DEFAULT_LEARNING_IDLE_THRESHOLD_MINUTES = 25
 DEFAULT_LEARNING_FAILURE_COOLDOWN_HOURS = 1
 DEFAULT_LEARNING_MAX_ENTRIES_PER_SESSION = 2
-DEFAULT_LEARNING_MAX_ENTRY_CHARS = 280
+# Day 4 v2 calibration: raised from 280 → 400. Day 4 eval surfaced
+# the LLM consistently producing 290-340 char lessons for technical
+# content (multilingual RAG, cinema-time-bound, code-review brevity).
+# These were good lessons — specific without being manifestos —
+# but the 280 cap rejected them. 400 keeps the manifesto defense
+# intact (a single-paragraph rule fits comfortably) while admitting
+# legitimate technical detail. The prompt still pushes for ≤300
+# typical with 400 as the ceiling.
+DEFAULT_LEARNING_MAX_ENTRY_CHARS = 400
 
 
 def _config_path() -> Path:

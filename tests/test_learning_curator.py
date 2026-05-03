@@ -608,3 +608,505 @@ def test_oversized_single_message_invisible_to_tail_read(env):
     assert len(metas) == 1
     # Last message timestamp is None — tail-read missed it.
     assert metas[0].last_message_timestamp is None
+
+
+# --------------------------------------------------------------------
+# Day 2: dispatcher routing — class-based write paths
+# --------------------------------------------------------------------
+
+
+def _make_review_output_with(lessons: list[dict]):
+    """Build a minimal ReviewOutput carrying ``lessons`` as the
+    verified set. Lets us drive ``_write_verified`` directly without
+    spinning up the full review subprocess."""
+    from core.learning_review import ReviewOutput
+    return ReviewOutput(verified_lessons=lessons)
+
+
+def _meta(uuid: str = "sess-1") -> "SessionMeta":
+    """Minimal SessionMeta for dispatcher tests. The dispatcher only
+    reads ``session_uuid`` (Day 3 onwards, for the IDENTITY queue)."""
+    from core.transcripts import SessionMeta
+    return SessionMeta(
+        session_uuid=uuid,
+        jsonl_path=Path(f"/tmp/{uuid}.jsonl"),
+        last_message_timestamp=_utc(hour=10),
+        message_count_estimate=2,
+    )
+
+
+def test_dispatcher_routes_procedural_s3_to_staging(env):
+    """Day 2: a verified PROCEDURAL/S3 lesson stages a new skill in
+    .shadow/ (NOT MEMORY-SHADOW.md as a content target) and writes
+    an audit-trail entry into MEMORY-SHADOW.md with the staging path."""
+    workspace = env
+    lesson = {
+        "class": "PROCEDURAL",
+        "lesson": "When listing time-bound options, filter ahead of now.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "time-bound listings",
+        "tier": "S3",
+        "target": {
+            "skill_name": "time-bound-listings",
+            "new_skill_body": (
+                "---\nname: time-bound-listings\n"
+                "description: Filter time-bound options.\n"
+                "origin: learning-curator\n---\n\n# Body\n"
+            ),
+        },
+    }
+    written = lc._write_verified(
+        workspace, _make_review_output_with([lesson]), meta=_meta(), shadow=True
+    )
+    assert written.written == 1
+    # The actual content lives in the staging tree:
+    from core.learning_writes import shadow_skills_root
+    staged = shadow_skills_root(workspace) / "time-bound-listings" / "SKILL.md"
+    assert staged.exists()
+    assert "origin: learning-curator" in staged.read_text(encoding="utf-8")
+    # MEMORY-SHADOW.md gets the audit record with the Staged: pointer:
+    audit = (workspace / "memories" / "MEMORY-SHADOW.md").read_text(encoding="utf-8")
+    assert "Class: PROCEDURAL" in audit
+    assert "Tier: S3" in audit
+    assert "Staged:" in audit
+    assert "time-bound-listings" in audit
+
+
+def test_dispatcher_routes_procedural_s1_to_staging(env):
+    """A PROCEDURAL/S1 patch stages a SKILL.md mutation in .shadow/."""
+    workspace = env
+    # Set up a live skill the patch can target:
+    from core.skills import create_skill
+    from core.paths import skills_dir
+    create_skill(
+        skills_dir(workspace),
+        "comm-style",
+        (
+            "---\nname: comm-style\ndescription: Communication.\n---\n\n"
+            "## Tone\nDefault is formal.\n"
+        ),
+    )
+    lesson = {
+        "class": "PROCEDURAL",
+        "lesson": "Direct factual answers default to one line.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "communication",
+        "tier": "S1",
+        "target": {
+            "skill_name": "comm-style",
+            "patch_old_string": "Default is formal.",
+            "patch_new_string": "Default is formal.\n\n## Brevity\nDirect Q→one line.\n",
+        },
+    }
+    written = lc._write_verified(
+        workspace, _make_review_output_with([lesson]), meta=_meta(), shadow=True
+    )
+    assert written.written == 1
+    from core.learning_writes import shadow_skills_root
+    staged = shadow_skills_root(workspace) / "comm-style" / "SKILL.md"
+    assert staged.exists()
+    body = staged.read_text(encoding="utf-8")
+    assert "## Brevity" in body
+    # Live skill is unchanged (Day 2 never writes live):
+    from core.paths import skills_dir as sd
+    live = (sd(workspace) / "comm-style" / "SKILL.md").read_text(encoding="utf-8")
+    assert "## Brevity" not in live
+    # Audit shadow records both the lesson and the staging path:
+    audit = (workspace / "memories" / "MEMORY-SHADOW.md").read_text(encoding="utf-8")
+    assert "Tier: S1" in audit
+    assert "comm-style" in audit
+
+
+def test_dispatcher_routes_situational_to_memory_shadow(env):
+    """SITUATIONAL goes to MEMORY-SHADOW.md as before — Day 2 does
+    NOT route this class to the staging tree."""
+    workspace = env
+    lesson = {
+        "class": "SITUATIONAL",
+        "lesson": "Vexis runs on Hetzner VPS at 203.0.113.42.",
+        "evidence": "filter to upcoming items only please",  # any user msg
+        "scope": "environment",
+    }
+    written = lc._write_verified(
+        workspace, _make_review_output_with([lesson]), meta=_meta(), shadow=True
+    )
+    assert written.written == 1
+    audit = (workspace / "memories" / "MEMORY-SHADOW.md").read_text(encoding="utf-8")
+    assert "Class: SITUATIONAL" in audit
+    assert "Hetzner" in audit
+    # No skill staging happened:
+    from core.learning_writes import list_staged_skills
+    assert list_staged_skills(workspace) == []
+
+
+# --------------------------------------------------------------------
+# Day 3: IDENTITY routes through the USER candidate queue
+# --------------------------------------------------------------------
+
+
+def test_dispatcher_identity_first_observation_queues_no_write(env):
+    """Day 3 checkpoint #1: a one-shot IDENTITY signal queues the
+    claim but does NOT write to USER-SHADOW.md. The cross-session
+    threshold (≥2 distinct sessions in 30d) hasn't been met."""
+    workspace = env
+    lesson = {
+        "class": "IDENTITY",
+        "lesson": "User prefers concise responses.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "communication preferences",
+    }
+    written = lc._write_verified(
+        workspace, _make_review_output_with([lesson]), meta=_meta("sess-1"), shadow=True
+    )
+    assert written.written == 1
+    # Audit shows the queued status:
+    audit = (workspace / "memories" / "MEMORY-SHADOW.md").read_text(encoding="utf-8")
+    assert "Class: IDENTITY" in audit
+    assert "queued (1/2 session(s))" in audit
+    # USER-SHADOW.md does NOT exist yet (no promotion):
+    user_shadow = workspace / "memories" / "USER-SHADOW.md"
+    assert not user_shadow.exists()
+    # Queue file got the candidate:
+    from core.user_candidates import UserCandidateStore
+    from core.paths import user_candidates_path
+    queue = UserCandidateStore(user_candidates_path()).list_all()
+    assert len(queue) == 1
+    assert queue[0].claim == "User prefers concise responses."
+    assert queue[0].promoted_to_user_md is False
+
+
+def test_dispatcher_identity_same_session_repeat_does_not_promote(env):
+    """A second observation of the same claim from the SAME session
+    must not promote — the threshold is by distinct session UUIDs,
+    not occurrence count."""
+    workspace = env
+    lesson = {
+        "class": "IDENTITY",
+        "lesson": "User prefers concise responses.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+    }
+    same_meta = _meta("sess-1")
+    lc._write_verified(workspace, _make_review_output_with([lesson]), meta=same_meta, shadow=True)
+    lc._write_verified(workspace, _make_review_output_with([lesson]), meta=same_meta, shadow=True)
+    user_shadow = workspace / "memories" / "USER-SHADOW.md"
+    assert not user_shadow.exists()
+
+
+def test_dispatcher_identity_second_session_promotes(env):
+    """Day 3 checkpoint #2: second observation in a DIFFERENT session
+    crosses the threshold and promotes to USER-SHADOW.md."""
+    workspace = env
+    lesson = {
+        "class": "IDENTITY",
+        "lesson": "User prefers concise responses.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+    }
+    # First session — queued, no promotion.
+    lc._write_verified(workspace, _make_review_output_with([lesson]), meta=_meta("sess-1"), shadow=True)
+    user_shadow = workspace / "memories" / "USER-SHADOW.md"
+    assert not user_shadow.exists()
+    # Second session — distinct UUID, threshold met, promotion.
+    lc._write_verified(workspace, _make_review_output_with([lesson]), meta=_meta("sess-2"), shadow=True)
+    assert user_shadow.exists()
+    body = user_shadow.read_text(encoding="utf-8")
+    assert "User prefers concise responses." in body
+    assert "Sessions: 2" in body
+    # Audit reflects the promotion on the second pass:
+    audit = (workspace / "memories" / "MEMORY-SHADOW.md").read_text(encoding="utf-8")
+    assert "promoted to USER-SHADOW.md" in audit
+    # Queue marks the claim promoted:
+    from core.user_candidates import UserCandidateStore
+    from core.paths import user_candidates_path
+    queue = UserCandidateStore(user_candidates_path()).get(
+        "User prefers concise responses."
+    )
+    assert queue is not None
+    assert queue.promoted_to_user_md is True
+
+
+def test_dispatcher_identity_alias_path_attaches_to_existing_claim(env):
+    """LLM emits target.user_claim_alias to dedupe paraphrases. A
+    second-session observation aliased to an existing queue claim
+    must promote that claim (not create a fresh one) when the
+    threshold is met."""
+    workspace = env
+    # First session: fresh claim.
+    fresh = {
+        "class": "IDENTITY",
+        "lesson": "User prefers concise responses for direct factual questions.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+    }
+    lc._write_verified(workspace, _make_review_output_with([fresh]), meta=_meta("sess-1"), shadow=True)
+    # Second session: paraphrased claim aliased to the first.
+    aliased = {
+        "class": "IDENTITY",
+        "lesson": "User wants tight, no-preamble answers to direct queries.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+        "target": {
+            "user_claim_alias": "User prefers concise responses for direct factual questions.",
+        },
+    }
+    lc._write_verified(workspace, _make_review_output_with([aliased]), meta=_meta("sess-2"), shadow=True)
+    # The original claim got promoted (not the paraphrase):
+    user_shadow = workspace / "memories" / "USER-SHADOW.md"
+    assert user_shadow.exists()
+    body = user_shadow.read_text(encoding="utf-8")
+    assert "User prefers concise responses for direct factual questions." in body
+    assert "User wants tight, no-preamble answers" not in body
+    # Queue has only one entry:
+    from core.user_candidates import UserCandidateStore
+    from core.paths import user_candidates_path
+    queue = UserCandidateStore(user_candidates_path()).list_all()
+    assert len(queue) == 1
+
+
+def test_housekeeping_expires_stale_user_candidates_periodically(env, monkeypatch):
+    """Day 3.5: every _HOUSEKEEPING_TICKS ticks the controller calls
+    expire_stale on the queue. Fresh observations stay; observations
+    older than the window are removed. Promoted claims are retained
+    even when stale (audit trail)."""
+    workspace = env
+    from core.paths import user_candidates_path
+    from core.user_candidates import UserCandidateStore, DEFAULT_WINDOW
+    # Seed a stale unpromoted claim and a stale-but-promoted claim.
+    store = UserCandidateStore(user_candidates_path())
+    far_past = _utc(hour=10) - DEFAULT_WINDOW - timedelta(days=1)
+    store.add_occurrence("stale-pending", "old-sess", "ev", now=far_past)
+    store.add_occurrence("stale-promoted", "old-sess", "ev", now=far_past)
+    store.add_occurrence("stale-promoted", "other-old", "ev", now=far_past)
+    store.mark_promoted("stale-promoted", now=far_past)
+    # Pre-flight: both exist.
+    assert store.get("stale-pending") is not None
+    assert store.get("stale-promoted") is not None
+
+    # Run the controller's tick a few times — each call to _run_once
+    # increments the tick counter; housekeeping fires when count %
+    # _HOUSEKEEPING_TICKS == 0.
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=12))
+    controller = LearningController(workspace=workspace, review_fn=_stub_review_fn)
+    for _ in range(controller._HOUSEKEEPING_TICKS):
+        controller._run_once()
+
+    # Stale unpromoted claim removed; promoted claim retained.
+    after = UserCandidateStore(user_candidates_path())
+    assert after.get("stale-pending") is None
+    assert after.get("stale-promoted") is not None
+
+
+def test_tick_report_includes_write_summary_fields(env, monkeypatch):
+    """Day 5: per-tick REPORT.md and run.json carry the new
+    classification / tier / dedup / queue counts so the user can
+    audit what the curator did this tick."""
+    workspace = env
+    _stage_session(workspace, "abc", "2026-05-02T10:00:00Z")
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+
+    # Stub returns a full WriteSummary so we know exactly what
+    # numbers should land in the report.
+    summary = lc.WriteSummary(
+        written=2,
+        by_class={"PROCEDURAL": 1, "SITUATIONAL": 1},
+        by_tier={"S3": 1, "MEM": 1},
+        dedup_skipped=1,
+        queue_added=0,
+        queue_promoted=0,
+        stage_refused=0,
+    )
+
+    def stub(workspace, meta):
+        return ("stub: 2 entries", summary)
+
+    controller = LearningController(workspace=workspace, review_fn=stub)
+    controller.run_now()
+
+    # Most-recent log dir
+    from core.paths import learning_logs_dir
+    tick_dirs = sorted(learning_logs_dir().iterdir(), reverse=True)
+    assert tick_dirs, "expected at least one tick log dir"
+    report_md = (tick_dirs[0] / "REPORT.md").read_text(encoding="utf-8")
+    assert "Write summary (Day 5)" in report_md
+    assert "total written: 2" in report_md
+    assert "PROCEDURAL=1" in report_md
+    assert "SITUATIONAL=1" in report_md
+    assert "S3=1" in report_md
+    assert "MEM=1" in report_md
+    assert "dedup-skipped (memory): 1" in report_md
+    # And run.json carries the structured form:
+    run_json = json.loads((tick_dirs[0] / "run.json").read_text(encoding="utf-8"))
+    assert run_json["summary"]["written"] == 2
+    assert run_json["summary"]["by_class"]["PROCEDURAL"] == 1
+    assert run_json["summary"]["dedup_skipped"] == 1
+
+
+def test_audit_text_surfaces_curator_authored_skills(env, monkeypatch):
+    """Day 5: /learning audit lists skills carrying
+    ``origin: learning-curator*`` in their YAML frontmatter so the
+    user can see what's been promoted vs hand-authored."""
+    workspace = env
+    from core.skills import create_skill
+    from core.paths import skills_dir
+    create_skill(
+        skills_dir(workspace),
+        "curator-made",
+        (
+            "---\n"
+            "name: curator-made\n"
+            "description: D.\n"
+            "origin: learning-curator\n"
+            "---\n\nB\n"
+        ),
+    )
+    create_skill(
+        skills_dir(workspace),
+        "hand-made",
+        "---\nname: hand-made\ndescription: D.\n---\n\nB\n",
+    )
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+    controller = LearningController(workspace=workspace, review_fn=_stub_review_fn)
+    audit = controller._audit_text()
+    assert "Curator-authored skills:" in audit
+    assert "curator-made" in audit
+    assert "hand-made" not in audit  # only the origin-tagged one shows
+
+
+def test_audit_text_surfaces_user_candidate_queue(env, monkeypatch):
+    """Day 5: /learning audit shows pending USER claims with
+    distinct-session count and days-until-expiry."""
+    workspace = env
+    from core.user_candidates import UserCandidateStore
+    from core.paths import user_candidates_path
+    store = UserCandidateStore(user_candidates_path())
+    store.add_occurrence("User prefers terse responses.", "sess-1", "ev",
+                         now=_utc(hour=10))
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+    controller = LearningController(workspace=workspace, review_fn=_stub_review_fn)
+    audit = controller._audit_text()
+    assert "USER candidate queue:" in audit
+    assert "User prefers terse responses." in audit
+    assert "1/2 sessions" in audit
+    assert "until expiry" in audit
+
+
+def test_audit_text_surfaces_recent_dedup_count(env, monkeypatch):
+    """Day 5: /learning audit aggregates the dedup_skipped count
+    from recent tick reports so the user can spot when the dedup
+    gate is firing often (signal to retune the prompt)."""
+    workspace = env
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+
+    # Run two ticks with a stub that simulates dedup-skipped counts.
+    summary1 = lc.WriteSummary(written=1, dedup_skipped=2)
+    summary2 = lc.WriteSummary(written=0, dedup_skipped=1)
+
+    def stub_with(s):
+        def _stub(workspace, meta):
+            return ("stub", s)
+        return _stub
+
+    _stage_session(workspace, "tick-a", "2026-05-02T10:00:00Z")
+    LearningController(workspace=workspace, review_fn=stub_with(summary1)).run_now()
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=12))
+    _stage_session(workspace, "tick-b", "2026-05-02T11:30:00Z")
+    LearningController(workspace=workspace, review_fn=stub_with(summary2)).run_now()
+
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=13))
+    audit = LearningController(
+        workspace=workspace, review_fn=_stub_review_fn,
+    )._audit_text()
+    assert "Dedup gate" in audit
+    # 2 + 1 = 3 dedup skips across both tick reports
+    assert "3 candidate(s) skipped" in audit
+
+
+def test_dispatcher_identity_alias_to_unknown_claim_falls_back_to_fresh(env):
+    """If the LLM hallucinates an alias target that doesn't exist in
+    the queue, the dispatcher falls back to fresh insertion under
+    the lesson's own text rather than dropping the observation."""
+    workspace = env
+    lesson = {
+        "class": "IDENTITY",
+        "lesson": "User prefers concise responses.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+        "target": {"user_claim_alias": "Nonexistent claim that was never seen."},
+    }
+    lc._write_verified(workspace, _make_review_output_with([lesson]), meta=_meta("sess-1"), shadow=True)
+    from core.user_candidates import UserCandidateStore
+    from core.paths import user_candidates_path
+    queue = UserCandidateStore(user_candidates_path()).list_all()
+    # Fresh claim under the lesson's own text:
+    assert len(queue) == 1
+    assert queue[0].claim == "User prefers concise responses."
+
+
+def test_dispatcher_records_failed_stage_in_audit(env):
+    """If skill staging refuses (e.g. live-tree collision for an S3),
+    the dispatcher records the refusal in MEMORY-SHADOW.md so the
+    user can see what the curator tried and why — but does NOT
+    increment the written count."""
+    workspace = env
+    # Set up a live collision so the S3 stage will refuse:
+    from core.skills import create_skill
+    from core.paths import skills_dir
+    create_skill(
+        skills_dir(workspace),
+        "occupied-name",
+        "---\nname: occupied-name\ndescription: D.\n---\n\nB\n",
+    )
+    lesson = {
+        "class": "PROCEDURAL",
+        "lesson": "Some procedural rule.",
+        "evidence": "filter to upcoming items only please",
+        "scope": "x",
+        "tier": "S3",
+        "target": {
+            "skill_name": "occupied-name",
+            "new_skill_body": (
+                "---\nname: occupied-name\ndescription: D.\n"
+                "origin: learning-curator\n---\n\nB\n"
+            ),
+        },
+    }
+    written = lc._write_verified(
+        workspace, _make_review_output_with([lesson]), meta=_meta(), shadow=True
+    )
+    assert written.written == 0  # the collision means nothing got staged
+    assert written.stage_refused == 1  # … and the refusal was tallied
+    audit = (workspace / "memories" / "MEMORY-SHADOW.md").read_text(encoding="utf-8")
+    assert "Stage refused:" in audit
+    assert "occupied-name" in audit
+
+
+def test_format_lesson_entry_v2_metadata():
+    """The audit entry surfaces Class + Tier (and skill-name / paths
+    for the readable variant) so a user reviewing MEMORY-SHADOW.md
+    can see what the curator INTENDED to write."""
+    lesson = {
+        "class": "PROCEDURAL",
+        "lesson": "X",
+        "evidence": "Y",
+        "scope": "Z",
+        "tier": "S3",
+        "target": {"skill_name": "fresh-skill", "new_skill_body": "..."},
+    }
+    rendered = lc._format_lesson_entry(lesson)
+    assert "Class: PROCEDURAL" in rendered
+    assert "Tier: S3" in rendered
+    assert "fresh-skill" in rendered
+
+
+def test_format_lesson_entry_legacy_v1_shape_renders():
+    """v1-shape entries (no class) still render legibly via the
+    legacy three-line layout — defense-in-depth for reading any
+    pre-v2 entries already in the shadow file."""
+    lesson = {"lesson": "old style", "evidence": "ev", "scope": "sc"}
+    rendered = lc._format_lesson_entry(lesson)
+    assert "old style" in rendered
+    assert "Scope: sc" in rendered
+    assert "Evidence: ev" in rendered
+    assert "Class:" not in rendered
+    assert "Tier:" not in rendered

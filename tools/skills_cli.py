@@ -26,7 +26,9 @@ Subcommands map 1:1 to the spec's "skill_manage" actions plus
     vexis-skill remove-file <name> --file <relpath>
     vexis-skill archive <name>
     vexis-skill restore <name>
-    vexis-skill render-index    # debug: prints the index block
+    vexis-skill render-index           # debug: prints the index block
+    vexis-skill flip-shadow [--all|--skill NAME] [--dry-run]
+    vexis-skill list-staged            # show what's staged in .shadow/
 """
 
 from __future__ import annotations
@@ -37,6 +39,10 @@ import os
 import sys
 from pathlib import Path
 
+from core.learning_writes import (
+    flip_shadow_to_live,
+    list_staged_skills,
+)
 from core.paths import skills_dir, workspace_dir
 from core.skills import (
     OpResult,
@@ -150,6 +156,90 @@ def _cmd_render_index() -> int:
     return 0
 
 
+def _workspace() -> Path:
+    """The current workspace, used by flip-shadow operations.
+
+    skills_dir(workspace) is what _root() already returns, but the
+    learning_writes module wants the workspace itself so it can
+    locate the staging tree alongside the live skill tree.
+    """
+    return workspace_dir(os.environ.get("VEXIS_WORKSPACE", "~/vexis-workspace"))
+
+
+def _cmd_flip_shadow(only_skill: str | None, dry_run: bool) -> int:
+    """Move staged skills from .shadow/ into the live tree.
+
+    With ``--dry-run``, lists what would be flipped without touching
+    the live tree (useful before a real flip when the user is
+    reviewing the staging area).
+    """
+    workspace = _workspace()
+    if dry_run:
+        staged = list_staged_skills(workspace)
+        if only_skill is not None:
+            staged = [s for s in staged if s.name == only_skill]
+        payload = {
+            "dry_run": True,
+            "would_flip": [
+                {
+                    "name": s.name,
+                    "is_new_skill": s.live_dir is None,
+                    "staged_dir": str(s.staged_dir),
+                    "support_files": [str(p) for p in s.support_files],
+                    "has_skill_md": s.has_skill_md,
+                }
+                for s in staged
+            ],
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    results = flip_shadow_to_live(workspace, only_skill=only_skill)
+    if not results:
+        print(json.dumps(
+            {"success": True, "message": "No staged skills to flip.", "flips": []},
+            ensure_ascii=False,
+        ))
+        return 0
+    payload = {
+        "success": all(r.ok for r in results),
+        "flips": [
+            {
+                "name": r.skill_name,
+                "ok": r.ok,
+                "message": r.message,
+                "files_copied": r.files_copied,
+                "is_new_skill": r.is_new_skill,
+            }
+            for r in results
+        ],
+    }
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0 if payload["success"] else 1
+
+
+def _cmd_list_staged() -> int:
+    """Inspect the staging tree without flipping. Pairs with
+    flip-shadow's --dry-run mode but suitable for separate audit
+    callers (e.g. /learning audit Telegram surface)."""
+    workspace = _workspace()
+    staged = list_staged_skills(workspace)
+    payload = {
+        "staged": [
+            {
+                "name": s.name,
+                "is_new_skill": s.live_dir is None,
+                "staged_dir": str(s.staged_dir),
+                "live_dir": str(s.live_dir) if s.live_dir else None,
+                "has_skill_md": s.has_skill_md,
+                "support_files": [str(p) for p in s.support_files],
+            }
+            for s in staged
+        ]
+    }
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="vexis-skill",
@@ -205,6 +295,37 @@ def main() -> int:
 
     sub.add_parser("render-index")
 
+    p_flip = sub.add_parser(
+        "flip-shadow",
+        help="Move staged skills from .shadow/ into the live tree",
+    )
+    flip_target = p_flip.add_mutually_exclusive_group()
+    flip_target.add_argument(
+        "--all",
+        dest="flip_all",
+        action="store_true",
+        default=False,
+        help="Flip every staged skill (default if --skill not given)",
+    )
+    flip_target.add_argument(
+        "--skill",
+        dest="flip_skill",
+        default=None,
+        help="Flip only the named staged skill",
+    )
+    p_flip.add_argument(
+        "--dry-run",
+        dest="flip_dry_run",
+        action="store_true",
+        default=False,
+        help="Show what would be flipped without touching the live tree",
+    )
+
+    sub.add_parser(
+        "list-staged",
+        help="Inspect the staging tree contents (no live-tree changes)",
+    )
+
     args = parser.parse_args()
 
     if _is_curator_context() and args.cmd in CURATOR_BLOCKED_VERBS:
@@ -247,6 +368,10 @@ def main() -> int:
         return _cmd_restore(args.name)
     if args.cmd == "render-index":
         return _cmd_render_index()
+    if args.cmd == "flip-shadow":
+        return _cmd_flip_shadow(args.flip_skill, args.flip_dry_run)
+    if args.cmd == "list-staged":
+        return _cmd_list_staged()
     return 2
 
 

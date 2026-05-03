@@ -117,3 +117,16 @@ def learning_logs_dir() -> Path:
     path = vexis_dir() / "logs" / "learning"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def user_candidates_path() -> Path:
+    """`~/.vexis/learning/user_candidates.json`. Day 3 queue file.
+
+    Holds pending IDENTITY claims awaiting the cross-session
+    threshold (≥2 distinct sessions in a 30-day window) before
+    promotion to USER.md. Sibling of reviewed.json — same locking
+    model, same parent directory.
+    """
+    parent = vexis_dir() / "learning"
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent / "user_candidates.json"
