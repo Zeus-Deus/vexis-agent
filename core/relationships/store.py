@@ -113,7 +113,23 @@ class Fact:
 
 @dataclass(frozen=True)
 class Person:
-    """One H2 section in a relationships file."""
+    """One H2 section in a relationships file.
+
+    ``coherence_block`` is a sticky shadow flag set when promotion
+    has been blocked by a coherence-related condition. Values:
+
+      - ``"missing_transcript"``: source turn JSONL not findable
+        (e.g. synthetic Telegram session_uuid in Day 2 — full
+        brain-session-UUID handoff is Day 3 scope). Entry stays
+        in shadow; promotion is deterministically refused without
+        invoking the judge subprocess.
+      - ``"incoherent"``: judge returned INCOHERENT (reserved for
+        the case where the entry stays in shadow rather than being
+        dropped — Day 2 currently leaves this implicit and just
+        records a drop event, but the field is here for forward-
+        compat with the dashboard's "blocked-pending review" view).
+      - ``None``: no block.
+    """
 
     slug: str
     display_name: str
@@ -125,6 +141,7 @@ class Person:
     pending: bool = False
     staged_at: str | None = None
     source_turn_index: int | None = None
+    coherence_block: str | None = None
 
     def heading(self) -> str:
         if self.qualifier:
@@ -146,6 +163,8 @@ class Person:
                 yaml_payload["staged_at"] = self.staged_at
             if self.source_turn_index is not None:
                 yaml_payload["source_turn_index"] = self.source_turn_index
+            if self.coherence_block:
+                yaml_payload["coherence_block"] = self.coherence_block
         yaml_text = yaml.safe_dump(
             yaml_payload, sort_keys=False, allow_unicode=True
         ).rstrip("\n")
@@ -270,6 +289,11 @@ def parse_relationships_file(text: str) -> list[Person]:
                     if isinstance(payload.get("source_turn_index"), int)
                     else None
                 ),
+                coherence_block=(
+                    str(payload.get("coherence_block")).strip()
+                    if payload.get("coherence_block") not in (None, "")
+                    else None
+                ),
             )
         )
     return people
@@ -331,12 +355,19 @@ class StoreResult:
 class RelationshipsStore:
     """Token-gated writes to RELATIONSHIPS.md / RELATIONSHIPS-SHADOW.md.
 
-    Every write requires a verified ``ConsentToken``. The store does
-    NOT itself verify the token — verification happens at the call
-    site in ``core/relationships/curator.py``, which is also the
-    only place that mints tokens. The store holds the file-shape
-    invariants (slug uniqueness within a file, per-fact provenance
-    pins, shadow vs live serialization differences).
+    Every write requires a verified ``ConsentToken`` passed
+    explicitly to ``stage`` / ``promote``. The store ALSO re-runs
+    the verify (defense in depth) — even though the curator caller
+    typically verifies upstream, a future second caller (Day 3
+    edit/delete, dashboard PATCH, any later code) cannot silently
+    bypass the token check by skipping the curator. The verify is
+    centralized in ``core.relationships.consent.verify_for_promotion``
+    and raises ``ConsentError`` (a ``PermissionError`` subclass) on
+    any violation; the store never catches.
+
+    The store holds the file-shape invariants (slug uniqueness
+    within a file, per-fact provenance pins, shadow vs live
+    serialization differences, the coherence_block flag).
     """
 
     def __init__(self, workspace: Path) -> None:
@@ -364,15 +395,22 @@ class RelationshipsStore:
                 return p
         return None
 
-    # ----- write paths (token already verified upstream) -----
+    # ----- write paths (token verification enforced HERE) -----
 
-    def stage(self, person: Person) -> StoreResult:
+    def stage(self, person: Person, *, token) -> StoreResult:
         """Append/replace a person in the SHADOW file.
 
-        Caller has already verified the ConsentToken and confirmed
-        the new facts pass the sensitive scanner. Sets
-        ``pending=True`` if not already.
+        Verifies the ConsentToken against the staged person's slug
+        and fact set. Sets ``pending=True`` if not already.
         """
+        # Lazy import to avoid a circular dep (consent imports
+        # nothing from store, but a future change might).
+        from core.relationships.consent import verify_for_promotion
+        verify_for_promotion(
+            token,
+            person_slug=person.slug,
+            facts=[f.text for f in person.facts],
+        )
         if not person.pending:
             person = replace(person, pending=True)
         people = self.list_shadow()
@@ -384,13 +422,40 @@ class RelationshipsStore:
             person_slug=person.slug,
         )
 
-    def promote(self, slug: str) -> StoreResult:
+    def update_shadow_flag(
+        self, slug: str, *, coherence_block: str | None
+    ) -> StoreResult:
+        """Set or clear the ``coherence_block`` field on a shadow
+        entry without touching its facts. NOT a write of new
+        relationships content — token check does not apply (this
+        only mutates a curator-owned diagnostic flag, never user
+        data). Used by ``RelationshipsCurator._promote_one`` to
+        record a missing-transcript or incoherent block."""
+        people = self.list_shadow()
+        match = next((p for p in people if p.slug == slug), None)
+        if match is None:
+            return StoreResult(
+                ok=False,
+                message=f"no shadow entry for slug={slug!r}",
+                person_slug=slug,
+            )
+        updated = replace(match, coherence_block=coherence_block)
+        people = [p for p in people if p.slug != slug] + [updated]
+        _write_people(self._shadow_path, people, kind="shadow")
+        return StoreResult(
+            ok=True,
+            message=f"updated coherence_block={coherence_block!r} for {slug}",
+            person_slug=slug,
+        )
+
+    def promote(self, slug: str, *, token) -> StoreResult:
         """Move a SHADOW person into LIVE.
 
-        Caller has already token-verified, coherence-judged, and
-        sensitive-scanned. Removes ``pending`` flag; rewrites
-        provenance pins from ``staged`` to ``confirmed``.
+        Verifies the ConsentToken against the shadow person's slug
+        and fact set BEFORE writing. Removes ``pending`` flag;
+        rewrites provenance pins from ``staged`` to ``confirmed``.
         """
+        from core.relationships.consent import verify_for_promotion
         shadow_people = self.list_shadow()
         match = next((p for p in shadow_people if p.slug == slug), None)
         if match is None:
@@ -399,6 +464,14 @@ class RelationshipsStore:
                 message=f"no shadow entry for slug={slug!r}",
                 person_slug=slug,
             )
+        # Defense-in-depth: the curator already verified upstream,
+        # but the store cannot trust its caller to do so. Verify
+        # again here against the shadow's own fact set.
+        verify_for_promotion(
+            token,
+            person_slug=slug,
+            facts=[f.text for f in match.facts],
+        )
         promoted_facts = tuple(
             replace(f, staged=False) for f in match.facts
         )

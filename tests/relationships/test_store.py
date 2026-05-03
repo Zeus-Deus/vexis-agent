@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from core.relationships.consent import ConsentError, mint
 from core.relationships.store import (
     Fact,
     Person,
@@ -15,6 +16,17 @@ from core.relationships.store import (
     relationships_shadow_path,
     serialize_relationships_file,
 )
+
+
+def _mint_for(person: Person):
+    """Helper: mint a token covering the given person's facts."""
+    return mint(
+        session_uuid=person.source_session or "sess-stub",
+        turn_index=person.source_turn_index or 1,
+        classifier_verdict="ADD",
+        person_slug=person.slug,
+        facts=[f.text for f in person.facts],
+    )
 
 
 @pytest.fixture
@@ -105,7 +117,7 @@ def test_two_people_same_first_name_different_slugs(workspace: Path):
 def test_store_stage_writes_to_shadow(workspace: Path):
     store = RelationshipsStore(workspace)
     p = _sample_person(staged=True)
-    res = store.stage(p)
+    res = store.stage(p, token=_mint_for(p))
     assert res.ok
     assert relationships_shadow_path(workspace).exists()
     assert not relationships_live_path(workspace).exists()
@@ -117,8 +129,10 @@ def test_store_stage_writes_to_shadow(workspace: Path):
 
 def test_store_promote_moves_shadow_to_live_and_flips_pins(workspace: Path):
     store = RelationshipsStore(workspace)
-    store.stage(_sample_person(staged=True))
-    res = store.promote("sarah")
+    p = _sample_person(staged=True)
+    tok = _mint_for(p)
+    store.stage(p, token=tok)
+    res = store.promote("sarah", token=tok)
     assert res.ok
     # Shadow now empty for sarah, live has it.
     assert store.get_shadow("sarah") is None
@@ -145,8 +159,10 @@ def test_store_promote_merges_into_existing_live_person(workspace: Path):
         relationships_live_path(workspace), [pre], kind="live"
     )
     # Now stage + promote a new shadow entry with two new facts.
-    store.stage(_sample_person(staged=True))
-    res = store.promote("sarah")
+    p = _sample_person(staged=True)
+    tok = _mint_for(p)
+    store.stage(p, token=tok)
+    res = store.promote("sarah", token=tok)
     assert res.ok
     live = store.get_live("sarah")
     assert live is not None
@@ -156,7 +172,8 @@ def test_store_promote_merges_into_existing_live_person(workspace: Path):
 
 def test_store_drop_shadow(workspace: Path):
     store = RelationshipsStore(workspace)
-    store.stage(_sample_person(staged=True))
+    p = _sample_person(staged=True)
+    store.stage(p, token=_mint_for(p))
     res = store.drop_shadow("sarah", reason="test")
     assert res.ok
     assert store.get_shadow("sarah") is None
@@ -196,6 +213,125 @@ source_session: g123
 
 def test_parser_handles_empty_input():
     assert parse_relationships_file("") == []
+
+
+# --------------------------------------------------------------------
+# Defense-in-depth: store re-verifies tokens (Ask 3 from Day 2 review).
+# --------------------------------------------------------------------
+
+
+def test_store_write_requires_token(workspace: Path):
+    """RelationshipsStore.stage / .promote refuse to write without
+    a verified ConsentToken, even if the curator caller forgets to
+    verify upstream. Mirrors the R1 pattern from
+    MemoryStore.add(target='relationships', ...).
+
+    Asserts the signature won't accept a positional-only call AND
+    that ConsentError (PermissionError subclass) is raised on
+    missing / mismatched tokens at the store level."""
+    store = RelationshipsStore(workspace)
+    p = _sample_person(staged=True)
+
+    # Missing token kwarg — TypeError from the kw-only signature.
+    with pytest.raises(TypeError):
+        store.stage(p)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        store.promote("sarah")  # type: ignore[call-arg]
+
+    # token=None — ConsentError from verify_for_promotion.
+    with pytest.raises(ConsentError, match="no consent token"):
+        store.stage(p, token=None)
+
+
+def test_store_promote_verifies_token_against_shadow_facts(
+    workspace: Path,
+):
+    """Token issued for one set of facts cannot promote a tampered
+    shadow entry that contains a fact the token doesn't cover."""
+    store = RelationshipsStore(workspace)
+    # Stage with the legitimate token.
+    p = _sample_person(staged=True)
+    legitimate = _mint_for(p)
+    store.stage(p, token=legitimate)
+    # Now manually tamper the shadow file to add an extra fact.
+    tampered = Person(
+        slug="sarah",
+        display_name="Sarah",
+        relationship="friend",
+        qualifier=None,
+        last_confirmed="2026-05-04",
+        source_session=p.source_session,
+        facts=p.facts + (
+            Fact(
+                text="extra hostile fact",
+                confirmed_date="2026-05-04",
+                source_session_short="abcdef12",
+                staged=True,
+            ),
+        ),
+        pending=True,
+        staged_at=p.staged_at,
+        source_turn_index=p.source_turn_index,
+    )
+    from core.relationships.store import _write_people
+    _write_people(
+        relationships_shadow_path(workspace), [tampered], kind="shadow",
+    )
+    with pytest.raises(ConsentError, match="does not cover"):
+        store.promote("sarah", token=legitimate)
+
+
+def test_store_stage_rejects_wrong_person_slug(workspace: Path):
+    """A token minted for slug A cannot stage a person at slug B."""
+    store = RelationshipsStore(workspace)
+    p = _sample_person(staged=True)  # slug=sarah
+    wrong_token = mint(
+        session_uuid=p.source_session,
+        turn_index=p.source_turn_index or 1,
+        classifier_verdict="ADD",
+        person_slug="marco",  # mismatch
+        facts=[f.text for f in p.facts],
+    )
+    with pytest.raises(ConsentError, match="person_slug mismatch"):
+        store.stage(p, token=wrong_token)
+
+
+def test_update_shadow_flag_does_not_require_token(workspace: Path):
+    """The coherence_block flag is a curator-internal diagnostic;
+    setting it is not a write of new content. Token check does
+    not apply (would otherwise stop the missing-transcript guard
+    in RelationshipsCurator from working at all)."""
+    store = RelationshipsStore(workspace)
+    p = _sample_person(staged=True)
+    store.stage(p, token=_mint_for(p))
+    # No token kwarg — should succeed.
+    res = store.update_shadow_flag("sarah", coherence_block="missing_transcript")
+    assert res.ok
+    refetched = store.get_shadow("sarah")
+    assert refetched is not None
+    assert refetched.coherence_block == "missing_transcript"
+
+
+def test_coherence_block_field_round_trips(workspace: Path):
+    """Parser + serializer preserve the coherence_block YAML field."""
+    p = Person(
+        slug="anna",
+        display_name="Anna",
+        relationship="friend",
+        qualifier="friend",
+        last_confirmed="2026-05-04",
+        source_session="telegram-chat-99",
+        facts=(Fact("likes hiking", "2026-05-04", "telegram", staged=True),),
+        pending=True,
+        staged_at="2026-05-04T12:00:00Z",
+        source_turn_index=4,
+        coherence_block="missing_transcript",
+    )
+    text = serialize_relationships_file([p], kind="shadow")
+    assert "coherence_block: missing_transcript" in text
+    parsed = parse_relationships_file(text)
+    assert len(parsed) == 1
+    assert parsed[0].coherence_block == "missing_transcript"
 
 
 def test_supersede_provenance_round_trip():

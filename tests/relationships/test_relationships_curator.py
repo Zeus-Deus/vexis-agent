@@ -26,6 +26,7 @@ from core.relationships.store import (
     Fact,
     Person,
     RelationshipsStore,
+    _write_people,
     relationships_live_path,
     relationships_shadow_path,
 )
@@ -202,7 +203,10 @@ def test_turn_level_delete_raises_not_implemented(workspace: Path):
 
 def test_tick_promote_happy_path(workspace: Path):
     """ADD trigger → shadow → tick-promote (coherence COHERENT,
-    no sensitive hit) → live."""
+    no sensitive hit) → live. Stages a source JSONL so the
+    Day-2-completion missing-transcript guard does not pre-empt
+    the judge call."""
+    _stage_source_jsonl(workspace, "sess-promote", "remember Sarah likes jazz")
     classifier_verdict = TriggerVerdict(
         verdict="ADD", person_name="Sarah", qualifier="friend",
         facts=("likes jazz",), confidence=0.95, matched_pattern_id="ADD-1",
@@ -245,6 +249,9 @@ def test_tick_promote_blocks_on_incoherent_judge(workspace: Path):
         reason="contradicts-window",
         explanation="user said 'I have no siblings' two turns earlier",
     )
+    _stage_source_jsonl(
+        workspace, "sess-cj3", "remember my sister Sarah hates jazz"
+    )
     curator = RelationshipsCurator(
         workspace=workspace,
         classifier_call=_stub_classifier(classifier_verdict),
@@ -272,6 +279,10 @@ def test_tick_promote_blocks_on_incoherent_judge(workspace: Path):
 def test_tick_promote_blocks_on_sensitive_hit(workspace: Path):
     """C-X1 analog: shadow entry contains a fact that the medical
     pattern catches at promote-time. BLOCKS promotion."""
+    _stage_source_jsonl(
+        workspace, "sess-med",
+        "remember that my coworker Marco is on prescription antidepressants",
+    )
     classifier_verdict = TriggerVerdict(
         verdict="ADD", person_name="Marco", qualifier="coworker",
         facts=("is on prescription antidepressants",),
@@ -318,13 +329,94 @@ def test_tick_promote_blocks_on_missing_token(workspace: Path):
         staged_at="2026-05-04T00:00:00Z",
         source_turn_index=1,
     )
-    curator.store.stage(person)
+    # Simulate "shadow file survived daemon restart, in-memory
+    # tokens lost" by writing the file at the storage layer
+    # directly (the curator-facing store.stage now requires a
+    # token, which is exactly what we're saying isn't here).
+    _write_people(
+        relationships_shadow_path(workspace), [person], kind="shadow",
+    )
     results = curator.tick_promote_pending()
     assert len(results) == 1
     assert results[0].promoted is False
     assert results[0].blocked_by == "missing-token"
     # Shadow still has the entry.
     assert len(curator.store.list_shadow()) == 1
+
+
+# --------------------------------------------------------------------
+# Ask 2 (Day 2 completion): missing-transcript guard. Synthetic
+# Telegram session_uuid → no JSONL on disk → curator MUST block
+# promotion deterministically rather than spawn the judge against
+# an empty transcript window.
+# --------------------------------------------------------------------
+
+
+def test_tick_promote_blocks_on_missing_transcript_for_telegram_synthetic_uuid(
+    workspace: Path,
+):
+    """Walks the real Telegram-triggered ADD code path:
+
+    1. Trigger detector fires, mints token, writes pending shadow
+       entry with source_session = 'telegram-chat-99' (no JSONL on
+       disk for that synthetic id).
+    2. Tick fires, RelationshipsCurator picks up the pending entry.
+    3. Token-presence check passes (we just minted it).
+    4. The curator pre-empts the judge call because source_msg is
+       None (no JSONL). Sets coherence_block = 'missing_transcript'
+       on the shadow entry, records a drop event, returns
+       PromoteResult(blocked_by='missing-transcript').
+
+    Asserts the entry stays in shadow with the flag, judge is NEVER
+    invoked (would otherwise spawn a real claude -p subprocess in
+    degraded mode), and a REPORT.md row is recorded."""
+    judge_calls = 0
+
+    def _spy_judge(workspace, lesson, messages, **kwargs):
+        nonlocal judge_calls
+        judge_calls += 1
+        return CoherenceVerdict.coherent()  # would be vacuous here
+
+    classifier_verdict = TriggerVerdict(
+        verdict="ADD", person_name="Sarah", qualifier="coworker",
+        facts=("likes mystery novels",), confidence=0.95,
+        matched_pattern_id="ADD-1",
+    )
+    curator = RelationshipsCurator(
+        workspace=workspace,
+        classifier_call=_stub_classifier(classifier_verdict),
+        coherence_judge=_spy_judge,
+    )
+    # Drive the turn-level path with a synthetic Telegram session_uuid.
+    asyncio.run(
+        curator.process_user_turn(
+            "remember my coworker Sarah likes mystery novels",
+            session_uuid="telegram-chat-99",  # no JSONL on disk
+            turn_index=1,
+        )
+    )
+    # Tick fires.
+    results = curator.tick_promote_pending()
+    assert len(results) == 1
+    assert results[0].promoted is False
+    assert results[0].blocked_by == "missing-transcript"
+    # Judge was NEVER invoked.
+    assert judge_calls == 0
+    # Shadow still holds the entry.
+    shadow = curator.store.list_shadow()
+    assert len(shadow) == 1
+    assert shadow[0].slug == "sarah"
+    # The shadow entry now carries the coherence_block flag.
+    assert shadow[0].coherence_block == "missing_transcript"
+    # Live empty.
+    assert curator.store.list_live() == []
+    # REPORT.md drop event recorded.
+    drops = curator.drain_drop_events()
+    assert any(d.reason == "coherence-missing-transcript" for d in drops)
+    # Token still in registry — entry is blocked, not dropped, so
+    # a future tick (e.g. once the JSONL becomes loadable via the
+    # Day 3 brain-session-UUID handoff) can retry.
+    assert len(curator.tokens) == 1
 
 
 # --------------------------------------------------------------------
@@ -448,7 +540,13 @@ def test_restart_recovery_drops_on_missing_source(workspace: Path):
         staged_at="2026-05-04T00:00:00Z",
         source_turn_index=1,
     )
-    curator.store.stage(person)
+    # Simulate "shadow file survived daemon restart, in-memory
+    # tokens lost" by writing the file at the storage layer
+    # directly (the curator-facing store.stage now requires a
+    # token, which is exactly what we're saying isn't here).
+    _write_people(
+        relationships_shadow_path(workspace), [person], kind="shadow",
+    )
     recovered = asyncio.run(curator.recover_after_restart())
     assert len(recovered) == 1
     assert recovered[0].re_minted is False
@@ -480,7 +578,13 @@ def test_restart_recovery_is_one_shot(workspace: Path):
         facts=(Fact("likes jazz", "2026-05-04", "sessonce", staged=True),),
         pending=True, staged_at="2026-05-04T00:00:00Z", source_turn_index=1,
     )
-    curator.store.stage(person)
+    # Simulate "shadow file survived daemon restart, in-memory
+    # tokens lost" by writing the file at the storage layer
+    # directly (the curator-facing store.stage now requires a
+    # token, which is exactly what we're saying isn't here).
+    _write_people(
+        relationships_shadow_path(workspace), [person], kind="shadow",
+    )
     first = asyncio.run(curator.recover_after_restart())
     second = asyncio.run(curator.recover_after_restart())
     assert len(first) == 1

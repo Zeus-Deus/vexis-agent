@@ -309,7 +309,7 @@ class RelationshipsCurator:
             session_uuid=session_uuid,
             turn_index=turn_index,
         )
-        self._store.stage(person)
+        self._store.stage(person, token=token)
         n = len(verdict.facts)
         word = "fact" if n == 1 else "facts"
         reply = (
@@ -371,7 +371,36 @@ class RelationshipsCurator:
             person.source_session,
             person.source_turn_index or 0,
         )
-        evidence = source_msg.text if source_msg else ""
+        # Day 2 completion guard: if the source turn isn't loadable
+        # we MUST NOT spawn the judge. run_coherence_judge() with an
+        # empty messages list silently degrades to a no-window
+        # subprocess call — that's vacuous on a relationships-scope
+        # claim AND wastes a sonnet call per pending entry per tick.
+        # Block deterministically; mark the shadow entry so the
+        # dashboard / REPORT.md surface it; entry stays in shadow
+        # for a future tick (Day 3's brain-session-UUID handoff
+        # will make these source turns loadable again).
+        if source_msg is None:
+            self._store.update_shadow_flag(
+                slug, coherence_block="missing_transcript",
+            )
+            self._record_drop(
+                slug, "coherence-missing-transcript",
+                f"source JSONL not found for "
+                f"sess={person.source_session} "
+                f"turn={person.source_turn_index}",
+            )
+            return PromoteResult(
+                person_slug=slug,
+                promoted=False,
+                blocked_by="missing-transcript",
+                detail=(
+                    f"source turn unloadable "
+                    f"(sess={person.source_session}, "
+                    f"turn={person.source_turn_index}); judge skipped"
+                ),
+            )
+        evidence = source_msg.text
         # Concatenate facts as the lesson body — the judge sees
         # "did the user's turn justify these claims?"
         lesson_body = "; ".join(f.text for f in person.facts)
@@ -428,8 +457,10 @@ class RelationshipsCurator:
                     detail=f"scanner-hit: {hit}",
                 )
 
-        # 4. Promote.
-        promote_res: StoreResult = self._store.promote(slug)
+        # 4. Promote. The store re-verifies the token (defense in
+        # depth) — passes here since the curator already verified
+        # at step 1 and we re-use the same in-memory token.
+        promote_res: StoreResult = self._store.promote(slug, token=token)
         if not promote_res.ok:
             return PromoteResult(
                 person_slug=slug,
