@@ -22,6 +22,16 @@ This is a transport layer in front of Claude Code, not a new agent. Telegram in,
 ## Conventions
 - Single-user by design. No multi-tenancy.
 - Audit before changing. Read the relevant module fully before editing.
+- Eval runs (`scripts/eval_learning.py`) are expensive (~50 LLM calls per run). Only invoke when prompts or fixtures change. Treat as a release gate, not a CI step.
+
+## Model selection
+Internal subsystems (learning curator review, coherence judge,
+migration classifier) call `claude -p` with `--model sonnet` by
+default so they don't compete for plan tokens with the user-facing
+brain. The brain uses the account default. Configure under
+`models:` in `~/.vexis/config.yaml`; the literal value `default`
+means "no `--model` flag — let `claude -p` pick". See
+`core/yaml_config.py:model_*()` and `resolve_model_flag()`.
 
 ## Reference repos (clone to /tmp when needed)
 - `NousResearch/hermes-agent` — peek at gateway, skills, memory patterns. Never bulk-copy.
@@ -52,3 +62,24 @@ found to the right durable store by class:
 
 Pinned skills are read-only to the curator. Full design and routing
 prompts: `.plans/learning-curator-v2-research.md`.
+
+## Coherence curator (v3a)
+
+Third curator. Runs inline inside the learning curator's tick: for
+every verified lesson, a `claude -p` "judge" call decides whether
+the lesson body is properly grounded in the cited evidence string.
+Verdicts: COHERENT (silent), NEAR_MISS_REVIEW (soft annotation),
+INCOHERENT (hard `Coherence: FLAGGED (<reason>)` annotation in the
+shadow file). Advisory-only — never blocks a write.
+
+Surfaces:
+- inline `Coherence:` line in MEMORY-SHADOW.md / USER-SHADOW.md /
+  staged SKILL.md entries
+- `## Coherence flags` section in per-tick REPORT.md (omitted when
+  empty)
+- `Coherence flags (last N tick reports):` row in `/learning audit`
+- `summary.coherence = {flagged, near_miss, by_reason}` in `run.json`
+- `/learning coherence-audit [--shadow-only]` to re-judge already-
+  promoted entries on demand (degraded mode — no transcript)
+
+Full design and prompts: `.plans/coherence-curator-research.md`.

@@ -49,9 +49,14 @@ from pathlib import Path
 # Allow `./venv-python scripts/eval_learning.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core.coherence_judge import (  # noqa: E402
+    CoherenceVerdict,
+    run_coherence_judge,
+)
 from core.learning_review import run_review  # noqa: E402
 from core.transcripts import (  # noqa: E402
     SessionMeta,
+    TranscriptMessage,
     claude_session_jsonl_dir,
     iter_messages,
 )
@@ -526,18 +531,25 @@ class EvalReport:
         d = sum(1 for s in self.scenarios if s.g8_user_threshold_respected is not None)
         return n, d
 
+    # v3a Day 3 — C-grade results live alongside G-grades in the
+    # same EvalReport so the CLI prints one combined PASS/FAIL line.
+    coherence: "CoherenceEvalReport | None" = None
+
     @property
     def passes_bar(self) -> bool:
-        """Pass criteria per v2 doc §4.3:
+        """Pass criteria per v2 doc §4.3 + v3a doc §4.1:
           G1 / G2 / G4 / G5 / G6 / G7 / G8 = strict (full denominator).
           G3 ≥ 6/8 (relaxed because new IDENTITY/dedup scenarios
           don't naturally fit the same-class probe shape).
+          C1 / C2 = strict (3/3 known-bad caught, 5/5 known-good clean).
+          C3 ≥ 2/3 with hard-fail guards (no INCOHERENT on a COHERENT-
+          expected fixture, no COHERENT on the sarcasm fixture).
         """
         n_total = len(self.scenarios)
         # G3 is gated only over the scenarios that have probes.
         g3_d = self.g3[1]
         g3_pass = (g3_d > 0 and self.g3[0] / g3_d >= 6 / 8) if g3_d else True
-        return (
+        g_passes = (
             self.g1[0] == n_total
             and self.g2[0] == n_total
             and g3_pass
@@ -547,6 +559,236 @@ class EvalReport:
             and self.g7[0] == self.g7[1] and self.g7[1] > 0
             and self.g8[0] == self.g8[1] and self.g8[1] > 0
         )
+        # When the coherence eval ran, it must also pass; when the
+        # caller skipped it (--no-coherence), the report still passes
+        # on G-grades alone. The default driver always runs both.
+        c_passes = self.coherence.passes_bar if self.coherence else True
+        return g_passes and c_passes
+
+
+# --------------------------------------------------------------------
+# v3a Day 3 — coherence judge eval (C1/C2/C3)
+# --------------------------------------------------------------------
+#
+# Loads fixtures from ``scripts/eval_coherence_fixtures.json``. Each
+# fixture builds a synthetic transcript inline (no JSONL on-disk
+# dependency); the driver constructs TranscriptMessage objects, calls
+# ``run_coherence_judge`` with the lesson + messages, then grades the
+# verdict against the fixture's ``expected_verdict`` (and
+# ``expected_reason_set`` when the verdict is INCOHERENT).
+#
+# Pass bar (v3a §4.1):
+#   C1 strict — all 3 known-bad fixtures must produce INCOHERENT
+#   C2 strict — all 5 known-good fixtures must produce COHERENT
+#               (NEAR_MISS_REVIEW degradation tolerated on at most 1)
+#   C3 ≥2/3 + hard-fail guards:
+#               NM-1 sarcasm must not return COHERENT
+#               NM-2 pidgin / NM-3 just-for-now must not return INCOHERENT
+
+
+COHERENCE_FIXTURES_PATH = (
+    Path(__file__).resolve().parent / "eval_coherence_fixtures.json"
+)
+
+
+@dataclass
+class CoherenceFixtureResult:
+    """One judge call against one fixture."""
+
+    fixture_id: str
+    category: str
+    expected_verdict: str
+    expected_reason_set: list[str]
+    actual_verdict: str
+    actual_reason: str | None
+    actual_explanation: str
+    degraded: bool
+    passed: bool
+    pass_reason: str
+    judge_error: str | None = None
+
+
+@dataclass
+class CoherenceEvalReport:
+    fixtures: list[CoherenceFixtureResult]
+
+    @property
+    def c1(self) -> tuple[int, int]:
+        bads = [f for f in self.fixtures if f.category == "known_bad"]
+        return sum(1 for f in bads if f.passed), len(bads)
+
+    @property
+    def c2(self) -> tuple[int, int]:
+        goods = [f for f in self.fixtures if f.category == "known_good"]
+        return sum(1 for f in goods if f.passed), len(goods)
+
+    @property
+    def c3(self) -> tuple[int, int]:
+        nms = [f for f in self.fixtures if f.category == "adversarial_near_miss"]
+        return sum(1 for f in nms if f.passed), len(nms)
+
+    @property
+    def passes_bar(self) -> bool:
+        c1n, c1d = self.c1
+        c2n, c2d = self.c2
+        c3n, c3d = self.c3
+        c1_pass = c1d > 0 and c1n == c1d
+        c2_pass = c2d > 0 and c2n == c2d
+        c3_pass = c3d > 0 and c3n / c3d >= 2 / 3
+        # C3 hard-fail guard: NM-1 sarcasm must NOT return COHERENT;
+        # NM-2/NM-3 must NOT return INCOHERENT. These are stricter
+        # than the 2/3 count — a 2/3 score that hides a hard-fail
+        # (e.g. sarcasm passed AS COHERENT, but pidgin and
+        # just-for-now passed correctly) is still a fail.
+        c3_hardfail = False
+        for f in self.fixtures:
+            if f.category != "adversarial_near_miss":
+                continue
+            if (
+                f.fixture_id == "near_sarcasm"
+                and f.actual_verdict == "COHERENT"
+            ):
+                c3_hardfail = True
+            if (
+                f.fixture_id in ("near_pidgin", "near_just_for_now")
+                and f.actual_verdict == "INCOHERENT"
+            ):
+                c3_hardfail = True
+        return c1_pass and c2_pass and c3_pass and not c3_hardfail
+
+
+def _fixture_to_messages(synthetic_transcript: list) -> list[TranscriptMessage]:
+    """Build TranscriptMessage list from the fixture's
+    ``synthetic_transcript`` shape ([[role, text], ...])."""
+    base = datetime.now(timezone.utc) - timedelta(minutes=30)
+    messages: list[TranscriptMessage] = []
+    for i, (role, text) in enumerate(synthetic_transcript):
+        messages.append(TranscriptMessage(
+            role=role,
+            text=text,
+            timestamp=base + timedelta(seconds=i * 30),
+            uuid=f"fix-{i}",
+            tool_calls=(),
+            raw={},
+        ))
+    return messages
+
+
+def _grade_coherence_fixture(
+    fixture: dict, verdict: CoherenceVerdict
+) -> tuple[bool, str]:
+    """Grade one fixture's verdict against its expected_verdict /
+    expected_reason_set. Returns (passed, reason_string).
+
+    Grading rules per v3a doc §4.1:
+      - known_bad: pass when verdict == INCOHERENT and (no
+        expected_reason_set OR actual reason is in the set).
+        NEAR_MISS_REVIEW counts as soft-pass (caught the issue,
+        downgraded to soft) — included in C1 numerator.
+      - known_good: pass when verdict == COHERENT. NEAR_MISS_REVIEW
+        is soft-pass on known_good (per §3.5: "≤1 NEAR_MISS_REVIEW
+        tolerated"). INCOHERENT is hard-fail.
+      - adversarial_near_miss: pass when verdict matches
+        expected_verdict EXACTLY (no NEAR_MISS_REVIEW degradation).
+        The hard-fail guards in CoherenceEvalReport.passes_bar
+        catch the worst inversions.
+    """
+    expected = fixture["expected_verdict"]
+    expected_reasons = set(fixture.get("expected_reason_set") or [])
+    cat = fixture["category"]
+    actual = verdict.verdict
+    actual_reason = verdict.reason
+
+    if cat == "known_bad":
+        # C1: caught the bad pairing. INCOHERENT is the expected
+        # outcome; NEAR_MISS_REVIEW is soft-pass (caught it,
+        # downgraded to soft).
+        if actual == "INCOHERENT":
+            if expected_reasons and actual_reason not in expected_reasons:
+                return False, (
+                    f"verdict=INCOHERENT but reason={actual_reason!r} "
+                    f"not in expected set {sorted(expected_reasons)}"
+                )
+            return True, "caught (INCOHERENT)"
+        if actual == "NEAR_MISS_REVIEW":
+            return True, "caught (NEAR_MISS_REVIEW soft-pass)"
+        return False, (
+            f"missed: expected INCOHERENT, got {actual!r} "
+            f"(this is a known-bad fixture)"
+        )
+
+    if cat == "known_good":
+        # C2: clean entry should not be flagged.
+        if actual == "COHERENT":
+            return True, "clean (COHERENT)"
+        if actual == "NEAR_MISS_REVIEW":
+            return True, "tolerable NEAR_MISS_REVIEW (counts toward soft-fail budget)"
+        return False, (
+            f"false-positive: expected COHERENT, got {actual!r} — "
+            f"reason={actual_reason!r}"
+        )
+
+    # adversarial_near_miss — exact-match grading per §3.5.
+    if actual == expected:
+        if expected == "INCOHERENT" and expected_reasons and actual_reason not in expected_reasons:
+            return False, (
+                f"verdict=INCOHERENT but reason={actual_reason!r} "
+                f"not in expected set {sorted(expected_reasons)}"
+            )
+        return True, f"exact match ({actual})"
+    return False, f"expected {expected!r}, got {actual!r}"
+
+
+def run_coherence_eval(workspace: Path) -> CoherenceEvalReport:
+    """Run the v3a coherence judge eval against every fixture in
+    ``COHERENCE_FIXTURES_PATH``.
+
+    ``workspace`` is the same tmpdir the G-eval uses; the judge
+    spawns ``claude -p`` and inherits standard env. No fixture I/O
+    against the workspace itself — the synthetic transcripts live
+    inline in the fixture file.
+    """
+    raw = json.loads(COHERENCE_FIXTURES_PATH.read_text(encoding="utf-8"))
+    fixtures = raw.get("fixtures") or []
+    results: list[CoherenceFixtureResult] = []
+    for fixture in fixtures:
+        fid = fixture.get("id", "?")
+        cat = fixture.get("category", "?")
+        print(f"  [{cat}] {fid} ...", flush=True)
+        messages = _fixture_to_messages(fixture.get("synthetic_transcript") or [])
+        try:
+            verdict = run_coherence_judge(
+                workspace, fixture["lesson"], messages,
+            )
+            judge_err = None
+        except Exception as exc:  # noqa: BLE001
+            verdict = CoherenceVerdict.near_miss(
+                reason="other",
+                explanation=f"judge raised: {exc}",
+            )
+            judge_err = str(exc)
+        passed, reason = _grade_coherence_fixture(fixture, verdict)
+        result = CoherenceFixtureResult(
+            fixture_id=fid,
+            category=cat,
+            expected_verdict=fixture["expected_verdict"],
+            expected_reason_set=fixture.get("expected_reason_set") or [],
+            actual_verdict=verdict.verdict,
+            actual_reason=verdict.reason,
+            actual_explanation=verdict.explanation or "",
+            degraded=verdict.degraded,
+            passed=passed,
+            pass_reason=reason,
+            judge_error=judge_err,
+        )
+        results.append(result)
+        flag = "PASS" if passed else "FAIL"
+        print(
+            f"    → {flag} actual={verdict.verdict} "
+            f"reason={verdict.reason!r}: {reason}",
+            flush=True,
+        )
+    return CoherenceEvalReport(fixtures=results)
 
 
 # --------------------------------------------------------------------
@@ -938,6 +1180,21 @@ def _build_markdown(report: EvalReport) -> str:
         f"- G7 (memory dedup works): **{g7n}/{g7d}** (target {g7d}/{g7d})",
         f"- G8 (USER.md threshold): **{g8n}/{g8d}** (target {g8d}/{g8d})",
         "",
+    ]
+    if report.coherence is not None:
+        c1n, c1d = report.coherence.c1
+        c2n, c2d = report.coherence.c2
+        c3n, c3d = report.coherence.c3
+        lines += [
+            "## v3a coherence eval",
+            "",
+            f"- C1 (known-bad caught): **{c1n}/{c1d}** (target {c1d}/{c1d})",
+            f"- C2 (known-good unflagged): **{c2n}/{c2d}** (target {c2d}/{c2d})",
+            f"- C3 (adversarial near-misses): **{c3n}/{c3d}** "
+            f"(target ≥2/3 + hard-fail guards)",
+            "",
+        ]
+    lines += [
         f"**Verdict: {'PASS — clear to flip shadow → live' if report.passes_bar else 'FAIL — do not flip live yet'}**",
         "",
     ]
@@ -988,6 +1245,35 @@ def _build_markdown(report: EvalReport) -> str:
             for err in r.judge_errors:
                 lines.append(f"- {err}")
         lines.append("")
+    if report.coherence is not None and report.coherence.fixtures:
+        lines.append("---")
+        lines.append("")
+        lines.append("## v3a coherence fixtures")
+        lines.append("")
+        for f in report.coherence.fixtures:
+            flag = "PASS" if f.passed else "FAIL"
+            lines.append(
+                f"### {f.fixture_id} — {f.category} — {flag}"
+            )
+            lines.append("")
+            lines.append(f"- expected: {f.expected_verdict}")
+            if f.expected_reason_set:
+                lines.append(
+                    f"- expected reason in: "
+                    f"{sorted(f.expected_reason_set)}"
+                )
+            lines.append(
+                f"- actual: {f.actual_verdict} "
+                f"(reason={f.actual_reason!r})"
+            )
+            if f.actual_explanation:
+                lines.append(f"- explanation: {f.actual_explanation}")
+            if f.degraded:
+                lines.append("- degraded: true")
+            lines.append(f"- grade: {f.pass_reason}")
+            if f.judge_error:
+                lines.append(f"- judge_error: {f.judge_error}")
+            lines.append("")
     return "\n".join(lines) + "\n"
 
 
@@ -996,10 +1282,11 @@ def _build_markdown(report: EvalReport) -> str:
 # --------------------------------------------------------------------
 
 
-def run_eval() -> EvalReport:
+def run_eval(*, run_coherence: bool = True) -> EvalReport:
     """Programmatic entry. Stages scenarios in a tmpdir, runs all
-    five with the real LLM pipeline, and returns the report.
-    Caller is responsible for printing or persisting."""
+    eight with the real LLM pipeline, optionally runs the v3a
+    coherence eval, and returns the report. Caller is responsible
+    for printing or persisting."""
     started_at = datetime.now(timezone.utc)
     workspace_root = Path(tempfile.mkdtemp(prefix="vexis-eval-"))
     workspace = workspace_root / "vexis-workspace"
@@ -1020,11 +1307,17 @@ def run_eval() -> EvalReport:
             r = run_one_scenario(s, workspace)
             print(_grade(r), flush=True)
             results.append(r)
+        coherence_report: CoherenceEvalReport | None = None
+        if run_coherence:
+            print()
+            print("running v3a coherence judge eval (C1/C2/C3) ...", flush=True)
+            coherence_report = run_coherence_eval(workspace)
         finished_at = datetime.now(timezone.utc)
         return EvalReport(
             started_at=started_at,
             finished_at=finished_at,
             scenarios=results,
+            coherence=coherence_report,
         )
     finally:
         pathlib.Path.home = real_home
@@ -1039,9 +1332,17 @@ def main() -> int:
         default=None,
         help="Markdown report path. Default: ~/.vexis/logs/learning-eval/<utc>/REPORT.md",
     )
+    parser.add_argument(
+        "--no-coherence",
+        action="store_true",
+        help=(
+            "Skip the v3a coherence judge eval (C1/C2/C3). The"
+            " G-grades alone determine PASS/FAIL when this is set."
+        ),
+    )
     args = parser.parse_args()
 
-    report = run_eval()
+    report = run_eval(run_coherence=not args.no_coherence)
 
     if args.out is None:
         folder = (
@@ -1065,6 +1366,11 @@ def main() -> int:
     print(f"G6 update-vs-create  : {report.g6[0]}/{report.g6[1]}")
     print(f"G7 memory dedup      : {report.g7[0]}/{report.g7[1]}")
     print(f"G8 USER.md threshold : {report.g8[0]}/{report.g8[1]}")
+    if report.coherence is not None:
+        print()
+        print(f"C1 known-bad caught  : {report.coherence.c1[0]}/{report.coherence.c1[1]}  (target {report.coherence.c1[1]}/{report.coherence.c1[1]} strict)")
+        print(f"C2 known-good clean  : {report.coherence.c2[0]}/{report.coherence.c2[1]}  (target {report.coherence.c2[1]}/{report.coherence.c2[1]} strict)")
+        print(f"C3 near-misses       : {report.coherence.c3[0]}/{report.coherence.c3[1]}  (target ≥2/3 + hard-fail guards)")
     print(f"report: {out}")
     print()
     if report.passes_bar:

@@ -45,6 +45,8 @@ from core.user_candidates import UserCandidateStore
 from core.yaml_config import (
     learning_max_entries_per_session,
     learning_max_entry_chars,
+    model_learning_review,
+    resolve_model_flag,
 )
 
 log = logging.getLogger(__name__)
@@ -1220,7 +1222,7 @@ def run_review(
         existing_memory_text=existing_memory_text,
         user_queue_text=user_queue_text,
     )
-    argv = ["claude", "-p", prompt]
+    argv = ["claude", "-p", *resolve_model_flag(model_learning_review()), prompt]
     env = {**os.environ, RECURSION_ENV_VAR: "1"}
 
     try:

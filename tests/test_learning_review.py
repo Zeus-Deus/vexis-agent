@@ -965,8 +965,12 @@ def test_run_review_happy_path_one_lesson(tmp_path):
     assert captured["env"][RECURSION_ENV_VAR] == "1"
     # No --resume: review session must stay isolated:
     assert "--resume" not in captured["argv"]
-    # The v2 prompt context blocks are present in the prompt:
-    prompt = captured["argv"][2]
+    # Internal model tier wired in (yaml_config.model_learning_review
+    # default is "sonnet" — config can override).
+    assert "--model" in captured["argv"]
+    # The v2 prompt context blocks are present in the prompt (last
+    # arg; resolve_model_flag inserts --model <tier> before it):
+    prompt = captured["argv"][-1]
     assert "<skill-index>" in prompt
     assert "<existing-memory>" in prompt
     assert "Classification — required before output" in prompt

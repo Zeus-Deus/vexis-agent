@@ -47,6 +47,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from core.coherence_judge import (
+    CoherenceVerdict,
+    run_coherence_judge,
+)
 from core.learning_review import (
     RECURSION_ENV_VAR,
     ReviewOutput,
@@ -306,6 +310,13 @@ class WriteSummary:
     classification-wise. The dispatcher reports counts via this
     struct; ``_run_once`` aggregates across sessions; the report
     writer surfaces them.
+
+    Day 6 (v3a) addition: coherence judge counts and per-flag
+    detail records. ``coherence_flagged`` and ``coherence_near_miss``
+    aggregate across sessions for the run.json summary; the
+    ``coherence_flags`` list carries per-flag detail records (session
+    uuid + lesson preview + verdict + reason + explanation) which
+    the per-tick REPORT.md narrates under ``## Coherence flags``.
     """
 
     written: int = 0
@@ -315,6 +326,13 @@ class WriteSummary:
     queue_added: int = 0
     queue_promoted: int = 0
     stage_refused: int = 0
+    # v3a coherence judge — aggregate counts go into run.json's
+    # ``summary.coherence`` block; per-flag detail records narrate
+    # the REPORT.md ``## Coherence flags`` section.
+    coherence_flagged: int = 0       # INCOHERENT verdicts (hard flag)
+    coherence_near_miss: int = 0     # NEAR_MISS_REVIEW verdicts (soft)
+    coherence_by_reason: dict[str, int] = field(default_factory=dict)
+    coherence_flags: list[dict] = field(default_factory=list)
 
     def merge(self, other: "WriteSummary") -> None:
         """Aggregate ``other`` into self. Used by ``_run_once`` to
@@ -328,6 +346,11 @@ class WriteSummary:
             self.by_class[k] = self.by_class.get(k, 0) + v
         for k, v in other.by_tier.items():
             self.by_tier[k] = self.by_tier.get(k, 0) + v
+        self.coherence_flagged += other.coherence_flagged
+        self.coherence_near_miss += other.coherence_near_miss
+        for k, v in other.coherence_by_reason.items():
+            self.coherence_by_reason[k] = self.coherence_by_reason.get(k, 0) + v
+        self.coherence_flags.extend(other.coherence_flags)
 
     def to_dict(self) -> dict:
         return {
@@ -338,6 +361,18 @@ class WriteSummary:
             "queue_added": self.queue_added,
             "queue_promoted": self.queue_promoted,
             "stage_refused": self.stage_refused,
+            # v3a — per-tick run.json shape per the brief:
+            # ``summary.coherence = {flagged, near_miss, by_reason}``.
+            # Per-flag detail (coherence_flags) lives only in the
+            # in-memory WriteSummary and the REPORT.md narrative;
+            # not in run.json by design (keep run.json an
+            # aggregates-only doc; future dashboards can mine
+            # REPORT.md if they want detail).
+            "coherence": {
+                "flagged": self.coherence_flagged,
+                "near_miss": self.coherence_near_miss,
+                "by_reason": dict(self.coherence_by_reason),
+            },
         }
 
 
@@ -412,6 +447,61 @@ def _read_curator_entries(path: Path) -> list[tuple[str, str]]:
         header = first_line[:200]
         entries.append((header, rest))
     return entries
+
+
+def _parse_curator_entries(path: Path) -> list[dict]:
+    """Parse curator-authored entries into structured dicts the
+    coherence judge can consume.
+
+    Returns a list of dicts with keys ``lesson``, ``class`` (optional),
+    ``tier`` (optional), ``scope``, ``evidence``. Skips any entry
+    without ``Scope:`` and ``Evidence:`` lines (degraded entries that
+    don't carry the curator's standard layout — the judge needs at
+    minimum the lesson + evidence to make a verdict). The previous
+    Coherence: line (if any) is intentionally NOT preserved — the
+    point of /learning coherence-audit is to RE-judge, so stale
+    annotations would just be noise.
+    """
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    out: list[dict] = []
+    for chunk in raw.split(ENTRY_DELIMITER):
+        chunk = chunk.strip()
+        if not chunk or not chunk.startswith("[learned"):
+            continue
+        first_line, _, rest = chunk.partition("\n")
+        # Lesson body lives between the ``]`` of the learned-marker
+        # and the first metadata line; can span multiple physical
+        # lines if the original lesson had embedded newlines.
+        bracket_end = first_line.find("]")
+        lesson_text = (
+            first_line[bracket_end + 1:].strip() if bracket_end >= 0 else first_line
+        )
+        entry: dict = {"lesson": lesson_text}
+        for line in rest.splitlines():
+            line = line.strip()
+            if line.startswith("Class:"):
+                entry["class"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Tier:"):
+                # Tier line may carry parenthetical context like
+                # "S3 (would create new skill: ...)" — keep just the
+                # tier letter.
+                tier_part = line.split(":", 1)[1].strip()
+                entry["tier"] = tier_part.split(" ", 1)[0].strip() if tier_part else None
+            elif line.startswith("Scope:"):
+                entry["scope"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Evidence:"):
+                entry["evidence"] = line.split(":", 1)[1].strip()
+        # The judge can only score entries with both scope + evidence;
+        # drop incomplete entries (legacy v1 shape without those
+        # lines wouldn't be useful inputs).
+        if "evidence" in entry and "scope" in entry:
+            out.append(entry)
+    return out
 
 
 def _append_shadow_entry(workspace: Path, content: str) -> None:
@@ -491,9 +581,10 @@ def _format_lesson_entry(lesson: dict) -> str:
 
     Layout: a tagged header line so a future ``/learning audit`` can
     grep for ``[learned`` to enumerate curator-authored entries, then
-    the lesson body, then class/tier (when present), then scope and
-    verbatim evidence as provenance. The whole block is one
-    §-delimited entry on disk.
+    the lesson body, then class/tier (when present), an optional
+    Coherence: line (v3a — only for non-COHERENT verdicts), then
+    scope and verbatim evidence as provenance. The whole block is
+    one §-delimited entry on disk.
 
     v2 (Day 1) addition: class + tier + target lines surfaced for
     audit so the user reviewing MEMORY-SHADOW.md can see what the
@@ -501,6 +592,12 @@ def _format_lesson_entry(lesson: dict) -> str:
     shadow file is a Day 1/Day 2 in-flight signal that the eventual
     skill write hasn't landed yet. v1-shape lessons (no class) still
     render legibly with the legacy three-line layout.
+
+    v3a (Day 6) addition: when the coherence judge attached a
+    non-COHERENT verdict (NEAR_MISS_REVIEW or INCOHERENT), surface a
+    Coherence: line so the user reviewing the shadow file sees the
+    flag inline. COHERENT verdicts are silent — no annotation, no
+    visual noise — per §3.4 of the v3a research doc.
     """
     today = _utc_now().strftime("%Y-%m-%d")
     lines: list[str] = [f"[learned {today}] {lesson['lesson']}"]
@@ -524,9 +621,43 @@ def _format_lesson_entry(lesson: dict) -> str:
             lines.append(f"  Tier: {tier}")
     elif tier:
         lines.append(f"  Tier: {tier}")
+    coherence_line = _format_coherence_line(lesson.get("coherence"))
+    if coherence_line:
+        lines.append(coherence_line)
     lines.append(f"  Scope: {lesson['scope']}")
     lines.append(f"  Evidence: {lesson['evidence']}")
     return "\n".join(lines)
+
+
+def _format_coherence_line(verdict: Any) -> str | None:
+    """Render the v3a Coherence: annotation, or None when silent.
+
+    Silent on COHERENT verdicts (no line emitted) so clean lessons
+    don't clutter the shadow file. NEAR_MISS_REVIEW gets the soft
+    label; INCOHERENT gets the hard FLAGGED label with the reason
+    name so the user can grep for specific failure modes
+    (``grep 'FLAGGED (mismatched-attribution)' MEMORY-SHADOW.md``).
+
+    Accepts ``Any`` rather than ``CoherenceVerdict | None`` because
+    legacy callers (tests that don't set ``lesson["coherence"]``)
+    pass ``None`` and we want to no-op cleanly.
+    """
+    if verdict is None:
+        return None
+    v = getattr(verdict, "verdict", None)
+    if not v or v == "COHERENT":
+        return None
+    explanation = (getattr(verdict, "explanation", None) or "").strip()
+    reason = getattr(verdict, "reason", None)
+    if v == "INCOHERENT":
+        reason_part = reason or "?"
+        return f"  Coherence: FLAGGED ({reason_part}) — {explanation}"
+    if v == "NEAR_MISS_REVIEW":
+        prefix = f"({reason}) " if reason else ""
+        return f"  Coherence: NEAR_MISS {prefix}— {explanation}"
+    # Defensive — unknown verdict (shouldn't happen since the judge's
+    # verifier already enum-checks).
+    return f"  Coherence: {v} — {explanation}"
 
 
 def _summarize_outcome(output: ReviewOutput, *, written: int) -> str:
@@ -550,12 +681,73 @@ def _summarize_outcome(output: ReviewOutput, *, written: int) -> str:
     return f"wrote {written} entry/entries (transcript {output.transcript_chars}c){suffix}"
 
 
+_LESSON_PREVIEW_CHARS = 80
+
+
+def _attach_coherence_verdict(
+    workspace: Path,
+    lesson: dict,
+    messages: list,
+    meta: SessionMeta,
+    summary: WriteSummary,
+) -> None:
+    """Run the v3a coherence judge on one verified lesson.
+
+    Side effects:
+      - Stores the ``CoherenceVerdict`` on ``lesson["coherence"]`` so
+        ``_format_lesson_entry`` can emit the inline annotation.
+      - Bumps ``summary.coherence_flagged`` (INCOHERENT) or
+        ``summary.coherence_near_miss`` (NEAR_MISS_REVIEW).
+      - Bumps ``summary.coherence_by_reason[reason]`` when the
+        verdict carries a reason.
+      - Appends a per-flag detail record to ``summary.coherence_flags``
+        for the REPORT.md narrative.
+
+    COHERENT verdicts are silent — attached to the lesson dict but
+    not surfaced in counts or annotations. The dict carries them so
+    a future audit could grep ``lesson["coherence"]`` to confirm
+    the judge ran (vs. opted out) but the user-facing channels stay
+    clean.
+
+    Never raises — ``run_coherence_judge`` already collapses every
+    failure path (timeout, parse failure, spawn error) to
+    NEAR_MISS_REVIEW with reason=other, so any failure of the judge
+    itself surfaces as a soft flag the user reviews.
+    """
+    verdict = run_coherence_judge(workspace, lesson, messages)
+    lesson["coherence"] = verdict
+    if verdict.verdict == "COHERENT":
+        return
+    if verdict.verdict == "INCOHERENT":
+        summary.coherence_flagged += 1
+    elif verdict.verdict == "NEAR_MISS_REVIEW":
+        summary.coherence_near_miss += 1
+    if verdict.reason:
+        summary.coherence_by_reason[verdict.reason] = (
+            summary.coherence_by_reason.get(verdict.reason, 0) + 1
+        )
+    lesson_text = str(lesson.get("lesson") or "")
+    preview = (
+        lesson_text
+        if len(lesson_text) <= _LESSON_PREVIEW_CHARS
+        else lesson_text[: _LESSON_PREVIEW_CHARS - 3] + "..."
+    )
+    summary.coherence_flags.append({
+        "session_uuid": meta.session_uuid,
+        "lesson_preview": preview,
+        "verdict": verdict.verdict,
+        "reason": verdict.reason,
+        "explanation": verdict.explanation or "",
+    })
+
+
 def _write_verified(
     workspace: Path,
     output: ReviewOutput,
     *,
     meta: SessionMeta,
     shadow: bool,
+    messages: list[Any] | None = None,
 ) -> WriteSummary:
     """Persist verified lessons. Returns a WriteSummary breakdown
     (Day 5: detailed counts per class / tier / outcome — see the
@@ -583,12 +775,35 @@ def _write_verified(
     - **VOLATILE** lessons were rejected at validate time and never
       reach this function.
 
+    v3a (Day 6): when ``messages`` is provided, run the coherence
+    judge on each verified lesson BEFORE the per-class branch.
+    The verdict gets attached to the lesson dict as
+    ``lesson["coherence"]`` so the downstream renderer
+    (``_format_lesson_entry``) can emit the inline annotation.
+    Aggregate counts and per-flag detail land on the WriteSummary.
+
+    ``messages=None`` (or empty) opts out of the coherence judge —
+    legacy callers (most existing tests) pass nothing and get the
+    pre-v3a behavior. Production ``_real_review`` always passes the
+    full transcript.
+
     The ``meta`` argument carries the session UUID, needed by the
     IDENTITY queue path so each observation is recorded against
-    the right session and the cross-session threshold can fire.
+    the right session and the cross-session threshold can fire AND
+    by the v3a flag-record so REPORT.md can attribute each flag
+    to its source session.
     """
     summary = WriteSummary()
     for lesson in output.verified_lessons:
+        # v3a coherence judge (Day 6) — runs first so the verdict
+        # is attached to the lesson dict before the per-class branch
+        # renders the entry. Per the v3a research doc §3.2, the
+        # judge is advisory-only: a flag annotates the audit entry
+        # but does NOT block the per-class write. Skipped when
+        # ``messages`` is None/empty (test seam — production always
+        # passes the parsed session transcript via _real_review).
+        if messages:
+            _attach_coherence_verdict(workspace, lesson, messages, meta, summary)
         class_ = lesson.get("class")
         if class_ in {"PROCEDURAL", "IDENTITY", "SITUATIONAL", "VOLATILE"}:
             summary.by_class[class_] = summary.by_class.get(class_, 0) + 1
@@ -966,7 +1181,10 @@ def _real_review(
         return ("nothing to save", WriteSummary())
 
     summary = _write_verified(
-        workspace, output, meta=meta, shadow=learning_shadow_mode(),
+        workspace, output,
+        meta=meta,
+        shadow=learning_shadow_mode(),
+        messages=messages,
     )
     return (
         _summarize_outcome(output, written=summary.written),
@@ -1253,6 +1471,42 @@ class LearningController:
                 short = uuid[:8] if len(uuid) >= 8 else uuid
                 md_lines.append(f"- `{short}` — {outcome}")
             md_lines.append("")
+        # v3a (Day 6): coherence flags section. Omitted entirely when
+        # no flags fired this tick (per §3.4 — silent on COHERENT).
+        if s.coherence_flags:
+            md_lines.append("## Coherence flags")
+            md_lines.append("")
+            md_lines.append(
+                f"- {s.coherence_flagged} INCOHERENT, "
+                f"{s.coherence_near_miss} NEAR_MISS_REVIEW"
+            )
+            if s.coherence_by_reason:
+                md_lines.append(
+                    f"- by reason: "
+                    f"{_format_count_dict(s.coherence_by_reason)}"
+                )
+            md_lines.append("")
+            for flag in s.coherence_flags:
+                short_uuid = (
+                    flag["session_uuid"][:8]
+                    if len(flag["session_uuid"]) >= 8
+                    else flag["session_uuid"]
+                )
+                if flag["verdict"] == "INCOHERENT":
+                    label = "FLAGGED"
+                elif flag["verdict"] == "NEAR_MISS_REVIEW":
+                    label = "NEAR_MISS"
+                else:
+                    label = flag["verdict"]
+                reason_part = f"({flag['reason']}) " if flag["reason"] else ""
+                preview = flag["lesson_preview"]
+                md_lines.append(
+                    f"- session `{short_uuid}`, lesson \"{preview}\":"
+                )
+                md_lines.append(
+                    f"  {label} {reason_part}— {flag['explanation']}"
+                )
+            md_lines.append("")
         report_md = folder / "REPORT.md"
         report_md.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
 
@@ -1356,7 +1610,7 @@ class LearningController:
 
     async def handle_telegram(self, sub: str, args: list[str]) -> str:
         """Implement ``/learning`` subcommands: status, pause, resume,
-        run, audit."""
+        run, audit, coherence-audit."""
         sub = (sub or "status").lower()
         if sub == "status":
             return self._status_text()
@@ -1377,7 +1631,21 @@ class LearningController:
             )
         if sub == "audit":
             return self._audit_text()
-        return "Usage: /learning [status|pause|resume|run|audit]"
+        if sub == "coherence-audit":
+            # v3a Day 3 — re-run the judge over already-promoted
+            # entries on demand. Async via the executor because the
+            # judge spawns claude -p (potentially several seconds per
+            # entry × N entries) and we don't want to block the
+            # Telegram event loop.
+            shadow_only = "--shadow-only" in args
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, self._coherence_audit_text, shadow_only,
+            )
+        return (
+            "Usage: /learning [status|pause|resume|run|audit|"
+            "coherence-audit [--shadow-only]]"
+        )
 
     def run_now(self) -> TickResult:
         """Force a tick on demand. Synchronous; safe to call from
@@ -1543,6 +1811,32 @@ class LearningController:
                 f"{recent_dedup} candidate(s) skipped as duplicates."
             )
 
+        # ----- Day 6 (v3a): recent coherence flags -----
+        # Mine the last N tick reports for coherence_flagged /
+        # coherence_near_miss totals + by-reason breakdown. Surfaces
+        # the v3a flag rate so the user can spot a prompt-calibration
+        # issue (>50% flag rate → prompt is over-eager; <5% over a
+        # week with normal volume → prompt is under-eager).
+        coh_flagged, coh_near_miss, coh_by_reason, coh_ticks = (
+            self._recent_coherence_flags(window_ticks=24)
+        )
+        if coh_ticks > 0:
+            lines.append("")
+            if coh_flagged or coh_near_miss:
+                lines.append(
+                    f"Coherence flags (last {coh_ticks} tick reports): "
+                    f"{coh_flagged} INCOHERENT, "
+                    f"{coh_near_miss} NEAR_MISS_REVIEW."
+                )
+                if coh_by_reason:
+                    for reason, count in sorted(coh_by_reason.items()):
+                        lines.append(f"  • {reason}: {count}")
+            else:
+                lines.append(
+                    f"Coherence flags (last {coh_ticks} tick reports): "
+                    f"0 entries flagged."
+                )
+
         # ----- Tier distribution (audit A2 deferred-fix instrument) -----
         # Aggregate by_tier counts from run.json across the last N
         # ticks. Surfaces "did S1 actually get picked, or is it stuck
@@ -1652,6 +1946,69 @@ class LearningController:
                 total += int(summary.get("dedup_skipped", 0) or 0)
         return total, scanned
 
+    def _recent_coherence_flags(
+        self, *, window_ticks: int
+    ) -> tuple[int, int, dict[str, int], int]:
+        """Aggregate ``summary.coherence`` counts across the most
+        recent ``window_ticks`` tick-report run.json files. Returns
+        ``(flagged_total, near_miss_total, by_reason_dict,
+        ticks_actually_scanned)``.
+
+        Mirrors ``_recent_dedup_skips`` / ``_recent_tier_distribution``
+        — same iteration shape, same JSON-parse tolerance. The
+        run.json schema already includes ``summary.coherence`` (per
+        ``WriteSummary.to_dict``), so no schema change required.
+
+        Used by ``_audit_text`` (v3a Day 6) to surface the rolling
+        flag rate. The user reads this to spot prompt-calibration
+        drift: >50% flag rate over a soak week → prompt is over-
+        eager; <5% with normal volume → under-eager (revisit C2).
+        """
+        logs_root = learning_logs_dir()
+        if not logs_root.exists():
+            return 0, 0, {}, 0
+        tick_dirs = sorted(
+            (p for p in logs_root.iterdir() if p.is_dir()),
+            key=lambda p: p.name,
+            reverse=True,
+        )[:window_ticks]
+        flagged_total = 0
+        near_miss_total = 0
+        by_reason: dict[str, int] = {}
+        scanned = 0
+        for d in tick_dirs:
+            run_json = d / "run.json"
+            try:
+                payload = json.loads(run_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            scanned += 1
+            summary = payload.get("summary") if isinstance(payload, dict) else None
+            if not isinstance(summary, dict):
+                continue
+            coh = summary.get("coherence")
+            if not isinstance(coh, dict):
+                continue
+            try:
+                flagged_total += int(coh.get("flagged", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                near_miss_total += int(coh.get("near_miss", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            reasons = coh.get("by_reason")
+            if isinstance(reasons, dict):
+                for reason, count in reasons.items():
+                    if not isinstance(reason, str):
+                        continue
+                    try:
+                        n = int(count)
+                    except (TypeError, ValueError):
+                        continue
+                    by_reason[reason] = by_reason.get(reason, 0) + n
+        return flagged_total, near_miss_total, by_reason, scanned
+
     def _recent_tier_distribution(
         self, *, window_ticks: int
     ) -> tuple[dict[str, int], int]:
@@ -1701,6 +2058,126 @@ class LearningController:
                     continue
                 totals[tier] = totals.get(tier, 0) + n
         return totals, scanned
+
+    # v3a Day 3 — manual /learning coherence-audit command. Re-runs
+    # the judge over already-promoted entries (shadow files by
+    # default; live tree's [learned-tagged entries when not
+    # --shadow-only) in degraded mode (no transcript window — the
+    # source-session JSONL linkage isn't preserved on already-
+    # promoted entries; see §5.5). Useful for retroactively checking
+    # v1-era entries that were promoted before v3a existed and for
+    # spot-checking shadow contents on demand.
+
+    _COHERENCE_AUDIT_MAX_ENTRIES_PER_FILE = 30
+    _COHERENCE_AUDIT_MAX_REPLY_LINES = 80
+
+    def _coherence_audit_text(self, shadow_only: bool) -> str:
+        """Re-run the coherence judge on already-promoted entries.
+
+        ``shadow_only=False`` also walks live MEMORY.md /
+        USER.md curator-authored entries (those marked with
+        ``[learned``); ``shadow_only=True`` restricts to the shadow
+        files. Caller (handle_telegram) already runs this in an
+        executor so the per-entry judge calls don't block the
+        event loop.
+
+        Output is a chat-friendly summary capped at
+        ``_COHERENCE_AUDIT_MAX_REPLY_LINES`` lines so it fits in
+        a single Telegram message; the full per-entry detail also
+        lands in a structured log entry under
+        ``learning_logs_dir() / coherence-audit / <utc>.json``
+        so the user can inspect later.
+        """
+        targets: list[tuple[str, Path]] = []
+        memories_root = memories_dir(self._workspace)
+        for name in (SHADOW_FILE_NAME, USER_SHADOW_FILE_NAME):
+            p = memories_root / name
+            if p.exists():
+                targets.append((name, p))
+        if not shadow_only:
+            for name in ("MEMORY.md", "USER.md"):
+                p = memories_root / name
+                if p.exists():
+                    targets.append((name, p))
+        if not targets:
+            return "No shadow or live curator-authored files to audit."
+
+        results: list[dict] = []
+        all_entries: list[tuple[str, dict]] = []  # (file_label, parsed_entry)
+        for label, path in targets:
+            entries = _parse_curator_entries(path)
+            cap = self._COHERENCE_AUDIT_MAX_ENTRIES_PER_FILE
+            for entry in entries[:cap]:
+                all_entries.append((label, entry))
+        if not all_entries:
+            return (
+                "Audited "
+                + ", ".join(label for label, _ in targets)
+                + " — no curator-authored entries found."
+            )
+
+        for label, entry in all_entries:
+            verdict = run_coherence_judge(
+                self._workspace,
+                {
+                    "class": entry.get("class") or "?",
+                    "lesson": entry["lesson"],
+                    "scope": entry.get("scope", ""),
+                    "evidence": entry.get("evidence", ""),
+                    "tier": entry.get("tier"),
+                },
+                [],  # degraded mode — no source transcript
+            )
+            results.append({
+                "file": label,
+                "lesson_preview": (
+                    entry["lesson"][: _LESSON_PREVIEW_CHARS - 3] + "..."
+                    if len(entry["lesson"]) > _LESSON_PREVIEW_CHARS
+                    else entry["lesson"]
+                ),
+                "verdict": verdict.verdict,
+                "reason": verdict.reason,
+                "explanation": verdict.explanation or "",
+                "degraded": verdict.degraded,
+            })
+
+        # Persist the structured detail so the user can read the
+        # full output later if the chat reply is truncated.
+        log_dir = learning_logs_dir() / "coherence-audit"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / (_iso(_utc_now()).replace(":", "") + ".json")
+        log_path.write_text(
+            json.dumps(
+                {"audited_at": _iso(_utc_now()),
+                 "shadow_only": shadow_only,
+                 "results": results},
+                indent=2, sort_keys=True, ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        flagged = [r for r in results if r["verdict"] == "INCOHERENT"]
+        near_miss = [r for r in results if r["verdict"] == "NEAR_MISS_REVIEW"]
+        coherent = [r for r in results if r["verdict"] == "COHERENT"]
+        lines = [
+            f"Coherence audit: {len(results)} entries judged "
+            f"(degraded mode — no transcript window).",
+            f"  COHERENT: {len(coherent)}",
+            f"  NEAR_MISS_REVIEW: {len(near_miss)}",
+            f"  INCOHERENT: {len(flagged)}",
+            f"  Full log: {log_path}",
+        ]
+        if flagged or near_miss:
+            lines.append("")
+            lines.append("Flagged entries:")
+            for r in (flagged + near_miss)[: self._COHERENCE_AUDIT_MAX_REPLY_LINES]:
+                label = "FLAGGED" if r["verdict"] == "INCOHERENT" else "NEAR_MISS"
+                reason = f"({r['reason']}) " if r["reason"] else ""
+                lines.append(
+                    f"  [{r['file']}] {label} {reason}— "
+                    f"\"{r['lesson_preview']}\""
+                )
+        return "\n".join(lines)
 
     def _status_text(self) -> str:
         state = _load_daemon_state()

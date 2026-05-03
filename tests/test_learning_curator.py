@@ -1481,3 +1481,774 @@ def test_format_lesson_entry_legacy_v1_shape_renders():
     assert "Evidence: ev" in rendered
     assert "Class:" not in rendered
     assert "Tier:" not in rendered
+
+
+# --------------------------------------------------------------------
+# Day 6 (v3a): coherence judge integration
+# --------------------------------------------------------------------
+#
+# Verifies the live shadow hook:
+#   - run_coherence_judge fires per verified lesson when messages is
+#     non-empty
+#   - the verdict gets attached to the lesson dict
+#   - the shadow file gets the inline Coherence: annotation per §3.4
+#   - the WriteSummary aggregates per-flag detail + counts
+#   - the per-tick REPORT.md surfaces the ## Coherence flags section
+#   - /learning audit row mirrors the dedup row shape
+
+
+from datetime import datetime as _datetime, timezone as _timezone
+from unittest import mock
+
+from core.coherence_judge import CoherenceVerdict
+from core.transcripts import TranscriptMessage as _TranscriptMessage
+
+
+def _tmsg(role: str, text: str, *, ts: str = "2026-05-02T10:00:00Z",
+          uuid: str = "m1") -> _TranscriptMessage:
+    return _TranscriptMessage(
+        role=role,
+        text=text,
+        timestamp=_datetime.fromisoformat(ts.replace("Z", "+00:00")),
+        uuid=uuid,
+        tool_calls=(),
+        raw={},
+    )
+
+
+def _proc_lesson(lesson_text: str = "When X, do Y.",
+                 evidence: str = "do Y please") -> dict:
+    return {
+        "class": "PROCEDURAL",
+        "lesson": lesson_text,
+        "evidence": evidence,
+        "scope": "X-related tasks",
+        "tier": "S3",
+        "target": {
+            "skill_name": "x-handling",
+            "new_skill_body": (
+                "---\nname: x-handling\ndescription: Handle X.\n"
+                "origin: learning-curator\n---\n\n# Body\n"
+            ),
+        },
+    }
+
+
+def test_coherence_coherent_verdict_silent_in_shadow(env):
+    """A COHERENT verdict produces NO Coherence: line in the shadow
+    file — silent on clean lessons keeps the file uncluttered."""
+    workspace = env
+    lesson = _proc_lesson()
+    messages = [_tmsg("user", "do Y please")]
+    with mock.patch(
+        "core.learning_curator.run_coherence_judge",
+        return_value=CoherenceVerdict.coherent(),
+    ) as judge_mock:
+        summary = lc._write_verified(
+            workspace,
+            _make_review_output_with([lesson]),
+            meta=_meta(),
+            shadow=True,
+            messages=messages,
+        )
+
+    judge_mock.assert_called_once()
+    # Verdict was attached to the lesson dict
+    assert lesson["coherence"].verdict == "COHERENT"
+    # No flag counts
+    assert summary.coherence_flagged == 0
+    assert summary.coherence_near_miss == 0
+    assert summary.coherence_by_reason == {}
+    assert summary.coherence_flags == []
+    # Shadow file: lesson present but no Coherence: line
+    audit = (workspace / "memories" / "MEMORY-SHADOW.md").read_text(encoding="utf-8")
+    assert lesson["lesson"] in audit
+    assert "Coherence:" not in audit
+
+
+def test_coherence_incoherent_verdict_annotates_shadow(env):
+    """An INCOHERENT verdict surfaces a FLAGGED line with the reason
+    name (greppable: ``grep 'FLAGGED (mismatched-attribution)'``)."""
+    workspace = env
+    lesson = _proc_lesson()
+    messages = [_tmsg("user", "do Y please")]
+    verdict = CoherenceVerdict.incoherent(
+        reason="mismatched-attribution",
+        explanation="evidence is about Tailscale; lesson is about Python",
+    )
+    with mock.patch(
+        "core.learning_curator.run_coherence_judge",
+        return_value=verdict,
+    ):
+        summary = lc._write_verified(
+            workspace,
+            _make_review_output_with([lesson]),
+            meta=_meta("sess-bad-1"),
+            shadow=True,
+            messages=messages,
+        )
+
+    assert summary.coherence_flagged == 1
+    assert summary.coherence_near_miss == 0
+    assert summary.coherence_by_reason == {"mismatched-attribution": 1}
+    # Per-flag detail captured for the REPORT.md narrative
+    assert len(summary.coherence_flags) == 1
+    flag = summary.coherence_flags[0]
+    assert flag["session_uuid"] == "sess-bad-1"
+    assert flag["verdict"] == "INCOHERENT"
+    assert flag["reason"] == "mismatched-attribution"
+    assert "Tailscale" in flag["explanation"]
+    # Shadow file has the FLAGGED line
+    audit = (workspace / "memories" / "MEMORY-SHADOW.md").read_text(encoding="utf-8")
+    assert "Coherence: FLAGGED (mismatched-attribution)" in audit
+    assert "Tailscale" in audit
+
+
+def test_coherence_near_miss_verdict_annotates_shadow(env):
+    """NEAR_MISS_REVIEW gets the soft NEAR_MISS label."""
+    workspace = env
+    lesson = _proc_lesson()
+    messages = [_tmsg("user", "do Y please")]
+    verdict = CoherenceVerdict.near_miss(
+        reason="narrow-one-shot",
+        explanation="evidence is one tactical exchange",
+    )
+    with mock.patch(
+        "core.learning_curator.run_coherence_judge",
+        return_value=verdict,
+    ):
+        summary = lc._write_verified(
+            workspace,
+            _make_review_output_with([lesson]),
+            meta=_meta(),
+            shadow=True,
+            messages=messages,
+        )
+
+    assert summary.coherence_flagged == 0
+    assert summary.coherence_near_miss == 1
+    assert summary.coherence_by_reason == {"narrow-one-shot": 1}
+    audit = (workspace / "memories" / "MEMORY-SHADOW.md").read_text(encoding="utf-8")
+    assert "Coherence: NEAR_MISS (narrow-one-shot)" in audit
+
+
+def test_coherence_skipped_when_messages_empty(env):
+    """Backward compat: callers that pass messages=None or [] don't
+    invoke the judge. Keeps every legacy _write_verified call site
+    working unchanged."""
+    workspace = env
+    lesson = _proc_lesson()
+    with mock.patch(
+        "core.learning_curator.run_coherence_judge"
+    ) as judge_mock:
+        # No messages kwarg → judge not called
+        lc._write_verified(
+            workspace,
+            _make_review_output_with([lesson]),
+            meta=_meta(),
+            shadow=True,
+        )
+        assert judge_mock.call_count == 0
+        # Empty messages list → also skipped
+        lc._write_verified(
+            workspace,
+            _make_review_output_with([_proc_lesson("X2", "ev2")]),
+            meta=_meta(),
+            shadow=True,
+            messages=[],
+        )
+        assert judge_mock.call_count == 0
+
+
+def test_coherence_summary_aggregates_across_lessons(env):
+    """Two verified lessons in one session → two judge calls; counts
+    sum correctly."""
+    workspace = env
+    lessons = [
+        _proc_lesson("first lesson", "evidence one"),
+        _proc_lesson("second lesson", "evidence two"),
+    ]
+    # Make second lesson's skill name distinct so staging doesn't collide
+    lessons[1]["target"]["skill_name"] = "x-handling-2"
+    lessons[1]["target"]["new_skill_body"] = (
+        "---\nname: x-handling-2\ndescription: Handle X variant.\n"
+        "origin: learning-curator\n---\n\n# Body\n"
+    )
+    messages = [
+        _tmsg("user", "evidence one", uuid="m1"),
+        _tmsg("user", "evidence two", uuid="m2"),
+    ]
+    verdicts = [
+        CoherenceVerdict.coherent(),
+        CoherenceVerdict.incoherent(
+            reason="hallucinated-inference",
+            explanation="not in evidence",
+        ),
+    ]
+    with mock.patch(
+        "core.learning_curator.run_coherence_judge",
+        side_effect=verdicts,
+    ):
+        summary = lc._write_verified(
+            workspace,
+            _make_review_output_with(lessons),
+            meta=_meta("sess-mixed"),
+            shadow=True,
+            messages=messages,
+        )
+
+    assert summary.coherence_flagged == 1
+    assert summary.coherence_near_miss == 0
+    assert summary.coherence_by_reason == {"hallucinated-inference": 1}
+    assert len(summary.coherence_flags) == 1
+    assert summary.coherence_flags[0]["lesson_preview"].startswith("second")
+
+
+def test_writesummary_to_dict_includes_coherence_block():
+    """run.json contract: summary.coherence = {flagged, near_miss,
+    by_reason}. Per the §3.4 brief shape."""
+    s = lc.WriteSummary(
+        coherence_flagged=2,
+        coherence_near_miss=1,
+        coherence_by_reason={"mismatched-attribution": 2,
+                             "narrow-one-shot": 1},
+    )
+    out = s.to_dict()
+    assert out["coherence"] == {
+        "flagged": 2,
+        "near_miss": 1,
+        "by_reason": {"mismatched-attribution": 2,
+                       "narrow-one-shot": 1},
+    }
+
+
+def test_writesummary_merge_aggregates_coherence_fields():
+    """Per-session summaries roll up into the tick total via merge()."""
+    a = lc.WriteSummary(
+        coherence_flagged=1,
+        coherence_by_reason={"mismatched-attribution": 1},
+        coherence_flags=[{"session_uuid": "s1", "lesson_preview": "x",
+                          "verdict": "INCOHERENT",
+                          "reason": "mismatched-attribution",
+                          "explanation": "..."}],
+    )
+    b = lc.WriteSummary(
+        coherence_flagged=1,
+        coherence_near_miss=2,
+        coherence_by_reason={"mismatched-attribution": 1,
+                             "narrow-one-shot": 2},
+        coherence_flags=[{"session_uuid": "s2", "lesson_preview": "y",
+                          "verdict": "INCOHERENT",
+                          "reason": "mismatched-attribution",
+                          "explanation": "..."}],
+    )
+    a.merge(b)
+    assert a.coherence_flagged == 2
+    assert a.coherence_near_miss == 2
+    assert a.coherence_by_reason == {
+        "mismatched-attribution": 2, "narrow-one-shot": 2,
+    }
+    assert len(a.coherence_flags) == 2
+
+
+def test_format_coherence_line_silent_on_coherent():
+    assert lc._format_coherence_line(None) is None
+    assert lc._format_coherence_line(CoherenceVerdict.coherent()) is None
+
+
+def test_format_coherence_line_renders_incoherent_and_near_miss():
+    inc = CoherenceVerdict.incoherent("scope-overflow", "scope too broad")
+    line = lc._format_coherence_line(inc)
+    assert "FLAGGED (scope-overflow)" in line
+    assert "scope too broad" in line
+
+    nm = CoherenceVerdict.near_miss("other", "thin grounding")
+    line = lc._format_coherence_line(nm)
+    assert "NEAR_MISS (other)" in line
+    assert "thin grounding" in line
+
+    # NEAR_MISS_REVIEW with no reason — prefix omitted
+    nm_no_reason = CoherenceVerdict.near_miss(None, "borderline")
+    line = lc._format_coherence_line(nm_no_reason)
+    assert "NEAR_MISS" in line
+    assert "borderline" in line
+    assert "()" not in line  # no empty parens for missing reason
+
+
+def test_tick_report_includes_coherence_section_when_flags(env):
+    """Per §3.4 #2: REPORT.md gets a ## Coherence flags section
+    listing per-session flag detail."""
+    workspace = env
+    controller = LearningController(workspace, review_fn=_stub_review_fn)
+    summary = lc.WriteSummary(
+        written=2,
+        coherence_flagged=1,
+        coherence_near_miss=1,
+        coherence_by_reason={"mismatched-attribution": 1, "other": 1},
+        coherence_flags=[
+            {"session_uuid": "sess-aaaa1234",
+             "lesson_preview": "When invoking vexis-agent tools...",
+             "verdict": "INCOHERENT",
+             "reason": "mismatched-attribution",
+             "explanation": "evidence is about Tailscale"},
+            {"session_uuid": "sess-bbbb5678",
+             "lesson_preview": "Always use ydotool fallback",
+             "verdict": "NEAR_MISS_REVIEW",
+             "reason": "other",
+             "explanation": "thin grounding"},
+        ],
+    )
+    result = lc.TickResult(
+        eligible=["sess-aaaa1234", "sess-bbbb5678"],
+        reviewed=["sess-aaaa1234", "sess-bbbb5678"],
+        outcomes=[
+            ("sess-aaaa1234", "wrote 1"),
+            ("sess-bbbb5678", "wrote 1"),
+        ],
+        summary=summary,
+    )
+    started = _utc(hour=10)
+    finished = _utc(hour=10, minute=1)
+    folder = controller._write_tick_report(started, finished, result)
+    report = (folder / "REPORT.md").read_text(encoding="utf-8")
+    assert "## Coherence flags" in report
+    assert "1 INCOHERENT, 1 NEAR_MISS_REVIEW" in report
+    assert "by reason: mismatched-attribution=1, other=1" in report
+    assert "FLAGGED (mismatched-attribution)" in report
+    assert "NEAR_MISS (other)" in report
+    assert "evidence is about Tailscale" in report
+    # Run.json carries the aggregate per the brief shape
+    run = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+    assert run["summary"]["coherence"] == {
+        "flagged": 1, "near_miss": 1,
+        "by_reason": {"mismatched-attribution": 1, "other": 1},
+    }
+
+
+def test_tick_report_omits_coherence_section_when_no_flags(env):
+    """No flags this tick → no ## Coherence flags section. Keeps the
+    report clean during normal operation when v3a is silent."""
+    workspace = env
+    controller = LearningController(workspace, review_fn=_stub_review_fn)
+    result = lc.TickResult(
+        eligible=["sess-clean"],
+        reviewed=["sess-clean"],
+        outcomes=[("sess-clean", "nothing to save")],
+        summary=lc.WriteSummary(),  # all zeros
+    )
+    folder = controller._write_tick_report(
+        _utc(hour=10), _utc(hour=10, minute=1), result,
+    )
+    report = (folder / "REPORT.md").read_text(encoding="utf-8")
+    assert "## Coherence flags" not in report
+    # Run.json still carries the empty coherence block (always present
+    # in summary.to_dict — schema stability)
+    run = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+    assert run["summary"]["coherence"] == {
+        "flagged": 0, "near_miss": 0, "by_reason": {},
+    }
+
+
+def test_audit_text_surfaces_coherence_row_when_flags(env):
+    """`/learning audit` row mirrors the existing dedup row shape."""
+    workspace = env
+    controller = LearningController(workspace, review_fn=_stub_review_fn)
+    # Synthesize a tick report with non-zero coherence counts so the
+    # audit's _recent_coherence_flags helper picks them up.
+    summary = lc.WriteSummary(
+        written=2,
+        coherence_flagged=2,
+        coherence_near_miss=1,
+        coherence_by_reason={"mismatched-attribution": 2, "narrow-one-shot": 1},
+        coherence_flags=[
+            {"session_uuid": "s1", "lesson_preview": "x",
+             "verdict": "INCOHERENT", "reason": "mismatched-attribution",
+             "explanation": "..."},
+            {"session_uuid": "s2", "lesson_preview": "y",
+             "verdict": "INCOHERENT", "reason": "mismatched-attribution",
+             "explanation": "..."},
+            {"session_uuid": "s3", "lesson_preview": "z",
+             "verdict": "NEAR_MISS_REVIEW", "reason": "narrow-one-shot",
+             "explanation": "..."},
+        ],
+    )
+    result = lc.TickResult(
+        eligible=["s1", "s2", "s3"],
+        reviewed=["s1", "s2", "s3"],
+        outcomes=[(u, "ok") for u in ("s1", "s2", "s3")],
+        summary=summary,
+    )
+    controller._write_tick_report(
+        _utc(hour=10), _utc(hour=10, minute=1), result,
+    )
+    audit = controller._audit_text()
+    assert "Coherence flags (last 1 tick reports)" in audit
+    assert "2 INCOHERENT, 1 NEAR_MISS_REVIEW" in audit
+    assert "mismatched-attribution: 2" in audit
+    assert "narrow-one-shot: 1" in audit
+
+
+def test_audit_text_shows_zero_coherence_row_when_clean(env):
+    """When tick reports exist but contain no flags, audit shows a
+    'Coherence flags ... 0 entries flagged.' row — confirms the
+    surface is alive even when v3a has nothing to flag."""
+    workspace = env
+    controller = LearningController(workspace, review_fn=_stub_review_fn)
+    result = lc.TickResult(
+        eligible=["s1"],
+        reviewed=["s1"],
+        outcomes=[("s1", "ok")],
+        summary=lc.WriteSummary(written=1),  # no coherence flags
+    )
+    controller._write_tick_report(
+        _utc(hour=10), _utc(hour=10, minute=1), result,
+    )
+    audit = controller._audit_text()
+    assert "Coherence flags (last 1 tick reports): 0 entries flagged" in audit
+
+
+def test_recent_coherence_flags_aggregates_across_ticks(env):
+    """Helper sums INCOHERENT + NEAR_MISS_REVIEW + by_reason across
+    the most recent N tick reports."""
+    workspace = env
+    controller = LearningController(workspace, review_fn=_stub_review_fn)
+    # Tick 1: 1 INCOHERENT (mismatched), 0 near-miss
+    s1 = lc.WriteSummary(
+        coherence_flagged=1,
+        coherence_by_reason={"mismatched-attribution": 1},
+        coherence_flags=[{"session_uuid": "a", "lesson_preview": "x",
+                          "verdict": "INCOHERENT",
+                          "reason": "mismatched-attribution",
+                          "explanation": "..."}],
+    )
+    controller._write_tick_report(
+        _utc(hour=10), _utc(hour=10, minute=1),
+        lc.TickResult(eligible=["a"], reviewed=["a"],
+                       outcomes=[("a", "ok")], summary=s1),
+    )
+    # Tick 2: 1 INCOHERENT (narrow-one-shot), 2 NEAR_MISS (other, narrow)
+    s2 = lc.WriteSummary(
+        coherence_flagged=1,
+        coherence_near_miss=2,
+        coherence_by_reason={"narrow-one-shot": 2, "other": 1},
+        coherence_flags=[{"session_uuid": "b", "lesson_preview": "y",
+                          "verdict": "NEAR_MISS_REVIEW",
+                          "reason": "narrow-one-shot",
+                          "explanation": "..."}],
+    )
+    controller._write_tick_report(
+        _utc(hour=11), _utc(hour=11, minute=1),
+        lc.TickResult(eligible=["b"], reviewed=["b"],
+                       outcomes=[("b", "ok")], summary=s2),
+    )
+    flagged, near_miss, by_reason, scanned = (
+        controller._recent_coherence_flags(window_ticks=24)
+    )
+    assert flagged == 2
+    assert near_miss == 2
+    assert by_reason == {"mismatched-attribution": 1,
+                         "narrow-one-shot": 2, "other": 1}
+    assert scanned == 2
+
+
+# --------------------------------------------------------------------
+# Day 3 — manual /learning coherence-audit command
+# --------------------------------------------------------------------
+
+
+def test_parse_curator_entries_extracts_structured_dicts(env):
+    """The shadow-file parser must round-trip the standard layout:
+    [learned ...] header → lesson, then Class/Tier/Scope/Evidence
+    metadata lines into matching dict keys."""
+    workspace = env
+    shadow = workspace / "memories" / "MEMORY-SHADOW.md"
+    shadow.write_text(
+        "[learned 2026-05-12] When listing time-bound options, filter ahead.\n"
+        "  Class: PROCEDURAL\n"
+        "  Tier: S3 (would create new skill: time-bound-listings)\n"
+        "  Scope: time-bound listings\n"
+        "  Evidence: filter to upcoming items only please\n"
+        "\n§\n"
+        "[learned 2026-05-13] User runs Vexis on Hetzner.\n"
+        "  Class: SITUATIONAL\n"
+        "  Scope: environment\n"
+        "  Evidence: yeah this is on the Hetzner box\n"
+        "\n§\n"
+        "Hand-written entry without [learned tag — should be skipped\n",
+        encoding="utf-8",
+    )
+    entries = lc._parse_curator_entries(shadow)
+    assert len(entries) == 2
+    assert entries[0]["lesson"].startswith("When listing time-bound")
+    assert entries[0]["class"] == "PROCEDURAL"
+    assert entries[0]["tier"] == "S3"
+    assert entries[0]["scope"] == "time-bound listings"
+    assert entries[0]["evidence"] == "filter to upcoming items only please"
+    assert entries[1]["class"] == "SITUATIONAL"
+    assert "tier" not in entries[1]
+
+
+def test_parse_curator_entries_skips_entries_without_evidence(env):
+    """Entries missing scope OR evidence can't be judged — skip them
+    silently rather than passing partial data to the judge."""
+    workspace = env
+    shadow = workspace / "memories" / "MEMORY-SHADOW.md"
+    shadow.write_text(
+        "[learned 2026-05-12] half-baked entry without metadata\n"
+        "\n§\n"
+        "[learned 2026-05-13] Complete entry.\n"
+        "  Scope: thing\n"
+        "  Evidence: ev\n",
+        encoding="utf-8",
+    )
+    entries = lc._parse_curator_entries(shadow)
+    assert len(entries) == 1
+    assert entries[0]["lesson"] == "Complete entry."
+
+
+def test_coherence_audit_text_judges_shadow_entries(env):
+    """Manual /learning coherence-audit walks shadow files, calls
+    the judge in degraded mode (no transcript), and returns a chat-
+    friendly summary plus a structured log."""
+    workspace = env
+    controller = LearningController(workspace, review_fn=_stub_review_fn)
+    shadow = workspace / "memories" / "MEMORY-SHADOW.md"
+    shadow.write_text(
+        "[learned 2026-05-12] Clean rule about X.\n"
+        "  Class: PROCEDURAL\n"
+        "  Tier: S3\n"
+        "  Scope: X-related\n"
+        "  Evidence: do X please\n"
+        "\n§\n"
+        "[learned 2026-05-13] Bad lesson with mismatched evidence.\n"
+        "  Class: PROCEDURAL\n"
+        "  Tier: S3\n"
+        "  Scope: Z-related\n"
+        "  Evidence: completely unrelated quote\n",
+        encoding="utf-8",
+    )
+    verdicts = [
+        CoherenceVerdict.coherent(),
+        CoherenceVerdict.incoherent(
+            "mismatched-attribution",
+            "lesson is about Z; evidence is unrelated",
+        ),
+    ]
+    with mock.patch(
+        "core.learning_curator.run_coherence_judge",
+        side_effect=verdicts,
+    ) as judge_mock:
+        out = controller._coherence_audit_text(shadow_only=True)
+
+    # Two judge calls (one per parsed entry)
+    assert judge_mock.call_count == 2
+    # Both were called with empty messages list (degraded mode)
+    for call in judge_mock.call_args_list:
+        _args, _ = call.args, call.kwargs
+        assert _args[2] == []  # messages is positional arg [2]
+    # Reply summary mentions counts and the flagged entry
+    assert "1" in out  # at least one of the counts
+    assert "COHERENT: 1" in out
+    assert "INCOHERENT: 1" in out
+    assert "FLAGGED" in out
+    assert "mismatched-attribution" in out
+    assert "Bad lesson" in out
+    # Structured log persisted
+    log_dir = lc.learning_logs_dir() / "coherence-audit"
+    assert log_dir.exists()
+    log_files = list(log_dir.glob("*.json"))
+    assert len(log_files) == 1
+    log = json.loads(log_files[0].read_text(encoding="utf-8"))
+    assert log["shadow_only"] is True
+    assert len(log["results"]) == 2
+    assert log["results"][1]["verdict"] == "INCOHERENT"
+    assert log["results"][1]["reason"] == "mismatched-attribution"
+
+
+def test_coherence_audit_handles_empty_targets(env):
+    """No shadow files → friendly empty-state message rather than
+    trying to judge nothing."""
+    workspace = env
+    controller = LearningController(workspace, review_fn=_stub_review_fn)
+    out = controller._coherence_audit_text(shadow_only=True)
+    assert "No shadow" in out
+
+
+def test_coherence_audit_skips_live_when_shadow_only(env):
+    """--shadow-only restricts to shadow files; live MEMORY.md /
+    USER.md curator-authored entries are skipped."""
+    workspace = env
+    controller = LearningController(workspace, review_fn=_stub_review_fn)
+    # Live MEMORY.md with curator-authored entry
+    live = workspace / "memories" / "MEMORY.md"
+    live.write_text(
+        "[learned 2026-05-01] Live curator entry.\n"
+        "  Class: SITUATIONAL\n"
+        "  Scope: env\n"
+        "  Evidence: live ev\n",
+        encoding="utf-8",
+    )
+    # Shadow MEMORY-SHADOW.md
+    shadow = workspace / "memories" / "MEMORY-SHADOW.md"
+    shadow.write_text(
+        "[learned 2026-05-12] Shadow entry.\n"
+        "  Class: SITUATIONAL\n"
+        "  Scope: env\n"
+        "  Evidence: shadow ev\n",
+        encoding="utf-8",
+    )
+    with mock.patch(
+        "core.learning_curator.run_coherence_judge",
+        return_value=CoherenceVerdict.coherent(),
+    ) as judge_mock:
+        controller._coherence_audit_text(shadow_only=True)
+    # Only the shadow entry got judged (1 call), not the live one
+    assert judge_mock.call_count == 1
+
+
+def test_coherence_audit_includes_live_when_not_shadow_only(env):
+    """Default (shadow_only=False) walks live MEMORY.md and USER.md
+    in addition to shadow files."""
+    workspace = env
+    controller = LearningController(workspace, review_fn=_stub_review_fn)
+    live = workspace / "memories" / "MEMORY.md"
+    live.write_text(
+        "[learned 2026-05-01] Live entry.\n"
+        "  Class: SITUATIONAL\n"
+        "  Scope: env\n"
+        "  Evidence: live ev\n",
+        encoding="utf-8",
+    )
+    shadow = workspace / "memories" / "MEMORY-SHADOW.md"
+    shadow.write_text(
+        "[learned 2026-05-12] Shadow entry.\n"
+        "  Class: SITUATIONAL\n"
+        "  Scope: env\n"
+        "  Evidence: shadow ev\n",
+        encoding="utf-8",
+    )
+    with mock.patch(
+        "core.learning_curator.run_coherence_judge",
+        return_value=CoherenceVerdict.coherent(),
+    ) as judge_mock:
+        controller._coherence_audit_text(shadow_only=False)
+    assert judge_mock.call_count == 2
+
+
+def test_handle_telegram_dispatches_coherence_audit_subcommand(env):
+    """The /learning coherence-audit command surface dispatches into
+    the controller's helper."""
+    workspace = env
+    controller = LearningController(workspace, review_fn=_stub_review_fn)
+    shadow = workspace / "memories" / "MEMORY-SHADOW.md"
+    shadow.write_text(
+        "[learned 2026-05-12] X.\n"
+        "  Scope: y\n  Evidence: ev\n",
+        encoding="utf-8",
+    )
+    with mock.patch(
+        "core.learning_curator.run_coherence_judge",
+        return_value=CoherenceVerdict.coherent(),
+    ):
+        out = asyncio.run(
+            controller.handle_telegram("coherence-audit", ["--shadow-only"])
+        )
+    assert "Coherence audit" in out
+    assert "COHERENT: 1" in out
+
+
+def test_handle_telegram_unknown_subcommand_lists_coherence_audit(env):
+    """Usage text mentions the new command so users discover it."""
+    workspace = env
+    controller = LearningController(workspace, review_fn=_stub_review_fn)
+    out = asyncio.run(controller.handle_telegram("nonsense", []))
+    assert "coherence-audit" in out
+
+
+def test_end_to_end_coherent_then_incoherent_through_pipeline(env):
+    """End-to-end Day 2 checkpoint: two ticks, one COHERENT lesson
+    and one INCOHERENT, both flow through _write_verified, the
+    shadow file gets the right annotations, and /learning audit
+    surfaces the flag count.
+    """
+    workspace = env
+    controller = LearningController(workspace, review_fn=_stub_review_fn)
+
+    coherent_lesson = _proc_lesson("clean lesson", "actual evidence")
+    incoherent_lesson = _proc_lesson("bad lesson", "different evidence string")
+    incoherent_lesson["target"]["skill_name"] = "x-handling-bad"
+    incoherent_lesson["target"]["new_skill_body"] = (
+        "---\nname: x-handling-bad\ndescription: variant.\n"
+        "origin: learning-curator\n---\n\n# Body\n"
+    )
+
+    messages_a = [_tmsg("user", "actual evidence")]
+    messages_b = [_tmsg("user", "different evidence string")]
+
+    # Tick A: COHERENT
+    with mock.patch(
+        "core.learning_curator.run_coherence_judge",
+        return_value=CoherenceVerdict.coherent(),
+    ):
+        s_a = lc._write_verified(
+            workspace,
+            _make_review_output_with([coherent_lesson]),
+            meta=_meta("sess-aaa11111"),
+            shadow=True,
+            messages=messages_a,
+        )
+    controller._write_tick_report(
+        _utc(hour=10), _utc(hour=10, minute=1),
+        lc.TickResult(eligible=["sess-aaa11111"],
+                       reviewed=["sess-aaa11111"],
+                       outcomes=[("sess-aaa11111", "ok")],
+                       summary=s_a),
+    )
+
+    # Tick B: INCOHERENT
+    inc_verdict = CoherenceVerdict.incoherent(
+        "mismatched-attribution",
+        "lesson is about Z; evidence cites W",
+    )
+    with mock.patch(
+        "core.learning_curator.run_coherence_judge",
+        return_value=inc_verdict,
+    ):
+        s_b = lc._write_verified(
+            workspace,
+            _make_review_output_with([incoherent_lesson]),
+            meta=_meta("sess-bbb22222"),
+            shadow=True,
+            messages=messages_b,
+        )
+    controller._write_tick_report(
+        _utc(hour=11), _utc(hour=11, minute=1),
+        lc.TickResult(eligible=["sess-bbb22222"],
+                       reviewed=["sess-bbb22222"],
+                       outcomes=[("sess-bbb22222", "ok")],
+                       summary=s_b),
+    )
+
+    # Shadow file: has the COHERENT entry (no annotation) AND the
+    # INCOHERENT entry (with FLAGGED annotation).
+    audit_md = (workspace / "memories" / "MEMORY-SHADOW.md").read_text(encoding="utf-8")
+    assert "clean lesson" in audit_md
+    assert "bad lesson" in audit_md
+    # Annotation appears exactly once (only the bad lesson)
+    assert audit_md.count("Coherence:") == 1
+    assert "Coherence: FLAGGED (mismatched-attribution)" in audit_md
+
+    # Per-tick REPORT.md for tick B has the section; tick A doesn't.
+    log_dirs = sorted((p for p in lc.learning_logs_dir().iterdir() if p.is_dir()),
+                      key=lambda p: p.name)
+    assert len(log_dirs) == 2
+    report_a = (log_dirs[0] / "REPORT.md").read_text(encoding="utf-8")
+    report_b = (log_dirs[1] / "REPORT.md").read_text(encoding="utf-8")
+    assert "## Coherence flags" not in report_a
+    assert "## Coherence flags" in report_b
+    assert "FLAGGED (mismatched-attribution)" in report_b
+
+    # /learning audit row: 1 INCOHERENT across the 2 ticks
+    audit = controller._audit_text()
+    assert "Coherence flags (last 2 tick reports): 1 INCOHERENT" in audit
+    assert "mismatched-attribution: 1" in audit

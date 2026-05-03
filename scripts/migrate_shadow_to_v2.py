@@ -74,6 +74,10 @@ from core.paths import (  # noqa: E402
     workspace_dir,
 )
 from core.user_candidates import UserCandidateStore  # noqa: E402
+from core.yaml_config import (  # noqa: E402
+    model_migration_classifier,
+    resolve_model_flag,
+)
 
 log = logging.getLogger(__name__)
 
@@ -311,7 +315,7 @@ def classify_entries(
     if not entries:
         return []
     prompt = _build_classify_prompt(entries)
-    argv = ["claude", "-p", prompt]
+    argv = ["claude", "-p", *resolve_model_flag(model_migration_classifier()), prompt]
     try:
         if spawn is not None:
             cp = spawn(argv, dict(os.environ))

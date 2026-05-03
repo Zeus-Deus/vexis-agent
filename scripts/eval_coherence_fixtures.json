@@ -1,0 +1,266 @@
+{
+  "_comment": "v3a coherence judge eval fixtures. Loaded by scripts/eval_learning.py for C1/C2/C3 grades. Each fixture builds a synthetic transcript inline (no JSONL dependency on the user's machine state) so the eval is reproducible across hosts. evidence_message_index points to the message containing the verbatim evidence string. expected_reason_set: list of acceptable reasons when verdict=INCOHERENT — sarcasm could plausibly be tagged either mismatched-attribution or hallucinated-inference, so the grader accepts any in the set.",
+  "fixtures": [
+    {
+      "id": "bad_20",
+      "category": "known_bad",
+      "expected_verdict": "INCOHERENT",
+      "expected_reason_set": ["mismatched-attribution", "hallucinated-inference"],
+      "notes": "Entry 20 from migration-plan-2026-05-03T100620Z.md (mismatched-attribution). The lesson is about conda env Python; the cited evidence is about Tailscale restart. The user's actual signal in the source session was Tailscale-related; the lesson appears to have been inferred from elsewhere in the session and back-attached to this user message.",
+      "lesson": {
+        "class": "SITUATIONAL",
+        "lesson": "When invoking vexis-agent tools/CLIs from Bash, use the conda env Python directly (~/miniconda3/envs/vexis-agent_env/bin/python -m ...) rather than the shell wrappers in scripts/, since wrappers may invoke system Python which lacks the required dependencies.",
+        "scope": "Running vexis-agent Python tools (livestream, etc.) from Bash on this machine",
+        "evidence": "But I just enabled it for you though. Do I need to maybe restart Tailscale? Is that maybe an issue?"
+      },
+      "synthetic_transcript": [
+        ["assistant", "I tried curl --tailscale-cert and it 401'd. Looks like the funnel route hasn't picked up the new tag — sometimes Tailscale needs to refresh."],
+        ["user", "But I just enabled it for you though. Do I need to maybe restart Tailscale? Is that maybe an issue?"],
+        ["assistant", "Restart shouldn't be needed for tag changes — they propagate to magicdns-style routing within a few seconds. Let me retry the curl in 30s."]
+      ],
+      "evidence_message_index": 1
+    },
+    {
+      "id": "bad_22",
+      "category": "known_bad",
+      "expected_verdict": "INCOHERENT",
+      "expected_reason_set": ["narrow-one-shot", "scope-overflow"],
+      "notes": "Entry 22 from migration plan (narrow-one-shot). The user's clarification 'you act as the middle guy instead the local llm' is a single tactical decision in one specific Roya Dutch RAG prototype session. The lesson generalizes it to a class-level rule about all local-RAG / hybrid retrieval workflows.",
+      "lesson": {
+        "class": "PROCEDURAL",
+        "tier": "S3",
+        "lesson": "When the user toggles the LLM step in a local-RAG pipeline to 'go through you,' confirm whether 'you' means just synthesis or replacing every LLM call (query expansion, reranker, synthesis). Default to full replacement when GPU silence is the goal.",
+        "scope": "Local-RAG / hybrid retrieval workflows where the user wants to bypass the local LLM for some or all of the pipeline.",
+        "evidence": "No I mean you act as the middle guy instead the local llm",
+        "target": {
+          "skill_name": "rag-pipeline-llm-routing",
+          "new_skill_body": "---\nname: rag-pipeline-llm-routing\ndescription: Confirm scope of LLM-step replacement in RAG pipelines.\norigin: learning-curator\n---\n\n# Body\n"
+        }
+      },
+      "synthetic_transcript": [
+        ["assistant", "For the Roya Dutch chat lookup, I can do embedding-only retrieval, run BM25 keyword search, or wire bge-m3 + a reranker. Which way do you want for this prototype?"],
+        ["user", "No I mean you act as the middle guy instead the local llm"],
+        ["assistant", "Got it — for this prototype I'll synthesize the answer myself rather than calling the local llama model. Just for this Roya pull."]
+      ],
+      "evidence_message_index": 1
+    },
+    {
+      "id": "bad_23",
+      "category": "known_bad",
+      "expected_verdict": "INCOHERENT",
+      "expected_reason_set": ["hallucinated-inference", "mismatched-attribution"],
+      "notes": "Entry 23 from migration plan (hallucinated-inference). The cited evidence is approval syntax ('Cool Lets run it that way just for now') with zero technical content. The lesson makes a substantive claim about multilingual embedders (bge-m3 retrieving unevenly across languages) that is nowhere in the cited evidence. This is the cleanest test of hallucinated-inference: real evidence quote, plausible technical lesson, no semantic link between them.",
+      "lesson": {
+        "class": "PROCEDURAL",
+        "tier": "S3",
+        "lesson": "When a multilingual RAG returns 'nothing found,' don't trust it — re-query in the corpus's native language before reporting absence. Multilingual embedders (e.g. bge-m3) retrieve unevenly across languages and can silently miss content.",
+        "scope": "Any retrieval/search task over a corpus whose language differs from the query language.",
+        "evidence": "Cool Lets run it that way just for now no code chances. Alright?",
+        "target": {
+          "skill_name": "multilingual-rag-queries",
+          "new_skill_body": "---\nname: multilingual-rag-queries\ndescription: Re-query in corpus language on multilingual nothing-found.\norigin: learning-curator\n---\n\n# Body\n"
+        }
+      },
+      "synthetic_transcript": [
+        ["assistant", "I can use grep for now while we prototype, or wire up the multilingual RAG. Quick path is grep — let me know."],
+        ["user", "Cool Lets run it that way just for now no code chances. Alright?"],
+        ["assistant", "Sounds good — using grep, no code changes."]
+      ],
+      "evidence_message_index": 1
+    },
+
+    {
+      "id": "good_4",
+      "category": "known_good",
+      "expected_verdict": "COHERENT",
+      "notes": "Entry 4 from migration plan. Yes/no question → terse answer rule. The user explicitly asked for shorter responses and posed a narrow factual question ('Is my current setup only going 15 deep?'). The lesson generalizes the corrective signal to a clean rule.",
+      "lesson": {
+        "class": "PROCEDURAL",
+        "tier": "S3",
+        "lesson": "When the user asks a yes/no or scoped question (e.g. 'is my setup only going N deep?'), answer the question first and stop. Offer the one-line follow-up only as a question, not a multi-section recommendation.",
+        "scope": "Any conversational reply where the user asked a narrow factual question; avoid expanding into ranked recommendation lists unless explicitly requested.",
+        "evidence": "So can you keep it a little shorter for me? My idea is that if I ask something about a chat, and for example the Roya chat is huge, right? Like you mentioned. If I need something very specific about it, I have to find it. Like no questions asked. Is my current setup only going 15 deep?",
+        "target": {
+          "skill_name": "concise-direct-answers",
+          "new_skill_body": "---\nname: concise-direct-answers\ndescription: Answer narrow questions directly.\norigin: learning-curator\n---\n\n# Body\n"
+        }
+      },
+      "synthetic_transcript": [
+        ["user", "How does the Roya chat ingest pipeline retrieve relevant messages right now?"],
+        ["assistant", "## Current setup\n\n1. Index pass with bge-m3 → vector store\n2. Query expansion via local LLM\n3. Top-K=15 dense retrieval\n4. Rerank with cross-encoder (top 5)\n5. Synthesize with the local LLM\n\n### Recommendations\n- Bump top-K to 25 for higher recall\n- Add BM25 hybrid for keyword precision\n- Cache the query-expansion step\n- Try MMR for diversity\n- Consider voyage-2 for embeddings"],
+        ["user", "So can you keep it a little shorter for me? My idea is that if I ask something about a chat, and for example the Roya chat is huge, right? Like you mentioned. If I need something very specific about it, I have to find it. Like no questions asked. Is my current setup only going 15 deep?"],
+        ["assistant", "Yes, top-K is 15. Want me to increase it?"]
+      ],
+      "evidence_message_index": 2
+    },
+    {
+      "id": "good_7",
+      "category": "known_good",
+      "expected_verdict": "COHERENT",
+      "notes": "Entry 7 from migration plan. File-delivery transport investigation. The user reported a delivery failure ('i dont see it you haent showed me'); the lesson generalizes to investigating transport limits before retrying. Clean rule grounded in real corrective signal.",
+      "lesson": {
+        "class": "PROCEDURAL",
+        "tier": "S3",
+        "lesson": "When a file delivery to the user appears to succeed locally but the user reports not receiving it, do not just resend — investigate the transport (dimensions, size, format limits of the channel) before retrying.",
+        "scope": "Handling 'I didn't receive it' reports for any file/asset transfer to the user",
+        "evidence": "i dont see it you haent showed me?",
+        "target": {
+          "skill_name": "chat-artifact-delivery",
+          "new_skill_body": "---\nname: chat-artifact-delivery\ndescription: Investigate transport before retrying delivery.\norigin: learning-curator\n---\n\n# Body\n"
+        }
+      },
+      "synthetic_transcript": [
+        ["user", "screenshot the dashboard and send it"],
+        ["assistant", "Captured the dashboard at /tmp/screenshot.png and uploaded via send_photo — should be in your chat now."],
+        ["user", "i dont see it you haent showed me?"],
+        ["assistant", "Sorry — let me check. The image is 4032x3024 (16MB) and Telegram rejects send_photo above 10MB or with dimensions above ~1280px in either direction. I'll resize and resend."]
+      ],
+      "evidence_message_index": 2
+    },
+    {
+      "id": "good_10",
+      "category": "known_good",
+      "expected_verdict": "COHERENT",
+      "notes": "Entry 10 from migration plan. Handoff/research brief format. The user explicitly asked for a self-contained brief to feed another agent; the lesson generalizes to all such handoff requests. Clean.",
+      "lesson": {
+        "class": "PROCEDURAL",
+        "tier": "S3",
+        "lesson": "When the user asks for a handoff/research brief to feed another agent, produce a self-contained document with explicit constraints, hard requirements, and concrete deliverables — not a conversational summary. The brief must stand alone without prior context.",
+        "scope": "Tasks where the user asks for a prompt, brief, or spec intended for handoff to another agent or person.",
+        "evidence": "Could you maybe write me like a short like description of what I want so I can feed it into another agent to do some research online about this topic? Like just give me like the full plan of what I want. So I like basically a handoff prompt to do some research online.",
+        "target": {
+          "skill_name": "agent-handoff-briefs",
+          "new_skill_body": "---\nname: agent-handoff-briefs\ndescription: Self-contained briefs for agent handoff.\norigin: learning-curator\n---\n\n# Body\n"
+        }
+      },
+      "synthetic_transcript": [
+        ["user", "I want to evaluate which open-weight RAG framework to standardize on for Vexis"],
+        ["assistant", "Main contenders are LlamaIndex, Haystack, and a custom thin-layer pattern. The tradeoffs hinge on: pluggability of the embedder, support for hybrid retrieval, and how the router stage composes."],
+        ["user", "Could you maybe write me like a short like description of what I want so I can feed it into another agent to do some research online about this topic? Like just give me like the full plan of what I want. So I like basically a handoff prompt to do some research online."],
+        ["assistant", "Sure, here's a self-contained brief:\n\n# Research brief: open-weight RAG framework selection for Vexis\n\n## Constraints\n- Single-user daemon, low traffic\n- Must support pluggable embedders (start with bge-m3)\n- Hybrid retrieval (dense + BM25) required\n\n## Deliverables\n1. Comparison table: LlamaIndex, Haystack, custom thin-layer\n2. ..."]
+      ],
+      "evidence_message_index": 2
+    },
+    {
+      "id": "good_15",
+      "category": "known_good",
+      "expected_verdict": "COHERENT",
+      "notes": "Entry 15 from migration plan. Pipeline ETA estimation. The user explicitly corrected the ETA ('you said 10-15 min, but it's been going on for another 35'); the lesson generalizes to estimating from per-item rates rather than surface proxies. Clean correction signal, technical lesson directly grounded in it.",
+      "lesson": {
+        "class": "PROCEDURAL",
+        "tier": "S3",
+        "lesson": "When estimating duration of a multi-stage pipeline, project from measured per-item rates against parsed input characteristics (message/file counts), not surface proxies like archive byte size. When live progress emits a per-item rate, recompute the ETA against it.",
+        "scope": "Pipeline / batch-job duration estimates where prior runs or live progress logs provide measurable per-item rates",
+        "evidence": "So quick note to you, Vexis, you said again it would take roughly 10 to 15 minutes, but you were wrong again. Because it's been going on for another 35 and it's still going on. And I'm not mad that it's still going on, because it's a lot of data and it's locally processing everything, so I get it. But why were you so off? Go ahead and take a look at it, and take a look on why you were so off. Maybe you looked at wrong data, or whatever it was. but let me know maybe you can learn from your mistakes",
+        "target": {
+          "skill_name": "pipeline-runtime-estimation",
+          "new_skill_body": "---\nname: pipeline-runtime-estimation\ndescription: Project pipeline ETA from measured per-item rates.\norigin: learning-curator\n---\n\n# Body\n"
+        }
+      },
+      "synthetic_transcript": [
+        ["user", "kick off the WhatsApp ingest for Roya"],
+        ["assistant", "Starting ingest. Based on the archive size (140MB), this should take roughly 10 to 15 minutes."],
+        ["user", "So quick note to you, Vexis, you said again it would take roughly 10 to 15 minutes, but you were wrong again. Because it's been going on for another 35 and it's still going on. And I'm not mad that it's still going on, because it's a lot of data and it's locally processing everything, so I get it. But why were you so off? Go ahead and take a look at it, and take a look on why you were so off. Maybe you looked at wrong data, or whatever it was. but let me know maybe you can learn from your mistakes"],
+        ["assistant", "You're right — I was projecting from byte size, but the bottleneck is per-message vector embedding (~80ms each at the local rate), and the archive contains ~21K messages. That's 28 minutes for embedding alone, plus indexing. I should have parsed the message count and projected from per-item embedding latency, not bytes."]
+      ],
+      "evidence_message_index": 2
+    },
+    {
+      "id": "good_21",
+      "category": "known_good",
+      "expected_verdict": "COHERENT",
+      "notes": "Entry 21 from migration plan. Prefer in-app management over file edits. Positive corrective signal ('you added it through the tui, which is good'); lesson generalizes to all app-managed state.",
+      "lesson": {
+        "class": "PROCEDURAL",
+        "tier": "S3",
+        "lesson": "Before editing user-managed app state (configs, vocab, settings), prefer the app's own UI/TUI/CLI over direct file edits — it keeps related files in sync and triggers the app's own validation/reload logic. Only fall back to manual edits if no in-app path exists.",
+        "scope": "Any task that mutates configuration or data owned by a running application that has its own management interface.",
+        "evidence": "Okay, so I get it. You didn't manually change any configs. You added it through the tui, which is good. Good job.",
+        "target": {
+          "skill_name": "app-managed-state-edits",
+          "new_skill_body": "---\nname: app-managed-state-edits\ndescription: Use app-native UI for managed state edits.\norigin: learning-curator\n---\n\n# Body\n"
+        }
+      },
+      "synthetic_transcript": [
+        ["user", "add 'voxtype' to the omarchy whitelist"],
+        ["assistant", "I launched the omarchy TUI, opened Settings → Whitelist, added 'voxtype', and saved. The UI did the validation pass and triggered a reload."],
+        ["user", "Okay, so I get it. You didn't manually change any configs. You added it through the tui, which is good. Good job."],
+        ["assistant", "Thanks — the TUI keeps the whitelist file and the runtime cache in sync, so direct file edits would drift from what omarchy actually loads."]
+      ],
+      "evidence_message_index": 2
+    },
+
+    {
+      "id": "near_sarcasm",
+      "category": "adversarial_near_miss",
+      "expected_verdict": "INCOHERENT",
+      "expected_reason_set": ["mismatched-attribution", "hallucinated-inference"],
+      "notes": "NM-1 sarcasm/rhetorical correction per §3.5. The user is rhetorically warning against hardcoding; the v2 reviewer (in this hypothetical) extracted a lesson that takes the surface text literally as a request to hardcode. Judge MUST recognize sarcasm and reject.",
+      "lesson": {
+        "class": "PROCEDURAL",
+        "tier": "S3",
+        "lesson": "When the user requests credential storage, hardcode the password directly into the script — env-var indirection adds unnecessary friction and the user prefers the simpler approach.",
+        "scope": "Tasks involving credential storage or authentication setup in scripts and configs.",
+        "evidence": "oh sure, just hardcode my password into the script — what could go wrong",
+        "target": {
+          "skill_name": "credential-hardcoding",
+          "new_skill_body": "---\nname: credential-hardcoding\ndescription: Hardcode credentials directly.\norigin: learning-curator\n---\n\n# Body\n"
+        }
+      },
+      "synthetic_transcript": [
+        ["user", "i need a quick script that hits the postgres db on prod"],
+        ["assistant", "Sure — I'll write a Python script using psycopg2. For the password, do you want me to read it from a $POSTGRES_PASSWORD env var (recommended), from a .pgpass file, or hardcode it?"],
+        ["user", "oh sure, just hardcode my password into the script — what could go wrong"],
+        ["assistant", "Right, that was a leading question — let me wire up env-var indirection. I'll read POSTGRES_PASSWORD from the environment and fail loudly if it's unset."]
+      ],
+      "evidence_message_index": 2
+    },
+    {
+      "id": "near_pidgin",
+      "category": "adversarial_near_miss",
+      "expected_verdict": "COHERENT",
+      "notes": "NM-2 pidgin/non-standard English per §3.5. The user's correction uses Nigerian Pidgin English ('abeg' = 'please', 'that ting too clutter' = 'that thing is too cluttered'). The lesson correctly captures the meaning. Judge MUST parse semantics, not flag for surface irregularity.",
+      "lesson": {
+        "class": "PROCEDURAL",
+        "tier": "S3",
+        "lesson": "When the user expresses preference for plain HTML over component libraries (Shadcn, MUI, etc.), default to plain HTML markup with utility classes unless explicitly asked otherwise.",
+        "scope": "Frontend page or component generation where bundle size or complexity is a stated concern.",
+        "evidence": "no shadcn that ting too clutter, abeg use plain html",
+        "target": {
+          "skill_name": "frontend-markup-defaults",
+          "new_skill_body": "---\nname: frontend-markup-defaults\ndescription: Default to plain HTML over component libraries.\norigin: learning-curator\n---\n\n# Body\n"
+        }
+      },
+      "synthetic_transcript": [
+        ["user", "yo this shadcn page e too heavy, the bundle dey balloon to 800kb every time"],
+        ["assistant", "Yeah, Shadcn pulls in Radix + tailwind plugins on top of React. I can swap to plain HTML + Tailwind utility classes — bundle drops to ~40kb. Want me to?"],
+        ["user", "no shadcn that ting too clutter, abeg use plain html"],
+        ["assistant", "Got it — plain HTML + Tailwind utilities, no Shadcn. Rewriting now."]
+      ],
+      "evidence_message_index": 2
+    },
+    {
+      "id": "near_just_for_now",
+      "category": "adversarial_near_miss",
+      "expected_verdict": "COHERENT",
+      "notes": "NM-3 just-for-now reuse per §3.5. Same evidence string as bad_23 ('Cool Lets run it that way just for now no code chances. Alright?') but used HERE for a coherent lesson — extracting the literal 'just for now' semantics. Tests that the judge doesn't poison-cache evidence strings: it must judge lesson↔evidence in context, not flag the string in isolation.",
+      "lesson": {
+        "class": "PROCEDURAL",
+        "tier": "S3",
+        "lesson": "When the user signals 'just for now' or 'temporary' on a tactical decision, treat the change as scoped to the current session — do not refactor surrounding code or commit the choice as the durable approach.",
+        "scope": "Conversational tactical decisions where the user explicitly marks the choice as temporary or session-scoped.",
+        "evidence": "Cool Lets run it that way just for now no code chances. Alright?",
+        "target": {
+          "skill_name": "session-scoped-tactical-decisions",
+          "new_skill_body": "---\nname: session-scoped-tactical-decisions\ndescription: Treat 'just for now' decisions as session-scoped.\norigin: learning-curator\n---\n\n# Body\n"
+        }
+      },
+      "synthetic_transcript": [
+        ["assistant", "I can use grep for now while we prototype, or wire up the multilingual RAG. Quick path is grep — let me know."],
+        ["user", "Cool Lets run it that way just for now no code chances. Alright?"],
+        ["assistant", "Sounds good — using grep, no code changes. Won't refactor the RAG path."]
+      ],
+      "evidence_message_index": 1
+    }
+  ]
+}

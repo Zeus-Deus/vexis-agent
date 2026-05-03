@@ -254,3 +254,77 @@ def browser_screenshot_include_base64() -> bool:
     """
     raw = _section("browser").get("screenshot_include_base64", False)
     return bool(raw)
+
+
+# --------------------------------------------------------------------
+# [models] — per-subsystem model tier for claude -p subprocess calls
+# --------------------------------------------------------------------
+#
+# Without this block every internal claude -p call (learning review,
+# coherence judge, migration classifier) runs against the account's
+# default model — typically Opus 4.7 — and competes for plan tokens
+# with the user-facing brain. The defaults below pin internal calls
+# to Sonnet (cheaper, fast enough for these use cases) while leaving
+# the brain on the account default.
+#
+# ``"default"`` is a sentinel meaning "do not pass --model; use whatever
+# claude -p picks on its own". Use this for the brain so user
+# conversations track the account's chosen capability tier without
+# the daemon second-guessing it.
+
+DEFAULT_MODEL_BRAIN = "default"
+DEFAULT_MODEL_LEARNING_REVIEW = "sonnet"
+DEFAULT_MODEL_COHERENCE_JUDGE = "sonnet"
+DEFAULT_MODEL_MIGRATION_CLASSIFIER = "sonnet"
+
+
+def _model_tier(key: str, default: str) -> str:
+    """Read one model-tier string from the ``[models]`` section.
+
+    Falls back to ``default`` on missing key, non-string values, or
+    empty strings. This matches the rest of yaml_config's posture —
+    a malformed config never blocks the daemon, it just falls through.
+    """
+    raw = _read_raw().get("models")
+    section = raw if isinstance(raw, dict) else {}
+    value = section.get(key, default)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
+
+
+def model_brain() -> str:
+    return _model_tier("brain", DEFAULT_MODEL_BRAIN)
+
+
+def model_learning_review() -> str:
+    return _model_tier("learning_review", DEFAULT_MODEL_LEARNING_REVIEW)
+
+
+def model_coherence_judge() -> str:
+    return _model_tier("coherence_judge", DEFAULT_MODEL_COHERENCE_JUDGE)
+
+
+def model_migration_classifier() -> str:
+    return _model_tier("migration_classifier", DEFAULT_MODEL_MIGRATION_CLASSIFIER)
+
+
+def resolve_model_flag(tier: str) -> list[str]:
+    """Translate a model-tier string into ``claude -p`` argv flags.
+
+    Returns ``["--model", "<tier>"]`` for any concrete tier
+    (``"sonnet"``, ``"haiku"``, ``"opus"``, or a full model id like
+    ``"claude-sonnet-4-6"``). Returns ``[]`` for the ``"default"``
+    sentinel (or any empty / falsy value), letting ``claude -p`` pick
+    its own default.
+
+    Empty list rather than a None return so callers can splat with
+    ``*resolve_model_flag(...)`` directly into argv composition without
+    a conditional.
+    """
+    if not isinstance(tier, str):
+        return []
+    cleaned = tier.strip()
+    if not cleaned or cleaned.lower() == "default":
+        return []
+    return ["--model", cleaned]
