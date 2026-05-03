@@ -256,6 +256,7 @@ async def _run() -> None:
         background_tasks=background_tasks,
         curator=curator,
         browser=browser_tools,
+        learning=learning_curator,
         config=DashboardConfig(
             port=dashboard_port,
             web_dist=Path(__file__).resolve().parent / "web" / "dist",

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """One-time cleanup: move curator-spawned JSONLs out of the workspace
 projects directory.
 

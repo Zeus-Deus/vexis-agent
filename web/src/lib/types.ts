@@ -178,3 +178,135 @@ export interface BrowserState {
   recent_screenshots: BrowserScreenshotEntry[];
   config: BrowserConfigSnapshot;
 }
+
+// ---- Learning tab (Step 15) ------------------------------------
+
+export type CoherenceVerdict = "INCOHERENT" | "NEAR_MISS_REVIEW" | "COHERENT";
+
+export interface LearningCuratorRow {
+  name: "archive" | "learning" | "coherence";
+  nested_under: string | null;
+  enabled: boolean;
+  paused: boolean;
+  running: boolean;
+  last_run_at: string | null;
+  next_eligible_at: string | null;
+  summary: string;
+  interval_label: string;
+}
+
+export type LearningOutcomeKind =
+  | "wrote"
+  | "rejected"
+  | "nothing-to-save"
+  | "cooldown"
+  | "error";
+
+export interface LearningActivityRow {
+  tick_folder: string;
+  tick_at: string | null;
+  session_uuid_prefix: string | null;
+  outcome: LearningOutcomeKind;
+  outcome_detail: string;
+  lesson_preview: string | null;
+  class: string | null;
+  tier: string | null;
+  source: string | null;
+  coherence_verdict: CoherenceVerdict | null;
+  coherence_reason: string | null;
+  outcome_marker: string | null;
+  entry_id: string | null;
+}
+
+export interface LearningShadowEntry {
+  source: string;
+  lesson: string;
+  lesson_preview: string;
+  class: string | null;
+  tier: string | null;
+  scope: string | null;
+  evidence: string | null;
+  coherence_verdict: CoherenceVerdict | null;
+  coherence_reason: string | null;
+  coherence_explanation: string | null;
+  outcome_marker: string | null;
+  source_session_prefix: string | null;
+  entry_id: string;
+}
+
+export interface LearningDistribution {
+  window_ticks: number;
+  by_class: Record<string, number>;
+  by_tier: Record<string, number>;
+  a2_watch: boolean;
+}
+
+export interface LearningRates {
+  window_ticks_scanned: number;
+  dedup_skipped: number;
+  coherence_flagged: number;
+  coherence_near_miss: number;
+  coherence_by_reason: Record<string, number>;
+}
+
+export interface LearningUserCandidate {
+  claim_preview: string;
+  distinct_sessions: number;
+  threshold: number;
+  first_seen: string;
+  last_seen: string;
+  days_until_expiry: number;
+}
+
+export interface LearningUserCandidates {
+  pending: LearningUserCandidate[];
+  promoted_count: number;
+}
+
+export interface LearningCuratorSkill {
+  name: string;
+  origin: string;
+}
+
+export interface LearningCuratorSkills {
+  live: LearningCuratorSkill[];
+  staged: LearningCuratorSkill[];
+}
+
+export interface LearningModels {
+  brain?: string;
+  learning_review?: string;
+  coherence_judge?: string;
+  migration_classifier?: string;
+}
+
+export interface LearningState {
+  curators: LearningCuratorRow[];
+  recent_activity: LearningActivityRow[];
+  shadow_entries: LearningShadowEntry[];
+  distribution: LearningDistribution;
+  rates: LearningRates;
+  user_candidates: LearningUserCandidates;
+  coherence_pending_review: LearningShadowEntry[];
+  curator_skills: LearningCuratorSkills;
+  models: LearningModels;
+  learning_disabled: boolean;
+}
+
+export interface LearningJudgeResult {
+  verdict: CoherenceVerdict;
+  reason: string | null;
+  explanation: string | null;
+  degraded: boolean;
+  judged_at: string;
+}
+
+export interface LearningJudgeRequest {
+  lesson: string;
+  scope: string;
+  evidence: string;
+  class?: string | null;
+  tier?: string | null;
+  source?: string | null;
+  entry_id?: string | null;
+}

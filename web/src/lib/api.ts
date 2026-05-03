@@ -5,6 +5,9 @@ import type {
   BrowserState,
   CuratorRunDetail,
   CuratorState,
+  LearningJudgeRequest,
+  LearningJudgeResult,
+  LearningState,
   MemoryState,
   SkillBody,
   SkillsState,
@@ -110,6 +113,12 @@ export const api = {
   browserRecycle: (token: string) =>
     call<{ ok: boolean; was_running: boolean }>(token, "/browser/recycle", {
       method: "POST",
+    }),
+  learning: (token: string) => call<LearningState>(token, "/learning"),
+  learningCoherenceAudit: (token: string, body: LearningJudgeRequest) =>
+    call<LearningJudgeResult>(token, "/learning/coherence-audit", {
+      method: "POST",
+      body,
     }),
 };
 

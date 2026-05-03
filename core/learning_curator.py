@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -90,6 +91,10 @@ from core.yaml_config import (
     learning_idle_threshold_minutes,
     learning_shadow_mode,
     learning_tick_interval_minutes,
+    model_brain,
+    model_coherence_judge,
+    model_learning_review,
+    model_migration_classifier,
 )
 
 # Type alias for dependency-injected review functions (used by tests
@@ -663,6 +668,168 @@ def _parse_curator_entries(path: Path) -> list[dict]:
     return out
 
 
+def _parse_curator_entries_annotated(path: Path) -> list[dict]:
+    """Parse curator-authored entries into structured dicts WITH the
+    trailing-line annotations preserved.
+
+    Sibling of ``_parse_curator_entries``. The judge-facing parser
+    deliberately strips the ``Coherence:`` / ``Staged:`` / ``Queue:`` /
+    ``Stage refused:`` / ``Source:`` lines because the judge wants
+    a clean (lesson, scope, evidence) tuple. The dashboard wants
+    those lines preserved so it can render verdicts inline, attribute
+    entries to source sessions, and show the staging outcome.
+
+    Output dict keys (Step 15 — dashboard surface):
+      - ``lesson``, ``class`` (optional), ``tier`` (optional),
+        ``scope``, ``evidence`` — same as ``_parse_curator_entries``.
+      - ``coherence_verdict``: ``"INCOHERENT"`` |
+        ``"NEAR_MISS_REVIEW"`` | ``None`` (parsed from the
+        ``Coherence: FLAGGED (reason) — explanation`` /
+        ``Coherence: NEAR_MISS (reason) — explanation`` line shape
+        emitted by ``_format_coherence_line``).
+      - ``coherence_reason``: str | None
+      - ``coherence_explanation``: str | None
+      - ``outcome_marker``: verbatim trailing-line text
+        (``"Staged: ..."``, ``"Queue: ..."``, ``"Stage refused: ..."``)
+        or ``None``.
+      - ``source_session_prefix``: 8-char session UUID prefix from
+        the ``Source:`` line (Step 15 instrumentation), or ``None``
+        for pre-instrumentation entries.
+      - ``entry_id``: 12-char blake2s hex of ``lesson + "\\n" +
+        evidence`` — stable across whitespace edits, changes when
+        the lesson body or evidence text changes. Used by the
+        dashboard to key the per-entry re-judge map.
+
+    Entries without both ``scope`` and ``evidence`` are dropped, same
+    as ``_parse_curator_entries`` — they don't have enough structure
+    for the dashboard to render usefully.
+    """
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return _parse_curator_entries_annotated_text(raw)
+
+
+def _parse_curator_entries_annotated_text(raw: str) -> list[dict]:
+    """String-input variant of ``_parse_curator_entries_annotated``.
+
+    Used to parse ``[learned ...]`` preambles inside staged-skill
+    SKILL.md bodies where the caller has already stripped YAML
+    frontmatter. Same parse rules and output dict shape; just no
+    file-IO step.
+    """
+    out: list[dict] = []
+    for chunk in raw.split(ENTRY_DELIMITER):
+        chunk = chunk.strip()
+        if not chunk or not chunk.startswith("[learned"):
+            continue
+        first_line, _, rest = chunk.partition("\n")
+        bracket_end = first_line.find("]")
+        lesson_text = (
+            first_line[bracket_end + 1:].strip() if bracket_end >= 0 else first_line
+        )
+        entry: dict = {
+            "lesson": lesson_text,
+            "coherence_verdict": None,
+            "coherence_reason": None,
+            "coherence_explanation": None,
+            "outcome_marker": None,
+            "source_session_prefix": None,
+        }
+        for line in rest.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Class:"):
+                entry["class"] = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("Tier:"):
+                tier_part = stripped.split(":", 1)[1].strip()
+                entry["tier"] = tier_part.split(" ", 1)[0].strip() if tier_part else None
+            elif stripped.startswith("Scope:"):
+                entry["scope"] = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("Evidence:"):
+                entry["evidence"] = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("Source:"):
+                entry["source_session_prefix"] = stripped.split(":", 1)[1].strip() or None
+            elif stripped.startswith("Coherence:"):
+                # Two shapes from _format_coherence_line:
+                #   "Coherence: FLAGGED (reason) — explanation"
+                #   "Coherence: NEAR_MISS (reason) — explanation"
+                body = stripped.split(":", 1)[1].strip()
+                if body.startswith("FLAGGED"):
+                    entry["coherence_verdict"] = "INCOHERENT"
+                    rest_after = body[len("FLAGGED"):].strip()
+                elif body.startswith("NEAR_MISS"):
+                    entry["coherence_verdict"] = "NEAR_MISS_REVIEW"
+                    rest_after = body[len("NEAR_MISS"):].strip()
+                else:
+                    rest_after = body
+                # rest_after looks like "(reason) — explanation"
+                if rest_after.startswith("("):
+                    close = rest_after.find(")")
+                    if close > 0:
+                        entry["coherence_reason"] = rest_after[1:close].strip() or None
+                        rest_after = rest_after[close + 1:].strip()
+                if rest_after.startswith("—"):
+                    rest_after = rest_after[1:].strip()
+                entry["coherence_explanation"] = rest_after or None
+            elif (
+                stripped.startswith("Staged:")
+                or stripped.startswith("Queue:")
+                or stripped.startswith("Stage refused:")
+            ):
+                # Last-write wins if multiple — only the staging-tier
+                # fallback path could emit two and that path is
+                # mutually exclusive in practice.
+                entry["outcome_marker"] = stripped
+        if "evidence" not in entry or "scope" not in entry:
+            continue
+        # Stable id for the per-entry re-judge map. blake2s with
+        # digest_size=6 → 12 hex chars; collisions are vanishingly
+        # rare across the few-dozen entries this file holds.
+        digest = hashlib.blake2s(
+            (entry["lesson"] + "\n" + entry["evidence"]).encode("utf-8"),
+            digest_size=6,
+        ).hexdigest()
+        entry["entry_id"] = digest
+        out.append(entry)
+    return out
+
+
+def _ellipsize(text: str, n: int) -> str:
+    """Truncate ``text`` to at most ``n`` characters with a trailing
+    ``...`` when shortened. Used by the dashboard payload for
+    ``lesson_preview`` / ``claim_preview`` shaping.
+    """
+    if len(text) <= n:
+        return text
+    return text[: max(0, n - 3)] + "..."
+
+
+def _classify_outcome(detail: str) -> str:
+    """Map a ``run.json`` outcome string to the dashboard-feed enum.
+
+    Dashboard renders one of ``wrote`` / ``rejected`` /
+    ``nothing-to-save`` / ``cooldown`` / ``error``. The outcome
+    strings the curator writes are free-form; this is the canonical
+    place that turns them into stable categories.
+    """
+    if not detail:
+        return "error"
+    if detail.startswith("wrote"):
+        return "wrote"
+    if detail.startswith("rejected"):
+        return "rejected"
+    if detail.startswith("nothing to save"):
+        return "nothing-to-save"
+    if detail == "cooldown" or detail.startswith("cooldown"):
+        return "cooldown"
+    if detail.startswith("error"):
+        return "error"
+    return "error"
+
+
 def _append_shadow_entry(workspace: Path, content: str) -> None:
     """Append one §-delimited entry to ``MEMORY-SHADOW.md``.
 
@@ -735,15 +902,16 @@ def _append_to_shadow_file(path: Path, content: str) -> None:
     os.replace(tmp, path)
 
 
-def _format_lesson_entry(lesson: dict) -> str:
+def _format_lesson_entry(lesson: dict, meta: SessionMeta | None = None) -> str:
     """Render one verified lesson into a memory-store entry.
 
     Layout: a tagged header line so a future ``/learning audit`` can
     grep for ``[learned`` to enumerate curator-authored entries, then
     the lesson body, then class/tier (when present), an optional
     Coherence: line (v3a — only for non-COHERENT verdicts), then
-    scope and verbatim evidence as provenance. The whole block is
-    one §-delimited entry on disk.
+    scope and verbatim evidence as provenance, then an optional
+    Source: line (Step 15 — 8-char session-UUID prefix when ``meta``
+    is provided). The whole block is one §-delimited entry on disk.
 
     v2 (Day 1) addition: class + tier + target lines surfaced for
     audit so the user reviewing MEMORY-SHADOW.md can see what the
@@ -757,6 +925,12 @@ def _format_lesson_entry(lesson: dict) -> str:
     Coherence: line so the user reviewing the shadow file sees the
     flag inline. COHERENT verdicts are silent — no annotation, no
     visual noise — per §3.4 of the v3a research doc.
+
+    Step 15 addition: when ``meta`` is provided, append a
+    ``Source: <8-char-uuid>`` line so the dashboard can join run.json
+    outcomes (which carry session_uuid) with shadow-file entries
+    (which previously did not). ``meta=None`` opts out for legacy
+    tests; production callers in ``_write_verified`` pass it.
     """
     today = _utc_now().strftime("%Y-%m-%d")
     lines: list[str] = [f"[learned {today}] {lesson['lesson']}"]
@@ -785,6 +959,8 @@ def _format_lesson_entry(lesson: dict) -> str:
         lines.append(coherence_line)
     lines.append(f"  Scope: {lesson['scope']}")
     lines.append(f"  Evidence: {lesson['evidence']}")
+    if meta is not None and meta.session_uuid:
+        lines.append(f"  Source: {meta.session_uuid[:8]}")
     return "\n".join(lines)
 
 
@@ -972,7 +1148,7 @@ def _write_verified(
             if stage_result.ok:
                 summary.written += 1
                 summary.by_tier[tier] = summary.by_tier.get(tier, 0) + 1
-                entry = _format_lesson_entry(lesson)
+                entry = _format_lesson_entry(lesson, meta)
                 if stage_result.staged_path is not None:
                     entry = f"{entry}\n  Staged: {stage_result.staged_path}"
                 _append_shadow_entry(workspace, entry)
@@ -982,14 +1158,14 @@ def _write_verified(
                     "Skill staging refused for lesson: %s",
                     stage_result.message,
                 )
-                entry = _format_lesson_entry(lesson)
+                entry = _format_lesson_entry(lesson, meta)
                 entry = f"{entry}\n  Stage refused: {stage_result.message}"
                 _append_shadow_entry(workspace, entry)
         elif class_ == "IDENTITY":
             queue_result = _route_identity(
                 workspace, lesson, meta=meta, shadow=shadow
             )
-            entry = _format_lesson_entry(lesson)
+            entry = _format_lesson_entry(lesson, meta)
             entry = f"{entry}\n  Queue: {queue_result.message}"
             _append_shadow_entry(workspace, entry)
             if queue_result.ok:
@@ -1000,7 +1176,7 @@ def _write_verified(
                 else:
                     summary.queue_added += 1
         elif class_ == "SITUATIONAL":
-            entry = _format_lesson_entry(lesson)
+            entry = _format_lesson_entry(lesson, meta)
             if shadow:
                 _append_shadow_entry(workspace, entry)
                 summary.written += 1
@@ -1026,7 +1202,7 @@ def _write_verified(
                 "to shadow as fallback",
                 class_,
             )
-            entry = _format_lesson_entry(lesson)
+            entry = _format_lesson_entry(lesson, meta)
             _append_shadow_entry(workspace, entry)
             summary.written += 1
     # Dedup skips happen INSIDE run_review (the verifier rejects
@@ -2247,6 +2423,52 @@ class LearningController:
                 totals[tier] = totals.get(tier, 0) + n
         return totals, scanned
 
+    def _recent_class_distribution(
+        self, *, window_ticks: int
+    ) -> tuple[dict[str, int], int]:
+        """Aggregate ``summary.by_class`` counts across the most recent
+        ``window_ticks`` tick-report run.json files. Returns
+        ``({class: count, ...}, ticks_actually_scanned)``.
+
+        Twin of ``_recent_tier_distribution`` — same iteration shape,
+        same JSON-parse tolerance, just keyed off ``summary.by_class``
+        (PROCEDURAL / IDENTITY / SITUATIONAL) instead of
+        ``summary.by_tier``. Used by the Step 15 dashboard to render
+        the by-class half of the distribution panel.
+        """
+        logs_root = learning_logs_dir()
+        if not logs_root.exists():
+            return {}, 0
+        tick_dirs = sorted(
+            (p for p in logs_root.iterdir() if p.is_dir()),
+            key=lambda p: p.name,
+            reverse=True,
+        )[:window_ticks]
+        totals: dict[str, int] = {}
+        scanned = 0
+        for d in tick_dirs:
+            run_json = d / "run.json"
+            try:
+                payload = json.loads(run_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            scanned += 1
+            summary = payload.get("summary") if isinstance(payload, dict) else None
+            if not isinstance(summary, dict):
+                continue
+            by_class = summary.get("by_class")
+            if not isinstance(by_class, dict):
+                continue
+            for cls, count in by_class.items():
+                if not isinstance(cls, str):
+                    continue
+                try:
+                    n = int(count)
+                except (TypeError, ValueError):
+                    continue
+                totals[cls] = totals.get(cls, 0) + n
+        return totals, scanned
+
     # v3a Day 3 — manual /learning coherence-audit command. Re-runs
     # the judge over already-promoted entries (shadow files by
     # default; live tree's [learned-tagged entries when not
@@ -2366,6 +2588,448 @@ class LearningController:
                     f"\"{r['lesson_preview']}\""
                 )
         return "\n".join(lines)
+
+    # ----- Step 15: dashboard surface ------------------------------
+
+    _DASHBOARD_DISTRIBUTION_WINDOW_TICKS = 84   # ~7d at 5-min cadence
+    _DASHBOARD_RATES_WINDOW_TICKS = 24          # ~2h at 5-min cadence
+    _DASHBOARD_ACTIVITY_LIMIT = 20
+
+    def dashboard_payload(self) -> dict:
+        """Return the Learning-tab combined-state payload.
+
+        Shape per ``.plans/dashboard-learning-tab.md`` §1. Everything
+        is on-disk reads; no contention with the running tick because
+        the only mutators (the tick itself, ``judge_entry``) write
+        through atomic temp+rename. The dashboard's payload builder
+        (``WebDashboard._learning_payload``) wraps this with the
+        archive-curator row before serializing.
+        """
+        state = _load_daemon_state()
+        last_tick = state.get("last_tick_at")
+        paused = bool(state.get("paused"))
+
+        # Pull the most-recent tick's run.json once — used both for
+        # the "learning" curator row's summary and the coherence row.
+        last_tick_summary, coherence_row_summary = (
+            self._format_last_tick_summaries()
+        )
+
+        # Curators panel — learning + nested coherence row. Archive
+        # row is added by the dashboard glue (it owns the archive
+        # controller).
+        interval_minutes = learning_tick_interval_minutes()
+        next_eligible: str | None = None
+        last_tick_dt = _parse_iso(last_tick)
+        if last_tick_dt is not None:
+            next_eligible = _iso(
+                last_tick_dt + timedelta(minutes=interval_minutes)
+            )
+        curators = [
+            {
+                "name": "learning",
+                "nested_under": None,
+                "enabled": True,
+                "paused": paused,
+                "running": self.is_running(),
+                "last_run_at": last_tick,
+                "next_eligible_at": next_eligible,
+                "summary": last_tick_summary,
+                "interval_label": f"{interval_minutes}m",
+            },
+            {
+                "name": "coherence",
+                "nested_under": "learning",
+                "enabled": True,
+                "paused": False,
+                "running": False,
+                "last_run_at": last_tick,
+                "next_eligible_at": None,
+                "summary": coherence_row_summary,
+                "interval_label": "inline",
+            },
+        ]
+
+        # Shadow / staged-skill entries — used both directly (for the
+        # coherence-flags panel) and as the join source for the
+        # merged activity feed.
+        memories_root = memories_dir(self._workspace)
+        shadow_entries: list[dict] = []
+        for source_label, filename in (
+            ("memory-shadow", SHADOW_FILE_NAME),
+            ("user-shadow", USER_SHADOW_FILE_NAME),
+        ):
+            path = memories_root / filename
+            for parsed in _parse_curator_entries_annotated(path):
+                shadow_entries.append({"source": source_label, **parsed})
+        # Staged skills — each may carry a [learned ...] preamble in
+        # the SKILL.md body. Walk and parse what's there.
+        shadow_root = skills_dir(self._workspace) / ".shadow"
+        if shadow_root.exists():
+            for skill_md in shadow_root.rglob("SKILL.md"):
+                try:
+                    content = skill_md.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                # Strip frontmatter so the parser sees the body's
+                # [learned ...] preamble cleanly.
+                body = content
+                if body.startswith("---"):
+                    end = body.find("\n---", 3)
+                    if end > 0:
+                        body = body[end + 4:]
+                tmp_entries = _parse_curator_entries_annotated_text(body)
+                if not tmp_entries:
+                    continue
+                # Skill name = parent directory under .shadow/.
+                try:
+                    skill_name = skill_md.parent.relative_to(shadow_root).parts[0]
+                except (IndexError, ValueError):
+                    skill_name = skill_md.parent.name
+                for parsed in tmp_entries:
+                    shadow_entries.append({
+                        "source": f"skill-shadow:{skill_name}",
+                        **parsed,
+                    })
+
+        # Build a session-prefix → entry index for the activity-feed
+        # join. First entry per prefix wins (entries are appended
+        # newest-tail in shadow files; iterating in document order
+        # preserves "first observation of this session" semantics).
+        by_session: dict[str, dict] = {}
+        for e in shadow_entries:
+            sp = e.get("source_session_prefix")
+            if isinstance(sp, str) and sp and sp not in by_session:
+                by_session[sp] = e
+
+        # Recent activity feed — merged outcome × shadow-entry view.
+        recent_activity = self._build_activity_feed(
+            by_session, limit=self._DASHBOARD_ACTIVITY_LIMIT,
+        )
+
+        # Distribution (last 7d default)
+        class_counts, class_ticks = self._recent_class_distribution(
+            window_ticks=self._DASHBOARD_DISTRIBUTION_WINDOW_TICKS,
+        )
+        tier_counts, tier_ticks = self._recent_tier_distribution(
+            window_ticks=self._DASHBOARD_DISTRIBUTION_WINDOW_TICKS,
+        )
+        distribution = {
+            "window_ticks": max(class_ticks, tier_ticks),
+            "by_class": class_counts,
+            "by_tier": tier_counts,
+            "a2_watch": (
+                tier_counts.get("S1", 0) == 0
+                and sum(tier_counts.get(k, 0) for k in ("S1", "S2", "S3")) >= 5
+            ),
+        }
+
+        # Rates (last 2h default)
+        dedup_total, dedup_ticks = self._recent_dedup_skips(
+            window_ticks=self._DASHBOARD_RATES_WINDOW_TICKS,
+        )
+        coh_flagged, coh_near_miss, coh_by_reason, coh_ticks = (
+            self._recent_coherence_flags(
+                window_ticks=self._DASHBOARD_RATES_WINDOW_TICKS,
+            )
+        )
+        rates = {
+            "window_ticks_scanned": max(dedup_ticks, coh_ticks),
+            "dedup_skipped": dedup_total,
+            "coherence_flagged": coh_flagged,
+            "coherence_near_miss": coh_near_miss,
+            "coherence_by_reason": coh_by_reason,
+        }
+
+        # USER candidate queue
+        try:
+            queue = UserCandidateStore(user_candidates_path())
+            pending = queue.list_pending()
+            promoted = queue.list_promoted()
+        except OSError:
+            pending = []
+            promoted = []
+        now = _utc_now()
+        user_candidates = {
+            "pending": [
+                {
+                    "claim_preview": (
+                        c.claim[:160] + "..." if len(c.claim) > 160 else c.claim
+                    ),
+                    "distinct_sessions": len(
+                        c.distinct_session_uuids_within(DEFAULT_WINDOW, now=now)
+                    ),
+                    "threshold": DEFAULT_PROMOTION_THRESHOLD,
+                    "first_seen": _iso(c.first_seen),
+                    "last_seen": _iso(c.last_seen),
+                    "days_until_expiry": max(
+                        0,
+                        DEFAULT_WINDOW.days - (now - c.last_seen).days,
+                    ),
+                }
+                for c in pending
+            ],
+            "promoted_count": len(promoted),
+        }
+
+        # Pending-review (denormalized filter of shadow_entries)
+        coherence_pending_review = [
+            self._strip_dashboard_entry_for_payload(e)
+            for e in shadow_entries
+            if e.get("coherence_verdict") in ("INCOHERENT", "NEAR_MISS_REVIEW")
+        ]
+
+        # Curator-authored skills (live + staged)
+        live_skills, staged_skills = self._scan_curator_skills()
+        curator_skills = {
+            "live": [{"name": n, "origin": o} for n, o in live_skills],
+            "staged": [{"name": n, "origin": o} for n, o in staged_skills],
+        }
+
+        # Models
+        models = {
+            "brain": model_brain(),
+            "learning_review": model_learning_review(),
+            "coherence_judge": model_coherence_judge(),
+            "migration_classifier": model_migration_classifier(),
+        }
+
+        return {
+            "curators": curators,
+            "recent_activity": recent_activity,
+            "shadow_entries": [
+                self._strip_dashboard_entry_for_payload(e)
+                for e in shadow_entries
+            ],
+            "distribution": distribution,
+            "rates": rates,
+            "user_candidates": user_candidates,
+            "coherence_pending_review": coherence_pending_review,
+            "curator_skills": curator_skills,
+            "models": models,
+        }
+
+    @staticmethod
+    def _strip_dashboard_entry_for_payload(entry: dict) -> dict:
+        """Trim the parsed-shadow dict for JSON serialization.
+
+        Drops nothing currently — but reserves a single point of
+        ``dict → wire-shape`` translation so future schema
+        changes (e.g., truncating long lessons, hiding scope from
+        the dashboard) land in one place.
+        """
+        return {
+            "source": entry.get("source"),
+            "lesson": entry.get("lesson"),
+            "lesson_preview": _ellipsize(entry.get("lesson") or "", 200),
+            "class": entry.get("class"),
+            "tier": entry.get("tier"),
+            "scope": entry.get("scope"),
+            "evidence": entry.get("evidence"),
+            "coherence_verdict": entry.get("coherence_verdict"),
+            "coherence_reason": entry.get("coherence_reason"),
+            "coherence_explanation": entry.get("coherence_explanation"),
+            "outcome_marker": entry.get("outcome_marker"),
+            "source_session_prefix": entry.get("source_session_prefix"),
+            "entry_id": entry.get("entry_id"),
+        }
+
+    def _format_last_tick_summaries(self) -> tuple[str, str]:
+        """Return ``(learning_row_summary, coherence_row_summary)``
+        formatted from the most-recent tick's ``run.json``. Both
+        strings are one-line; "—" if no tick has happened yet.
+        """
+        logs_root = learning_logs_dir()
+        if not logs_root.exists():
+            return ("no ticks yet", "no ticks yet")
+        tick_dirs = sorted(
+            (p for p in logs_root.iterdir() if p.is_dir()),
+            key=lambda p: p.name,
+            reverse=True,
+        )
+        if not tick_dirs:
+            return ("no ticks yet", "no ticks yet")
+        run_json = tick_dirs[0] / "run.json"
+        try:
+            payload = json.loads(run_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ("last tick log unreadable", "last tick log unreadable")
+        summary = payload.get("summary") if isinstance(payload, dict) else None
+        if not isinstance(summary, dict):
+            return ("last tick had no summary block", "no judged lessons")
+        written = int(summary.get("written", 0) or 0)
+        by_class = summary.get("by_class") or {}
+        by_tier = summary.get("by_tier") or {}
+        class_part = (
+            ", ".join(f"{k}={v}" for k, v in sorted(by_class.items()))
+            if by_class else "—"
+        )
+        tier_part = (
+            ", ".join(f"{k}={v}" for k, v in sorted(by_tier.items()))
+            if by_tier else "—"
+        )
+        learning_summary = (
+            f"wrote {written} ({class_part}); {tier_part}"
+            if written
+            else f"reviewed {payload.get('reviewed', 0)}, "
+                 f"nothing-to-save / rejected / cooldown"
+        )
+        coh = summary.get("coherence")
+        if isinstance(coh, dict):
+            judged = (
+                int(coh.get("flagged", 0) or 0)
+                + int(coh.get("near_miss", 0) or 0)
+                + int(coh.get("coherent", 0) or 0)
+            )
+            coherence_summary = (
+                f"{coh.get('flagged', 0)} flagged, "
+                f"{coh.get('near_miss', 0)} near-miss "
+                f"across {judged} lessons judged"
+            )
+        else:
+            coherence_summary = "no judged lessons in last tick"
+        return learning_summary, coherence_summary
+
+    def _build_activity_feed(
+        self, by_session: dict[str, dict], *, limit: int
+    ) -> list[dict]:
+        """Walk recent tick ``run.json`` files and produce the merged
+        activity feed.
+
+        For each outcome in ``run.json``, attempt a join by 8-char
+        session-UUID prefix into ``by_session``. Hits get
+        ``lesson_preview`` / ``class`` / ``tier`` / etc. populated
+        from the shadow entry; misses (pre-instrumentation entries
+        or non-write outcomes) leave those fields null.
+        """
+        logs_root = learning_logs_dir()
+        if not logs_root.exists():
+            return []
+        # Look back farther than `limit` because some ticks have
+        # zero outcomes — the limit is on rendered rows, not ticks
+        # scanned.
+        tick_dirs = sorted(
+            (p for p in logs_root.iterdir() if p.is_dir()),
+            key=lambda p: p.name,
+            reverse=True,
+        )[: max(limit * 4, 16)]
+        rows: list[dict] = []
+        for d in tick_dirs:
+            run_json = d / "run.json"
+            try:
+                payload = json.loads(run_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            tick_at = payload.get("started_at") if isinstance(payload, dict) else None
+            outcomes = payload.get("outcomes") if isinstance(payload, dict) else None
+            if not isinstance(outcomes, list):
+                continue
+            for o in outcomes:
+                if not isinstance(o, dict):
+                    continue
+                detail = str(o.get("outcome") or "")
+                session_uuid = str(o.get("session_uuid") or "")
+                outcome_kind = _classify_outcome(detail)
+                # Skip cooldowns from the feed — they're not actions,
+                # just "next tick we'll look again." 200 cooldowns per
+                # tick swamp the panel otherwise.
+                if outcome_kind == "cooldown":
+                    continue
+                prefix = session_uuid[:8] if session_uuid else ""
+                joined = by_session.get(prefix) if prefix else None
+                rows.append({
+                    "tick_folder": d.name,
+                    "tick_at": tick_at,
+                    "session_uuid_prefix": prefix or None,
+                    "outcome": outcome_kind,
+                    "outcome_detail": detail,
+                    "lesson_preview": (
+                        _ellipsize(joined.get("lesson") or "", 200)
+                        if joined else None
+                    ),
+                    "class": joined.get("class") if joined else None,
+                    "tier": joined.get("tier") if joined else None,
+                    "source": joined.get("source") if joined else None,
+                    "coherence_verdict": (
+                        joined.get("coherence_verdict") if joined else None
+                    ),
+                    "coherence_reason": (
+                        joined.get("coherence_reason") if joined else None
+                    ),
+                    "outcome_marker": (
+                        joined.get("outcome_marker") if joined else None
+                    ),
+                    "entry_id": joined.get("entry_id") if joined else None,
+                })
+                if len(rows) >= limit:
+                    return rows
+        return rows
+
+    def judge_entry(self, entry: dict) -> dict:
+        """Run ``run_coherence_judge`` on a single entry and return
+        ``{verdict, reason, explanation, degraded, judged_at}``.
+
+        Synchronous — the caller (the dashboard route handler) wraps
+        this in ``asyncio.to_thread`` since ``run_coherence_judge``
+        spawns ``claude -p`` and blocks for ~1–3 s.
+
+        Persists a single-entry record to
+        ``learning_logs_dir() / "coherence-audit" / <utc>.json`` in
+        the same shape ``_coherence_audit_text`` uses, so the chat-
+        triggered batch audits and the dashboard one-offs share
+        history on disk.
+        """
+        verdict = run_coherence_judge(
+            self._workspace,
+            {
+                "class": entry.get("class") or "?",
+                "lesson": entry.get("lesson") or "",
+                "scope": entry.get("scope") or "",
+                "evidence": entry.get("evidence") or "",
+                "tier": entry.get("tier"),
+            },
+            [],  # degraded mode — no source transcript
+        )
+        judged_at = _iso(_utc_now())
+        result = {
+            "verdict": verdict.verdict,
+            "reason": verdict.reason,
+            "explanation": verdict.explanation or None,
+            "degraded": verdict.degraded,
+            "judged_at": judged_at,
+        }
+        log_dir = learning_logs_dir() / "coherence-audit"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / (
+                _iso(_utc_now()).replace(":", "") + "-dashboard.json"
+            )
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "audited_at": judged_at,
+                        "shadow_only": True,
+                        "trigger": "dashboard",
+                        "entry_id": entry.get("entry_id"),
+                        "results": [{
+                            "file": entry.get("source") or "unknown",
+                            "lesson_preview": _ellipsize(
+                                entry.get("lesson") or "", _LESSON_PREVIEW_CHARS,
+                            ),
+                            **result,
+                        }],
+                    },
+                    indent=2, sort_keys=True, ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            # Logging failure shouldn't block the judge result. Fall
+            # through with the in-memory verdict.
+            pass
+        return result
+
+    # ----- end Step 15 dashboard surface ---------------------------
 
     def _status_text(self) -> str:
         state = _load_daemon_state()

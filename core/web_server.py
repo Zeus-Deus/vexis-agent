@@ -52,6 +52,7 @@ from core.curator import (
     load_state as load_curator_state,
 )
 from core.dashboard_token import clear_token, issue_token
+from core.learning_curator import LearningController
 from core.memory import MemoryStore
 from core.paths import (
     curator_logs_dir,
@@ -161,6 +162,7 @@ class WebDashboard:
         background_tasks: BackgroundTasks,
         curator: CuratorController | None,
         browser: BrowserTools,
+        learning: LearningController | None,
         config: DashboardConfig,
     ) -> None:
         self._workspace = workspace
@@ -169,6 +171,7 @@ class WebDashboard:
         self._background_tasks = background_tasks
         self._curator = curator
         self._browser = browser
+        self._learning = learning
         self._config = config
 
         # Issue a fresh token immediately so the Telegram /dashboard
@@ -460,6 +463,39 @@ class WebDashboard:
             await self._browser.manager.stop()
             return {"ok": True, "was_running": was_running}
 
+        # ----- Step 15: learning tab -----
+
+        @app.get("/api/v1/learning", dependencies=[Depends(_require_auth)])
+        async def get_learning() -> dict:
+            return self._learning_payload()
+
+        @app.post(
+            "/api/v1/learning/coherence-audit",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_learning_coherence_audit(body: dict) -> dict:
+            if self._learning is None:
+                raise HTTPException(503, "learning curator not initialised")
+            # The judge needs at minimum lesson + scope + evidence.
+            # Reject early with a clear error rather than returning a
+            # garbage NEAR_MISS verdict from the degraded path.
+            for required in ("lesson", "scope", "evidence"):
+                value = body.get(required)
+                if not isinstance(value, str) or not value.strip():
+                    raise HTTPException(
+                        400, f"missing or empty field: {required}"
+                    )
+            entry = {
+                "lesson": body["lesson"],
+                "scope": body["scope"],
+                "evidence": body["evidence"],
+                "class": body.get("class"),
+                "tier": body.get("tier"),
+                "source": body.get("source"),
+                "entry_id": body.get("entry_id"),
+            }
+            return await asyncio.to_thread(self._learning.judge_entry, entry)
+
         # ----- frontend bootstrap -----
 
         index_html = self._config.web_dist / "index.html"
@@ -712,6 +748,70 @@ class WebDashboard:
             "foreground_chats": fg,
             "background_tasks": bg,
             "log_lines": log_lines,
+        }
+
+    def _learning_payload(self) -> dict:
+        """Combined Learning-tab payload.
+
+        Pulls the lion's share from ``LearningController.dashboard_payload()``
+        (which knows the on-disk shape), then prepends the archive-curator
+        row sourced from the same internals ``_curator_payload`` uses so
+        the user sees all three curator rows in one place.
+
+        When the learning controller is None (curator disabled at boot),
+        return a stub payload with empty arrays and an "off" archive
+        row — the frontend renders a graceful message rather than 500.
+        """
+        if self._learning is None:
+            return {
+                "curators": [self._archive_curator_row()],
+                "recent_activity": [],
+                "shadow_entries": [],
+                "distribution": {"window_ticks": 0, "by_class": {}, "by_tier": {}, "a2_watch": False},
+                "rates": {
+                    "window_ticks_scanned": 0,
+                    "dedup_skipped": 0,
+                    "coherence_flagged": 0,
+                    "coherence_near_miss": 0,
+                    "coherence_by_reason": {},
+                },
+                "user_candidates": {"pending": [], "promoted_count": 0},
+                "coherence_pending_review": [],
+                "curator_skills": {"live": [], "staged": []},
+                "models": {},
+                "learning_disabled": True,
+            }
+        payload = self._learning.dashboard_payload()
+        # Prepend the archive-curator row — the learning controller
+        # doesn't know about the archive curator, and shouldn't.
+        archive_row = self._archive_curator_row()
+        payload["curators"] = [archive_row, *payload["curators"]]
+        payload["learning_disabled"] = False
+        return payload
+
+    def _archive_curator_row(self) -> dict:
+        """Build the archive-curator row for the Learning-tab Curators
+        panel. Sources the same data ``_curator_payload`` exposes but
+        narrows it to the row shape (the Learning tab's row contract).
+        """
+        state = load_curator_state()
+        last = state.get("last_run_at")
+        last_dt = _parse_iso(last)
+        next_eligible: str | None = None
+        if last_dt is not None:
+            next_eligible = (last_dt + _hours(curator_interval_hours())).isoformat()
+        return {
+            "name": "archive",
+            "nested_under": None,
+            "enabled": curator_enabled(),
+            "paused": bool(state.get("paused")),
+            "running": (
+                self._curator.is_running() if self._curator is not None else False
+            ),
+            "last_run_at": last,
+            "next_eligible_at": next_eligible,
+            "summary": state.get("last_run_summary") or "no runs yet",
+            "interval_label": f"{curator_interval_hours()}h",
         }
 
     def _browser_payload(self) -> dict:
