@@ -192,6 +192,12 @@ def _make_transport(handler: _FakeHandler, allowed_user_id: int) -> TelegramTran
     t._handler = handler  # type: ignore[attr-defined]
     t._allowed_user_id = allowed_user_id  # type: ignore[attr-defined]
     t._running_tasks = RunningTasks()  # type: ignore[attr-defined]
+    # v3b Day 2: optional collaborators that the dispatch path
+    # references — defaulted to None to keep these legacy tests
+    # focused on the drain/pickup behavior without dragging in a
+    # learning curator.
+    t._learning_curator = None  # type: ignore[attr-defined]
+    t._relationships_turn_counter = {}  # type: ignore[attr-defined]
     return t
 
 

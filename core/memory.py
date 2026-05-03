@@ -282,7 +282,29 @@ class MemoryStore:
         block = self.render(target)
         return block if block else None
 
-    def add(self, target: Target, content: str) -> MemorySuccess | MemoryError_:
+    def add(self, target: str, content: str) -> MemorySuccess | MemoryError_:
+        # ``target`` accepts the wider str type (not just Target) so
+        # we can intercept the special-case "relationships" value
+        # below. Existing callers continue to pass ``"memory"`` /
+        # ``"user"`` and behavior is unchanged for those.
+        if target == "relationships":
+            # v3b: writes to RELATIONSHIPS.md require an explicit
+            # ConsentToken and are routed through
+            # ``core/relationships/store.py`` ``RelationshipsStore``,
+            # NOT through MemoryStore. The bullet-text content shape
+            # MemoryStore enforces doesn't fit the H2-per-person
+            # YAML+facts shape relationships uses, and the
+            # token-gated bypass at ``core/learning_review.py`` only
+            # runs at the RelationshipsStore call site. Fail fast
+            # rather than risk a writer accidentally bypassing
+            # consent by calling the wrong API.
+            raise PermissionError(
+                "MemoryStore does not write to RELATIONSHIPS.md. "
+                "Relationships writes require an explicit ConsentToken; "
+                "use core.relationships.store.RelationshipsStore "
+                "(staged via core.relationships.curator.RelationshipsCurator) "
+                "instead."
+            )
         content = content.strip()
         if not content:
             return MemoryError_("content is empty")

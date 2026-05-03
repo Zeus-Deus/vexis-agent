@@ -30,17 +30,29 @@ from core.relationships.triggers import (
 
 # Helper: drive an async detector call from a sync test, mirroring
 # the existing convention in tests/test_learning_curator.py.
-def _detect(text: str, *, role: str = "user", uuid: str = "s-1", turn: int = 1) -> TriggerVerdict:
-    # The detector's role parameter is typed Literal["user"]. Tests
-    # that intentionally pass other roles use a type-ignore to
-    # signal the deliberate violation; the runtime gate is what we
-    # actually exercise.
+#
+# ``skip_classifier`` defaults to True because the bulk of these
+# tests exercise the regex matrix and the role-gate / quoted-content
+# preamble — they don't want to spawn a real claude -p classifier
+# call (or even mock one). Dedicated classifier-pipeline tests pass
+# their own ``classifier_call=`` stub.
+def _detect(
+    text: str,
+    *,
+    role: str = "user",
+    uuid: str = "s-1",
+    turn: int = 1,
+    skip_classifier: bool = True,
+    classifier_call=None,
+) -> TriggerVerdict:
     return asyncio.run(
         detect(
             text,
             role=role,  # type: ignore[arg-type]
             session_uuid=uuid,
             turn_index=turn,
+            skip_classifier=skip_classifier,
+            classifier_call=classifier_call,
         )
     )
 
@@ -184,7 +196,7 @@ def test_role_gate_dispatch_path_does_not_invoke_detect_over_replies():
         controller = lc.LearningController(workspace=workspace)
         seen_texts: list[str] = []
 
-        async def _spy(text, *, role, session_uuid, turn_index):
+        async def _spy(text, **kwargs):
             seen_texts.append(text)
             return TriggerVerdict(verdict="NONE")
 
@@ -259,63 +271,124 @@ def test_quoted_c_q3_inline_backtick_about_delete_verbs():
 # --------------------------------------------------------------------
 
 
+# --- Day 2: full pipeline (regex gates, classifier always parses) ---
+# These exercise the classifier injection. Use ADD-1-matching text
+# so the regex gates the classifier in. The classifier_call=
+# injection short-circuits the real claude -p subprocess.
+
+
 def test_fail_open_classifier_raises():
-    async def _boom(text, *, session_uuid, turn_index):
+    async def _boom(text, **kwargs):
         raise RuntimeError("classifier transport error")
 
-    # Use a text that does NOT match any canonical regex so the
-    # classifier path is exercised.
-    text = "tell me a joke about pythons"
-    with patch.object(triggers, "_classifier_call", _boom):
-        v = _detect(text)
+    text = "remember that my girlfriend Sarah likes mystery novels"
+    v = _detect(text, skip_classifier=False, classifier_call=_boom)
     assert v.verdict == "NONE"
     assert classifier_errors.get("error") == 1
 
 
 def test_fail_open_classifier_times_out():
-    async def _slow(text, *, session_uuid, turn_index):
+    async def _slow(text, **kwargs):
         await asyncio.sleep(10)
         return TriggerVerdict(verdict="ADD", confidence=1.0)
 
-    text = "tell me a story please"
-    with (
-        patch.object(triggers, "_classifier_call", _slow),
-        patch.object(triggers, "CLASSIFIER_TIMEOUT_SECONDS", 0.05),
-    ):
-        v = _detect(text)
+    text = "remember that my girlfriend Sarah likes mystery novels"
+    with patch.object(triggers, "CLASSIFIER_TIMEOUT_SECONDS", 0.05):
+        v = _detect(text, skip_classifier=False, classifier_call=_slow)
     assert v.verdict == "NONE"
     assert classifier_errors.get("timeout") == 1
 
 
 def test_classifier_below_threshold_is_dropped():
-    async def _low(text, *, session_uuid, turn_index):
+    async def _low(text, **kwargs):
         return TriggerVerdict(
             verdict="ADD",
             confidence=CLASSIFIER_CONFIDENCE_THRESHOLD - 0.01,
-            matched_pattern_id="classifier",
-        )
-
-    text = "tell me a joke about pythons"
-    with patch.object(triggers, "_classifier_call", _low):
-        v = _detect(text)
-    assert v.verdict == "NONE"
-
-
-def test_classifier_at_threshold_passes_through():
-    async def _high(text, *, session_uuid, turn_index):
-        return TriggerVerdict(
-            verdict="ADD",
-            confidence=CLASSIFIER_CONFIDENCE_THRESHOLD,
             person_name="Sarah",
             facts=("likes mystery novels",),
             matched_pattern_id="classifier",
         )
 
-    text = "tell me a joke about pythons"
-    with patch.object(triggers, "_classifier_call", _high):
-        v = _detect(text)
+    text = "remember that my girlfriend Sarah likes mystery novels"
+    v = _detect(text, skip_classifier=False, classifier_call=_low)
+    assert v.verdict == "NONE"
+
+
+def test_classifier_at_threshold_passes_through():
+    async def _high(text, **kwargs):
+        return TriggerVerdict(
+            verdict="ADD",
+            confidence=CLASSIFIER_CONFIDENCE_THRESHOLD,
+            person_name="Sarah",
+            qualifier="girlfriend",
+            facts=("likes mystery novels",),
+            matched_pattern_id="classifier",
+        )
+
+    text = "remember that my girlfriend Sarah likes mystery novels"
+    v = _detect(text, skip_classifier=False, classifier_call=_high)
+    assert v.verdict == "ADD"
+    assert v.person_name == "Sarah"
+    assert v.qualifier == "girlfriend"
+    assert v.facts == ("likes mystery novels",)
+    # Regex hit takes precedence in matched_pattern_id when both fire.
+    assert v.matched_pattern_id == "ADD-1"
+
+
+def test_full_pipeline_regex_miss_no_third_party_does_not_invoke_classifier():
+    """Path (a) gate: regex miss + no third party named → classifier
+    never runs (cost-bound). Asserts the gate by counting calls."""
+    call_count = 0
+
+    async def _spy(text, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return TriggerVerdict(verdict="ADD", confidence=1.0,
+                              person_name="X", facts=("y",))
+
+    v = _detect("just a normal message about nothing in particular",
+                skip_classifier=False, classifier_call=_spy)
+    assert v.verdict == "NONE"
+    assert call_count == 0
+
+
+def test_full_pipeline_regex_miss_third_party_present_invokes_classifier():
+    """Path (a) gate: regex miss BUT third party named → classifier
+    runs (the v3.4 fallback case)."""
+    call_count = 0
+
+    async def _spy(text, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return TriggerVerdict(
+            verdict="ADD",
+            confidence=0.9,
+            person_name="Sarah",
+            qualifier="coworker",
+            facts=("prefers async",),
+            matched_pattern_id="classifier",
+        )
+
+    # "Sarah on the team prefers async" matches THIRD_PARTY_SUBJECT_RE.
+    v = _detect("Sarah on the team prefers async standups",
+                skip_classifier=False, classifier_call=_spy)
+    assert call_count == 1
     assert v.verdict == "ADD"
     assert v.matched_pattern_id == "classifier"
+
+
+def test_full_pipeline_classifier_returns_no_facts_for_add_drops():
+    """Schema rule: ADD requires ≥1 fact. Classifier returning ADD
+    with empty facts list collapses to NONE."""
+    async def _empty(text, **kwargs):
+        return TriggerVerdict(
+            verdict="ADD", confidence=0.95,
+            person_name="Sarah", facts=(),
+        )
+
+    text = "remember that Sarah is my friend"
+    v = _detect(text, skip_classifier=False, classifier_call=_empty)
+    assert v.verdict == "NONE"
 
 
 # --------------------------------------------------------------------

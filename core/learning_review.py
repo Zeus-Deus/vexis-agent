@@ -1136,17 +1136,31 @@ def _scan_lesson_for_sensitive_content(
         (religion, politics, sexuality, self-harm, mental health) AND
         the named-third-party scanner. Used for IDENTITY
         classifications whose route is the USER.md candidate queue.
+      - ``"relationships"``: the base set PLUS the USER.md-specific
+        patterns. The named-third-party scanner is **DELIBERATELY
+        SUSPENDED** because the caller has already verified an
+        explicit ``ConsentToken`` for the third party at
+        ``core/relationships/curator.py``'s promotion site. This is
+        the entire scope of the v3b consent bypass: ONE call. Every
+        other regex (medical, legal, financial, religion, politics,
+        sexuality, self-harm, mental health) STILL FIRES so that
+        sensitive facts ABOUT the consented third party (e.g. medical
+        diagnoses) still reject. The token-verify gate at the call
+        site is what makes this branch safe; the scanner itself does
+        not validate tokens.
     """
     target = f"{lesson}\n{scope}"
     for pattern, pid in _LEARNING_THREAT_PATTERNS:
         if pattern.search(target):
             return pid
-    if target_file == "user":
+    if target_file in ("user", "relationships"):
         for pattern, pid in _USER_MD_THREAT_PATTERNS:
             if pattern.search(target):
                 return pid
+    if target_file == "user":
         # Named-third-party check has its own scanner with allowlist
         # post-filter — runs after the simpler tuple-based patterns.
+        # Suspended for target_file="relationships" per v3b §3.4.
         third_party = _check_named_third_party(target)
         if third_party:
             return third_party

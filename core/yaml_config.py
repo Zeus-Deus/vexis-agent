@@ -276,6 +276,7 @@ DEFAULT_MODEL_BRAIN = "default"
 DEFAULT_MODEL_LEARNING_REVIEW = "sonnet"
 DEFAULT_MODEL_COHERENCE_JUDGE = "sonnet"
 DEFAULT_MODEL_MIGRATION_CLASSIFIER = "sonnet"
+DEFAULT_MODEL_RELATIONSHIPS_CLASSIFIER = "sonnet"
 
 
 def _model_tier(key: str, default: str) -> str:
@@ -307,6 +308,12 @@ def model_coherence_judge() -> str:
 
 def model_migration_classifier() -> str:
     return _model_tier("migration_classifier", DEFAULT_MODEL_MIGRATION_CLASSIFIER)
+
+
+def model_relationships_classifier() -> str:
+    return _model_tier(
+        "relationships_classifier", DEFAULT_MODEL_RELATIONSHIPS_CLASSIFIER
+    )
 
 
 def resolve_model_flag(tier: str) -> list[str]:
