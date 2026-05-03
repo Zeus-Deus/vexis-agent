@@ -183,6 +183,31 @@ def iter_session_metas(workspace: Path) -> Iterator[SessionMeta]:
         )
 
 
+def _is_curator_owned(jsonl_path: Path) -> bool:
+    """Return True iff the first non-sidechain user turn is the
+    curator's review prompt.
+
+    Belt-and-braces filter alongside the persistent spawned-UUIDs
+    registry: catches legacy backlog (JSONLs spawned before the
+    persistent guard landed), eval workspaces the daemon never
+    learned about, and any case where ``spawned.json`` got lost or
+    corrupted. Costs one JSONL open per eligible candidate; we break
+    on the first match so the cost is bounded by the position of the
+    first user turn (typically near the head of the file).
+
+    Lazy-imports the prompt prefix to avoid a circular import — the
+    curator imports from this module, and the prompt constant lives
+    next to the prompt builder in ``core.learning_review``.
+    """
+    from core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX
+
+    for msg in iter_messages(jsonl_path):
+        if msg.role != "user":
+            continue
+        return msg.text.startswith(CURATOR_REVIEW_PROMPT_PREFIX)
+    return False
+
+
 def list_eligible_sessions(
     workspace: Path,
     *,
@@ -195,12 +220,16 @@ def list_eligible_sessions(
 
     A session is eligible when:
       - ``last_message_timestamp`` is not None,
+      - ``session_uuid`` is not in ``spawned_by_curator`` (recursion
+        guard — sessions started by the curator's own review forks
+        get filtered out even if their JSONLs land in the same
+        projects directory; the caller passes the union of the
+        in-memory set and the persistent ``spawned.json`` registry),
+      - the JSONL's first user turn doesn't start with the curator
+        review prompt (content-based recursion guard, catches legacy
+        backlog and any case the persistent registry missed),
       - ``last_message_timestamp > reviewed.get(uuid, datetime.min)``,
-      - ``now - last_message_timestamp >= idle_threshold``,
-      - ``session_uuid`` is not in ``spawned_by_curator``
-        (recursion guard — sessions started by the curator's own
-        review forks get filtered out even if their JSONLs land in
-        the same projects directory).
+      - ``now - last_message_timestamp >= idle_threshold``.
 
     Returned in oldest-last_message order so abandoned sessions
     (those waiting longest) get reviewed first when there's a
@@ -216,6 +245,13 @@ def list_eligible_sessions(
         if meta.last_message_timestamp is None:
             continue
         if meta.session_uuid in spawned:
+            continue
+        # Content filter runs before the cheap-but-meaningful reviewed/
+        # idle gates so we pay one open per candidate rather than
+        # eligibility-passing curator JSONLs through to the review
+        # path. Order matters: spawned-set check (free) → content
+        # check (one open) → reviewed/idle (cheap dict + arith).
+        if _is_curator_owned(meta.jsonl_path):
             continue
         last_reviewed = reviewed.get(meta.session_uuid, epoch)
         if meta.last_message_timestamp <= last_reviewed:

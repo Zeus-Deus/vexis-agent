@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
+import errno
+import fcntl
 import logging
 import os
 import shutil
+import signal
 import sys
 from pathlib import Path
 
@@ -24,7 +28,7 @@ from core.handler import MessageHandler
 from core.learning_curator import LearningController
 from core.logging import setup_logging
 from core.notify import Notifier
-from core.paths import state_dir, workspace_dir
+from core.paths import daemon_pid_path, state_dir, workspace_dir
 from core.running_tasks import RunningTasks
 from core.sessions import SessionStore
 from core.web_server import DEFAULT_DASHBOARD_PORT, DashboardConfig, WebDashboard
@@ -34,9 +38,136 @@ from transports.telegram import TelegramTransport
 log = logging.getLogger(__name__)
 
 
+class DaemonAlreadyRunning(RuntimeError):
+    """Raised at startup when another vexis-agent process holds the
+    PID lock at ``~/.vexis/daemon.pid``. The error message names the
+    incumbent PID so the user can identify and stop it."""
+
+
+def _alive(pid: int) -> bool:
+    """``kill -0 PID`` — true iff the process exists and we can signal
+    it. ``PermissionError`` (EPERM) is treated as alive: another user
+    owns the PID, but it IS running, which is what the lock cares about.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def acquire_daemon_lock(pid_path: Path | None = None) -> int:
+    """Acquire the single-instance daemon lock.
+
+    Writes the current PID to ``~/.vexis/daemon.pid`` (or the override).
+    Refuses to start when an alive incumbent already holds the lock;
+    cleans up stale locks (PID file present but process dead) and
+    proceeds. Race-safe via ``fcntl.flock`` on the file itself: two
+    daemons starting in the same millisecond serialize on the lock and
+    only the first one wins.
+
+    Registers an ``atexit`` cleanup and SIGTERM/SIGINT handlers that
+    unlink the file — but only if it still contains our own PID, so a
+    later instance that legitimately replaced us isn't dispossessed by
+    our shutdown.
+
+    Raises :class:`DaemonAlreadyRunning` when a live incumbent exists.
+    Returns the open file descriptor (kept open for the process
+    lifetime so the flock survives).
+    """
+    target = pid_path or daemon_pid_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(target), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EWOULDBLOCK, errno.EACCES):
+                raise
+            # Another startup is mid-acquire. Read whatever it wrote
+            # so the error message can name the incumbent.
+            try:
+                existing = int(os.read(fd, 64).decode("ascii", "ignore").strip() or "0")
+            except (ValueError, OSError):
+                existing = 0
+            os.close(fd)
+            raise DaemonAlreadyRunning(
+                f"Vexis daemon already starting (lock held by PID {existing or '?'}); "
+                f"refusing to start a second instance."
+            ) from None
+
+        # We hold the exclusive flock. Read the existing PID to decide
+        # stale-vs-alive.
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            existing = int(os.read(fd, 64).decode("ascii", "ignore").strip() or "0")
+        except (ValueError, OSError):
+            existing = 0
+
+        if existing and existing != os.getpid() and _alive(existing):
+            os.close(fd)
+            raise DaemonAlreadyRunning(
+                f"Vexis daemon already running as PID {existing}. Stop it "
+                f"with `kill {existing}` (or check ~/.vexis/daemon.pid if "
+                f"that PID is wrong) before starting a new instance."
+            )
+
+        # Stale or empty — overwrite with our PID.
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+        os.fsync(fd)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+    own_pid = os.getpid()
+
+    def _release() -> None:
+        # Only unlink if the file still names us. Defensive against a
+        # later instance that legitimately replaced our lock (which
+        # would only happen if we crashed without releasing — flock
+        # is freed on process exit so the next startup would clear us).
+        try:
+            current = target.read_text(encoding="utf-8").strip()
+        except (FileNotFoundError, OSError):
+            current = ""
+        if current == str(own_pid):
+            try:
+                target.unlink()
+            except OSError:
+                pass
+
+    atexit.register(_release)
+
+    def _on_signal(signum: int, _frame) -> None:
+        _release()
+        # Re-raise the default behaviour so the asyncio loop unwinds.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _on_signal)
+        except (ValueError, OSError):
+            # Non-main-thread or unsupported signal — atexit still fires.
+            pass
+
+    return fd
+
+
 async def _run() -> None:
     config = load_config()
     setup_logging(config.log_level)
+
+    acquire_daemon_lock()
 
     for cmd in (
         "claude",
@@ -334,6 +465,13 @@ def _build_dispatch(bg: BackgroundTasks, browser: BrowserTools):
 if __name__ == "__main__":
     try:
         asyncio.run(_run())
+    except DaemonAlreadyRunning as exc:
+        # Distinct exit code so a supervisor (systemd, nohup loop,
+        # whatever) can tell "another instance owns this" apart from
+        # actual config errors. Stderr — logging may not be set up
+        # yet when the lock check fires.
+        print(f"vexis-agent: {exc}", file=sys.stderr)
+        sys.exit(2)
     except RuntimeError as exc:
         # Startup failures: env validation, missing claude on PATH, etc.
         print(f"vexis-agent: {exc}", file=sys.stderr)

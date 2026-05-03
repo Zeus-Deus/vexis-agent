@@ -63,6 +63,51 @@ found to the right durable store by class:
 Pinned skills are read-only to the curator. Full design and routing
 prompts: `.plans/learning-curator-v2-research.md`.
 
+### Recursion guard
+
+Each `claude -p` review fork writes a NEW session JSONL into the
+same projects directory the curator scans for eligibility. Four
+mechanisms keep the curator from reviewing its own reviews:
+
+1. **Persistent spawned-UUIDs registry** at
+   `~/.vexis/learning/spawned.json`. Every review fork's session UUID
+   is appended before the spawn returns; `list_eligible_sessions`
+   unions this with the in-memory set so a daemon restart doesn't
+   drop the exclusion list.
+2. **Content-prefix filter**: `list_eligible_sessions` opens each
+   candidate JSONL and skips any whose first user message starts
+   with `CURATOR_REVIEW_PROMPT_PREFIX`. Catches legacy backlog and
+   anything the persistent registry missed (eval workspaces, restored
+   backups, store corruption). The unit test
+   `test_curator_prompt_invariant` asserts that the rendered prompt
+   actually starts with the constant, so future prompt edits surface
+   a test failure rather than a silent filter regression.
+3. **Max-attempts cap** at `MAX_REVIEW_FAILURES=3`. After three
+   consecutive failures the curator pins the session's
+   `last_message_at_review_time` so the eligibility gate filters it
+   until the user adds new content (which advances the JSONL's
+   `last_message_timestamp` past the pinned snapshot, reopening
+   eligibility). Bounds runaway retry loops on transcripts that the
+   verifier consistently rejects.
+4. **Single-instance PID lock** at `~/.vexis/daemon.pid` (acquired in
+   `main.acquire_daemon_lock` before any work). Two concurrent
+   daemons can't fan out into each other's spawns; the second
+   startup exits 2 with a clear pointer to the live PID.
+
+Cleanup: `scripts/clean_curator_jsonls.py` (dry-run by default,
+`--apply` to act) moves curator-owned JSONLs out of a workspace's
+projects directory and into a timestamped archive under
+`~/.vexis/learning/curator-jsonl-archive/`.
+
+Historical note: v2 shipped with only the in-memory `_spawned_uuids`
+set, which didn't survive daemon restart. The May 2026 audit found
+2,165 of 2,207 JSONLs in the workspace projects directory were
+curator-owned reviews of past curator reviews. The recursion-fix
+commit added the persistent registry, the content filter, the
+max-attempts cap, and the PID lock; the cleanup script moved the
+legacy fanout out of the workspace. Plan:
+`.plans/learning-curator-recursion-fix.md`.
+
 ## Coherence curator (v3a)
 
 Third curator. Runs inline inside the learning curator's tick: for

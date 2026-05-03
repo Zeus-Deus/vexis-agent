@@ -76,6 +76,19 @@ LEARNING_TRANSCRIPT_DECLINE_CHARS = 200_000
 # spawn another review.
 RECURSION_ENV_VAR = "VEXIS_LEARNING_REVIEW"
 
+# Recognisable opening of the curator's review prompt. Used as the
+# content-filter signature in core/transcripts.py:list_eligible_sessions
+# so a JSONL whose first user message starts with this string is
+# recognised as a curator-spawned review and excluded from eligibility
+# even when the persistent spawned-UUIDs registry doesn't know about
+# it (legacy backlog, eval workspaces, restored-from-backup state).
+# The unit test ``test_curator_prompt_invariant`` asserts that the
+# rendered prompt actually starts with this prefix, so future prompt
+# edits surface a test failure rather than a silent filter regression.
+CURATOR_REVIEW_PROMPT_PREFIX = (
+    "You are reviewing a finished Vexis session for memorable lessons"
+)
+
 
 # Placeholders for the contextual sections rendered in by
 # _build_review_prompt. Double-curlies disambiguate from the JSON

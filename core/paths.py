@@ -119,6 +119,44 @@ def learning_logs_dir() -> Path:
     return path
 
 
+def learning_spawned_path() -> Path:
+    """`~/.vexis/learning/spawned.json`. Persistent recursion-guard registry.
+
+    Sibling of reviewed.json. Records every UUID the curator's own
+    ``claude -p`` review forks created so the eligibility filter can
+    exclude them across daemon restarts (the in-memory ``_spawned_uuids``
+    set doesn't survive). Same locking model as reviewed.json.
+    """
+    parent = vexis_dir() / "learning"
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent / "spawned.json"
+
+
+def learning_curator_archive_dir() -> Path:
+    """`~/.vexis/learning/curator-jsonl-archive/`. Where the cleanup
+    script (``scripts/clean_curator_jsonls.py``) moves curator-owned
+    JSONLs out of the live workspace projects directory.
+
+    Per-run subdirectory is timestamped at the call site so multiple
+    cleanup runs don't collide.
+    """
+    parent = vexis_dir() / "learning" / "curator-jsonl-archive"
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent
+
+
+def daemon_pid_path() -> Path:
+    """`~/.vexis/daemon.pid`. Single-instance lock file.
+
+    Plain text, single line — just the PID. Lives in ``vexis_dir()``
+    rather than ``runtime_dir()`` so a stale lock survives a reboot
+    only if the previous daemon also did (which it doesn't — the file
+    is removed on graceful shutdown). Locked via ``fcntl.flock`` for
+    write race safety; staleness detection is ``os.kill(pid, 0)``.
+    """
+    return vexis_dir() / "daemon.pid"
+
+
 def user_candidates_path() -> Path:
     """`~/.vexis/learning/user_candidates.json`. Day 3 queue file.
 

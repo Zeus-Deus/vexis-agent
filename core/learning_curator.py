@@ -66,6 +66,7 @@ from core.memory import MemoryStore, MemorySuccess
 from core.notify import Notifier
 from core.paths import (
     learning_logs_dir,
+    learning_spawned_path,
     learning_state_path,
     memories_dir,
     skills_dir,
@@ -112,6 +113,18 @@ USER_SHADOW_FILE_NAME = "USER-SHADOW.md"
 # manual cutover to live mode is a `mv` not a reformat.
 ENTRY_DELIMITER = "\n§\n"
 
+# After this many consecutive failures the controller pins
+# ``last_message_at_review_time`` to the current snapshot so the
+# eligibility gate filters the session until the user adds new content
+# (which advances the JSONL's last_message_timestamp past the pinned
+# value, reopening eligibility). Three retries at the 1h cooldown
+# default = ~3h of transient-error tolerance, enough for rate-limit
+# resets and brief Anthropic outages but bounded for genuine failures
+# (parse errors, prompt-format breaks, transcripts that always blow
+# the verifier). Constant rather than configurable — promote to
+# yaml_config.py if a real production need to tune it emerges.
+MAX_REVIEW_FAILURES = 3
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -145,6 +158,13 @@ class ReviewRecord:
     last_review_attempt_at: datetime | None = None
     last_message_at_review_time: datetime | None = None
     outcome: str = ""
+    # Number of consecutive failed review attempts since the last
+    # success. Resets to 0 on success. When it reaches
+    # ``MAX_REVIEW_FAILURES`` the store pins ``last_message_at_review_time``
+    # so the eligibility gate filters the session until its transcript
+    # advances. Defaults to 0 so old-shape records (pre-fix) round-trip
+    # cleanly.
+    failure_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         def _fmt(dt: datetime | None) -> str | None:
@@ -154,10 +174,16 @@ class ReviewRecord:
             "last_review_attempt_at": _fmt(self.last_review_attempt_at),
             "last_message_at_review_time": _fmt(self.last_message_at_review_time),
             "outcome": self.outcome,
+            "failure_count": self.failure_count,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ReviewRecord":
+        raw_fc = data.get("failure_count", 0)
+        try:
+            fc = int(raw_fc)
+        except (TypeError, ValueError):
+            fc = 0
         return cls(
             last_reviewed_at=_parse_iso(data.get("last_reviewed_at")),
             last_review_attempt_at=_parse_iso(data.get("last_review_attempt_at")),
@@ -165,6 +191,7 @@ class ReviewRecord:
                 data.get("last_message_at_review_time")
             ),
             outcome=str(data.get("outcome") or ""),
+            failure_count=max(0, fc),
         )
 
 
@@ -233,10 +260,20 @@ class ReviewedStore:
         """Record one review attempt's outcome.
 
         On success: advance ``last_reviewed_at`` and
-        ``last_message_at_review_time`` (the eligibility-gate snapshot).
-        On failure: advance only ``last_review_attempt_at`` so the
-        cooldown gate kicks in and the eligibility gate stays open
-        (the same content can be retried after the cooldown).
+        ``last_message_at_review_time`` (the eligibility-gate snapshot);
+        reset ``failure_count`` to 0.
+
+        On failure: advance ``last_review_attempt_at`` so the cooldown
+        gate kicks in and the eligibility gate stays open (the same
+        content can be retried after the cooldown). Increment
+        ``failure_count``. Once ``failure_count`` reaches
+        ``MAX_REVIEW_FAILURES``, also pin
+        ``last_message_at_review_time`` to the current snapshot so the
+        eligibility gate closes — the session is filtered until the
+        user adds new content (which advances the JSONL's
+        ``last_message_timestamp`` past the pinned value, reopening
+        eligibility and resetting the retry budget on the next
+        successful review).
         """
         records = self.load()
         rec = records.get(session_uuid) or ReviewRecord()
@@ -246,8 +283,130 @@ class ReviewedStore:
         if success:
             rec.last_reviewed_at = when
             rec.last_message_at_review_time = last_message_at_review_time
+            rec.failure_count = 0
+        else:
+            rec.failure_count += 1
+            if rec.failure_count >= MAX_REVIEW_FAILURES:
+                # Bound the retry loop. The session reopens for review
+                # only if ``last_message_timestamp`` advances past this
+                # snapshot — i.e. the user actually added new content.
+                rec.last_message_at_review_time = last_message_at_review_time
         records[session_uuid] = rec
         self.save(records)
+
+
+# --------------------------------------------------------------------
+# SpawnedStore — persistent recursion-guard registry
+# (~/.vexis/learning/spawned.json)
+# --------------------------------------------------------------------
+
+
+class SpawnedStore:
+    """Owns ``spawned.json``. Records every UUID created by the
+    curator's own ``claude -p`` review forks so the eligibility filter
+    can exclude them across daemon restarts.
+
+    Same locking model as :class:`ReviewedStore` — sidecar ``.lock`` +
+    ``fcntl.flock`` + atomic temp-rename. Reads do not lock; the atomic
+    rename guarantees readers see either old or new state, never a
+    tear.
+
+    Schema:
+
+    .. code-block:: json
+
+       {
+         "version": 1,
+         "spawned": {
+           "<session-uuid>": {
+             "spawned_at": "<iso utc>",
+             "parent_session": "<uuid being reviewed at spawn time>"
+           }
+         }
+       }
+
+    ``parent_session`` is forensic only — if missing or wrong the
+    recursion guard still filters by UUID alone.
+    """
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock_path = path.with_suffix(path.suffix + ".lock")
+
+    def load(self) -> dict[str, dict[str, str]]:
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            log.warning(
+                "spawned.json corrupt at %s; treating as empty", self._path
+            )
+            return {}
+        spawned = data.get("spawned") if isinstance(data, dict) else None
+        if not isinstance(spawned, dict):
+            return {}
+        out: dict[str, dict[str, str]] = {}
+        for k, v in spawned.items():
+            if isinstance(k, str) and isinstance(v, dict):
+                out[k] = {kk: str(vv) for kk, vv in v.items() if isinstance(kk, str)}
+        return out
+
+    def load_uuids(self) -> set[str]:
+        """Convenience: just the UUID set, which is what the eligibility
+        filter actually consumes. Same I/O cost as ``load`` — saves
+        callers a comprehension."""
+        return set(self.load().keys())
+
+    def add_many(
+        self,
+        uuids: set[str],
+        *,
+        parent_session: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Append the given UUIDs to the on-disk registry. No-op when
+        ``uuids`` is empty so the caller doesn't need to guard.
+
+        ``parent_session`` is the UUID being reviewed at the time of
+        the spawn — recorded for forensics so a future audit can
+        reconstruct which review produced which fork. Never read by
+        the eligibility filter.
+        """
+        if not uuids:
+            return
+        when = _iso(now or _utc_now())
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            current = self.load()
+            for uuid in uuids:
+                if uuid in current:
+                    continue
+                current[uuid] = {
+                    "spawned_at": when,
+                    "parent_session": parent_session,
+                }
+            payload = {
+                "version": self.SCHEMA_VERSION,
+                "spawned": current,
+            }
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True, ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self._path)
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 # --------------------------------------------------------------------
@@ -1234,16 +1393,21 @@ class LearningController:
         self._busy_per_session: set[str] = set()
         self._busy_lock = threading.Lock()
         self._reviewed = ReviewedStore(learning_state_path())
+        self._spawned_store = SpawnedStore(learning_spawned_path())
         # UUIDs the curator's own review forks spawned. Populated by
-        # ``_review_one``'s scan-diff (§4.6 of the research doc):
-        # before/after snapshots of the projects directory expose the
-        # new JSONL each ``claude -p`` invocation creates, and those
-        # UUIDs feed into ``list_eligible_sessions``'s exclusion set
-        # so the next tick can't pick up the curator's own session.
-        # Survives daemon restart only as a soft state — restart loses
-        # the set, but the env-var recursion guard plus the 25-min
-        # idle gate plus the reviewed.json gate make a true loop
-        # essentially impossible even with the set forgotten.
+        # ``_review_one``'s scan-diff: before/after snapshots of the
+        # projects directory expose the new JSONL each ``claude -p``
+        # invocation creates, and those UUIDs feed into
+        # ``list_eligible_sessions``'s exclusion set so the next tick
+        # can't pick up the curator's own session.
+        #
+        # In-memory only; the disk-backed authoritative store is
+        # ``self._spawned_store``. The eligibility filter unions both.
+        # The set caches the same data the disk store holds so the
+        # per-tick path doesn't reload spawned.json on every spawn —
+        # the ``add_many`` call inside ``_review_one`` keeps both in
+        # lockstep. On daemon restart the set starts empty and the
+        # disk store carries the whole history forward.
         self._spawned_uuids: set[str] = set()
         # Day 3.5: tick counter drives periodic housekeeping
         # (currently: USER candidate queue expire_stale). Increments
@@ -1351,12 +1515,18 @@ class LearningController:
             if rec.last_message_at_review_time is not None
         }
 
+        # Recursion guard: union the in-memory set with the persistent
+        # disk store so daemon restarts don't drop our exclusion list.
+        # Disk read is small (one parse per tick) and well under the
+        # per-tick scan budget noted in core/transcripts.py.
+        spawned_union = self._spawned_uuids | self._spawned_store.load_uuids()
+
         candidates = list_eligible_sessions(
             workspace=self._workspace,
             reviewed=eligibility_map,
             idle_threshold=idle_threshold,
             now=started_at,
-            spawned_by_curator=self._spawned_uuids,
+            spawned_by_curator=spawned_union,
         )
         result.eligible = [m.session_uuid for m in candidates]
 
@@ -1590,6 +1760,24 @@ class LearningController:
             after = self._scan_projects_uuids(projects_dir)
             new_uuids = after - before
             if new_uuids:
+                # Persist FIRST so a crash between the two updates
+                # leaves the disk authoritative — better to over-filter
+                # (a UUID known to disk but lost from memory still
+                # exits via the union) than under-filter (a UUID in
+                # memory but not on disk would vanish on restart).
+                try:
+                    self._spawned_store.add_many(
+                        new_uuids, parent_session=meta.session_uuid,
+                    )
+                except OSError:
+                    # Disk-write failure is logged but doesn't abort
+                    # the review path — the in-memory set still
+                    # protects this daemon's lifetime.
+                    log.exception(
+                        "Could not persist spawned UUIDs %s to %s",
+                        sorted(new_uuids),
+                        self._spawned_store._path,
+                    )
                 self._spawned_uuids.update(new_uuids)
                 log.debug(
                     "Learning curator added spawned UUIDs to recursion "
