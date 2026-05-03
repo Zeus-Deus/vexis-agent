@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import threading
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -76,10 +77,12 @@ from core.paths import (
 from core.skills import discover_skills, parse_skill_md
 from core.transcripts import (
     SessionMeta,
+    _is_curator_owned,
     claude_session_jsonl_dir,
     iter_messages,
     list_eligible_sessions,
 )
+from core.relationships.triggers import detect as relationships_detect
 from core.user_candidates import (
     DEFAULT_PROMOTION_THRESHOLD,
     DEFAULT_WINDOW,
@@ -805,6 +808,27 @@ def _ellipsize(text: str, n: int) -> str:
     if len(text) <= n:
         return text
     return text[: max(0, n - 3)] + "..."
+
+
+def _parse_last_n_sessions(args: list[str], *, default: int) -> int:
+    """Parse ``--last-n-sessions N`` out of a /learning args list.
+
+    Accepts either ``--last-n-sessions=30`` or
+    ``--last-n-sessions 30`` (two tokens). Falls back to
+    ``default`` on missing flag or unparseable value.
+    """
+    for i, tok in enumerate(args):
+        if tok.startswith("--last-n-sessions="):
+            try:
+                return max(1, int(tok.split("=", 1)[1]))
+            except ValueError:
+                return default
+        if tok == "--last-n-sessions" and i + 1 < len(args):
+            try:
+                return max(1, int(args[i + 1]))
+            except ValueError:
+                return default
+    return default
 
 
 def _classify_outcome(detail: str) -> str:
@@ -2006,10 +2030,108 @@ class LearningController:
             return await loop.run_in_executor(
                 None, self._coherence_audit_text, shadow_only,
             )
+        if sub == "relationships-dryrun":
+            # v3b Day 1 — observation-only. Walks recent session
+            # JSONLs, runs the trigger detector against each
+            # role=user turn, prints what *would* trigger. No file
+            # writes anywhere.
+            last_n = _parse_last_n_sessions(args, default=30)
+            return await self._relationships_dryrun_text(last_n)
         return (
             "Usage: /learning [status|pause|resume|run|audit|"
-            "coherence-audit [--shadow-only]]"
+            "coherence-audit [--shadow-only]|"
+            "relationships-dryrun [--last-n-sessions N]]"
         )
+
+    async def _relationships_dryrun_text(self, last_n: int) -> str:
+        """v3b Day 1 — observation-only.
+
+        Walks the most recent ``last_n`` session JSONLs (by file
+        mtime, descending), runs ``relationships_detect`` against
+        every ``role=="user"`` turn, and returns a printable report
+        of what *would* trigger. NO file writes anywhere — no
+        consent token, no shadow file, no live file. Day 2 wires
+        the detector into ``_dispatch_to_brain`` for real.
+
+        Curator-owned JSONLs (review forks) are filtered out via
+        the same content-prefix guard the daemon tick uses, so a
+        prior review of "remember that …" inside a quoted lesson
+        body doesn't show up as a fake trigger.
+        """
+        projects_dir = claude_session_jsonl_dir(self._workspace)
+        if not projects_dir.exists():
+            return (
+                f"relationships-dryrun: no session JSONLs at "
+                f"{projects_dir} (workspace has no Claude Code "
+                f"history yet)."
+            )
+
+        all_jsonls = sorted(
+            (p for p in projects_dir.glob("*.jsonl") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        recent = all_jsonls[: max(1, last_n)]
+
+        lines: list[str] = []
+        verdict_counts: Counter[str] = Counter()
+        total_user_turns = 0
+        triggered_turns = 0
+        sessions_scanned = 0
+        sessions_skipped_curator = 0
+
+        for jsonl in recent:
+            if _is_curator_owned(jsonl):
+                sessions_skipped_curator += 1
+                continue
+            sessions_scanned += 1
+            session_uuid = jsonl.stem
+            short = session_uuid[:8]
+            user_turn_index = 0
+            for msg in iter_messages(jsonl):
+                if msg.role != "user":
+                    continue
+                user_turn_index += 1
+                total_user_turns += 1
+                verdict = await relationships_detect(
+                    msg.text,
+                    role="user",
+                    session_uuid=session_uuid,
+                    turn_index=user_turn_index,
+                )
+                if verdict.verdict == "NONE":
+                    continue
+                triggered_turns += 1
+                verdict_counts[verdict.verdict] += 1
+                pattern = verdict.matched_pattern_id or "?"
+                lines.append(
+                    f"  Session {short} (T{user_turn_index}): "
+                    f"MATCH {pattern} → {verdict.verdict}"
+                )
+
+        header = (
+            f"relationships-dryrun (NO writes): "
+            f"scanned {sessions_scanned} session(s) "
+            f"(skipped {sessions_skipped_curator} curator-owned), "
+            f"{total_user_turns} user turn(s)."
+        )
+        if not lines:
+            body = "  (no triggers fired)"
+        else:
+            body = "\n".join(lines)
+
+        if total_user_turns:
+            pct = 100.0 * triggered_turns / total_user_turns
+        else:
+            pct = 0.0
+        summary = (
+            f"Summary: {triggered_turns}/{total_user_turns} "
+            f"turns triggered ({pct:.2f}%). "
+            f"{verdict_counts.get('ADD', 0)} ADD, "
+            f"{verdict_counts.get('DELETE', 0)} DELETE, "
+            f"{verdict_counts.get('SUPERSEDE', 0)} SUPERSEDE."
+        )
+        return f"{header}\n{body}\n{summary}"
 
     def run_now(self) -> TickResult:
         """Force a tick on demand. Synchronous; safe to call from
