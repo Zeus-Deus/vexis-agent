@@ -346,6 +346,41 @@ class MemoryStore:
                 self._render_block(target, new_entries),
             )
 
+    def ensure_seed(
+        self, target: Target, *, marker: str, content: str,
+    ) -> bool:
+        """Idempotent seed: write ``content`` as a new entry only
+        if no existing entry contains ``marker``. Returns True iff
+        the seed was added.
+
+        Used by daemon startup to install meta-system context (e.g.
+        v3c's "Vexis silently captures third-party relationship
+        facts ..." line) directly into USER.md without going
+        through the candidate queue. The marker is the dedup key:
+        future daemon starts that find the marker substring in any
+        existing entry skip the install.
+
+        Skips threat-scanning and char-limit checks because the
+        caller is the daemon itself, not a model output. The
+        content is hand-authored docs-style text; the threat
+        scanner's medical/legal/financial regexes would never fire
+        on it, and the char-limit is the user's quota — a
+        single-line seed shouldn't fail it. If a real production
+        case ever hits the limit here, swap to ``add`` for the
+        full validation path.
+        """
+        if not marker.strip():
+            raise ValueError("ensure_seed: marker must be non-empty")
+        if not content.strip():
+            raise ValueError("ensure_seed: content must be non-empty")
+        with self._lock_for(target):
+            entries = _read_entries(self._path(target))
+            if any(marker in entry for entry in entries):
+                return False
+            new_entries = entries + [content.strip()]
+            self._write_entries(target, new_entries)
+            return True
+
     def replace(
         self, target: Target, old_text: str, content: str
     ) -> MemorySuccess | MemoryError_:

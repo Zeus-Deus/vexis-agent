@@ -11,9 +11,10 @@
     "must_emit_qualifier_for": {},
     "must_contain_fact_substring": {
       "sarah": ["conference"],
-      "marco": ["jet"]
+      "marco": ["jet|trip"]
     },
     "must_not_emit_slug": [],
-    "must_not_leak_sensitive": false
+    "must_not_leak_sensitive": false,
+    "_substring_alt_note": "marco substring uses '|' to accept either 'jet' (jet-lagged) OR 'trip' (just got back from his trip). Both are valid extractions of the same source utterance about Marco's recent travel — strict 'jet'-only matching was a fixture-design oversight in Day 4c. Day 5 release-gate fix per .plans/relationships-v3c-research.md §8."
   }
 }

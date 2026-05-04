@@ -134,10 +134,27 @@ def _evaluate(fixture: dict, queued: dict[str, list[str]],
         notes.append(f"unexpected slug(s) emitted: {leaked}")
 
     # 4. fact substrings — for each required slug, at least one fact
-    #    must contain each substring.
+    #    must contain each substring entry. An entry may use a pipe
+    #    ``|`` to express "any-of" (e.g. ``"jet|trip"`` matches a
+    #    fact containing "jet" OR "trip"). Day 5 fix: strict-AND
+    #    semantics rejected legitimate paraphrases of the same
+    #    source utterance.
     for slug, substrs in must_substring.items():
         slug_facts = [f.lower() for f in queued.get(slug, [])]
-        missing_terms = [s for s in substrs if not any(s in f for f in slug_facts)]
+        missing_terms: list[str] = []
+        for entry in substrs:
+            alts = [
+                a.strip().lower()
+                for a in str(entry).split("|")
+                if a.strip()
+            ]
+            if not alts:
+                continue
+            satisfied = any(
+                any(alt in f for alt in alts) for f in slug_facts
+            )
+            if not satisfied:
+                missing_terms.append(entry)
         if missing_terms:
             notes.append(
                 f"slug={slug} facts missing substring(s): {missing_terms}"

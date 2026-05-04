@@ -206,6 +206,33 @@ async def _run() -> None:
             soul_path,
         )
 
+    # v3c Day 5: seed USER.md with the relationships meta-system
+    # context line on first daemon boot. Idempotent — the marker
+    # in existing entries skips the install on subsequent starts.
+    # The seed describes the silent-extraction-default mental
+    # model so the brain knows about the queue + approval surface
+    # before it sees its first candidate. Direct write (not via
+    # the candidate queue) because this is meta-system context
+    # about the system itself, not a recurring observation.
+    try:
+        from core.memory import MemoryStore
+        from core.paths import memories_dir as memories_dir_fn
+        from core.relationships import (
+            RELATIONSHIPS_USER_SEED_MARKER,
+            RELATIONSHIPS_USER_SEED_TEXT,
+        )
+        memory_store = MemoryStore(memories_dir_fn(workspace))
+        if memory_store.ensure_seed(
+            "user",
+            marker=RELATIONSHIPS_USER_SEED_MARKER,
+            content=RELATIONSHIPS_USER_SEED_TEXT,
+        ):
+            log.info("Installed v3c relationships seed into USER.md")
+    except Exception:
+        # Seeding is convenience, not load-bearing — never fail
+        # daemon startup over it.
+        log.exception("relationships USER.md seed install raised")
+
     capabilities_path = Path(__file__).resolve().parent / "CAPABILITIES.md"
     if not capabilities_path.is_file():
         log.warning(

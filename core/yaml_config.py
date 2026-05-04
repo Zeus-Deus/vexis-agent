@@ -288,12 +288,17 @@ DEFAULT_MODEL_LEARNING_TRIAGE = "haiku"
 DEFAULT_MODEL_COHERENCE_JUDGE = "sonnet"
 DEFAULT_MODEL_MIGRATION_CLASSIFIER = "sonnet"
 DEFAULT_MODEL_RELATIONSHIPS_CLASSIFIER = "sonnet"
-# v3c silent-extraction default. Haiku because the task is
-# structurally simpler than the lesson reviewer (no class
-# taxonomy, fixed JSON schema). The token-burn analysis behind
-# commit b8fa780 is the precedent for keeping cheap-model
-# defaults where quality permits.
-DEFAULT_MODEL_RELATIONSHIPS_EXTRACTOR = "haiku"
+# v3c silent-extraction default. Originally haiku per the §4.1
+# patch (cheap-model preference). Flipped to sonnet at v3c Day 5
+# release gate after eval runs at haiku stalled at 83% positive
+# (below the 85% release threshold) on multi-person + strong-cue
+# fixtures, even after substring-OR + 60s-timeout + relational-
+# referent-prompt fixes. Sonnet hit 100% on the same corpus.
+# Cost trade-off accepted: ~7-8 sonnet calls per chatty user-day
+# at the current tick volume vs. unreliable extractions at haiku.
+# Override to haiku in ``~/.vexis/config.yaml`` if cost matters
+# more than reliability for a given workspace.
+DEFAULT_MODEL_RELATIONSHIPS_EXTRACTOR = "sonnet"
 
 
 def _model_tier(key: str, default: str) -> str:
