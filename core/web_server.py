@@ -34,7 +34,7 @@ import re
 import secrets
 import sqlite3
 import time
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,6 +88,17 @@ from tools.browser.profile import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _token_fingerprint(token: str) -> str:
+    """Short fingerprint of the bearer token for audit logs.
+
+    Logging the full token would defeat the auth model. SHA-256
+    truncated to 12 hex chars is enough to disambiguate one
+    daemon's session from another in the daemon log; not enough
+    to reconstruct the token."""
+    import hashlib
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
 
 # Default port. Can be overridden by VEXIS_DASHBOARD_PORT in the env.
 DEFAULT_DASHBOARD_PORT = 8766
@@ -187,6 +198,19 @@ class WebDashboard:
         # Profile-size cache. The walk is the only piece of the browser
         # payload that costs real I/O; everything else is in-memory.
         self._profile_size_cache: tuple[float, int, str] | None = None
+
+        # v3c Day 4b: in-memory sliding-window rate limiter for the
+        # relationships approval/reject/edit/resolve endpoints.
+        # Keyed by the bearer token (only one in this single-user
+        # deployment, but the structure carries forward if the auth
+        # surface ever grows). Per-token deque of timestamps; we
+        # evict anything older than the window on every check.
+        # The limit defends the v3c "approval is now security-relevant"
+        # risk row: 100 mutations / 10 min is well above human pace
+        # and well below a malicious bulk-approve scenario.
+        self._relationships_mutation_window_seconds: int = 600
+        self._relationships_mutation_limit: int = 100
+        self._relationships_mutation_log: dict[str, deque[float]] = defaultdict(deque)
 
         self._app = self._build_app()
 
@@ -468,6 +492,466 @@ class WebDashboard:
         @app.get("/api/v1/learning", dependencies=[Depends(_require_auth)])
         async def get_learning() -> dict:
             return self._learning_payload()
+
+        # ----- v3c Day 4b: relationships dashboard endpoints -----
+        #
+        # All gated by ``_require_auth`` (the existing bearer-token
+        # check above). Mutations also hit the sliding-window rate
+        # limiter. Approve / reject / edit / resolve_qualifier emit
+        # structured INFO log lines for audit.
+
+        def _rate_limit_or_raise() -> None:
+            """Sliding-window check. Tokens are single-user in this
+            deployment, but keying by token + path works if the
+            auth surface ever grows."""
+            now = time.time()
+            window = self._relationships_mutation_window_seconds
+            limit = self._relationships_mutation_limit
+            log_for_token = self._relationships_mutation_log[self._token]
+            cutoff = now - window
+            while log_for_token and log_for_token[0] < cutoff:
+                log_for_token.popleft()
+            if len(log_for_token) >= limit:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=(
+                        f"rate limit exceeded: {limit} mutations per "
+                        f"{window}s window"
+                    ),
+                )
+            log_for_token.append(now)
+
+        def _audit_log(
+            action: str,
+            slug: str,
+            *,
+            fact_ids: list[str] | None = None,
+            extra: dict | None = None,
+        ) -> None:
+            """Structured audit line for the relationships mutation
+            surface. Same INFO logger the rest of the daemon uses;
+            JSON-shaped fields so downstream log shippers can parse."""
+            payload = {
+                "action": action,
+                "slug": slug,
+                "fact_ids": list(fact_ids) if fact_ids is not None else None,
+                "token_subject": _token_fingerprint(self._token),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            if extra:
+                payload.update(extra)
+            log.info("relationships.%s %s", action, json.dumps(payload, sort_keys=True))
+
+        def _candidate_view_to_dict(view) -> dict:
+            return {
+                "slug": view.slug,
+                "display_name": view.display_name,
+                "qualifier": view.qualifier,
+                "qualifier_candidates": list(view.qualifier_candidates),
+                "strongest_cue_seen": view.strongest_cue_seen,
+                "session_count": view.session_count,
+                "fact_count": view.fact_count,
+                "eligible": view.eligible,
+                "first_seen": view.first_seen.isoformat(),
+                "last_seen": view.last_seen.isoformat(),
+                "approved_at": (
+                    view.approved_at.isoformat() if view.approved_at else None
+                ),
+                "rejected_at": (
+                    view.rejected_at.isoformat() if view.rejected_at else None
+                ),
+                "facts": [
+                    {
+                        "fact_id": f.fact_id,
+                        "text": f.text,
+                        "occurrence_count": f.occurrence_count,
+                        "first_seen": f.first_seen.isoformat(),
+                        "last_seen": f.last_seen.isoformat(),
+                        "rejected_at": (
+                            f.rejected_at.isoformat() if f.rejected_at else None
+                        ),
+                    }
+                    for f in view.facts
+                ],
+            }
+
+        @app.get(
+            "/api/v1/relationships/live",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_relationships_live() -> dict:
+            """Read-only RELATIONSHIPS.md view for the dashboard
+            top-half pane. Parses the live file via the existing
+            ``RelationshipsStore.list_live`` and returns a JSON
+            shape suitable for person-cards rendering."""
+            if self._learning is None:
+                raise HTTPException(503, "learning curator not initialised")
+            curator = self._learning.relationships_curator
+            people = curator.store.list_live()
+            return {
+                "people": [
+                    {
+                        "slug": p.slug,
+                        "display_name": p.display_name,
+                        "relationship": p.relationship,
+                        "qualifier": p.qualifier,
+                        "last_confirmed": p.last_confirmed,
+                        "source_session": p.source_session,
+                        "facts": [
+                            {
+                                "text": f.text,
+                                "confirmed_date": f.confirmed_date,
+                                "source_session_short": f.source_session_short,
+                                "superseded_by_date": f.superseded_by_date,
+                                "superseded_by_session": (
+                                    f.superseded_by_session
+                                ),
+                            }
+                            for f in p.facts
+                        ],
+                    }
+                    for p in people
+                ],
+            }
+
+        @app.get(
+            "/api/v1/relationships/candidates",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_relationships_candidates(
+            request: Request,
+        ) -> dict:
+            if self._learning is None:
+                raise HTTPException(503, "learning curator not initialised")
+            include_rejected = (
+                request.query_params.get("include_rejected", "")
+                .strip()
+                .lower()
+                in ("1", "true", "yes", "on")
+            )
+            curator = self._learning.relationships_curator
+            views = curator.candidate_store.list_all(
+                include_rejected=include_rejected,
+            )
+            # Filter out approved entries from the default "what
+            # needs my attention" view (they're audit-retained but
+            # don't belong on the action surface).
+            return {
+                "candidates": [
+                    _candidate_view_to_dict(v) for v in views
+                    if v.approved_at is None
+                ],
+            }
+
+        @app.get(
+            "/api/v1/relationships/candidates/{slug}",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_relationships_candidate_detail(slug: str) -> dict:
+            if self._learning is None:
+                raise HTTPException(503, "learning curator not initialised")
+            curator = self._learning.relationships_curator
+            candidate = curator.candidate_store.get(slug)
+            if candidate is None:
+                raise HTTPException(404, f"no candidate for slug={slug!r}")
+            return {
+                "slug": candidate.slug,
+                "display_name": candidate.display_name,
+                "qualifier_candidates": list(candidate.qualifier_candidates),
+                "strongest_cue_seen": candidate.strongest_cue_seen,
+                "first_seen": candidate.first_seen.isoformat(),
+                "last_seen": candidate.last_seen.isoformat(),
+                "approved_at": (
+                    candidate.approved_at.isoformat()
+                    if candidate.approved_at
+                    else None
+                ),
+                "rejected_at": (
+                    candidate.rejected_at.isoformat()
+                    if candidate.rejected_at
+                    else None
+                ),
+                "facts": [
+                    {
+                        "fact_id": fid,
+                        "text": fact.text,
+                        "first_seen": fact.first_seen.isoformat(),
+                        "last_seen": fact.last_seen.isoformat(),
+                        "approved_at": (
+                            fact.approved_at.isoformat()
+                            if fact.approved_at
+                            else None
+                        ),
+                        "rejected_at": (
+                            fact.rejected_at.isoformat()
+                            if fact.rejected_at
+                            else None
+                        ),
+                        "occurrences": [
+                            {
+                                "session_uuid": o.session_uuid,
+                                "turn_index": o.turn_index,
+                                "seen_at": o.seen_at.isoformat(),
+                            }
+                            for o in fact.occurrences
+                        ],
+                    }
+                    for fid, fact in candidate.facts.items()
+                ],
+            }
+
+        @app.post(
+            "/api/v1/relationships/candidates/{slug}/approve",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_relationships_approve(slug: str, body: dict) -> JSONResponse:
+            if self._learning is None:
+                raise HTTPException(503, "learning curator not initialised")
+            _rate_limit_or_raise()
+            fact_ids_raw = body.get("fact_ids")
+            fact_ids: list[str] | None
+            if fact_ids_raw is None:
+                fact_ids = None
+            elif isinstance(fact_ids_raw, list) and all(
+                isinstance(x, str) for x in fact_ids_raw
+            ):
+                fact_ids = list(fact_ids_raw) or None
+            else:
+                raise HTTPException(400, "fact_ids must be list[str] or absent")
+            qualifier = body.get("qualifier")
+            if qualifier is not None and not isinstance(qualifier, str):
+                raise HTTPException(400, "qualifier must be str or null")
+            curator = self._learning.relationships_curator
+            try:
+                result = curator.approve_candidate(
+                    slug,
+                    fact_ids=fact_ids,
+                    qualifier=qualifier or None,
+                )
+            except Exception:
+                log.exception("relationships approve raised")
+                raise HTTPException(500, "approve failed")
+            _audit_log(
+                "approve",
+                slug,
+                fact_ids=fact_ids,
+                extra={
+                    "ok": result.ok,
+                    "blocked_by": result.blocked_by,
+                },
+            )
+            if result.ok:
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "slug": result.slug,
+                        "reply_text": result.reply_text,
+                    }
+                )
+            if result.blocked_by == "missing_existing_qualifier":
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "missing_existing_qualifier",
+                        "slug": result.slug,
+                        "existing_slug": result.existing_slug,
+                        "existing_facts": list(result.existing_facts),
+                        "existing_qualifier_candidates": list(
+                            result.existing_qualifier_candidates
+                        ),
+                        "proposed_qualifier": result.proposed_qualifier,
+                        "reply_text": result.reply_text,
+                    },
+                )
+            if result.blocked_by == "sensitive-pattern":
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "error": "blocked_by_sensitive_pattern",
+                        "slug": result.slug,
+                        "reply_text": result.reply_text,
+                        "detail": result.detail,
+                    },
+                )
+            # Other refusals (not-in-queue, slug-rejected,
+            # no-active-facts, store-error) → 400 with the
+            # blocked_by code.
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": result.blocked_by or "unknown",
+                    "slug": result.slug,
+                    "reply_text": result.reply_text,
+                    "detail": result.detail,
+                },
+            )
+
+        @app.post(
+            "/api/v1/relationships/candidates/{slug}/reject",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_relationships_reject(slug: str, body: dict) -> dict:
+            if self._learning is None:
+                raise HTTPException(503, "learning curator not initialised")
+            _rate_limit_or_raise()
+            fact_ids_raw = body.get("fact_ids")
+            fact_ids: list[str] | None
+            if fact_ids_raw is None:
+                fact_ids = None
+            elif isinstance(fact_ids_raw, list) and all(
+                isinstance(x, str) for x in fact_ids_raw
+            ):
+                fact_ids = list(fact_ids_raw) or None
+            else:
+                raise HTTPException(400, "fact_ids must be list[str] or absent")
+            curator = self._learning.relationships_curator
+            try:
+                result = curator.reject_candidate(slug, fact_ids=fact_ids)
+            except Exception:
+                log.exception("relationships reject raised")
+                raise HTTPException(500, "reject failed")
+            _audit_log(
+                "reject",
+                slug,
+                fact_ids=fact_ids,
+                extra={"ok": result.ok},
+            )
+            if not result.ok:
+                raise HTTPException(404, result.reply_text)
+            return {
+                "ok": True,
+                "slug": result.slug,
+                "reply_text": result.reply_text,
+            }
+
+        @app.post(
+            "/api/v1/relationships/candidates/{slug}/edit",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_relationships_edit(slug: str, body: dict) -> dict:
+            if self._learning is None:
+                raise HTTPException(503, "learning curator not initialised")
+            _rate_limit_or_raise()
+            fact_id = body.get("fact_id")
+            new_text = body.get("new_text")
+            if not isinstance(fact_id, str) or not fact_id.strip():
+                raise HTTPException(400, "fact_id must be a non-empty string")
+            if not isinstance(new_text, str) or not new_text.strip():
+                raise HTTPException(400, "new_text must be a non-empty string")
+            curator = self._learning.relationships_curator
+            store = curator.candidate_store
+            candidate = store.get(slug)
+            if candidate is None:
+                raise HTTPException(404, f"no candidate for slug={slug!r}")
+            old_fact = candidate.facts.get(fact_id)
+            if old_fact is None:
+                raise HTTPException(404, f"no fact_id={fact_id!r} under {slug!r}")
+            # Audit-edit semantics: tombstone the old fact_id
+            # under the slug, queue a new observation with the
+            # edited text inheriting the old fact's first
+            # occurrence's session UUID + turn index. The new
+            # fact_id is computed deterministically from the new
+            # text; eligibility recomputes on next call.
+            store.mark_rejected(slug, fact_ids=[fact_id])
+            anchor = old_fact.occurrences[0] if old_fact.occurrences else None
+            anchor_session = anchor.session_uuid if anchor else "edit"
+            anchor_turn = anchor.turn_index if anchor else 1
+            new_candidate = store.add_observation(
+                slug=slug,
+                display_name=candidate.display_name,
+                qualifier=(
+                    candidate.qualifier_candidates[-1]
+                    if candidate.qualifier_candidates
+                    else None
+                ),
+                fact_text=new_text.strip(),
+                session_uuid=anchor_session,
+                turn_index=anchor_turn,
+            )
+            from core.relationships.consent import _fact_id as compute_fact_id
+            new_id = compute_fact_id(new_text.strip())
+            _audit_log(
+                "edit",
+                slug,
+                fact_ids=[fact_id],
+                extra={
+                    "new_fact_id": new_id,
+                    "ok": new_candidate is not None,
+                },
+            )
+            return {
+                "ok": True,
+                "slug": slug,
+                "old_fact_id": fact_id,
+                "new_fact_id": new_id,
+            }
+
+        @app.post(
+            "/api/v1/relationships/candidates/{slug}/resolve_qualifier",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_relationships_resolve_qualifier(
+            slug: str, body: dict,
+        ) -> dict:
+            """Used by the dashboard's missing-qualifier modal flow.
+            Renames an existing live entry from ``slug`` to
+            ``slug-<existing_qualifier>`` and stamps the YAML
+            qualifier so the next approve attempt no longer hits
+            the 409. Wraps ``RelationshipsStore.rename_live_slug``
+            from v3b."""
+            if self._learning is None:
+                raise HTTPException(503, "learning curator not initialised")
+            _rate_limit_or_raise()
+            existing_qualifier = body.get("existing_qualifier")
+            if (
+                not isinstance(existing_qualifier, str)
+                or not existing_qualifier.strip()
+            ):
+                raise HTTPException(
+                    400,
+                    "existing_qualifier must be a non-empty string",
+                )
+            existing_qualifier = existing_qualifier.strip()
+            curator = self._learning.relationships_curator
+            from core.relationships.triggers import (
+                derive_slug_with_disambiguation,
+            )
+            existing = curator.store.get_live(slug)
+            if existing is None:
+                raise HTTPException(
+                    404, f"no live entry for slug={slug!r}",
+                )
+            new_slug = derive_slug_with_disambiguation(
+                existing.display_name, existing_qualifier,
+            )
+            today = datetime.now(timezone.utc).date().isoformat()
+            try:
+                rename_res = curator.store.rename_live_slug(
+                    old_slug=slug,
+                    new_slug=new_slug,
+                    new_qualifier=existing_qualifier,
+                    disambiguated_date=today,
+                )
+            except Exception:
+                log.exception("relationships rename_live_slug raised")
+                raise HTTPException(500, "rename failed")
+            _audit_log(
+                "resolve_qualifier",
+                slug,
+                extra={
+                    "ok": rename_res.ok,
+                    "new_slug": new_slug,
+                    "existing_qualifier": existing_qualifier,
+                },
+            )
+            if not rename_res.ok:
+                raise HTTPException(409, rename_res.message)
+            return {
+                "ok": True,
+                "old_slug": slug,
+                "new_slug": new_slug,
+                "qualifier": existing_qualifier,
+            }
 
         @app.post(
             "/api/v1/learning/coherence-audit",

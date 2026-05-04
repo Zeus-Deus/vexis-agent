@@ -310,3 +310,79 @@ export interface LearningJudgeRequest {
   source?: string | null;
   entry_id?: string | null;
 }
+
+// v3c Day 4b — RELATIONSHIPS.md live + candidate queue.
+
+export interface RelationshipFact {
+  text: string;
+  confirmed_date: string;
+  source_session_short: string;
+  superseded_by_date: string | null;
+  superseded_by_session: string | null;
+}
+
+export interface RelationshipPerson {
+  slug: string;
+  display_name: string;
+  relationship: string;
+  qualifier: string | null;
+  last_confirmed: string;
+  source_session: string;
+  facts: RelationshipFact[];
+}
+
+export interface RelationshipsLiveState {
+  people: RelationshipPerson[];
+}
+
+export interface CandidateFactView {
+  fact_id: string;
+  text: string;
+  occurrence_count: number;
+  first_seen: string;
+  last_seen: string;
+  rejected_at: string | null;
+}
+
+export interface RelationshipCandidate {
+  slug: string;
+  display_name: string;
+  qualifier: string | null;
+  qualifier_candidates: string[];
+  strongest_cue_seen: "weak" | "soft" | "strong";
+  session_count: number;
+  fact_count: number;
+  eligible: boolean;
+  first_seen: string;
+  last_seen: string;
+  approved_at: string | null;
+  rejected_at: string | null;
+  facts: CandidateFactView[];
+}
+
+export interface RelationshipsCandidatesState {
+  candidates: RelationshipCandidate[];
+}
+
+export interface ApproveOkResponse {
+  ok: true;
+  slug: string;
+  reply_text: string;
+}
+
+export interface ApproveCollisionPayload {
+  error: "missing_existing_qualifier";
+  slug: string;
+  existing_slug: string;
+  existing_facts: string[];
+  existing_qualifier_candidates: string[];
+  proposed_qualifier: string | null;
+  reply_text: string;
+}
+
+export interface ApproveSensitivePayload {
+  error: "blocked_by_sensitive_pattern";
+  slug: string;
+  reply_text: string;
+  detail: string;
+}

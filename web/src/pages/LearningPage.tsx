@@ -16,6 +16,7 @@ import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
 import { Card, Section } from "../components/Card";
 import { EmptyState } from "../components/EmptyState";
+import { RelationshipsPanel } from "./RelationshipsPanel";
 
 interface LearningPageProps {
   token: string;
@@ -126,6 +127,10 @@ export function LearningPage({ token, onAuthFail }: LearningPageProps) {
       <CuratorSkillsPanel skills={state.curator_skills} />
       <RatesPanel rates={state.rates} />
       <ModelsPanel models={state.models} />
+      {/* v3c Day 4b — relationships panel goes last because it's the
+          most interactive surface (mutation actions, modal flow) and
+          users will scroll to it intentionally. */}
+      <RelationshipsPanel token={token} onAuthFail={onAuthFail} />
     </div>
   );
 }
