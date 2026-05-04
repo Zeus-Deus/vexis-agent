@@ -1975,6 +1975,19 @@ class LearningController:
             "restore_executed",
             "restore_missing",
             "restore_collision",
+            # 4a (silent extraction)
+            "extractor_runs",
+            "extractor_errors",
+            "extractor_facts_emitted",
+            "extractor_facts_dropped_sensitive",
+            "extractor_facts_dropped_dedup",
+            "candidates_queued",
+            "candidates_eligible",
+            "candidates_approved",
+            "candidates_rejected",
+            "candidates_expired",
+            "approve_blocked_sensitive",
+            "approve_blocked_missing_qualifier",
         ):
             md_lines.append(f"- {name}: {rel_counters.get(name, 0)}")
         md_lines.append("")
@@ -2124,7 +2137,72 @@ class LearningController:
                     "guard set: %s",
                     sorted(new_uuids),
                 )
+        # v3c Day 4a: silent extractor runs after the lesson reviewer
+        # on the same session, sharing the loaded transcript. Failures
+        # are isolated — extractor errors don't undermine the lesson
+        # reviewer's success bookkeeping above. Sequential rather than
+        # asyncio.gather because the lesson reviewer is sync and
+        # restructuring the entire daemon to async for a marginal
+        # latency win wasn't worth the blast radius (documented as
+        # a deviation in the day-4a deliverables).
+        try:
+            self._run_silent_extractor(meta)
+        except Exception:
+            log.exception(
+                "relationships extractor raised for %s",
+                meta.session_uuid,
+            )
+            self._relationships_curator.increment_counter("extractor_errors")
         return outcome, summary
+
+    def _run_silent_extractor(self, meta: SessionMeta) -> None:
+        """v3c Day 4a: fire the relationships extractor against
+        ``meta``'s session JSONL. No-op when the transcript is
+        empty. Counter updates land on the curator so REPORT.md
+        surfaces them under the existing relationships block."""
+        from core.relationships.extractor import (
+            extract_relationships,
+        )
+        messages = list(iter_messages(meta.jsonl_path))
+        if not messages:
+            return
+        rel = self._relationships_curator
+        rel.increment_counter("extractor_runs")
+        try:
+            result = asyncio.run(
+                extract_relationships(
+                    messages,
+                    meta.session_uuid,
+                    workspace=self._workspace,
+                    candidate_store=rel.candidate_store,
+                    relationships_store=rel.store,
+                )
+            )
+        except Exception:
+            log.exception(
+                "extract_relationships raised for %s",
+                meta.session_uuid,
+            )
+            rel.increment_counter("extractor_errors")
+            return
+        if result.error:
+            rel.increment_counter("extractor_errors")
+            return
+        rel.increment_counter("extractor_facts_emitted", by=result.facts_emitted)
+        rel.increment_counter(
+            "extractor_facts_dropped_sensitive",
+            by=result.facts_dropped_sensitive,
+        )
+        rel.increment_counter(
+            "extractor_facts_dropped_dedup",
+            by=result.facts_dropped_dedup,
+        )
+        rel.increment_counter("candidates_queued", by=result.facts_queued)
+        if result.facts_queued:
+            log.info(
+                "relationships extractor queued %d fact(s) for sess %s",
+                result.facts_queued, meta.session_uuid,
+            )
 
     @staticmethod
     def _scan_projects_uuids(projects_dir: Path) -> set[str]:
@@ -2196,12 +2274,88 @@ class LearningController:
                 log.exception("relationships.restore raised")
                 return "⚠️ Restore failed; check the logs."
             return result.reply_text or "(no reply)"
+        if sub == "relationships-pending":
+            # v3c Day 4a — list pending candidates from the silent
+            # extraction queue. Read-only.
+            return self._relationships_pending_text()
+        if sub == "relationships-approve":
+            # v3c Day 4a — whole-person approve via slash command.
+            # Per-fact toggle is dashboard-only.
+            if not args:
+                return (
+                    "Usage: /learning relationships-approve <slug>"
+                )
+            slug = args[0].strip()
+            if not slug:
+                return (
+                    "Usage: /learning relationships-approve <slug>"
+                )
+            try:
+                result = self._relationships_curator.approve_candidate(slug)
+            except Exception:
+                log.exception("relationships.approve_candidate raised")
+                return "⚠️ Approve failed; check the logs."
+            return result.reply_text or "(no reply)"
+        if sub == "relationships-reject":
+            # v3c Day 4a — whole-slug reject via slash command.
+            if not args:
+                return (
+                    "Usage: /learning relationships-reject <slug>"
+                )
+            slug = args[0].strip()
+            if not slug:
+                return (
+                    "Usage: /learning relationships-reject <slug>"
+                )
+            try:
+                result = self._relationships_curator.reject_candidate(slug)
+            except Exception:
+                log.exception("relationships.reject_candidate raised")
+                return "⚠️ Reject failed; check the logs."
+            return result.reply_text or "(no reply)"
         return (
             "Usage: /learning [status|pause|resume|run|audit|"
             "coherence-audit [--shadow-only]|"
             "relationships-dryrun [--last-n-sessions N]|"
-            "relationships-restore <slug>]"
+            "relationships-restore <slug>|"
+            "relationships-pending|"
+            "relationships-approve <slug>|"
+            "relationships-reject <slug>]"
         )
+
+    def _relationships_pending_text(self) -> str:
+        """Render the ``/learning relationships-pending`` reply.
+
+        Format from research doc §5.2:
+
+            Pending relationships (3):
+              sarah (coworker, 2 sess, 2 facts) — eligible
+              marco (?, 1 sess, 1 fact) — below threshold
+              mom (mom, 1 sess, 0 facts) — drop on next sweep
+        """
+        try:
+            views = self._relationships_curator.list_pending_candidates()
+        except Exception:
+            log.exception("relationships pending list raised")
+            return "⚠️ Could not list pending candidates."
+        if not views:
+            return "No pending relationships."
+        lines = [f"Pending relationships ({len(views)}):"]
+        for v in views:
+            qual = v.qualifier or "?"
+            sess = v.session_count
+            facts = v.fact_count
+            if v.eligible:
+                state = "eligible"
+            elif facts == 0:
+                state = "drop on next sweep"
+            else:
+                state = "below threshold"
+            lines.append(
+                f"  {v.slug} ({qual}, {sess} sess, {facts} fact"
+                f"{'s' if facts != 1 else ''}) — {state}"
+            )
+        return "\n".join(lines)
 
     async def _relationships_dryrun_text(self, last_n: int) -> str:
         """v3b Day 1 — observation-only.

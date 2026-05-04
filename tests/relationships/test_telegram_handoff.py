@@ -347,8 +347,17 @@ def test_hook_fires_inside_drain_with_real_session_uuid(
 ):
     """End-to-end: relationships hook receives the brain's real
     session_uuid (NOT 'telegram-chat-...'), with a JSONL-derived
-    turn_index. Hook reply arrives BEFORE brain reply on Telegram."""
+    turn_index. Hook reply arrives BEFORE brain reply on Telegram.
 
+    v3c Day 4a: this test exercises the explicit-consent fast lane,
+    which is runtime-disabled by default. Flag flipped on for the
+    duration of this test.
+    """
+
+    monkeypatch.setattr(
+        "core.yaml_config.relationships_explicit_consent_enabled",
+        lambda: True,
+    )
     pdir = claude_session_jsonl_dir(workspace)
     _write_jsonl(pdir / "real-uuid-aaa.jsonl", user_count=2)
 
@@ -390,8 +399,16 @@ def test_cursor_collision_skips_staging_silently(
     """If the JSONL doesn't advance between two hook fires, the
     second hook gets None back from claim_next_turn_index and
     skips staging — no relationships call, no Telegram receipt,
-    brain still receives the user's text."""
+    brain still receives the user's text.
 
+    v3c Day 4a: explicit-consent flag flipped on (this test exercises
+    the legacy explicit-consent path).
+    """
+
+    monkeypatch.setattr(
+        "core.yaml_config.relationships_explicit_consent_enabled",
+        lambda: True,
+    )
     handler = _build_handler(workspace, "sess-coll")
 
     async def patched_handle(user_id: int, chat_id: int, text: str):

@@ -333,16 +333,29 @@ class TelegramTransport:
     ) -> None:
         """Fire the relationships trigger detector for one user turn.
 
-        Called from inside ``_drain_chat`` so each turn fires
-        sequentially against the JSONL state ``claude -p`` is about
-        to append to. On a positive ADD/DELETE verdict the staged-
-        ack / DELETE-receipt is sent BEFORE the brain dispatch
-        (receipt-then-reply UX, scoping doc §3.2). On collision —
-        ``claim_next_turn_index`` returns None because the JSONL
-        hasn't advanced past our last mint — we log warning and
-        skip staging silently; the brain dispatch proceeds normally
-        (option (a) per scoping doc §3.1).
+        v3c Day 4a default: this hook short-circuits at function
+        entry when ``relationships.explicit_consent_enabled`` is
+        ``false`` (the default). Silent extraction at curator tick
+        time replaces the per-message trigger detection. Set the
+        flag to ``true`` in ``~/.vexis/config.yaml`` to re-enable
+        the v3a/v3b explicit path.
+
+        When the flag IS on: each turn fires sequentially against
+        the JSONL state ``claude -p`` is about to append to. On a
+        positive ADD/DELETE verdict the staged-ack / DELETE-receipt
+        is sent BEFORE the brain dispatch (receipt-then-reply UX,
+        scoping doc §3.2). On collision — ``claim_next_turn_index``
+        returns None because the JSONL hasn't advanced past our
+        last mint — we log warning and skip staging silently; the
+        brain dispatch proceeds normally (option (a) per scoping
+        doc §3.1).
         """
+        # v3c Day 4a flag: zero-cost short-circuit when the legacy
+        # explicit path is disabled (the default). No detector
+        # call, no cursor claim, nothing.
+        from core.yaml_config import relationships_explicit_consent_enabled
+        if not relationships_explicit_consent_enabled():
+            return
         if self._learning_curator is None:
             return
         relationships = self._learning_curator.relationships_curator

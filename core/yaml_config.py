@@ -288,6 +288,12 @@ DEFAULT_MODEL_LEARNING_TRIAGE = "haiku"
 DEFAULT_MODEL_COHERENCE_JUDGE = "sonnet"
 DEFAULT_MODEL_MIGRATION_CLASSIFIER = "sonnet"
 DEFAULT_MODEL_RELATIONSHIPS_CLASSIFIER = "sonnet"
+# v3c silent-extraction default. Haiku because the task is
+# structurally simpler than the lesson reviewer (no class
+# taxonomy, fixed JSON schema). The token-burn analysis behind
+# commit b8fa780 is the precedent for keeping cheap-model
+# defaults where quality permits.
+DEFAULT_MODEL_RELATIONSHIPS_EXTRACTOR = "haiku"
 
 
 def _model_tier(key: str, default: str) -> str:
@@ -333,6 +339,38 @@ def model_relationships_classifier() -> str:
     return _model_tier(
         "relationships_classifier", DEFAULT_MODEL_RELATIONSHIPS_CLASSIFIER
     )
+
+
+def model_relationships_extractor() -> str:
+    """v3c silent-extraction subprocess. Haiku-default per the
+    research-doc patch (§4.1 + commit `e2c6155`). Override to
+    sonnet via ``models.relationships_extractor`` in
+    ``~/.vexis/config.yaml`` if extraction quality is poor."""
+    return _model_tier(
+        "relationships_extractor", DEFAULT_MODEL_RELATIONSHIPS_EXTRACTOR
+    )
+
+
+# v3c relationships section helpers — gates for the silent queue
+# pipeline and the explicit-consent fast lane.
+
+
+def relationships_explicit_consent_enabled() -> bool:
+    """Default: ``False``. When True, the legacy v3b explicit-
+    consent path runs on every Telegram message (per-turn regex
+    matrix + cursor-claim + classifier subprocess). When False
+    (the v3c default), ``_run_relationships_hook`` short-circuits
+    at function entry — zero per-message cost — and the candidate
+    queue is the only path to RELATIONSHIPS.md.
+
+    Documented in CLAUDE.md as "legacy explicit-consent path."
+    """
+    raw = _section("relationships").get("explicit_consent_enabled", False)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and raw.strip().lower() in ("true", "yes", "1", "on"):
+        return True
+    return False
 
 
 def resolve_model_flag(tier: str) -> list[str]:
