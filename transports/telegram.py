@@ -300,6 +300,10 @@ class TelegramTransport:
         # Telegram bot commands can't contain hyphens, so /confirm-delete from
         # the spec becomes /confirm_delete here.
         self._pending_deletes: dict[str, datetime] = {}
+        # v3b Day 2 provisional: per-chat monotonic counter for the
+        # relationships curator's synthetic turn_index. Replaces with
+        # the real brain-session turn count in Day 3.
+        self._relationships_turn_counter: dict[int, int] = {}
         # concurrent_updates(True) is load-bearing for /cancel: PTB's default
         # serializes every update through one task, so a /cancel sent while
         # a brain call is in flight queues behind it for up to 30 minutes
@@ -328,6 +332,15 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("dashboard", self._on_dashboard))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
 
+    def _next_relationships_turn_index(self, chat_id: int) -> int:
+        """Provisional per-chat counter for the relationships hook.
+        Day 3 will replace this with the real brain-session turn
+        count. The counter resets on daemon restart, which lines up
+        with the in-memory PendingTokens registry's lifetime."""
+        n = self._relationships_turn_counter.get(chat_id, 0) + 1
+        self._relationships_turn_counter[chat_id] = n
+        return n
+
     async def _on_text(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
         user = update.effective_user
@@ -344,10 +357,55 @@ class TelegramTransport:
         appended to its queue silently — the user gets a "Picking up:"
         ack when the drain reaches it. Otherwise we claim the chat and
         run the drain loop ourselves until the queue is empty.
+
+        Before any brain dispatch, the relationships curator gets a
+        crack at the user's text per research doc §3.4. On a positive
+        ADD trigger, the staged-acknowledge reply is sent immediately
+        and the message ALSO proceeds to the brain so the conversation
+        flows naturally. The detector's hard role-gate ("user" only)
+        is enforced at the curator entry point.
         """
         if not is_allowed(user_id, self._allowed_user_id):
             log.warning("Rejected message from user_id=%s", user_id)
             return
+
+        # v3b Day 2 — relationships hook. Provisional session_uuid +
+        # turn_index plumbing: full brain-session-UUID handoff is a
+        # Day 3 architecture decision. For now we synthesize an ID
+        # from the chat_id and use a per-chat monotonic counter.
+        # Restart-recovery for these synthetic IDs gracefully drops
+        # them (the JSONL won't resolve), surfaced in REPORT.md.
+        # TODO Day 3: replace with handler.current_session_uuid() once
+        # the brain exposes its session UUID at dispatch time.
+        if self._learning_curator is not None:
+            relationships = self._learning_curator.relationships_curator
+            if relationships is not None:
+                turn_index = self._next_relationships_turn_index(chat_id)
+                try:
+                    result = await relationships.process_user_turn(
+                        text,
+                        session_uuid=f"telegram-chat-{chat_id}",
+                        turn_index=turn_index,
+                    )
+                except NotImplementedError:
+                    # Day 3 verdicts (DELETE / SUPERSEDE) — pass through.
+                    result = None
+                except Exception:
+                    log.exception(
+                        "relationships hook raised; proceeding to brain"
+                    )
+                    result = None
+                if result is not None and result.staged and result.reply_text:
+                    try:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=result.reply_text,
+                            parse_mode=None,
+                        )
+                    except Exception:
+                        log.exception(
+                            "Failed to send relationships staged-ack"
+                        )
 
         if not await self._running_tasks.claim(chat_id):
             await self._running_tasks.enqueue(chat_id, user_id, text)

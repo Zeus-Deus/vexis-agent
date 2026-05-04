@@ -45,7 +45,9 @@ from core.user_candidates import UserCandidateStore
 from core.yaml_config import (
     learning_max_entries_per_session,
     learning_max_entry_chars,
+    learning_triage_enabled,
     model_learning_review,
+    model_learning_triage,
     resolve_model_flag,
 )
 
@@ -55,6 +57,12 @@ log = logging.getLogger(__name__)
 # can take a minute or so; 5 min is comfortable headroom while still
 # catching genuine hangs.
 LEARNING_REVIEW_TIMEOUT_SECONDS = 5 * 60
+
+# Triage uses a tighter wall: haiku on a yes/no judgment over the same
+# transcript should comfortably finish in well under a minute. 90 s
+# gives headroom for cold-start latency without letting a hung triage
+# stall the per-tick budget.
+LEARNING_TRIAGE_TIMEOUT_SECONDS = 90
 
 # Soft warning threshold: above this, we still send the transcript
 # but log a warning so context-limit issues are visible. We do NOT
@@ -451,6 +459,15 @@ class ReviewOutput:
     ``declined_too_large`` is mutually exclusive with the other
     success/error paths — if the flag is True, the LLM was never
     called and ``raw_response`` is empty.
+
+    Two-tier additions:
+      - ``triage_skipped`` is True when the cheap haiku triage call
+        returned NO and we short-circuited without spawning the full
+        sonnet review. Implies ``nothing_to_save`` is also True.
+      - ``triage_result`` is the raw triage verdict ("YES", "NO",
+        "DISABLED", "FAIL_OPEN", "ERROR") for the audit trail; None
+        when triage didn't run for any reason (e.g. declined_too_large
+        gate fired first).
     """
 
     raw_response: str = ""
@@ -462,6 +479,8 @@ class ReviewOutput:
     error: str | None = None
     transcript_chars: int = 0
     transcript_messages: int = 0
+    triage_skipped: bool = False
+    triage_result: str | None = None
 
 
 # --------------------------------------------------------------------
@@ -1136,21 +1155,234 @@ def _scan_lesson_for_sensitive_content(
         (religion, politics, sexuality, self-harm, mental health) AND
         the named-third-party scanner. Used for IDENTITY
         classifications whose route is the USER.md candidate queue.
+      - ``"relationships"``: the base set PLUS the USER.md-specific
+        patterns. The named-third-party scanner is **DELIBERATELY
+        SUSPENDED** because the caller has already verified an
+        explicit ``ConsentToken`` for the third party at
+        ``core/relationships/curator.py``'s promotion site. This is
+        the entire scope of the v3b consent bypass: ONE call. Every
+        other regex (medical, legal, financial, religion, politics,
+        sexuality, self-harm, mental health) STILL FIRES so that
+        sensitive facts ABOUT the consented third party (e.g. medical
+        diagnoses) still reject. The token-verify gate at the call
+        site is what makes this branch safe; the scanner itself does
+        not validate tokens.
     """
     target = f"{lesson}\n{scope}"
     for pattern, pid in _LEARNING_THREAT_PATTERNS:
         if pattern.search(target):
             return pid
-    if target_file == "user":
+    if target_file in ("user", "relationships"):
         for pattern, pid in _USER_MD_THREAT_PATTERNS:
             if pattern.search(target):
                 return pid
+    if target_file == "user":
         # Named-third-party check has its own scanner with allowlist
         # post-filter — runs after the simpler tuple-based patterns.
+        # Suspended for target_file="relationships" per v3b §3.4.
         third_party = _check_named_third_party(target)
         if third_party:
             return third_party
     return None
+
+
+# --------------------------------------------------------------------
+# Two-tier triage: cheap haiku skim before the full sonnet review
+# --------------------------------------------------------------------
+
+
+# Triage prompt is intentionally tiny: no skill index, no existing
+# memory, no USER queue. It only needs the transcript and the yes/no
+# question. Keeping context small is the entire point — haiku input
+# tokens have to stay cheap for triage to pay off vs running sonnet
+# on every session.
+_LEARNING_TRIAGE_PROMPT = """\
+You are skimming a finished Vexis session to decide if it MIGHT contain a memorable lesson worth a deeper review.
+
+Answer YES if the session contains ANY of:
+  - The user explicitly corrected or instructed Vexis ("no", "don't", "stop", "from now on", "remember this", "always X", "never Y")
+  - The user revealed a durable fact about themselves, their preferences, their environment, or their workflow ("I prefer", "I work in", "the box is at", "I'm a [role]", "I always X")
+  - The user expressed a preference applicable beyond this one task
+
+Answer NO if:
+  - The session is purely Q&A with no corrective or instructional content
+  - Vexis self-corrected without user input
+  - The session is short, trivial, or one-off
+  - No durable signals appear
+
+When uncertain, answer YES (a deeper review will catch the false positive cheaply).
+
+Output exactly one word: YES or NO. No explanation, no punctuation.
+
+<transcript>
+{transcript}
+</transcript>
+"""
+
+
+# Sentinel raised when the triage subprocess returns a rate-limit
+# error. The wrapper in run_review catches this, sets output.error
+# to the underlying message, and returns — same shape as the full
+# review's rate-limit path so the curator's tick-abort logic
+# triggers identically. Defined here (not in core/learning_curator)
+# to keep run_review free of curator imports.
+class _TriageRateLimitError(RuntimeError):
+    """Triage spawn hit an Anthropic-side quota error.
+
+    Carries the raw message verbatim so the controller's existing
+    ``_is_rate_limit_error`` check fires on the same string the full
+    review would have produced. Internal — never escapes run_review.
+    """
+
+
+# Local copy of the rate-limit detector. Kept in sync with
+# core.learning_curator._is_rate_limit_error by sharing the marker
+# tuple — duplicating the four-line function avoids a circular import
+# (learning_curator already imports from learning_review).
+_TRIAGE_RATE_LIMIT_MARKERS = (
+    "hit your limit",
+    "usage limit",
+    "rate limit",
+    "rate-limit",
+    "429",
+)
+
+
+def _is_triage_rate_limit(message: str) -> bool:
+    if not message:
+        return False
+    lowered = message.lower()
+    return any(marker in lowered for marker in _TRIAGE_RATE_LIMIT_MARKERS)
+
+
+def _build_triage_prompt(transcript_text: str) -> str:
+    """Render the triage prompt with the formatted transcript inline.
+
+    Separate helper so tests can assert on the rendered shape without
+    touching the subprocess path.
+    """
+    return _LEARNING_TRIAGE_PROMPT.format(transcript=transcript_text)
+
+
+def _parse_triage_response(text: str) -> bool | None:
+    """Return True for YES, False for NO, None for anything else.
+
+    Anything-else includes empty output, paragraphs of explanation,
+    and the model's occasional "Yes." or "Maybe" — None signals to
+    the caller that triage was inconclusive and we should fail open
+    (run the full review). First-token only because haiku occasionally
+    pads with a trailing period or quote.
+    """
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    first = stripped.split(maxsplit=1)[0].upper().rstrip(".,!?:;\"'")
+    if first == "YES":
+        return True
+    if first == "NO":
+        return False
+    return None
+
+
+def _run_triage(
+    workspace: Path,
+    meta: SessionMeta,
+    messages: list[TranscriptMessage],
+    transcript: str,
+    *,
+    spawn: "SpawnFn | None" = None,
+) -> tuple[bool, str]:
+    """Cheap pre-review skim. Returns ``(should_review, raw_verdict)``.
+
+    Semantics:
+      - YES → run the full sonnet review (return True, "YES").
+      - NO  → skip; mark session nothing-to-save (return False, "NO").
+      - Garbage / empty / parse failure → fail open, run sonnet
+        anyway (return True, "FAIL_OPEN"). Logged so we can monitor
+        parse-failure rates.
+      - Spawn errors (timeout, OSError, non-zero exit *not* identified
+        as rate-limit) → fail open (return True, "ERROR"). We do NOT
+        propagate as a review error, otherwise a flaky triage would
+        burn the per-session 3-strikes budget for what's a degraded-
+        mode pass.
+
+    Rate-limit specifically: re-raised as ``_TriageRateLimitError`` so
+    the caller can surface it as ``output.error`` and let the existing
+    tick-abort path in core/learning_curator handle it. Silently
+    failing-open on rate-limits would defeat the whole point of the
+    rate-limit handling that the parent fixes added today.
+    """
+    prompt = _build_triage_prompt(transcript)
+    argv = ["claude", "-p", *resolve_model_flag(model_learning_triage()), prompt]
+    env = {**os.environ, RECURSION_ENV_VAR: "1"}
+
+    try:
+        if spawn is not None:
+            cp = spawn(argv, env)
+        else:
+            cp = subprocess.run(
+                argv,
+                env=env,
+                cwd=str(workspace),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=LEARNING_TRIAGE_TIMEOUT_SECONDS,
+            )
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "Learning triage for session %s timed out after %ds; "
+            "failing open to full review",
+            meta.session_uuid, LEARNING_TRIAGE_TIMEOUT_SECONDS,
+        )
+        return True, "ERROR"
+    except (OSError, FileNotFoundError) as exc:
+        log.warning(
+            "Learning triage for session %s spawn failed (%s); "
+            "failing open to full review",
+            meta.session_uuid, exc,
+        )
+        return True, "ERROR"
+
+    stdout = (
+        cp.stdout.decode("utf-8", errors="replace")
+        if isinstance(cp.stdout, bytes)
+        else cp.stdout or ""
+    )
+    stderr = (
+        cp.stderr.decode("utf-8", errors="replace")
+        if isinstance(cp.stderr, bytes)
+        else cp.stderr or ""
+    )
+    if cp.returncode != 0:
+        body = (stderr or stdout).strip()
+        if _is_triage_rate_limit(body):
+            # Surfacing this as an error (not a fail-open) is the
+            # whole point of separate rate-limit handling. The caller
+            # converts it into output.error so the curator's
+            # _is_rate_limit_error gate aborts the tick.
+            raise _TriageRateLimitError(
+                f"claude -p (triage) exited {cp.returncode}: {body[:500]}"
+            )
+        log.warning(
+            "Learning triage for session %s exited %d (%s); "
+            "failing open to full review",
+            meta.session_uuid, cp.returncode, body[:200],
+        )
+        return True, "ERROR"
+
+    verdict = _parse_triage_response(stdout)
+    if verdict is True:
+        return True, "YES"
+    if verdict is False:
+        return False, "NO"
+    log.warning(
+        "Learning triage for session %s returned unparseable output "
+        "(%r); failing open to full review",
+        meta.session_uuid, stdout.strip()[:200],
+    )
+    return True, "FAIL_OPEN"
 
 
 # --------------------------------------------------------------------
@@ -1215,6 +1447,30 @@ def run_review(
             output.transcript_chars,
             output.transcript_messages,
         )
+
+    # Two-tier review: cheap haiku triage decides whether the full
+    # sonnet pass is worth running. ~85% of sessions return
+    # nothing-to-save when reviewed; triage filters those without
+    # paying full sonnet cost. Disabled via config => skip triage and
+    # fall through to legacy single-pass behavior.
+    if learning_triage_enabled():
+        try:
+            should_review, verdict = _run_triage(
+                workspace, meta, messages, transcript, spawn=spawn
+            )
+        except _TriageRateLimitError as exc:
+            # Mirror the full-review rate-limit shape so the curator's
+            # _is_rate_limit_error check fires identically.
+            output.error = str(exc)
+            output.triage_result = "RATE_LIMITED"
+            return output
+        output.triage_result = verdict
+        if not should_review:
+            output.triage_skipped = True
+            output.nothing_to_save = True
+            return output
+    else:
+        output.triage_result = "DISABLED"
 
     # v2 context blocks: render the skill index + existing memory +
     # USER candidate queue and substitute into the prompt's
@@ -1337,12 +1593,17 @@ def run_review(
 
 __all__ = [
     "LEARNING_REVIEW_TIMEOUT_SECONDS",
+    "LEARNING_TRIAGE_TIMEOUT_SECONDS",
     "LARGE_TRANSCRIPT_WARN_CHARS",
     "LEARNING_TRANSCRIPT_DECLINE_CHARS",
     "RECURSION_ENV_VAR",
     "ReviewOutput",
     "SpawnFn",
     "run_review",
+    "_run_triage",
+    "_build_triage_prompt",
+    "_parse_triage_response",
+    "_LEARNING_TRIAGE_PROMPT",
     # Internal helpers exported for direct unit testing:
     "_LEARNING_REVIEW_PROMPT",
     "_LEARNING_THREAT_PATTERNS",

@@ -133,13 +133,43 @@ ENTRY_DELIMITER = "\n§\n"
 # yaml_config.py if a real production need to tune it emerges.
 MAX_REVIEW_FAILURES = 3
 
+# Maximum number of `claude -p` review spawns per tick. A 40-session
+# backlog (legacy data, restored backup, dedup-gate regression) used to
+# fan out into 40 spawns in one tick — burning quota in minutes. With
+# this cap a backlog drains over multiple ticks instead, bounding the
+# blast radius of any future eligibility bug. Constant rather than
+# configurable; promote to yaml_config.py if a real production need
+# emerges to tune it.
+MAX_SPAWNS_PER_TICK = 3
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def _iso(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Keep microsecond precision so reviewed.json round-trips JSONL
+    # message timestamps faithfully (Claude Code writes ms precision).
+    # The transcripts.py eligibility gate compares at second precision
+    # for legacy-record tolerance, so this is a cleanliness change for
+    # new writes — not a correctness fix on its own.
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+_RATE_LIMIT_MARKERS = (
+    "hit your limit",
+    "usage limit",
+    "rate limit",
+    "rate-limit",
+    "429",
+)
+
+
+def _is_rate_limit_error(message: str) -> bool:
+    if not message:
+        return False
+    lowered = message.lower()
+    return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -1537,6 +1567,12 @@ def _real_review(
         )
 
     if output.nothing_to_save:
+        # Distinguish triage-skipped from a full-review nothing-to-save
+        # so the audit surface (REPORT.md / /learning audit) can show
+        # how often the cheap pass is filtering work that the expensive
+        # pass would have dropped anyway.
+        if output.triage_skipped:
+            return ("nothing to save (triage)", WriteSummary())
         return ("nothing to save", WriteSummary())
 
     summary = _write_verified(
@@ -1619,6 +1655,13 @@ class LearningController:
         # short-circuit the real subprocess pipeline. Production
         # leaves it None and the controller calls ``_real_review``.
         self._review_fn = review_fn or _real_review
+        # v3b Day 2: relationships curator hangs off the same
+        # workspace + tick. Lazy-imported to avoid the optional-
+        # dependency churn that would come from a top-level import.
+        from core.relationships.curator import RelationshipsCurator
+        self._relationships_curator = RelationshipsCurator(
+            workspace=workspace,
+        )
 
     # ---------- lifecycle ----------
 
@@ -1685,6 +1728,20 @@ class LearningController:
         cooldown = timedelta(hours=learning_failure_cooldown_hours())
         records = self._reviewed.load()
 
+        # v3b Day 2: relationships restart-recovery is one-shot,
+        # gated by an internal `_has_recovered` flag in the curator
+        # itself. Runs BEFORE the lesson-curator work so any tokens
+        # we re-mint are available to the promote pass below. Recovery
+        # spawns claude -p per pending entry — bounded at ~5 calls
+        # per restart per the research doc; safe under the per-tick
+        # budget. Failures are logged and don't block the tick.
+        try:
+            asyncio.run(
+                self._relationships_curator.recover_after_restart()
+            )
+        except Exception:
+            log.exception("relationships.recover_after_restart raised")
+
         # Day 3.5 housekeeping: every N ticks, expire stale USER
         # candidate queue entries. Runs BEFORE the per-session reviews
         # so the rendered queue context the LLM sees doesn't include
@@ -1730,7 +1787,12 @@ class LearningController:
         )
         result.eligible = [m.session_uuid for m in candidates]
 
+        spawn_count = 0
         for meta in candidates:
+            if spawn_count >= MAX_SPAWNS_PER_TICK:
+                result.skipped.append((meta.session_uuid, "tick-budget"))
+                result.outcomes.append((meta.session_uuid, "tick-budget"))
+                continue
             rec = records.get(meta.session_uuid)
             if self._in_cooldown(rec, started_at, cooldown):
                 result.skipped.append((meta.session_uuid, "cooldown"))
@@ -1743,6 +1805,7 @@ class LearningController:
                     continue
                 self._busy_per_session.add(meta.session_uuid)
             try:
+                spawn_count += 1
                 outcome, session_summary = self._review_one(meta)
                 self._reviewed.update(
                     meta.session_uuid,
@@ -1759,6 +1822,23 @@ class LearningController:
             except Exception as exc:
                 log.exception("Review failed for %s", meta.session_uuid)
                 err_outcome = f"error: {exc}"
+                # Anthropic-side quota errors aren't review failures —
+                # they're a "you can't talk to the API right now" signal.
+                # Recording them as failures would burn the per-session
+                # 3-strikes budget and pin sessions until the user adds
+                # new content, which is the wrong recovery. Instead: skip
+                # the failure-bookkeeping write and abort the rest of
+                # this tick (subsequent spawns would hit the same wall).
+                if _is_rate_limit_error(err_outcome):
+                    log.warning(
+                        "Rate-limit hit for %s; aborting tick. (%s)",
+                        meta.session_uuid, err_outcome,
+                    )
+                    result.skipped.append((meta.session_uuid, "rate-limited"))
+                    result.outcomes.append((meta.session_uuid, "rate-limited"))
+                    with self._busy_lock:
+                        self._busy_per_session.discard(meta.session_uuid)
+                    break
                 self._reviewed.update(
                     meta.session_uuid,
                     success=False,
@@ -1783,6 +1863,22 @@ class LearningController:
         state["last_tick_skipped"] = len(result.skipped)
         _save_daemon_state(state)
 
+        # v3b Day 2: relationships tick-promote pass. Runs AFTER
+        # the lesson-curator work so any restart-recovered tokens
+        # from this tick's startup pass are still in the registry.
+        # Failures are logged and don't fail the tick.
+        try:
+            promote_results = self._relationships_curator.tick_promote_pending()
+            if promote_results:
+                promoted = sum(1 for r in promote_results if r.promoted)
+                blocked = len(promote_results) - promoted
+                log.info(
+                    "relationships tick: %d attempted, %d promoted, %d blocked",
+                    len(promote_results), promoted, blocked,
+                )
+        except Exception:
+            log.exception("relationships.tick_promote_pending raised")
+
         # Per-tick REPORT.md + run.json — only when the tick did
         # something (eligible or skipped). No-op ticks would otherwise
         # spam the logs dir; the heartbeat above is enough for
@@ -1794,6 +1890,16 @@ class LearningController:
                 log.exception("Could not write learning tick report")
 
         return result
+
+    @property
+    def relationships_curator(self):
+        """v3b: accessor for the per-controller RelationshipsCurator.
+
+        Returns the in-memory instance bound to this LearningController;
+        Telegram and tests reach in here to invoke the turn-level
+        ``process_user_turn`` entry point.
+        """
+        return self._relationships_curator
 
     def _write_tick_report(
         self,
@@ -2098,6 +2204,11 @@ class LearningController:
                     role="user",
                     session_uuid=session_uuid,
                     turn_index=user_turn_index,
+                    # Dryrun is observation-only: regex gate is enough
+                    # to surface "this turn looks like a trigger." Full
+                    # classifier pass would spawn one claude -p per
+                    # candidate user turn — prohibitive for a CLI tool.
+                    skip_classifier=True,
                 )
                 if verdict.verdict == "NONE":
                     continue

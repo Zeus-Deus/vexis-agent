@@ -1,56 +1,56 @@
 """Consent-trigger detector for the RELATIONSHIPS.md curator.
 
-Day 1: regex matrix + classifier-stub wiring + fail-open wrapper +
-hard role-gate. No file writes anywhere. The detector is invoked
-only from the dryrun CLI (``/learning relationships-dryrun``) and
-from tests; the live Telegram path wiring lands Day 2.
+Day 2 (path (a) per research doc §3.1 amendment 2): canonical
+regex hits are a CHEAP GATE, not a parse. On any triggered turn
+(regex hit OR regex miss with a named third party present), the
+sonnet classifier always runs to extract ``person_slug``,
+``qualifier``, and ``facts``. Token mint at §3.4 requires those
+fields, so the classifier is the canonical extractor and there
+is no canonical-only path that bypasses it.
 
-Design source: ``.plans/relationships-md-research.md`` §3.1 and
-§3.4. Specifically:
+Production flow (``detect`` with ``skip_classifier=False``):
 
-- Hybrid detector: canonical regex fast-path → sonnet classifier
-  on ambiguity. Day 1 ships the regex matrix verbatim from §3.1
-  and stubs the classifier (always returns NONE). The classifier
-  prompt + temperature=0 wiring lands Day 2.
-- Hard role-gate: ``role != "user"`` short-circuits to NONE
-  before any pattern runs. The literal-type annotation plus the
-  runtime check is the spec — both are required so a future
-  refactor can't silently bypass either layer.
-- Fail-open wrapper: classifier timeout/error/rate-limit returns
-  NONE with confidence=0.0, logs at WARNING, increments a
-  process-local error counter. The user's turn must NEVER block on
-  detector flakiness — this is on the synchronous Telegram → brain
-  path.
+  role-gate → quoted-content strip → regex gate → classifier
+  always runs IF (regex hit OR named third party present)
+  → if classifier verdict ∈ {ADD, DELETE, SUPERSEDE} ∧
+    confidence ≥ 0.75 → return TriggerVerdict with person/facts.
 
-# TODO Day 2: replace ``_classifier_call`` stub with the real
-# sonnet call at temperature=0. Temperature=0 is REQUIRED because
-# the restart-recovery procedure in §3.4 ("Bounded restart-
-# recovery procedure") re-runs the classifier against the stored
-# source turn and compares verdicts. Any nondeterminism produces
-# spurious "verdict mismatch → drop" events that lose legitimate
-# pending entries.
+Dryrun + regex-matrix tests flow (``skip_classifier=True``):
+
+  same preamble → regex gate → return the regex match as the
+  trigger verdict (with empty person/facts). Cheap. No subprocess.
 
 # TODO Day 3: AMBIGUOUS → clarification flow needs a per-user
 # "pending disambiguation" state so the next user turn is
-# recognized as a continuation ("she's the one from work") rather
-# than a fresh non-trigger. Day 1's detector is stateless.
+# recognized as a continuation ("she's the one from work")
+# rather than a fresh non-trigger. Day 2's detector is stateless.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re
+import subprocess
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Literal
+from pathlib import Path
+from typing import Awaitable, Callable, Literal
 
 log = logging.getLogger(__name__)
 
+from core.identity_threat import check_named_third_party
 from core.relationships.quoted import strip_quoted_blocks
+from core.yaml_config import (
+    model_relationships_classifier,
+    resolve_model_flag,
+)
 
-CLASSIFIER_TIMEOUT_SECONDS = 3.0
+CLASSIFIER_TIMEOUT_SECONDS = 12.0
 CLASSIFIER_CONFIDENCE_THRESHOLD = 0.75
+RELATIONSHIPS_CLASSIFIER_ENV_VAR = "VEXIS_RELATIONSHIPS_CLASSIFIER"
 
 Verdict = Literal["ADD", "DELETE", "SUPERSEDE", "NONE"]
 
@@ -60,11 +60,11 @@ class TriggerVerdict:
     """Result of one detect() call.
 
     ``matched_pattern_id`` is the canonical regex ID (``"ADD-1"`` …
-    ``"SUP-1"``), the literal ``"classifier"`` if the fallback
-    classifier produced the verdict, or ``None`` for NONE results.
-    Day 1 leaves ``person_name`` / ``qualifier`` / ``facts`` empty
-    because the canonical regexes don't extract them — the
-    classifier (Day 2) is the source of those fields.
+    ``"SUP-1"``), the literal ``"classifier"`` if only the
+    fallback classifier produced the trigger, or ``None`` for NONE
+    results. When BOTH a regex matched AND the classifier ran (the
+    common Day 2 path), this records the regex id (the regex is
+    what gated the classifier).
     """
 
     verdict: Verdict
@@ -78,8 +78,6 @@ class TriggerVerdict:
 _NONE = TriggerVerdict(verdict="NONE", confidence=0.0)
 
 
-# Process-local error counter. Wrapped in a small helper class so a
-# test can read + reset without touching the module's namespace.
 class _ErrorCounter:
     def __init__(self) -> None:
         self._counts: Counter[str] = Counter()
@@ -97,13 +95,7 @@ class _ErrorCounter:
 classifier_errors = _ErrorCounter()
 
 
-# ---------- Canonical regex matrix (research doc §3.1) ----------
-#
-# All seven compiled at import time. Each ``re.IGNORECASE``. Each
-# anchored at start-of-string (``^``) with optional leading
-# whitespace — the user's turn is the WHOLE message text, not an
-# arbitrary span inside a longer document. If the user buries a
-# trigger phrase mid-paragraph, that's classifier territory.
+# ---------- Canonical regex matrix (research doc §3.1 amendment 2) ----------
 
 _ADD_1 = re.compile(
     r"^\s*(?:please\s+)?remember\s+(?:that\s+)?(?:my\s+)?\w+",
@@ -118,12 +110,9 @@ _ADD_3 = re.compile(
     re.IGNORECASE,
 )
 _ADD_4 = re.compile(
-    # Deviation from research doc §3.1's literal table: the table
-    # uses ``\s+`` after the verb, but the §4 C-P5 fixture
-    # ("note: my brother lives in Lisbon") requires zero whitespace
-    # between the verb and the colon. ``[\s:,]+`` covers both
-    # "note: ..." and "add this:" while ``\b`` after the verb
-    # alternation keeps "noteworthy" / "address" from matching.
+    # \b after the verb keeps "noteworthy" / "address" out;
+    # [\s:,]+ covers "note: my brother…" (zero whitespace before
+    # the colon — research doc §4 C-P5).
     r"^\s*(?:add|note|store)\b[\s:,]+(?:to\s+)?(?:relationships|profile|notes)?\s*[:,]?",
     re.IGNORECASE,
 )
@@ -132,7 +121,10 @@ _DEL_1 = re.compile(
     re.IGNORECASE,
 )
 _DEL_2 = re.compile(
-    r"^\s*(?:delete|remove|drop)\s+(?:that|the\s+thing|everything)\s+about\s+\w+",
+    # Synced to research doc §3.1 amendment 2: "that\s+thing" not
+    # bare "that" — "delete that thing about my brother" is the
+    # natural phrasing.
+    r"^\s*(?:delete|remove|drop)\s+(?:that\s+thing|the\s+thing|everything)\s+about\s+\w+",
     re.IGNORECASE,
 )
 _SUP_1 = re.compile(
@@ -140,8 +132,6 @@ _SUP_1 = re.compile(
     re.IGNORECASE,
 )
 
-# Ordered: ADD before DEL before SUP, since the matrix has no
-# overlapping prefixes between groups; first match wins.
 _REGEX_MATRIX: tuple[tuple[str, re.Pattern[str], Verdict], ...] = (
     ("ADD-1", _ADD_1, "ADD"),
     ("ADD-2", _ADD_2, "ADD"),
@@ -156,11 +146,8 @@ _REGEX_MATRIX: tuple[tuple[str, re.Pattern[str], Verdict], ...] = (
 def _regex_pass(text: str) -> TriggerVerdict:
     """Symmetric paranoid wrapper around the canonical regex pass.
 
-    Regex compilation can't fail at this point (compiled at import
-    time and any failure would have surfaced at module load), but
-    ``Pattern.match`` itself is in CPython and could in principle
-    raise (e.g. on absurd input). Fail-open mirrors the classifier
-    side: any exception → NONE, error counted.
+    Fail-open mirrors the classifier side: any exception → NONE,
+    error counted.
     """
     try:
         for pattern_id, pattern, verdict in _REGEX_MATRIX:
@@ -177,29 +164,197 @@ def _regex_pass(text: str) -> TriggerVerdict:
         return _NONE
 
 
+# --------------------------------------------------------------------
+# Classifier — real claude -p call, with injectable spawn hook for
+# tests. Pattern mirrors core/coherence_judge.py and
+# core/learning_review.py.
+# --------------------------------------------------------------------
+
+
+_CLASSIFIER_PROMPT_TEMPLATE = """You are a strict consent-trigger classifier for a personal-assistant memory system. Your job is to decide whether a single user message contains an EXPLICIT, UNAMBIGUOUS instruction to remember (ADD), forget (DELETE), or update (SUPERSEDE) facts about a SPECIFIC NAMED THIRD-PARTY PERSON.
+
+You DO NOT infer consent. You DO NOT generalize. You output JSON only.
+
+Output schema (strict JSON, no surrounding prose, no markdown fences):
+{{
+  "verdict":    "ADD" | "DELETE" | "SUPERSEDE" | "NONE",
+  "person":     "<name as written, or null>",
+  "qualifier":  "<relationship qualifier like friend / coworker / mom, or null>",
+  "facts":      ["<one canonical phrasing per atomic fact>"],
+  "confidence": 0.0
+}}
+
+Hard rules:
+- VERDICT must be NONE unless the message is an explicit user instruction to remember / forget / update facts about a named person.
+- ADD requires at least one extractable fact. Emit one entry per atomic claim — DO NOT concatenate ("likes mystery novels and is allergic to peanuts" → two entries).
+- DELETE / SUPERSEDE may have an empty facts list.
+- person field is the FIRST name as written (e.g. "Sarah" not "my sister Sarah").
+- qualifier is the relationship word ("sister", "coworker") if present, else null.
+- confidence must be ≥ 0.75 to be acted on; if you are unsure, output verdict NONE.
+- If the message names a third party but is NOT an explicit instruction (e.g. "Sarah and I went to dinner"), output verdict NONE.
+- Quoted / roleplay content has already been stripped before you see this message; if anything looks like a quote, treat it conservatively.
+
+User turn (session_uuid={session_uuid}, turn_index={turn_index}):
+<<<USER_TURN>>>
+{user_turn}
+<<<END_USER_TURN>>>
+
+Output the JSON object now, nothing else.
+"""
+
+
+SpawnFn = Callable[[list[str], dict[str, str]], "subprocess.CompletedProcess[bytes]"]
+
+
+def _build_classifier_argv(workspace: Path) -> list[str]:
+    return [
+        "claude",
+        "-p",
+        *resolve_model_flag(model_relationships_classifier()),
+    ]
+
+
+def _build_classifier_env() -> dict[str, str]:
+    env = {**os.environ}
+    env[RELATIONSHIPS_CLASSIFIER_ENV_VAR] = "1"
+    return env
+
+
+def _parse_classifier_output(stdout: str) -> TriggerVerdict:
+    """Parse the classifier's JSON response into a TriggerVerdict.
+
+    Tolerant: if the classifier wraps JSON in a markdown fence or
+    leading prose, locate the first ``{`` and last ``}`` and try
+    to parse the substring. Returns NONE on any parse failure.
+    """
+    s = stdout.strip()
+    if not s:
+        return _NONE
+    # Locate JSON object boundaries.
+    i = s.find("{")
+    j = s.rfind("}")
+    if i < 0 or j <= i:
+        return _NONE
+    try:
+        obj = json.loads(s[i : j + 1])
+    except json.JSONDecodeError:
+        return _NONE
+    if not isinstance(obj, dict):
+        return _NONE
+    verdict_raw = str(obj.get("verdict") or "NONE").strip().upper()
+    if verdict_raw not in ("ADD", "DELETE", "SUPERSEDE", "NONE"):
+        return _NONE
+    if verdict_raw == "NONE":
+        return _NONE
+    person_raw = obj.get("person")
+    person = str(person_raw).strip() if person_raw not in (None, "", "null") else None
+    qualifier_raw = obj.get("qualifier")
+    qualifier = (
+        str(qualifier_raw).strip()
+        if qualifier_raw not in (None, "", "null")
+        else None
+    )
+    facts_raw = obj.get("facts") or []
+    if not isinstance(facts_raw, list):
+        return _NONE
+    facts = tuple(str(f).strip() for f in facts_raw if str(f).strip())
+    try:
+        confidence = float(obj.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if verdict_raw == "ADD" and not facts:
+        # Schema requires ≥1 fact for ADD; refuse this output.
+        return _NONE
+    return TriggerVerdict(
+        verdict=verdict_raw,  # type: ignore[arg-type]
+        person_name=person,
+        qualifier=qualifier,
+        facts=facts,
+        confidence=confidence,
+        matched_pattern_id="classifier",
+    )
+
+
+def _spawn_default(
+    argv: list[str], env: dict[str, str]
+) -> "subprocess.CompletedProcess[bytes]":
+    return subprocess.run(
+        argv,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=CLASSIFIER_TIMEOUT_SECONDS,
+    )
+
+
 async def _classifier_call(
     text: str,
     *,
     session_uuid: str,
     turn_index: int,
+    workspace: Path | None = None,
+    spawn: SpawnFn | None = None,
 ) -> TriggerVerdict:
-    """Day 1 stub. Always returns NONE.
+    """Spawn ``claude -p --model <relationships_classifier>`` with
+    the canonical prompt; parse the JSON output; return the verdict.
 
-    Day 2: replace with a real sonnet ``claude -p`` call at
-    temperature=0 with the 4-output schema:
-
-        verdict: ADD | DELETE | SUPERSEDE | NONE
-        person:  <name as written, or null>
-        fact:    <one-sentence canonical fact, or null>
-        confidence: 0.0..1.0
-
-    Promote to a trigger only when verdict != NONE and confidence
-    >= CLASSIFIER_CONFIDENCE_THRESHOLD. The session_uuid + turn_index
-    arguments will be threaded into the prompt so the classifier
-    sees the surrounding context window.
+    Wrapped by ``detect()`` in ``asyncio.wait_for(...,
+    timeout=CLASSIFIER_TIMEOUT_SECONDS)`` and a broad ``except
+    Exception:`` that returns NONE on any failure (transport,
+    spawn, exit-nonzero, parse). Tests inject ``spawn`` to
+    deterministically return canned subprocess results.
     """
-    del text, session_uuid, turn_index  # Day 1: unused by stub
-    return _NONE
+    if workspace is None:
+        workspace = Path.cwd()
+    argv = _build_classifier_argv(workspace)
+    env = _build_classifier_env()
+    prompt = _CLASSIFIER_PROMPT_TEMPLATE.format(
+        session_uuid=session_uuid,
+        turn_index=turn_index,
+        user_turn=text,
+    )
+    argv = argv + [prompt]
+
+    spawn_fn: SpawnFn = spawn or _spawn_default
+
+    def _run() -> TriggerVerdict:
+        try:
+            cp = spawn_fn(argv, env)
+        except subprocess.TimeoutExpired:
+            log.warning("relationships.classifier_subprocess_timeout")
+            classifier_errors.incr("subprocess_timeout")
+            return _NONE
+        except (OSError, FileNotFoundError) as exc:
+            log.warning("relationships.classifier_spawn_failed: %s", exc)
+            classifier_errors.incr("spawn_failed")
+            return _NONE
+        stdout = (
+            cp.stdout.decode("utf-8", errors="replace")
+            if isinstance(cp.stdout, bytes)
+            else (cp.stdout or "")
+        )
+        if cp.returncode != 0:
+            stderr = (
+                cp.stderr.decode("utf-8", errors="replace")
+                if isinstance(cp.stderr, bytes)
+                else (cp.stderr or "")
+            )
+            log.warning(
+                "relationships.classifier_nonzero_exit code=%s body=%s",
+                cp.returncode, (stderr or stdout)[:300],
+            )
+            classifier_errors.incr("nonzero_exit")
+            return _NONE
+        return _parse_classifier_output(stdout)
+
+    # Run the blocking subprocess in a thread so the asyncio event
+    # loop isn't blocked.
+    return await asyncio.to_thread(_run)
+
+
+# --------------------------------------------------------------------
+# Public detect()
+# --------------------------------------------------------------------
 
 
 async def detect(
@@ -208,59 +363,69 @@ async def detect(
     role: Literal["user"],
     session_uuid: str,
     turn_index: int,
+    skip_classifier: bool = False,
+    workspace: Path | None = None,
+    classifier_call: (
+        Callable[..., Awaitable[TriggerVerdict]] | None
+    ) = None,
 ) -> TriggerVerdict:
     """Run the consent-trigger detector against one user turn.
 
-    Returns the regex verdict if any canonical pattern matches.
-    Otherwise falls through to the classifier (stubbed in Day 1).
+    Production path (``skip_classifier=False``): regex matrix is a
+    cheap gate; on any regex hit OR a regex miss where the turn
+    names a third party, the sonnet classifier runs and is the
+    canonical extractor for ``person_name`` / ``qualifier`` /
+    ``facts``. Verdict is the classifier's verdict; regex info is
+    preserved in ``matched_pattern_id`` only when the regex hit
+    (otherwise ``"classifier"``).
+
+    Cheap path (``skip_classifier=True``): used by the dryrun CLI
+    and the regex-matrix tests. Returns the regex match verbatim
+    with empty person/facts, or NONE if no regex matched. No
+    subprocess fired.
+
     Hard role-gate at the top: any role other than ``"user"`` is
     short-circuited to NONE before any pattern or classifier work.
 
     Quoted content (markdown blockquotes, fenced code blocks,
     inline backtick spans) is stripped from ``text`` BEFORE regex
-    and BEFORE classifier prompt assembly so the user can quote a
-    trigger phrase without firing one (research doc C-Q1..C-Q3).
+    and BEFORE classifier prompt assembly.
 
-    Empty / whitespace-only input returns NONE.
+    Empty / whitespace-only input → NONE.
 
-    Failure mode (research doc §3.1): classifier timeout, transport
-    error, rate-limit, or unparseable response → NONE with
-    confidence=0.0, error logged at WARNING and counted in
-    ``classifier_errors``. The synchronous Telegram → brain path
-    must NEVER block on detector flakiness.
+    Failure mode: classifier timeout, transport error,
+    rate-limit, or unparseable response → NONE with
+    confidence=0.0, error counted in ``classifier_errors``. The
+    synchronous Telegram → brain path must NEVER block on
+    detector flakiness.
     """
-    # Hard role-gate. The literal-type annotation documents the
-    # expected caller contract; the runtime check is what actually
-    # enforces it. Both are required — a future refactor that
-    # weakens the type annotation must not silently bypass the
-    # gate, and a future caller that ignores the type hint must
-    # not silently sneak past either.
     if role != "user":
         return _NONE
-
     if not text or not text.strip():
         return _NONE
-
     stripped = strip_quoted_blocks(text)
     if not stripped.strip():
         return _NONE
 
     regex_result = _regex_pass(stripped)
-    if regex_result.verdict != "NONE":
+
+    if skip_classifier:
         return regex_result
 
-    # Fallback to classifier. Wrapped in wait_for + broad except so
-    # any transport flakiness fails open. Day 1's stub returns NONE
-    # synchronously and won't time out, but the wrapper is wired
-    # now so Day 2 can swap in the real call without re-architecting.
+    has_third_party = bool(check_named_third_party(stripped))
+    if regex_result.verdict == "NONE" and not has_third_party:
+        return _NONE
+
+    call = classifier_call or _classifier_call
     try:
         verdict = await asyncio.wait_for(
-            _classifier_call(
+            call(
                 stripped,
                 session_uuid=session_uuid,
                 turn_index=turn_index,
+                workspace=workspace,
             ),
-            timeout=CLASSIFIER_TIMEOUT_SECONDS,
+            timeout=CLASSIFIER_TIMEOUT_SECONDS + 2.0,
         )
     except TimeoutError:
         log.warning(
@@ -281,4 +446,37 @@ async def detect(
         return _NONE
     if verdict.confidence < CLASSIFIER_CONFIDENCE_THRESHOLD:
         return _NONE
+    if verdict.verdict == "ADD" and not verdict.facts:
+        return _NONE
+
+    # Preserve the regex pattern_id when both fired (the regex is
+    # what gated the classifier; useful for dryrun annotation).
+    if regex_result.verdict != "NONE":
+        verdict = TriggerVerdict(
+            verdict=verdict.verdict,
+            person_name=verdict.person_name,
+            qualifier=verdict.qualifier,
+            facts=verdict.facts,
+            confidence=verdict.confidence,
+            matched_pattern_id=regex_result.matched_pattern_id,
+        )
     return verdict
+
+
+# --------------------------------------------------------------------
+# Slug derivation (Day 2 minimum; Day 3 adds disambiguation).
+# --------------------------------------------------------------------
+
+
+_SLUG_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
+
+
+def derive_slug(person_name: str) -> str:
+    """Produce a lowercase-kebab slug from a person's name.
+
+    Day 2 spec: identity-only slug ("Sarah" → "sarah"). Day 3
+    layers disambiguation on top (slug suffix from qualifier when
+    a collision exists).
+    """
+    cleaned = _SLUG_NORMALIZE_RE.sub("-", person_name.lower()).strip("-")
+    return cleaned or "unknown"

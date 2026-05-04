@@ -244,6 +244,16 @@ def learning_max_entry_chars() -> int:
     )
 
 
+def learning_triage_enabled() -> bool:
+    """Two-tier review feature gate. When True (default), a cheap
+    haiku triage call decides whether to run the full sonnet review;
+    when False, every eligible session gets the full review (legacy
+    behavior). Lets the user disable triage from config without code
+    changes if quality regresses."""
+    raw = _section("learning").get("triage_enabled", True)
+    return bool(raw)
+
+
 def browser_screenshot_include_base64() -> bool:
     """Whether ``vexis-browse screenshot`` includes ``image_base64`` by
     default. Off because most harnesses (including Claude Code) read
@@ -274,8 +284,10 @@ def browser_screenshot_include_base64() -> bool:
 
 DEFAULT_MODEL_BRAIN = "default"
 DEFAULT_MODEL_LEARNING_REVIEW = "sonnet"
+DEFAULT_MODEL_LEARNING_TRIAGE = "haiku"
 DEFAULT_MODEL_COHERENCE_JUDGE = "sonnet"
 DEFAULT_MODEL_MIGRATION_CLASSIFIER = "sonnet"
+DEFAULT_MODEL_RELATIONSHIPS_CLASSIFIER = "sonnet"
 
 
 def _model_tier(key: str, default: str) -> str:
@@ -301,12 +313,26 @@ def model_learning_review() -> str:
     return _model_tier("learning_review", DEFAULT_MODEL_LEARNING_REVIEW)
 
 
+def model_learning_triage() -> str:
+    """Tier used for the cheap pre-review skim that decides whether to
+    spawn the full learning review at all. Defaults to haiku because
+    triage is a yes/no judgment over a transcript, not a structured
+    classification task."""
+    return _model_tier("learning_triage", DEFAULT_MODEL_LEARNING_TRIAGE)
+
+
 def model_coherence_judge() -> str:
     return _model_tier("coherence_judge", DEFAULT_MODEL_COHERENCE_JUDGE)
 
 
 def model_migration_classifier() -> str:
     return _model_tier("migration_classifier", DEFAULT_MODEL_MIGRATION_CLASSIFIER)
+
+
+def model_relationships_classifier() -> str:
+    return _model_tier(
+        "relationships_classifier", DEFAULT_MODEL_RELATIONSHIPS_CLASSIFIER
+    )
 
 
 def resolve_model_flag(tier: str) -> list[str]:

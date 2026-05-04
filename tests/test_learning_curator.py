@@ -513,6 +513,10 @@ def test_audit_surfaces_skip_rate(env, monkeypatch):
 def test_audit_skip_rate_below_threshold_no_warning(env, monkeypatch):
     workspace = env
     monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+    # Lift the per-tick spawn cap so this test exercises 10 reviews in
+    # one tick. The cap is a production blast-radius guard; here we want
+    # to assert audit math on a full backlog.
+    monkeypatch.setattr(lc, "MAX_SPAWNS_PER_TICK", 100)
 
     # 1 declined + 9 successful → 10% — exactly at threshold, no
     # warning fires (we want >10%, not >=10%).
@@ -582,6 +586,91 @@ def test_real_review_returns_skipped_outcome_for_oversized(env, monkeypatch):
     assert "huge" in records
     assert records["huge"].outcome.startswith("skipped: transcript too large")
     assert records["huge"].last_reviewed_at is not None
+
+
+def test_real_review_triage_no_skips_sonnet_end_to_end(env, monkeypatch):
+    """Curator-level integration: an eligible session whose triage
+    returns NO finishes the tick without ever spawning sonnet, and
+    the recorded outcome distinguishes triage-skipped from a
+    full-review nothing-to-save."""
+    from core import learning_review as lr
+
+    workspace = env
+    _stage_session(workspace, "skim-me", "2026-05-02T10:00:00Z")
+
+    # Re-enable triage (the global suite default may not toggle this).
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv, env, cwd, stdout, stderr, timeout):
+        calls.append(argv)
+        # The triage prompt is short; sonnet's prompt is long. Keying
+        # off model flag is the most direct discriminator.
+        if "haiku" in argv:
+            return _CP(stdout=b"NO\n", returncode=0)
+        raise AssertionError(
+            "sonnet must not be called when triage returned NO; "
+            f"argv={argv!r}"
+        )
+
+    monkeypatch.setattr(lr.subprocess, "run", fake_run)
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+
+    controller = LearningController(workspace=workspace)
+    result = controller.run_now()
+
+    assert "skim-me" in result.reviewed
+    # Exactly one subprocess fired — the triage call.
+    assert len(calls) == 1
+    # Outcome string distinguishes triage-skipped so the audit trail
+    # can show how often the cheap pass is filtering work.
+    rec = controller._reviewed.load()["skim-me"]
+    assert rec.outcome == "nothing to save (triage)"
+
+
+def test_real_review_triage_yes_runs_sonnet_end_to_end(env, monkeypatch):
+    """Triage YES → sonnet runs → outcome reflects sonnet's verdict
+    (here also nothing-to-save, but via the full path so the outcome
+    string is the legacy 'nothing to save' without the (triage)
+    suffix)."""
+    from core import learning_review as lr
+
+    workspace = env
+    _stage_session(workspace, "look-deeper", "2026-05-02T10:00:00Z")
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv, env, cwd, stdout, stderr, timeout):
+        calls.append(argv)
+        if "haiku" in argv:
+            return _CP(stdout=b"YES\n", returncode=0)
+        return _CP(stdout=b"Nothing to save.\n", returncode=0)
+
+    monkeypatch.setattr(lr.subprocess, "run", fake_run)
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+
+    controller = LearningController(workspace=workspace)
+    controller.run_now()
+
+    assert len(calls) == 2  # triage + sonnet
+    rec = controller._reviewed.load()["look-deeper"]
+    # Plain "nothing to save" — the (triage) suffix only attaches when
+    # the cheap pass short-circuited.
+    assert rec.outcome == "nothing to save"
+
+
+class _CP:
+    """Tiny CompletedProcess stand-in for the integration tests above.
+
+    subprocess.CompletedProcess works fine but is verbose to construct
+    inline; this reduces the noise."""
+
+    def __init__(self, *, stdout: bytes, returncode: int = 0, stderr: bytes = b""):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
 
 
 def test_oversized_single_message_invisible_to_tail_read(env):

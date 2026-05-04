@@ -24,6 +24,37 @@ learning:
   shadow_mode: false
 ```
 
+## Two-tier review (haiku triage)
+
+Every eligible session first gets a cheap haiku triage call ("does
+this session contain anything memorable? YES/NO"). Only YES sessions
+escalate to the full sonnet review. About 85% of sessions return
+"nothing to save" — triage skips the expensive sonnet call entirely
+on those.
+
+Knobs in `~/.vexis/config.yaml`:
+
+```yaml
+learning:
+  triage_enabled: true   # default; set false to restore single-pass
+
+models:
+  learning_triage: haiku  # default; any model name resolve_model_flag accepts
+  learning_review: sonnet # unchanged; runs only on YES verdicts
+```
+
+Failure modes:
+
+- **Garbage / unparseable triage output** → fail open, sonnet runs.
+  Logged at WARNING under `learning_review`.
+- **Triage timeout (90 s) or spawn error** → fail open.
+- **Rate-limit hit on triage** → propagated as a review error so the
+  curator's tick-abort path triggers. Sonnet is NOT called.
+
+The audit trail records `triage_skipped` and `triage_result`
+(`YES` / `NO` / `FAIL_OPEN` / `ERROR` / `DISABLED`) per session so
+parse-failure rates and quality drift are visible in `run.json`.
+
 ## Soak windows (recommended; from `.plans/learning-curator-v2-research.md` §3.4)
 
 | Target | Window | Why |
