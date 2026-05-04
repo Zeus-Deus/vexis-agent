@@ -363,9 +363,12 @@ class TelegramTransport:
                 text,
                 session_uuid=session_uuid,
                 turn_index=turn_index,
+                chat_id=chat_id,
             )
         except NotImplementedError:
-            # SUPERSEDE (3b) — pass through to brain.
+            # Reserved for any future verdict not yet wired. 3a/3b
+            # cover ADD / DELETE / SUPERSEDE / AMBIGUOUS — none of
+            # these raise.
             return
         except Exception:
             log.exception(

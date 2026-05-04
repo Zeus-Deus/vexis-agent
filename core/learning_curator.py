@@ -1956,11 +1956,25 @@ class LearningController:
         md_lines.append("## Relationships counters (since startup)")
         md_lines.append("")
         for name in (
+            # 3a
             "add_staged",
             "delete_executed",
             "delete_missing",
             "cursor_collision",
             "hook_errors",
+            # 3b
+            "supersede_executed",
+            "supersede_missing",
+            "supersede_blocked_sensitive",
+            "supersede_blocked_coherence",
+            "ambiguous_emitted",
+            "ambiguous_resolved",
+            "ambiguous_dropped_unresolved",
+            "ambiguous_dropped_unrelated",
+            "disambiguation_back_edit",
+            "restore_executed",
+            "restore_missing",
+            "restore_collision",
         ):
             md_lines.append(f"- {name}: {rel_counters.get(name, 0)}")
         md_lines.append("")
@@ -2163,10 +2177,30 @@ class LearningController:
             # writes anywhere.
             last_n = _parse_last_n_sessions(args, default=30)
             return await self._relationships_dryrun_text(last_n)
+        if sub == "relationships-restore":
+            # v3b Day 3b — user-initiated reverse of a deletion.
+            # Token-free: the user is the explicit caller (the
+            # Telegram allow-list already auth-gated this surface).
+            if not args:
+                return (
+                    "Usage: /learning relationships-restore <slug>"
+                )
+            slug = args[0].strip()
+            if not slug:
+                return (
+                    "Usage: /learning relationships-restore <slug>"
+                )
+            try:
+                result = self._relationships_curator.restore(slug)
+            except Exception:
+                log.exception("relationships.restore raised")
+                return "⚠️ Restore failed; check the logs."
+            return result.reply_text or "(no reply)"
         return (
             "Usage: /learning [status|pause|resume|run|audit|"
             "coherence-audit [--shadow-only]|"
-            "relationships-dryrun [--last-n-sessions N]]"
+            "relationships-dryrun [--last-n-sessions N]|"
+            "relationships-restore <slug>]"
         )
 
     async def _relationships_dryrun_text(self, last_n: int) -> str:

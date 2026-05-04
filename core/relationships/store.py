@@ -403,17 +403,80 @@ def append_archive_block(
     truncated mix. Caller is the synchronous DELETE flow in
     ``RelationshipsStore.delete_live``.
     """
+    _append_archive_block_raw(
+        path,
+        block=f"## REMOVED {removed_date}\n{person.render()}\n",
+    )
+
+
+def _append_archive_block_raw(path: Path, *, block: str) -> None:
+    """Append a pre-rendered block to the archive file.
+
+    The block is responsible for its own H2 header (``## REMOVED ...``,
+    ``## SUPERSEDED ...``, ``## DISAMBIGUATED ...``) and trailing
+    newline. We init the file if missing, then atomic-write tmp +
+    rename so an interrupted append leaves the previous archive
+    intact.
+    """
     _initialize_archive_if_needed(path)
     body = path.read_text(encoding="utf-8")
     if not body.endswith("\n"):
         body += "\n"
-    block = (
-        f"\n## REMOVED {removed_date}\n"
-        f"{person.render()}\n"
-    )
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(body + block, encoding="utf-8")
+    tmp.write_text(body + "\n" + block, encoding="utf-8")
     tmp.replace(path)
+
+
+def append_supersede_archive_block(
+    path: Path,
+    *,
+    old_person: Person,
+    superseded_date: str,
+    new_session_short: str,
+) -> None:
+    """Append the OLD Person block to the archive under a
+    ``## SUPERSEDED <date>`` separator, with each old fact carrying
+    a ``[superseded YYYY-MM-DD by sess:<short>]`` provenance line.
+
+    Caller is the synchronous SUPERSEDE flow. The new (replacement)
+    facts are NOT written here — they go into the live file.
+    """
+    annotated_facts = tuple(
+        replace(
+            f,
+            superseded_by_date=superseded_date,
+            superseded_by_session=new_session_short,
+        )
+        for f in old_person.facts
+    )
+    annotated = replace(old_person, facts=annotated_facts)
+    _append_archive_block_raw(
+        path,
+        block=f"## SUPERSEDED {superseded_date}\n{annotated.render()}\n",
+    )
+
+
+def append_disambiguation_archive_line(
+    path: Path,
+    *,
+    disambiguated_date: str,
+    old_slug: str,
+    new_slug: str,
+) -> None:
+    """Append a ``## DISAMBIGUATED <date>`` block with a single
+    provenance line per scoping doc §3.5: a previously-unqualified
+    slug got back-edited to a qualified slug because a second
+    person with the same first name appeared. The line lives in
+    the archive ONLY — the live file just shows the renamed slug.
+    """
+    line = (
+        f'- [disambiguated {disambiguated_date} from "{old_slug}" '
+        f'to "{new_slug}"]'
+    )
+    _append_archive_block_raw(
+        path,
+        block=f"## DISAMBIGUATED {disambiguated_date}\n{line}\n",
+    )
 
 
 @dataclass(frozen=True)
@@ -652,15 +715,339 @@ class RelationshipsStore:
             self._archive_path, person=match, removed_date=removed_date,
         )
         # Step 2: rewrite live without the block (atomic).
-        new_live = [p for p in live_people if p.slug != slug]
-        live_tmp = self._live_path.with_suffix(self._live_path.suffix + ".tmp")
-        live_tmp.write_text(
-            serialize_relationships_file(new_live, kind="live"),
-            encoding="utf-8",
+        self._atomic_rewrite_live(
+            [p for p in live_people if p.slug != slug]
         )
-        live_tmp.replace(self._live_path)
         return StoreResult(
             ok=True,
             message=f"deleted {slug} (archived to {self._archive_path.name})",
             person_slug=slug,
         )
+
+    def _atomic_rewrite_live(self, people: list[Person]) -> None:
+        """Write the live file via ``.tmp + replace``. Centralised so
+        the SUPERSEDE / DELETE / rename / restore paths share one
+        atomic-rename implementation."""
+        live_tmp = self._live_path.with_suffix(self._live_path.suffix + ".tmp")
+        live_tmp.write_text(
+            serialize_relationships_file(people, kind="live"),
+            encoding="utf-8",
+        )
+        live_tmp.replace(self._live_path)
+
+    # ----- synchronous SUPERSEDE (3b) -----
+
+    def supersede_live(
+        self,
+        slug: str,
+        *,
+        token,
+        new_facts: list[str],
+        new_session_uuid: str,
+        new_session_short: str,
+        superseded_date: str,
+    ) -> StoreResult:
+        """Atomically archive the OLD facts then rewrite the live
+        Person with the NEW fact set under the same H2.
+
+        Verifies the ConsentToken with ``expected_action="supersede"``
+        AND that the token's fact_ids cover ``new_facts`` (so a
+        tampered runtime can't slip in extra facts before the live
+        rewrite lands). YAML preserved verbatim except
+        ``last_confirmed`` is bumped to ``superseded_date`` and
+        ``source_session`` is updated to ``new_session_uuid`` (the
+        live entry's "most recent confirmation" pin moves to the
+        SUPERSEDE turn).
+
+        Atomicity: archive append first, then live rewrite. A crash
+        between the two leaves both the OLD facts (in the archive
+        under SUPERSEDED) AND the OLD facts in the live file. Same
+        recovery contract as DELETE — user re-runs "update Sarah" to
+        converge.
+
+        ``ok=False`` when no live entry matches the slug. Token
+        check raises ConsentError on failure.
+        """
+        from core.relationships.consent import verify_for_promotion
+        verify_for_promotion(
+            token,
+            person_slug=slug,
+            facts=new_facts,
+            expected_action="supersede",
+        )
+        live_people = self.list_live()
+        match = next((p for p in live_people if p.slug == slug), None)
+        if match is None:
+            return StoreResult(
+                ok=False,
+                message=f"no live entry for slug={slug!r}",
+                person_slug=slug,
+            )
+        # Step 1: archive the OLD block with SUPERSEDED marker and
+        # per-fact `[superseded ... by sess:...]` provenance lines.
+        append_supersede_archive_block(
+            self._archive_path,
+            old_person=match,
+            superseded_date=superseded_date,
+            new_session_short=new_session_short,
+        )
+        # Step 2: build the new live block — same heading + slug +
+        # qualifier, updated last_confirmed + source_session, NEW
+        # facts as `[confirmed ...]` pins.
+        new_fact_objs = tuple(
+            Fact(
+                text=t,
+                confirmed_date=superseded_date,
+                source_session_short=new_session_short,
+                staged=False,
+            )
+            for t in new_facts
+        )
+        new_person = replace(
+            match,
+            last_confirmed=superseded_date,
+            source_session=new_session_uuid,
+            facts=new_fact_objs,
+        )
+        new_live = [p for p in live_people if p.slug != slug] + [new_person]
+        self._atomic_rewrite_live(new_live)
+        return StoreResult(
+            ok=True,
+            message=(
+                f"superseded {slug} ({len(new_facts)} new fact(s); "
+                f"old archived)"
+            ),
+            person_slug=slug,
+        )
+
+    # ----- 3b disambiguation back-edit -----
+
+    def rename_live_slug(
+        self,
+        *,
+        old_slug: str,
+        new_slug: str,
+        new_qualifier: str | None,
+        disambiguated_date: str,
+    ) -> StoreResult:
+        """Rename a live Person from ``old_slug`` to ``new_slug``,
+        appending a ``## DISAMBIGUATED <date>`` provenance entry to
+        the archive.
+
+        Caller is the disambiguation back-edit flow when a second
+        person with the same first name appears and the existing
+        bare-slug entry needs to be renamed to its qualified form.
+        Both writes are atomic (.tmp + replace), archive-first.
+
+        ``new_qualifier`` overrides the existing entry's YAML
+        qualifier (passed by caller because the back-edit decision
+        was made from that field). The H2 heading is recomputed
+        from ``display_name`` + ``new_qualifier``.
+
+        No token requirement — the back-edit is curator-driven on
+        an already-consented entry; the rename does not introduce
+        new content. Defense-in-depth: the live file rewrite is
+        atomic so a tampered intermediate state can't leak.
+
+        ``ok=False`` when ``old_slug`` doesn't exist or
+        ``new_slug`` would collide with another live entry.
+        """
+        live_people = self.list_live()
+        match = next((p for p in live_people if p.slug == old_slug), None)
+        if match is None:
+            return StoreResult(
+                ok=False,
+                message=f"no live entry for slug={old_slug!r}",
+                person_slug=old_slug,
+            )
+        if any(p.slug == new_slug for p in live_people if p.slug != old_slug):
+            return StoreResult(
+                ok=False,
+                message=(
+                    f"rename target slug={new_slug!r} already exists in live"
+                ),
+                person_slug=old_slug,
+            )
+        # Step 1: archive the disambiguation provenance line.
+        append_disambiguation_archive_line(
+            self._archive_path,
+            disambiguated_date=disambiguated_date,
+            old_slug=old_slug,
+            new_slug=new_slug,
+        )
+        # Step 2: rewrite live with the renamed entry.
+        renamed = replace(
+            match,
+            slug=new_slug,
+            qualifier=new_qualifier,
+        )
+        new_live = [p for p in live_people if p.slug != old_slug] + [renamed]
+        self._atomic_rewrite_live(new_live)
+        return StoreResult(
+            ok=True,
+            message=f"renamed {old_slug!r} → {new_slug!r}",
+            person_slug=new_slug,
+        )
+
+    # ----- 3b restore from archive -----
+
+    def restore_from_archive(self, slug: str) -> StoreResult:
+        """Restore the most-recent ``## REMOVED`` block for ``slug``
+        from RELATIONSHIPS-ARCHIVE.md back into RELATIONSHIPS.md,
+        and remove the REMOVED block from the archive.
+
+        Token-free path — caller is the user-initiated
+        ``/learning relationships-restore`` slash command. No
+        classifier verdict, no consent ambiguity.
+
+        ``ok=False`` shapes:
+        - ``"slug-already-live"``: ``slug`` exists in the live file.
+          Restore would overwrite; user must /forget first.
+        - ``"no-archive"``: archive file doesn't exist.
+        - ``"no-removed-block"``: archive has no REMOVED block for
+          ``slug``.
+
+        On success: live rewrite (.tmp + replace), archive rewrite
+        (.tmp + replace), archive-first. Multiple REMOVED blocks
+        for the same slug → restore the LAST one (most recent),
+        leave older REMOVED blocks alone (deleted-restored-deleted
+        history is preserved for audit).
+        """
+        live_people = self.list_live()
+        if any(p.slug == slug for p in live_people):
+            return StoreResult(
+                ok=False,
+                message="slug-already-live",
+                person_slug=slug,
+            )
+        if not self._archive_path.exists():
+            return StoreResult(
+                ok=False,
+                message="no-archive",
+                person_slug=slug,
+            )
+        archive_text = self._archive_path.read_text(encoding="utf-8")
+        block_idx, block = _find_last_removed_block_for_slug(
+            archive_text, slug,
+        )
+        if block_idx is None or block is None:
+            return StoreResult(
+                ok=False,
+                message="no-removed-block",
+                person_slug=slug,
+            )
+        # Parse the embedded Person from the block (the block is the
+        # markdown body that lived in the live file). We strip the
+        # leading `## REMOVED <date>` line and parse the rest as a
+        # one-Person file.
+        person_md = _strip_removed_header(block)
+        people = parse_relationships_file(person_md)
+        if not people:
+            return StoreResult(
+                ok=False,
+                message="archive-block-unparseable",
+                person_slug=slug,
+            )
+        restored = people[0]
+        # Step 1: rewrite the archive without the restored REMOVED block.
+        new_archive_text = _archive_with_block_removed(
+            archive_text, block_idx, block,
+        )
+        archive_tmp = self._archive_path.with_suffix(
+            self._archive_path.suffix + ".tmp"
+        )
+        archive_tmp.write_text(new_archive_text, encoding="utf-8")
+        archive_tmp.replace(self._archive_path)
+        # Step 2: rewrite live with the restored entry appended.
+        live_people.append(restored)
+        self._atomic_rewrite_live(live_people)
+        return StoreResult(
+            ok=True,
+            message=f"restored {slug} from archive",
+            person_slug=slug,
+        )
+
+
+# --------------------------------------------------------------------
+# Archive parsing helpers (3b restore path)
+# --------------------------------------------------------------------
+
+
+_REMOVED_HEADER_RE = re.compile(
+    r"^##\s+REMOVED\s+(\d{4}-\d{2}-\d{2})\s*$",
+    re.MULTILINE,
+)
+# Marker H2s the archive uses to separate top-level entries.
+# A REMOVED/SUPERSEDED/DISAMBIGUATED block extends from its marker
+# H2 up to (but not including) the next marker H2 or EOF — including
+# any embedded Person H2s within (the Person heading is data, not a
+# new top-level block).
+_ARCHIVE_TOPLEVEL_H2_RE = re.compile(
+    r"^##\s+(?:REMOVED|SUPERSEDED|DISAMBIGUATED)\s+\d{4}-\d{2}-\d{2}\s*$",
+    re.MULTILINE,
+)
+
+
+def _find_last_removed_block_for_slug(
+    archive_text: str, slug: str
+) -> tuple[int | None, str | None]:
+    """Locate the most recent ``## REMOVED <date>`` block whose
+    embedded YAML carries ``slug:`` for the requested slug.
+
+    Returns ``(start_offset, block_text)`` so the caller can splice
+    the block out of the archive. Returns ``(None, None)`` if no
+    block matches. ``block_text`` includes the leading
+    ``## REMOVED <date>\n`` header and the body up to (but not
+    including) the next top-level archive H2 (REMOVED / SUPERSEDED /
+    DISAMBIGUATED) or EOF.
+    """
+    boundaries = [
+        m.start() for m in _ARCHIVE_TOPLEVEL_H2_RE.finditer(archive_text)
+    ]
+    if not boundaries:
+        return None, None
+    boundaries.append(len(archive_text))
+    last_match: tuple[int, str] | None = None
+    for i, start in enumerate(boundaries[:-1]):
+        end = boundaries[i + 1]
+        section = archive_text[start:end]
+        first_newline = section.find("\n")
+        header_line = section[:first_newline] if first_newline >= 0 else section
+        if not _REMOVED_HEADER_RE.match(header_line):
+            continue
+        body = section[first_newline + 1:] if first_newline >= 0 else ""
+        people = parse_relationships_file(body)
+        if any(p.slug == slug for p in people):
+            last_match = (start, section)
+    if last_match is None:
+        return None, None
+    return last_match
+
+
+def _strip_removed_header(block: str) -> str:
+    """Drop the leading ``## REMOVED <date>\n`` line from a block
+    so what remains parses as a one-Person markdown body."""
+    first_newline = block.find("\n")
+    if first_newline < 0:
+        return ""
+    return block[first_newline + 1:]
+
+
+def _archive_with_block_removed(
+    archive_text: str, block_start: int, block_text: str
+) -> str:
+    """Splice ``block_text`` out of ``archive_text`` starting at
+    ``block_start``. Preserves preceding header/intro and any
+    later REMOVED blocks intact. Trims any orphan blank lines that
+    would otherwise stack after the splice."""
+    before = archive_text[:block_start]
+    after = archive_text[block_start + len(block_text):]
+    # Trim any orphan blank lines at the splice seam: rstrip the
+    # preceding text down to one trailing newline, lstrip leading
+    # blank lines from the following text.
+    before = before.rstrip() + "\n"
+    after = after.lstrip("\n")
+    if after:
+        # Leave one blank line between intro/header and the next H2.
+        return before + "\n" + after
+    return before
