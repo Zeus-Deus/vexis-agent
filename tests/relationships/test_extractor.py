@@ -319,18 +319,29 @@ def test_extractor_dedups_against_live(tmp_path: Path):
 # ---------------------------------------------------------------- model default
 
 
-def test_extractor_resolves_haiku_by_default():
-    """Confirm the haiku-default model knob (§4.1 patch). Reads
-    yaml_config directly because the spawn argv is the proof."""
+def test_extractor_resolves_sonnet_by_default():
+    """v3c Day 5: the source-level default flipped haiku → sonnet
+    after the release-gate eval. Day 4a's haiku-default test was
+    renamed and re-targeted; the runtime-level
+    ``model_relationships_extractor()`` reads
+    ``~/.vexis/config.yaml`` so we monkeypatch the read to keep
+    this test independent of the user's local config."""
+    from core import yaml_config
     from core.yaml_config import (
         DEFAULT_MODEL_RELATIONSHIPS_EXTRACTOR,
         model_relationships_extractor,
         resolve_model_flag,
     )
-    assert DEFAULT_MODEL_RELATIONSHIPS_EXTRACTOR == "haiku"
-    assert model_relationships_extractor() == "haiku"
-    flag = resolve_model_flag(model_relationships_extractor())
-    assert flag == ["--model", "haiku"]
+    assert DEFAULT_MODEL_RELATIONSHIPS_EXTRACTOR == "sonnet"
+    # Read with no config override → returns the source default.
+    original_read_raw = yaml_config._read_raw
+    yaml_config._read_raw = lambda: {}  # type: ignore[assignment]
+    try:
+        assert model_relationships_extractor() == "sonnet"
+        flag = resolve_model_flag(model_relationships_extractor())
+        assert flag == ["--model", "sonnet"]
+    finally:
+        yaml_config._read_raw = original_read_raw  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------- error path

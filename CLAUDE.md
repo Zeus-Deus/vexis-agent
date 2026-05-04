@@ -137,9 +137,16 @@ and queues them for your approval. Approved facts land in
 next session spawn. The brain never sees the candidate queue.
 
 **Default flow.** A relationships extractor (`claude -p`,
-haiku-default) runs at every learning-curator tick over each
-session that passed triage. Extracted facts get tiered eligibility
-per `core/relationships/candidate_store.py`:
+sonnet-default since v3c Day 5) runs at every learning-curator
+tick over each session that passed triage. The model started as
+haiku in 4a but the Day 5 release-gate eval surfaced reliability
+gaps haiku couldn't close (83% positive against the 85%
+threshold, even after fixture and prompt fixes); sonnet hit
+100% on the same corpus. Override to haiku via
+`models.relationships_extractor: haiku` in `~/.vexis/config.yaml`
+if cost matters more than reliability for a workspace.
+Extracted facts get tiered eligibility per
+`core/relationships/candidate_store.py`:
 
 - **Strong qualifier cues** (mom, dad, partner, sibling, child,
   etc.): eligible after 1 session.
@@ -175,8 +182,10 @@ pytest tests/relationships/ -m eval
 ```
 
 Thresholds: ≥85% positive accuracy, ≥95% negative accuracy,
-**zero** sensitive-content leaks. Below threshold, flip
-`models.relationships_extractor: sonnet` in
-`~/.vexis/config.yaml` and re-run.
+**zero** sensitive-content leaks. v3c shipped on sonnet at
+100% positive on Day 5; if you've overridden to haiku and the
+eval drops, flip back to sonnet via
+`models.relationships_extractor: sonnet`.
 
 Full design: `.plans/relationships-v3c-research.md`.
+End-user one-pager: `docs/relationships.md`.

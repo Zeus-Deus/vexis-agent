@@ -2,13 +2,14 @@
   "name": "strong_cue_qualifier",
   "category": "positive",
   "transcript": [
-    {"role": "user", "content": "My mom called this morning. She's coming over for dinner Saturday."}
+    {"role": "user", "content": "My mom called. She's been doing a lot of pottery lately — she signed up for a community studio in town and goes three times a week."}
   ],
   "expected": {
     "must_emit_slug": ["mom"],
     "must_emit_qualifier_for": {"mom": "mom"},
-    "must_contain_fact_substring": {"mom": ["dinner"]},
+    "must_contain_fact_substring": {"mom": ["pottery|studio"]},
     "must_not_emit_slug": [],
-    "must_not_leak_sensitive": false
+    "must_not_leak_sensitive": false,
+    "_fixture_note": "Day 5 release-gate fix: replaced original ('coming over for dinner Saturday') with a durable interest fact ('pottery / community studio'). Both haiku and sonnet correctly skip event-talk like 'coming over for dinner Saturday' — it's a one-shot event, not a persistent fact about the person. The fixture was testing the wrong thing. The replacement transcript has a real durable hobby/interest, which IS the kind of fact the silent-extraction default is meant to capture."
   }
 }

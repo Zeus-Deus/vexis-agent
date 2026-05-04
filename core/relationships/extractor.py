@@ -52,7 +52,15 @@ from core.yaml_config import (
 
 log = logging.getLogger(__name__)
 
-EXTRACTOR_TIMEOUT_SECONDS = 30.0
+# Hard ceiling on a single extractor ``claude -p`` invocation.
+# Bumped 30 → 60 in v3c Day 5 because the Day 4c eval surfaced
+# cold-start latencies that exceed 30s on first-invocation in a
+# fresh shell (claude CLI auth + model warm-up). 60s still bails
+# on genuine hangs (haiku rarely takes more than ~10s on a
+# transcript that fits the MAX_USER_TURNS_PER_EXTRACTION cap),
+# while absorbing the cold-start variance that produced flaky
+# eval failures unrelated to extraction quality.
+EXTRACTOR_TIMEOUT_SECONDS = 60.0
 EXTRACTOR_ENV_VAR = "VEXIS_RELATIONSHIPS_EXTRACTOR"
 
 # Cap on the number of user-role turns the extractor sees per
@@ -115,7 +123,7 @@ Output schema (strict JSON, no surrounding prose, no markdown fences):
 {{
   "extractions": [
     {{
-      "person":     "<first name as written>",
+      "person":     "<first name OR a relational referent like 'mom' / 'dad' / 'partner'>",
       "qualifier":  "<relationship word like friend / coworker / mom, or null>",
       "fact":       "<one canonical phrasing of one atomic fact about the person>",
       "confidence": 0.0
@@ -129,7 +137,7 @@ Hard rules:
 - The fact field describes the THIRD PARTY, not the user's relationship to them. "Sarah is my coworker" → fact="works with the user as a coworker"; the qualifier field carries "coworker" separately.
 - Skip mere mentions without facts ("had lunch with Marco today" → no extraction).
 - Skip user-self-claims ("I had lunch with Marco" with no fact about Marco → no extraction; "Marco told me he uses Vim" → emit person=Marco fact="uses Vim").
-- person must be a name, not a pronoun. If you can't recover a name, skip the extraction.
+- person must be the referent the user uses. A first name is preferred ("Sarah", "Marco"). When the user's only referent is a relational term ("my mom", "my dad", "my partner", "my brother"), use the lowercase relational term as the person value AND set qualifier to the same word — these are real third-party people the user identifies by role, not pronouns to skip. Genuine pronouns ("she", "he", "they") with no antecedent → skip.
 - qualifier is the relationship word ("sister", "coworker", "mom", "friend") if present anywhere in the conversation about that person; null otherwise.
 - confidence ≥ 0.5 to be acted on. Below that, omit the extraction.
 - Output empty extractions array if no facts surface.
