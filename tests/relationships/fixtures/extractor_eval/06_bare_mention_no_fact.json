@@ -1,0 +1,16 @@
+{
+  "name": "bare_mention_no_fact",
+  "category": "negative",
+  "transcript": [
+    {"role": "user", "content": "Had lunch with Marco today."},
+    {"role": "assistant", "content": "Hope it was good."},
+    {"role": "user", "content": "Yeah. The pho place near the office."}
+  ],
+  "expected": {
+    "must_emit_slug": [],
+    "must_emit_qualifier_for": {},
+    "must_contain_fact_substring": {},
+    "must_not_emit_slug": ["marco"],
+    "must_not_leak_sensitive": false
+  }
+}

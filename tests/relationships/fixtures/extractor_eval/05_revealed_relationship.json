@@ -1,0 +1,16 @@
+{
+  "name": "revealed_relationship_qualifier",
+  "category": "positive",
+  "transcript": [
+    {"role": "user", "content": "Sarah and I went hiking yesterday."},
+    {"role": "assistant", "content": "Nice. Where to?"},
+    {"role": "user", "content": "Just up Eagle Peak. Anyway, my girlfriend Sarah is really into climbing now — she just signed up for a bouldering gym."}
+  ],
+  "expected": {
+    "must_emit_slug": ["sarah"],
+    "must_emit_qualifier_for": {"sarah": "girlfriend"},
+    "must_contain_fact_substring": {"sarah": ["climb", "boulder"]},
+    "must_not_emit_slug": [],
+    "must_not_leak_sensitive": false
+  }
+}

@@ -2295,7 +2295,21 @@ class LearningController:
             except Exception:
                 log.exception("relationships.approve_candidate raised")
                 return "⚠️ Approve failed; check the logs."
-            return result.reply_text or "(no reply)"
+            reply_text = result.reply_text or "(no reply)"
+            # v3c Day 4c: append the brain-cache invalidation hint
+            # on success. Suppressible via
+            # relationships.approval_hint_enabled (default true).
+            if result.ok:
+                from core.yaml_config import (
+                    relationships_approval_hint_enabled,
+                )
+                if relationships_approval_hint_enabled():
+                    reply_text = (
+                        f"{reply_text} "
+                        f"(Active in your next session — `/clear` "
+                        f"to start fresh.)"
+                    )
+            return reply_text
         if sub == "relationships-reject":
             # v3c Day 4a — whole-slug reject via slash command.
             if not args:
@@ -2313,6 +2327,11 @@ class LearningController:
                 log.exception("relationships.reject_candidate raised")
                 return "⚠️ Reject failed; check the logs."
             return result.reply_text or "(no reply)"
+        if sub == "relationships-digest":
+            # v3c Day 4c — on-demand summary of pending candidates.
+            # User-pull, no cron. Output mirrors the research doc §5.3
+            # format with a glyph + ending CTA.
+            return self._relationships_digest_text()
         return (
             "Usage: /learning [status|pause|resume|run|audit|"
             "coherence-audit [--shadow-only]|"
@@ -2320,8 +2339,52 @@ class LearningController:
             "relationships-restore <slug>|"
             "relationships-pending|"
             "relationships-approve <slug>|"
-            "relationships-reject <slug>]"
+            "relationships-reject <slug>|"
+            "relationships-digest]"
         )
+
+    def _relationships_digest_text(self) -> str:
+        """Render the ``/learning relationships-digest`` reply.
+
+        Output shape (per research doc §5.3):
+
+            Pending relationships (3):
+              ▲ sarah (coworker) — 2 sessions, 2 facts. Eligible.
+              ▲ marco (?) — 1 session, 1 fact. Below threshold.
+              ▲ mom (mom) — 1 session, 0 facts. (will drop on next sweep)
+
+            Run `/learning relationships-approve <slug>` to approve from
+            here, or use the dashboard for per-fact granularity.
+        """
+        try:
+            views = self._relationships_curator.list_pending_candidates()
+        except Exception:
+            log.exception("relationships digest list raised")
+            return "⚠️ Could not list pending candidates."
+        if not views:
+            return "No pending relationships."
+        lines = [f"Pending relationships ({len(views)}):"]
+        for v in views:
+            qual = v.qualifier or "?"
+            sess_word = "session" if v.session_count == 1 else "sessions"
+            fact_word = "fact" if v.fact_count == 1 else "facts"
+            if v.eligible:
+                state = "Eligible."
+            elif v.fact_count == 0:
+                state = "(will drop on next sweep)"
+            else:
+                state = "Below threshold."
+            lines.append(
+                f"  ▲ {v.slug} ({qual}) — "
+                f"{v.session_count} {sess_word}, "
+                f"{v.fact_count} {fact_word}. {state}"
+            )
+        lines.append("")
+        lines.append(
+            "Run `/learning relationships-approve <slug>` to approve from "
+            "here, or use the dashboard for per-fact granularity."
+        )
+        return "\n".join(lines)
 
     def _relationships_pending_text(self) -> str:
         """Render the ``/learning relationships-pending`` reply.

@@ -1,0 +1,16 @@
+{
+  "name": "explicit_fact_with_qualifier",
+  "category": "positive",
+  "transcript": [
+    {"role": "user", "content": "Sarah from work uses Vim at her desk. We were pair-programming today and I noticed."},
+    {"role": "assistant", "content": "Got it."},
+    {"role": "user", "content": "She's pretty fast with it actually."}
+  ],
+  "expected": {
+    "must_emit_slug": ["sarah"],
+    "must_emit_qualifier_for": {"sarah": "coworker"},
+    "must_contain_fact_substring": {"sarah": ["vim"]},
+    "must_not_emit_slug": [],
+    "must_not_leak_sensitive": false
+  }
+}

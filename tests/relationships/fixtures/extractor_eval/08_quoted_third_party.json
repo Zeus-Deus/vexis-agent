@@ -1,0 +1,16 @@
+{
+  "name": "quoted_third_party",
+  "category": "negative",
+  "transcript": [
+    {"role": "user", "content": "Sarah said John uses Emacs and is really proud of it."}
+  ],
+  "expected": {
+    "must_emit_slug": [],
+    "must_emit_qualifier_for": {},
+    "must_contain_fact_substring": {},
+    "must_not_emit_slug": ["john"],
+    "must_not_leak_sensitive": false,
+    "tolerance": "soft",
+    "tolerance_reason": "Sarah relayed a fact about John; the user did not directly observe John. Permissive: emitting Sarah-said-X-about-John is acceptable; emitting John-uses-Emacs as a direct fact is the failure."
+  }
+}
