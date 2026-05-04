@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ from core.notify import ContextNote, Notifier
 from core.paths import skills_dir
 from core.sessions import SessionInfo, SessionStore
 from core.skills import PinStore, archived_skill_names
+from core.transcripts import claude_session_jsonl_dir, iter_messages
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +52,15 @@ class MessageHandler:
         # warnings) become visible to claude -p as a [SYSTEM CONTEXT]
         # block prepended to the user's message.
         self._notifier = notifier
+        # v3b Day 3a: per-session "highest minted turn_index" cursor for
+        # the relationships hook. In-memory only; on restart it's empty
+        # and ``next_user_turn_index`` rebuilds from the JSONL.
+        # ``claim_next_turn_index`` is the only mutation site, guarded
+        # by ``_cursor_lock`` so two parallel hook fires (post-claim
+        # the drain serialises per-chat, but defense in depth) cannot
+        # both see the same ``proposed`` and pass.
+        self._dispatched_turn_index: dict[str, int] = {}
+        self._cursor_lock = asyncio.Lock()
 
     async def handle(self, user_id: int, chat_id: int, text: str) -> str | None:
         if not is_allowed(user_id, self._allowed_user_id):
@@ -205,6 +216,70 @@ class MessageHandler:
         if self._workspace is None:
             return []
         return archived_skill_names(skills_dir(self._workspace))
+
+    # ---------- v3b Day 3a: relationships hook accessors ----------
+    #
+    # The relationships trigger hook in transports/telegram.py reads
+    # the brain's session_uuid synchronously and asks for the next
+    # user-turn_index that ``claude -p`` will write to. The pair
+    # replaces the synthetic ``telegram-chat-{chat_id}`` UUID + per-
+    # chat counter from Day 2.
+    #
+    # ``claim_next_turn_index`` is the load-bearing mutation: it
+    # computes the proposed index from the JSONL and bumps the
+    # in-memory cursor only when the JSONL has advanced past the
+    # last mint. On collision it returns ``None`` and the caller
+    # is expected to log a warning, skip staging, and let the brain
+    # dispatch proceed normally.
+
+    def current_session_uuid(self) -> str:
+        """Active brain session UUID (synchronous read of SessionStore)."""
+        return self._sessions.get()
+
+    def next_user_turn_index(self, session_uuid: str) -> int:
+        """Predict the user-turn ordinal that ``claude -p`` will write
+        next for ``session_uuid``.
+
+        Reads ``<encoded-cwd>/<session_uuid>.jsonl`` and counts
+        user-role lines via ``iter_messages`` (which already skips
+        sidechain + non-conversational types). Returns ``count + 1``.
+        Returns 1 when the JSONL doesn't exist (first turn of a
+        never-initialised session) or the workspace isn't configured
+        on the handler (test fixtures).
+        """
+        if self._workspace is None:
+            return 1
+        pdir = claude_session_jsonl_dir(self._workspace)
+        jsonl = pdir / f"{session_uuid}.jsonl"
+        if not jsonl.exists():
+            return 1
+        n = 0
+        for msg in iter_messages(jsonl):
+            if msg.role == "user":
+                n += 1
+        return n + 1
+
+    async def claim_next_turn_index(self, session_uuid: str) -> int | None:
+        """Atomically reserve a turn_index for the relationships hook.
+
+        Computes ``proposed = next_user_turn_index(session_uuid)`` and
+        compares against the cursor. Returns the proposed index and
+        bumps the cursor when ``proposed > last``; returns ``None``
+        when the JSONL hasn't advanced past the last mint (the
+        ``claude -p`` no-write edge — see scoping doc §3.1).
+
+        Wrapped in ``_cursor_lock`` so the read-modify-write is
+        atomic w.r.t. concurrent callers. The drain loop already
+        serialises per-chat; the lock guards against any future
+        codepath that fires the hook outside the drain.
+        """
+        async with self._cursor_lock:
+            proposed = self.next_user_turn_index(session_uuid)
+            last = self._dispatched_turn_index.get(session_uuid, 0)
+            if proposed <= last:
+                return None
+            self._dispatched_turn_index[session_uuid] = proposed
+            return proposed
 
 
 _SYSTEM_CONTEXT_HEADER = "[SYSTEM CONTEXT — events since your last reply]"

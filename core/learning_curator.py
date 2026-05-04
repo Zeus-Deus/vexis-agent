@@ -1947,6 +1947,23 @@ class LearningController:
                 short = uuid[:8] if len(uuid) >= 8 else uuid
                 md_lines.append(f"- `{short}` — {outcome}")
             md_lines.append("")
+        # v3b Day 3a: relationships curator counters surfaced into
+        # REPORT.md alongside lesson-curator stats. Present on every
+        # tick so a steady "0 across the board" run is visible (a
+        # zero-row reads as "the relationships path was healthy this
+        # tick", not "the section is missing").
+        rel_counters = self._relationships_curator.counters
+        md_lines.append("## Relationships counters (since startup)")
+        md_lines.append("")
+        for name in (
+            "add_staged",
+            "delete_executed",
+            "delete_missing",
+            "cursor_collision",
+            "hook_errors",
+        ):
+            md_lines.append(f"- {name}: {rel_counters.get(name, 0)}")
+        md_lines.append("")
         # v3a (Day 6): coherence flags section. Omitted entirely when
         # no flags fired this tick (per §3.4 — silent on COHERENT).
         if s.coherence_flags:
@@ -2002,6 +2019,9 @@ class LearningController:
                 for u, o in result.outcomes
             ],
             "summary": s.to_dict(),
+            "relationships_counters": dict(
+                self._relationships_curator.counters
+            ),
         }
         run_json.write_text(
             json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False),

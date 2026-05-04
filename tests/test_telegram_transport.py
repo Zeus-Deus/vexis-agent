@@ -181,6 +181,19 @@ class _FakeHandler:
         self.last_text = text
         return self.reply
 
+    # v3b Day 3a accessors. _learning_curator is None on these
+    # legacy fixtures so the relationships hook short-circuits
+    # before reaching them, but the transport defends against an
+    # AttributeError by delegating only when both are wired.
+    def current_session_uuid(self) -> str:
+        return "test-session"
+
+    def next_user_turn_index(self, _session_uuid: str) -> int:
+        return 1
+
+    async def claim_next_turn_index(self, _session_uuid: str) -> int | None:
+        return 1
+
 
 def _make_transport(handler: _FakeHandler, allowed_user_id: int) -> TelegramTransport:
     """Build a TelegramTransport without going through PTB's Application.
@@ -192,12 +205,10 @@ def _make_transport(handler: _FakeHandler, allowed_user_id: int) -> TelegramTran
     t._handler = handler  # type: ignore[attr-defined]
     t._allowed_user_id = allowed_user_id  # type: ignore[attr-defined]
     t._running_tasks = RunningTasks()  # type: ignore[attr-defined]
-    # v3b Day 2: optional collaborators that the dispatch path
-    # references — defaulted to None to keep these legacy tests
-    # focused on the drain/pickup behavior without dragging in a
-    # learning curator.
+    # v3b Day 3a: optional collaborators the drain references.
+    # Defaulted to None so the relationships hook short-circuits
+    # and these legacy tests stay focused on drain/pickup behavior.
     t._learning_curator = None  # type: ignore[attr-defined]
-    t._relationships_turn_counter = {}  # type: ignore[attr-defined]
     return t
 
 

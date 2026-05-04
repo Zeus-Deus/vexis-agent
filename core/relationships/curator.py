@@ -90,11 +90,21 @@ log = logging.getLogger(__name__)
 class TurnLevelResult:
     """Outcome of one ``process_user_turn`` call.
 
-    ``staged`` is True when an ADD trigger fired and a Person was
-    written to RELATIONSHIPS-SHADOW.md. ``reply_text`` is the
-    staged-acknowledge text the transport should send to the user
-    (None when no trigger fired — message proceeds to brain
-    unchanged).
+    Day 3a fields:
+
+    - ``staged``: True when an ADD trigger fired and a Person was
+      written to RELATIONSHIPS-SHADOW.md.
+    - ``deleted``: True when a DELETE trigger fired AND the slug
+      matched a live entry that was archived + removed (synchronous
+      flow, no shadow involvement).
+    - ``matched``: For DELETE only — True when the slug existed in
+      RELATIONSHIPS.md, False when DELETE-on-missing-person took
+      the no-op path. Always True for ADD; False otherwise.
+    - ``reply_text``: The text the transport should send to the
+      user. None when no trigger fired (message proceeds to brain
+      unchanged).
+    - ``verdict``: Echo of the classifier's verdict label
+      ("ADD" / "DELETE" / "NONE").
     """
 
     staged: bool
@@ -102,6 +112,8 @@ class TurnLevelResult:
     person_slug: str | None = None
     fact_count: int = 0
     verdict: str = "NONE"
+    deleted: bool = False
+    matched: bool = False
 
 
 @dataclass(frozen=True)
@@ -240,6 +252,17 @@ class RelationshipsCurator:
         self._coherence_judge = coherence_judge or run_coherence_judge
         self._drop_events: list[_DropEvent] = []
         self._has_recovered = False
+        # v3b Day 3a: per-curator counters surfaced in REPORT.md and
+        # consumed by the dashboard's telemetry hook. Reset only on
+        # process restart — the LearningController owns the curator
+        # lifecycle.
+        self._counters: dict[str, int] = {
+            "add_staged": 0,
+            "delete_executed": 0,
+            "delete_missing": 0,
+            "cursor_collision": 0,
+            "hook_errors": 0,
+        }
 
     # ----- properties for telemetry / tests -----
 
@@ -255,6 +278,20 @@ class RelationshipsCurator:
         events = list(self._drop_events)
         self._drop_events.clear()
         return events
+
+    @property
+    def counters(self) -> dict[str, int]:
+        """Snapshot of per-curator telemetry counters. Live dict —
+        callers should not mutate."""
+        return self._counters
+
+    def increment_counter(self, name: str, by: int = 1) -> None:
+        """Bump a counter by ``by``. Unknown names are ignored
+        (forwards-compat for transport-side increments like
+        ``cursor_collision`` / ``hook_errors`` that originate
+        outside the curator)."""
+        if name in self._counters:
+            self._counters[name] += by
 
     # ----- entry point 1: turn-level -----
 
@@ -279,11 +316,17 @@ class RelationshipsCurator:
         if verdict.verdict == "NONE":
             return TurnLevelResult(staged=False, reply_text=None)
 
-        if verdict.verdict in ("DELETE", "SUPERSEDE"):
-            # TODO Day 3: synchronous delete + supersede flow per
-            # research doc §3.3. Day 2's scope is ADD only.
+        if verdict.verdict == "SUPERSEDE":
+            # 3b: SUPERSEDE synchronous + provenance line + restore.
             raise NotImplementedError(
-                f"verdict {verdict.verdict} not yet wired (Day 3 scope)"
+                "SUPERSEDE not yet wired (Day 3b scope)"
+            )
+
+        if verdict.verdict == "DELETE":
+            return self._process_delete(
+                verdict=verdict,
+                session_uuid=session_uuid,
+                turn_index=turn_index,
             )
 
         # ADD path.
@@ -302,6 +345,7 @@ class RelationshipsCurator:
             classifier_verdict="ADD",
             person_slug=slug,
             facts=list(verdict.facts),
+            action="add",
         )
         self._tokens.add(token)
         person = _person_from_trigger(
@@ -317,12 +361,113 @@ class RelationshipsCurator:
             f"{verdict.person_name} for the relationships file. "
             f"It'll land after the next audit pass."
         )
+        self._counters["add_staged"] += 1
         return TurnLevelResult(
             staged=True,
             reply_text=reply,
             person_slug=slug,
             fact_count=n,
             verdict="ADD",
+            matched=True,
+        )
+
+    def _process_delete(
+        self,
+        *,
+        verdict: TriggerVerdict,
+        session_uuid: str,
+        turn_index: int,
+    ) -> TurnLevelResult:
+        """Synchronous DELETE — looks up slug in RELATIONSHIPS.md,
+        mints a delete-action token, archives the H2 block, removes
+        it from live. Missing slug → friendly no-op (no token, no
+        write, no archive).
+
+        DELETE skips the shadow / tick-promote pipeline entirely.
+        It does NOT invoke the coherence judge (no claim to ground
+        — we're removing information, not asserting it) and does
+        NOT invoke the sensitive-pattern scanner (deletion can't
+        introduce new sensitive content).
+        """
+        if not verdict.person_name:
+            log.warning(
+                "relationships.process_user_turn: DELETE verdict missing "
+                "person_name (sess=%s turn=%s)",
+                session_uuid, turn_index,
+            )
+            return TurnLevelResult(
+                staged=False, reply_text=None, verdict="DELETE",
+            )
+        slug = derive_slug(verdict.person_name)
+        live_match = self._store.get_live(slug)
+        if live_match is None:
+            self._counters["delete_missing"] += 1
+            return TurnLevelResult(
+                staged=False,
+                deleted=False,
+                matched=False,
+                reply_text=(
+                    f"I don't have anything on {verdict.person_name} to forget."
+                ),
+                person_slug=slug,
+                verdict="DELETE",
+            )
+        token = mint(
+            session_uuid=session_uuid,
+            turn_index=turn_index,
+            classifier_verdict="DELETE",
+            person_slug=slug,
+            facts=[],
+            action="delete",
+        )
+        # Track the token in PendingTokens for symmetry with ADD —
+        # DELETE is synchronous so the token isn't strictly needed
+        # post-execution, but the registry record helps audit ("a
+        # delete fired at sess X turn N for slug Y") and keeps the
+        # mint surface uniform. Consume immediately on success.
+        self._tokens.add(token)
+        removed_date = _iso_date(_utc_now())
+        result = self._store.delete_live(
+            slug, token=token, removed_date=removed_date,
+        )
+        if not result.ok:
+            # delete_live already verified the token; an ok=False
+            # here means the slug was found at lookup-time but
+            # vanished by store-time (raced with another call). Drop
+            # the token, surface as missing.
+            self._tokens.consume(
+                session_uuid=session_uuid,
+                turn_index=turn_index,
+                person_slug=slug,
+            )
+            self._counters["delete_missing"] += 1
+            return TurnLevelResult(
+                staged=False,
+                deleted=False,
+                matched=False,
+                reply_text=(
+                    f"I don't have anything on {verdict.person_name} to forget."
+                ),
+                person_slug=slug,
+                verdict="DELETE",
+            )
+        # Consume the token now that the live + archive write succeeded.
+        self._tokens.consume(
+            session_uuid=session_uuid,
+            turn_index=turn_index,
+            person_slug=slug,
+        )
+        self._counters["delete_executed"] += 1
+        return TurnLevelResult(
+            staged=False,
+            deleted=True,
+            matched=True,
+            reply_text=(
+                f"Forgot what I had on {verdict.person_name}. "
+                f"Archived for restore."
+            ),
+            person_slug=slug,
+            verdict="DELETE",
         )
 
     # ----- entry point 2: tick-level promote -----
