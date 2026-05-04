@@ -55,7 +55,9 @@ DISALLOWED_TOOLS: list[str] = []  # All tools enabled in Step 6
 DEFAULT_SOUL = (
     "You are Vexis, the user's personal agent. Be concise, truth-seeking, "
     "and genuinely useful. Never invent information; admit uncertainty. "
-    "Address the user as 'sir' occasionally where it fits."
+    "Address the user as 'sir' occasionally where it fits.\n\n"
+    "Facts in RELATIONSHIPS.md are durable but not necessarily current — "
+    "defer to in-conversation evidence on conflict."
 )
 
 # Phrases that suggest Vexis is asking permission rather than reporting
@@ -102,14 +104,30 @@ def build_system_prompt(workspace: Path) -> str:
     """Compose the system prompt fed to claude -p.
 
     Layers (top → bottom): SOUL.md (or default), CAPABILITIES.md,
-    MEMORY.md block, USER.md block, skills index. Each layer is
-    independent and dropped if empty. Re-reads from disk on every
-    call so file edits take effect on the next spawn without
-    restarting the daemon — the foreground brain caches the result
-    per session UUID for prefix-cache stability (see
-    ``ClaudeCodeBrain._system_prompt_for``); background tasks call
-    this directly and naturally get a fresh snapshot per spawn.
+    MEMORY.md block, USER.md block, RELATIONSHIPS.md block, skills
+    index. Each layer is independent and dropped if empty.
+    Re-reads from disk on every call so file edits take effect on
+    the next spawn without restarting the daemon — the foreground
+    brain caches the result per session UUID for prefix-cache
+    stability (see ``ClaudeCodeBrain._system_prompt_for``);
+    background tasks call this directly and naturally get a fresh
+    snapshot per spawn.
+
+    v3c (Day 4a) wires RELATIONSHIPS.md into this prompt — without
+    that wiring, approval has no product effect. Brain isolation
+    contract: this function reads ONLY the live file via
+    ``format_relationships_for_system_prompt``. It does NOT read
+    ``RELATIONSHIPS-SHADOW.md``, ``RELATIONSHIPS-ARCHIVE.md``, or
+    ``.vexis/relationships-candidates.json``. Enforced by
+    ``tests/test_brain_isolation.py``.
     """
+    # Lazy-import to keep the brain layer's startup fast (the
+    # relationships package pulls in YAML + the trigger detector
+    # modules on first import).
+    from core.relationships.store import (
+        format_relationships_for_system_prompt,
+    )
+
     soul = _read_markdown(workspace / "SOUL.md") or DEFAULT_SOUL
     capabilities = _read_markdown(_PROJECT_ROOT / "CAPABILITIES.md")
     parts: list[str] = [soul]
@@ -125,6 +143,13 @@ def build_system_prompt(workspace: Path) -> str:
     user_block = memory_store.format_for_system_prompt("user")
     if user_block:
         parts.append(user_block)
+
+    # v3c Day 4a: RELATIONSHIPS.md after USER.md. The brain's
+    # mental model is "first who I'm talking to (USER), then who
+    # they talk about (RELATIONSHIPS)." Empty file → no block.
+    relationships_block = format_relationships_for_system_prompt(workspace)
+    if relationships_block:
+        parts.append(relationships_block)
 
     # Skills index — last so it sits next to where the model is most
     # likely to consult it (right before the conversation starts).

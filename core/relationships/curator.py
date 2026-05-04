@@ -150,6 +150,32 @@ class RecoveryResult:
     dropped_reason: str | None = None  # "verdict-mismatch" / "source-missing" / None
 
 
+@dataclass(frozen=True)
+class ApproveCandidateResult:
+    """v3c outcome of one ``approve_candidate`` call."""
+
+    ok: bool
+    reply_text: str
+    slug: str
+    blocked_by: str | None = None  # "sensitive-pattern" / "missing_existing_qualifier" / "not-in-queue" / "slug-rejected" / "no-active-facts" / store-error
+    detail: str = ""
+    # Populated when blocked_by="missing_existing_qualifier"
+    # (mirrors AddLiveResult so the dashboard can render the modal):
+    existing_slug: str | None = None
+    existing_facts: tuple[str, ...] = ()
+    existing_qualifier_candidates: tuple[str, ...] = ()
+    proposed_qualifier: str | None = None
+
+
+@dataclass(frozen=True)
+class RejectCandidateResult:
+    """v3c outcome of one ``reject_candidate`` call."""
+
+    ok: bool
+    reply_text: str
+    slug: str
+
+
 # --------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------
@@ -259,6 +285,7 @@ class RelationshipsCurator:
             Callable[..., CoherenceVerdict] | None
         ) = None,
         pending_disambiguation: PendingDisambiguationStore | None = None,
+        candidate_store: "RelationshipsCandidateStore | None" = None,
     ) -> None:
         self._workspace = workspace
         self._store = store or RelationshipsStore(workspace)
@@ -276,9 +303,20 @@ class RelationshipsCurator:
         self._pending_disambig = pending_disambiguation or PendingDisambiguationStore(
             workspace=workspace,
         )
-        # v3b Day 3a-3b: per-curator counters surfaced in REPORT.md
-        # and consumed by the dashboard's telemetry hook. Reset only
-        # on process restart — LearningController owns the lifecycle.
+        # v3c Day 4a: silent-extraction candidate queue. Owned by
+        # the curator so the extractor (curator-driven) and the
+        # approval surface (slash-command + dashboard) share one
+        # disk-backed store under one fcntl lock.
+        from core.relationships.candidate_store import (
+            RelationshipsCandidateStore,
+            candidates_path,
+        )
+        self._candidate_store = candidate_store or RelationshipsCandidateStore(
+            candidates_path(workspace),
+        )
+        # v3b Day 3a-3b + v3c Day 4a: per-curator counters surfaced
+        # in REPORT.md and consumed by the dashboard's telemetry
+        # hook. Reset only on process restart.
         self._counters: dict[str, int] = {
             # 3a
             "add_staged": 0,
@@ -299,6 +337,19 @@ class RelationshipsCurator:
             "restore_executed": 0,
             "restore_missing": 0,
             "restore_collision": 0,
+            # 4a (silent extraction)
+            "extractor_runs": 0,
+            "extractor_errors": 0,
+            "extractor_facts_emitted": 0,
+            "extractor_facts_dropped_sensitive": 0,
+            "extractor_facts_dropped_dedup": 0,
+            "candidates_queued": 0,
+            "candidates_eligible": 0,
+            "candidates_approved": 0,
+            "candidates_rejected": 0,
+            "candidates_expired": 0,
+            "approve_blocked_sensitive": 0,
+            "approve_blocked_missing_qualifier": 0,
         }
 
     # ----- properties for telemetry / tests -----
@@ -310,6 +361,10 @@ class RelationshipsCurator:
     @property
     def tokens(self) -> PendingTokens:
         return self._tokens
+
+    @property
+    def candidate_store(self) -> "RelationshipsCandidateStore":
+        return self._candidate_store
 
     def drain_drop_events(self) -> list[_DropEvent]:
         events = list(self._drop_events)
@@ -1234,6 +1289,228 @@ class RelationshipsCurator:
             person_slug=slug,
             verdict="RESTORE",
         )
+
+    # ----- v3c silent-queue entry points -----
+
+    def approve_candidate(
+        self,
+        slug: str,
+        *,
+        fact_ids: list[str] | None = None,
+        qualifier: str | None = None,
+        token_session_uuid: str = "approve",
+        token_turn_index: int = 1,
+    ) -> "ApproveCandidateResult":
+        """Promote queued candidate facts to live RELATIONSHIPS.md.
+
+        Token semantics: the approval click IS the consent moment;
+        the token's ``session_uuid`` defaults to the literal
+        ``"approve"`` to disambiguate from extraction-time session
+        UUIDs in audit logs. Caller (slash-command / dashboard)
+        may override to attach a more informative attribution.
+
+        ``fact_ids=None`` approves every active (non-rejected,
+        non-yet-approved) fact under the slug. ``qualifier``
+        overrides the candidate's current qualifier guess; when
+        both are non-null the slug becomes
+        ``derive_slug_with_disambiguation(display_name, qualifier)``
+        for the live write.
+        """
+        from core.relationships.candidate_store import CandidateView
+        from core.relationships.consent import mint as _mint
+        from core.relationships.triggers import (
+            derive_slug_with_disambiguation,
+        )
+
+        candidate = self._candidate_store.get(slug)
+        if candidate is None:
+            return ApproveCandidateResult(
+                ok=False,
+                blocked_by="not-in-queue",
+                reply_text=f"No candidate in the queue for {slug}.",
+                slug=slug,
+            )
+        if candidate.rejected_at is not None:
+            return ApproveCandidateResult(
+                ok=False,
+                blocked_by="slug-rejected",
+                reply_text=(
+                    f"Candidate {slug} is rejected. "
+                    f"Restore it first via the dashboard."
+                ),
+                slug=slug,
+            )
+        # Resolve the fact set + qualifier.
+        active = candidate.active_facts()
+        if fact_ids is not None:
+            id_set = set(fact_ids)
+            active = [f for f in active if f.fact_id in id_set]
+        if not active:
+            return ApproveCandidateResult(
+                ok=False,
+                blocked_by="no-active-facts",
+                reply_text=f"No facts to approve for {slug}.",
+                slug=slug,
+            )
+        chosen_qualifier = (
+            qualifier if qualifier is not None
+            else (
+                candidate.qualifier_candidates[-1]
+                if candidate.qualifier_candidates
+                else None
+            )
+        )
+        target_slug = (
+            derive_slug_with_disambiguation(
+                candidate.display_name, chosen_qualifier,
+            )
+            if chosen_qualifier
+            else slug
+        )
+        today = _iso_date(_utc_now())
+        short = _short_session(token_session_uuid)
+        person = Person(
+            slug=target_slug,
+            display_name=candidate.display_name,
+            relationship=chosen_qualifier or "(unspecified)",
+            qualifier=chosen_qualifier,
+            last_confirmed=today,
+            source_session=token_session_uuid,
+            facts=tuple(
+                Fact(
+                    text=f.text,
+                    confirmed_date=today,
+                    source_session_short=short,
+                    staged=False,
+                )
+                for f in active
+            ),
+        )
+        token = _mint(
+            session_uuid=token_session_uuid,
+            turn_index=token_turn_index,
+            classifier_verdict="ADD",
+            person_slug=target_slug,
+            facts=[f.text for f in active],
+            action="approve",
+        )
+        add_res = self._store.add_live(person, token=token)
+        if not add_res.ok:
+            if add_res.blocked_by == "sensitive-pattern":
+                self._counters["approve_blocked_sensitive"] += 1
+                return ApproveCandidateResult(
+                    ok=False,
+                    blocked_by="sensitive-pattern",
+                    reply_text=(
+                        f"Couldn't approve {candidate.display_name} — "
+                        f"that includes content I can't store."
+                    ),
+                    slug=target_slug,
+                    detail=add_res.detail,
+                )
+            if add_res.blocked_by == "missing_existing_qualifier":
+                self._counters["approve_blocked_missing_qualifier"] += 1
+                return ApproveCandidateResult(
+                    ok=False,
+                    blocked_by="missing_existing_qualifier",
+                    reply_text=(
+                        f"Couldn't approve {candidate.display_name} — "
+                        f"existing entry {add_res.existing_slug!r} has "
+                        f"no qualifier. Resolve via dashboard."
+                    ),
+                    slug=target_slug,
+                    detail=add_res.detail,
+                    existing_slug=add_res.existing_slug,
+                    existing_facts=add_res.existing_facts,
+                    existing_qualifier_candidates=add_res.existing_qualifier_candidates,
+                    proposed_qualifier=add_res.proposed_qualifier,
+                )
+            return ApproveCandidateResult(
+                ok=False,
+                blocked_by=add_res.blocked_by or "store-error",
+                reply_text=(
+                    f"Couldn't approve {candidate.display_name}: "
+                    f"{add_res.detail or add_res.blocked_by}."
+                ),
+                slug=target_slug,
+                detail=add_res.detail,
+            )
+        # Mark approved in the queue. If every fact under the slug
+        # is now approved, drop the candidate entirely.
+        self._candidate_store.mark_approved(
+            slug, fact_ids=[f.fact_id for f in active],
+        )
+        post = self._candidate_store.get(slug)
+        if post is not None:
+            remaining = [
+                f for f in post.facts.values()
+                if f.approved_at is None and f.rejected_at is None
+            ]
+            if not remaining:
+                self._candidate_store.delete_slug(slug)
+        self._counters["candidates_approved"] += 1
+        n = len(active)
+        word = "fact" if n == 1 else "facts"
+        return ApproveCandidateResult(
+            ok=True,
+            blocked_by=None,
+            reply_text=(
+                f"Approved {n} {word} for {candidate.display_name}. "
+                f"Saved to RELATIONSHIPS.md."
+            ),
+            slug=target_slug,
+            detail=add_res.detail,
+        )
+
+    def reject_candidate(
+        self,
+        slug: str,
+        *,
+        fact_ids: list[str] | None = None,
+    ) -> "RejectCandidateResult":
+        """Tombstone a slug or its specific facts. Per §3.6.
+
+        ``fact_ids=None`` rejects the entire slug (all current and
+        future facts under it drop silently). With ``fact_ids``,
+        only those facts are tombstoned.
+        """
+        candidate = self._candidate_store.get(slug)
+        if candidate is None:
+            return RejectCandidateResult(
+                ok=False,
+                reply_text=f"No candidate in the queue for {slug}.",
+                slug=slug,
+            )
+        self._candidate_store.mark_rejected(slug, fact_ids=fact_ids)
+        self._counters["candidates_rejected"] += 1
+        if fact_ids is None:
+            return RejectCandidateResult(
+                ok=True,
+                reply_text=(
+                    f"Rejected {candidate.display_name}. "
+                    f"Future mentions will drop silently."
+                ),
+                slug=slug,
+            )
+        n = len(fact_ids)
+        word = "fact" if n == 1 else "facts"
+        return RejectCandidateResult(
+            ok=True,
+            reply_text=(
+                f"Rejected {n} {word} for {candidate.display_name}."
+            ),
+            slug=slug,
+        )
+
+    def list_pending_candidates(self) -> list:
+        """List eligible + below-threshold candidates for the
+        ``/learning relationships-pending`` slash command."""
+        # `list_all` returns active + approved; we filter to
+        # not-yet-approved, not-rejected.
+        return [
+            v for v in self._candidate_store.list_all()
+            if v.approved_at is None and v.rejected_at is None
+        ]
 
     def _display_for_slug_after_restore(self, slug: str) -> str:
         """Find the live entry's display_name for ``slug`` (after

@@ -493,6 +493,57 @@ class StoreResult:
     person_slug: str | None = None
 
 
+@dataclass(frozen=True)
+class AddLiveResult:
+    """Return type for ``RelationshipsStore.add_live`` (v3c approval).
+
+    Distinct from ``StoreResult`` because the approve path needs
+    to surface structured failure reasons to the dashboard's
+    409-modal flow (§5.1 patch). Fields beyond ``ok`` are populated
+    only for the missing-qualifier collision case.
+    """
+
+    ok: bool
+    person_slug: str | None = None
+    merged: bool = False
+    blocked_by: str | None = None  # "sensitive-pattern" / "missing_existing_qualifier" / "back-edit-failed"
+    detail: str = ""
+    # Populated when blocked_by="missing_existing_qualifier":
+    existing_slug: str | None = None
+    existing_facts: tuple[str, ...] = ()
+    existing_qualifier_candidates: tuple[str, ...] = ()
+    proposed_qualifier: str | None = None
+
+
+def format_relationships_for_system_prompt(workspace: Path) -> str:
+    """Render RELATIONSHIPS.md for inclusion in the brain's system
+    prompt (v3c, Day 4a — patch to §2.2 of the research doc).
+
+    Returns the live file's content verbatim when present, prefixed
+    by a one-line section header so the brain knows what it's
+    looking at. Empty string when the file is absent or empty —
+    the caller drops empty blocks in ``build_system_prompt``.
+
+    Reads ONLY the live file at ``relationships_live_path``. Does
+    NOT read ``RELATIONSHIPS-SHADOW.md`` (in-flight v3b explicit
+    stages), ``RELATIONSHIPS-ARCHIVE.md`` (deletion / supersede
+    history), or ``.vexis/relationships-candidates.json`` (v3c
+    silent queue). Brain isolation for the candidates file is
+    enforced by ``tests/test_brain_isolation.py``.
+    """
+    live_path = relationships_live_path(workspace)
+    if not live_path.exists():
+        return ""
+    try:
+        body = live_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    body = body.strip()
+    if not body:
+        return ""
+    return body
+
+
 class RelationshipsStore:
     """Token-gated writes to RELATIONSHIPS.md / RELATIONSHIPS-SHADOW.md.
 
@@ -540,6 +591,19 @@ class RelationshipsStore:
             if p.slug == slug:
                 return p
         return None
+
+    def has_live_fact(self, slug: str, fact_id: str) -> bool:
+        """Dedup check used by v3c silent extractor: return True iff
+        ``slug`` exists in live AND ``fact_id`` matches one of its
+        live facts. Same fact-id scheme as
+        ``core.relationships.consent._fact_id`` (sha256 of stripped
+        text, 16-hex truncation). Avoids re-queueing facts the user
+        has already approved."""
+        from core.relationships.consent import _fact_id
+        match = self.get_live(slug)
+        if match is None:
+            return False
+        return any(_fact_id(f.text) == fact_id for f in match.facts)
 
     # ----- write paths (token verification enforced HERE) -----
 
@@ -734,6 +798,147 @@ class RelationshipsStore:
             encoding="utf-8",
         )
         live_tmp.replace(self._live_path)
+
+    # ----- v3c approval-time write to live -----
+
+    def add_live(
+        self, person: Person, *, token
+    ) -> "AddLiveResult":
+        """Promote an approved candidate to RELATIONSHIPS.md.
+
+        Verifies the ConsentToken with ``expected_action="approve"``
+        and that fact_ids cover ``person.facts``. Re-runs the
+        sensitive-pattern scan with ``target_file="relationships"``
+        — the third-party check is now suspended on the verified
+        token, but the medical/legal/financial/etc. set still fires.
+        A sensitive hit refuses with ``blocked_by="sensitive-pattern"``;
+        token NOT consumed (caller decides whether to retry).
+
+        Slug-collision handling:
+
+        - No existing live entry for the slug → atomic append.
+        - Existing live entry has a YAML qualifier that DIFFERS
+          from ``person.qualifier`` → fire ``rename_live_slug`` to
+          rename the existing bare slug to its qualified form,
+          then append the new entry as the qualified slug. Caller
+          (curator) is expected to derive ``person.slug`` to the
+          qualified form already (matching v3b's
+          ``_resolve_add_slug`` semantics).
+        - Existing live entry has NO YAML qualifier AND
+          ``person.qualifier`` is non-null → return
+          ``blocked_by="missing_existing_qualifier"`` with the
+          existing facts so the dashboard modal can render.
+        - Existing live entry slug exactly matches and has the same
+          qualifier (or both null) → merge: append the new facts
+          to the existing block.
+        """
+        from core.relationships.consent import verify_for_promotion
+        from core.learning_review import _scan_lesson_for_sensitive_content
+
+        verify_for_promotion(
+            token,
+            person_slug=person.slug,
+            facts=[f.text for f in person.facts],
+            expected_action="approve",
+        )
+        # Step 1: sensitive-pattern scan with the token-verified
+        # target_file. Joined fact text so a multi-fact promotion
+        # that hides one bad fact in benign ones still trips.
+        joined = "; ".join(f.text for f in person.facts)
+        hit = _scan_lesson_for_sensitive_content(
+            joined,
+            scope=f"relationships:{person.slug}",
+            target_file="relationships",
+        )
+        if hit:
+            return AddLiveResult(
+                ok=False,
+                blocked_by="sensitive-pattern",
+                detail=f"scanner-hit: {hit}",
+                person_slug=person.slug,
+            )
+        # Step 2: slug-collision handling. v3c approval routes
+        # qualified slugs already; bare-slug collisions only
+        # happen when an existing live entry's YAML qualifier
+        # introduces ambiguity.
+        live_people = self.list_live()
+        existing = next(
+            (p for p in live_people if p.slug == person.slug), None
+        )
+        if existing is not None:
+            # Same slug — merge facts (preserve existing qualifier
+            # if the approval didn't supply one).
+            from dataclasses import replace as _dc_replace
+            merged_facts = existing.facts + person.facts
+            merged = _dc_replace(
+                existing,
+                facts=merged_facts,
+                last_confirmed=person.last_confirmed,
+                source_session=person.source_session,
+                qualifier=existing.qualifier or person.qualifier,
+            )
+            new_live = [p for p in live_people if p.slug != person.slug] + [merged]
+            self._atomic_rewrite_live(new_live)
+            return AddLiveResult(
+                ok=True,
+                merged=True,
+                person_slug=person.slug,
+                detail=f"merged {len(person.facts)} fact(s) into existing {person.slug}",
+            )
+        # No same-slug match. Bare-slug collision case: the user's
+        # approval supplied a qualifier (so person.slug is qualified
+        # like ``sarah-coworker``) but a bare ``sarah`` exists in
+        # live. Detect by stripping the qualifier suffix.
+        if person.qualifier:
+            from core.relationships.triggers import derive_slug
+            base_slug = derive_slug(person.display_name)
+            if base_slug != person.slug:
+                bare_match = next(
+                    (p for p in live_people if p.slug == base_slug),
+                    None,
+                )
+                if bare_match is not None:
+                    if bare_match.qualifier is None:
+                        # Missing-qualifier modal case (§5.1 patch).
+                        return AddLiveResult(
+                            ok=False,
+                            blocked_by="missing_existing_qualifier",
+                            person_slug=person.slug,
+                            existing_slug=base_slug,
+                            existing_facts=tuple(
+                                f.text for f in bare_match.facts
+                            ),
+                            existing_qualifier_candidates=(),
+                            proposed_qualifier=person.qualifier,
+                            detail=(
+                                f"existing live entry {base_slug!r} has "
+                                f"no qualifier; resolve via dashboard"
+                            ),
+                        )
+                    # Existing has a qualifier — back-edit it to the
+                    # qualified form first, then append the new entry.
+                    rename_res = self.rename_live_slug(
+                        old_slug=base_slug,
+                        new_slug=f"{base_slug}-{bare_match.qualifier}",
+                        new_qualifier=bare_match.qualifier,
+                        disambiguated_date=person.last_confirmed,
+                    )
+                    if not rename_res.ok:
+                        return AddLiveResult(
+                            ok=False,
+                            blocked_by="back-edit-failed",
+                            person_slug=person.slug,
+                            detail=rename_res.message,
+                        )
+                    live_people = self.list_live()
+        # Plain append.
+        new_live = list(live_people) + [person]
+        self._atomic_rewrite_live(new_live)
+        return AddLiveResult(
+            ok=True,
+            person_slug=person.slug,
+            detail=f"added {len(person.facts)} fact(s) for {person.slug}",
+        )
 
     # ----- synchronous SUPERSEDE (3b) -----
 

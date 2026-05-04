@@ -38,11 +38,12 @@ log = logging.getLogger(__name__)
 _ALLOWED_VERDICTS = frozenset({"ADD", "DELETE", "SUPERSEDE"})
 
 # Token action — distinct from classifier_verdict because SUPERSEDE
-# wraps an archive+rewrite pair, and AMBIGUOUS replays can shift
-# which action the original turn ultimately authorises once
-# disambiguated.
-TokenAction = Literal["add", "delete", "supersede"]
-_ALLOWED_ACTIONS = frozenset({"add", "delete", "supersede"})
+# wraps an archive+rewrite pair, AMBIGUOUS replays can shift which
+# action the original turn ultimately authorises once disambiguated,
+# and v3c's silent-queue path mints "approve" tokens at the user's
+# approval click rather than at extraction time.
+TokenAction = Literal["add", "delete", "supersede", "approve"]
+_ALLOWED_ACTIONS = frozenset({"add", "delete", "supersede", "approve"})
 
 
 def _fact_id(fact_text: str) -> str:
@@ -145,7 +146,7 @@ def mint(
         raise ConsentError(
             f"mint: action must be one of {_ALLOWED_ACTIONS}, got {action!r}"
         )
-    if action in ("add", "supersede") and not facts:
+    if action in ("add", "supersede", "approve") and not facts:
         raise ConsentError(
             f"mint: {action!r} action requires at least one fact "
             "(zero-fact triggers are routed as NONE upstream)"
