@@ -177,9 +177,11 @@ def test_turn_level_no_trigger_returns_no_op(workspace: Path):
     assert curator.store.list_shadow() == []
 
 
-def test_turn_level_supersede_raises_not_implemented(workspace: Path):
-    """SUPERSEDE remains 3b scope; DELETE was wired in 3a (see
-    tests/relationships/test_delete_path.py)."""
+def test_turn_level_supersede_zero_facts_returns_no_op(workspace: Path):
+    """3b: SUPERSEDE with no extracted facts is a degenerate
+    classifier output. Curator returns staged=False, reply None,
+    no token. Real SUPERSEDE flows live in test_supersede_path.py.
+    """
     classifier_verdict = TriggerVerdict(
         verdict="SUPERSEDE",
         person_name="Sarah",
@@ -189,14 +191,17 @@ def test_turn_level_supersede_raises_not_implemented(workspace: Path):
         workspace=workspace,
         classifier_call=_stub_classifier(classifier_verdict),
     )
-    with pytest.raises(NotImplementedError):
-        asyncio.run(
-            curator.process_user_turn(
-                "update what you know about Sarah",
-                session_uuid="sess-s",
-                turn_index=1,
-            )
+    res = asyncio.run(
+        curator.process_user_turn(
+            "update what you know about Sarah",
+            session_uuid="sess-s",
+            turn_index=1,
         )
+    )
+    assert res.staged is False
+    assert res.reply_text is None
+    assert res.verdict == "SUPERSEDE"
+    assert len(curator.tokens) == 0
 
 
 # --------------------------------------------------------------------

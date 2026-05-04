@@ -37,11 +37,12 @@ log = logging.getLogger(__name__)
 # the curator threads them through.
 _ALLOWED_VERDICTS = frozenset({"ADD", "DELETE", "SUPERSEDE"})
 
-# Token action — distinct from classifier_verdict so a future verdict
-# value (SUPERSEDE) can mint with action="add" or action="delete"
-# depending on which half of the rewrite is being authorised.
-TokenAction = Literal["add", "delete"]
-_ALLOWED_ACTIONS = frozenset({"add", "delete"})
+# Token action — distinct from classifier_verdict because SUPERSEDE
+# wraps an archive+rewrite pair, and AMBIGUOUS replays can shift
+# which action the original turn ultimately authorises once
+# disambiguated.
+TokenAction = Literal["add", "delete", "supersede"]
+_ALLOWED_ACTIONS = frozenset({"add", "delete", "supersede"})
 
 
 def _fact_id(fact_text: str) -> str:
@@ -144,9 +145,9 @@ def mint(
         raise ConsentError(
             f"mint: action must be one of {_ALLOWED_ACTIONS}, got {action!r}"
         )
-    if action == "add" and not facts:
+    if action in ("add", "supersede") and not facts:
         raise ConsentError(
-            "mint: ADD action requires at least one fact "
+            f"mint: {action!r} action requires at least one fact "
             "(zero-fact triggers are routed as NONE upstream)"
         )
     fact_ids = derive_fact_ids(facts) if facts else ()
@@ -179,6 +180,12 @@ def verify_for_promotion(
     presence, action match, person_slug match. ``facts`` is ignored
     — a deletion is authorised at the slug level, not the fact
     level.
+
+    Checks (SUPERSEDE path, ``expected_action="supersede"``): same
+    as ADD — the token's fact_ids must cover the new fact set
+    being written. This guards against a tampered shadow / runtime
+    mutation injecting extra facts under an in-flight supersede
+    token before the live rewrite lands.
 
     The action check happens BEFORE slug/fact checks so an ADD
     call site presented with a delete token (or vice versa) gets

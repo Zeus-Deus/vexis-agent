@@ -281,7 +281,12 @@ class _RecordingRelationships:
         self.counter_increments: list[str] = []
 
     async def process_user_turn(
-        self, text: str, *, session_uuid: str, turn_index: int
+        self,
+        text: str,
+        *,
+        session_uuid: str,
+        turn_index: int,
+        chat_id: int | None = None,
     ):
         self.calls.append((session_uuid, turn_index))
         if self._reply_text is None:

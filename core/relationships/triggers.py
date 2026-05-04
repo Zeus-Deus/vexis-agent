@@ -474,9 +474,31 @@ _SLUG_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 def derive_slug(person_name: str) -> str:
     """Produce a lowercase-kebab slug from a person's name.
 
-    Day 2 spec: identity-only slug ("Sarah" → "sarah"). Day 3
-    layers disambiguation on top (slug suffix from qualifier when
-    a collision exists).
+    Day 2 spec: identity-only slug ("Sarah" → "sarah"). 3b layers
+    disambiguation on top via ``derive_slug_with_disambiguation``
+    when a collision exists.
     """
     cleaned = _SLUG_NORMALIZE_RE.sub("-", person_name.lower()).strip("-")
     return cleaned or "unknown"
+
+
+def derive_slug_with_disambiguation(
+    person_name: str, qualifier: str | None
+) -> str:
+    """Produce ``"{base}-{qual_slug}"`` when a qualifier is present,
+    else ``"{base}"``.
+
+    Used by 3b's curator when an utterance carries a qualifier and
+    the curator needs to either route the write to the qualified
+    slug (collision-free case) or trigger a back-edit on an
+    existing bare slug (disambiguation case). Identical kebab
+    normalisation to ``derive_slug`` so ``"sarah"`` + ``"co worker"``
+    yields ``"sarah-co-worker"``.
+    """
+    base = derive_slug(person_name)
+    if not qualifier:
+        return base
+    qual = _SLUG_NORMALIZE_RE.sub("-", qualifier.lower()).strip("-")
+    if not qual:
+        return base
+    return f"{base}-{qual}"
