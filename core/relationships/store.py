@@ -327,6 +327,10 @@ def relationships_shadow_path(workspace: Path) -> Path:
     return workspace / SHADOW_FILE_NAME
 
 
+def relationships_archive_path(workspace: Path) -> Path:
+    return workspace / ARCHIVE_FILE_NAME
+
+
 def _read_people(path: Path) -> list[Person]:
     if not path.exists():
         return []
@@ -336,6 +340,80 @@ def _read_people(path: Path) -> list[Person]:
 def _write_people(path: Path, people: list[Person], *, kind: FileKind) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(serialize_relationships_file(people, kind=kind), encoding="utf-8")
+
+
+# --------------------------------------------------------------------
+# Archive file — RELATIONSHIPS-ARCHIVE.md
+# --------------------------------------------------------------------
+#
+# 3a is append-only on the archive. Each removed Person becomes a
+# block headed by a `## REMOVED <ISO-date>` separator immediately
+# preceding the original H2. Restore (3b) will read these back.
+#
+# Layout:
+#
+#     # RELATIONSHIPS-ARCHIVE.md
+#
+#     > Removed Person blocks. Each entry has a `## REMOVED <date>`
+#     > marker preceding the original H2 + YAML + facts.
+#
+#     ## REMOVED 2026-05-04
+#     ## Sarah (work)
+#     ```yaml
+#     slug: sarah-work
+#     ...
+#     ```
+#     - [confirmed 2026-04-18 sess:b5fa9911] Tech lead.
+#
+# `## REMOVED ...` and `## <Name>` are both H2; the parser
+# distinguishes by prefix. We render archive entries by hand
+# (rather than re-using ``serialize_relationships_file``) because
+# 3a needs the REMOVED separator and the block is the verbatim
+# Person markdown — same renderer the live file uses.
+
+ARCHIVE_HEADER = "# RELATIONSHIPS-ARCHIVE.md\n"
+ARCHIVE_INTRO = (
+    "> Removed Person blocks. Each entry is preceded by a\n"
+    "> `## REMOVED <ISO-date>` marker; the block below it is the\n"
+    "> verbatim H2 + YAML + facts that lived in RELATIONSHIPS.md.\n"
+    "> 3b's `/relationships restore <slug>` reads from this file.\n"
+)
+
+
+def _initialize_archive_if_needed(path: Path) -> None:
+    """Create the archive file with header+intro if it doesn't exist.
+
+    Idempotent: if the file already exists with any content, leaves
+    it alone. The header lines are stable so future restore code
+    can skip them.
+    """
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(ARCHIVE_HEADER + "\n" + ARCHIVE_INTRO, encoding="utf-8")
+
+
+def append_archive_block(
+    path: Path, *, person: Person, removed_date: str
+) -> None:
+    """Append a REMOVED Person block to the archive file.
+
+    Writes via ``<path>.tmp`` + atomic rename so a crash mid-write
+    leaves either the previous archive or the new one, never a
+    truncated mix. Caller is the synchronous DELETE flow in
+    ``RelationshipsStore.delete_live``.
+    """
+    _initialize_archive_if_needed(path)
+    body = path.read_text(encoding="utf-8")
+    if not body.endswith("\n"):
+        body += "\n"
+    block = (
+        f"\n## REMOVED {removed_date}\n"
+        f"{person.render()}\n"
+    )
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(body + block, encoding="utf-8")
+    tmp.replace(path)
 
 
 @dataclass(frozen=True)
@@ -374,6 +452,11 @@ class RelationshipsStore:
         self._workspace = workspace
         self._live_path = relationships_live_path(workspace)
         self._shadow_path = relationships_shadow_path(workspace)
+        self._archive_path = relationships_archive_path(workspace)
+
+    @property
+    def archive_path(self) -> Path:
+        return self._archive_path
 
     # ----- read paths -----
 
@@ -522,5 +605,62 @@ class RelationshipsStore:
         return StoreResult(
             ok=True,
             message=f"dropped shadow entry for {slug}: {reason}",
+            person_slug=slug,
+        )
+
+    # ----- synchronous DELETE (3a) -----
+
+    def delete_live(
+        self, slug: str, *, token, removed_date: str
+    ) -> StoreResult:
+        """Atomically archive then remove a Person from the live file.
+
+        Verifies the ConsentToken with ``expected_action="delete"``,
+        appends the Person's verbatim block to RELATIONSHIPS-ARCHIVE.md
+        (under a ``## REMOVED <removed_date>`` separator), and rewrites
+        RELATIONSHIPS.md without the block.
+
+        Atomicity: archive write happens first via tmp+rename, then
+        live rewrite via tmp+rename. A crash between the two leaves
+        the archive with a REMOVED-block AND the live file still
+        carrying the same slug. Recovery path:
+
+            if slug in archive (with REMOVED marker) and slug in live:
+                resume the live rewrite (re-call delete_live with the
+                same token reissued by recovery — 3a does not auto-
+                recover; surfaced in REPORT.md and the user can re-run
+                "forget Sarah" to converge). 3b will harden recovery.
+
+        Returns ``ok=False`` with a non-error reason when no live
+        entry exists for the slug — caller distinguishes this from
+        a token failure (which raises ConsentError).
+        """
+        from core.relationships.consent import verify_for_promotion
+        verify_for_promotion(
+            token, person_slug=slug, facts=[], expected_action="delete",
+        )
+        live_people = self.list_live()
+        match = next((p for p in live_people if p.slug == slug), None)
+        if match is None:
+            return StoreResult(
+                ok=False,
+                message=f"no live entry for slug={slug!r}",
+                person_slug=slug,
+            )
+        # Step 1: append to archive (atomic via tmp+rename inside).
+        append_archive_block(
+            self._archive_path, person=match, removed_date=removed_date,
+        )
+        # Step 2: rewrite live without the block (atomic).
+        new_live = [p for p in live_people if p.slug != slug]
+        live_tmp = self._live_path.with_suffix(self._live_path.suffix + ".tmp")
+        live_tmp.write_text(
+            serialize_relationships_file(new_live, kind="live"),
+            encoding="utf-8",
+        )
+        live_tmp.replace(self._live_path)
+        return StoreResult(
+            ok=True,
+            message=f"deleted {slug} (archived to {self._archive_path.name})",
             person_slug=slug,
         )

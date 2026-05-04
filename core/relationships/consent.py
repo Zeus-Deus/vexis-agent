@@ -28,6 +28,7 @@ import hashlib
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Literal
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +36,12 @@ log = logging.getLogger(__name__)
 # duplicated here as plain strings to avoid an import cycle when
 # the curator threads them through.
 _ALLOWED_VERDICTS = frozenset({"ADD", "DELETE", "SUPERSEDE"})
+
+# Token action — distinct from classifier_verdict so a future verdict
+# value (SUPERSEDE) can mint with action="add" or action="delete"
+# depending on which half of the rewrite is being authorised.
+TokenAction = Literal["add", "delete"]
+_ALLOWED_ACTIONS = frozenset({"add", "delete"})
 
 
 def _fact_id(fact_text: str) -> str:
@@ -62,6 +69,20 @@ class ConsentToken:
     covers a given fact use ``verify_for_promotion`` rather than
     inspecting ``fact_ids`` directly — keeps the verification
     surface centralized.
+
+    ``action`` distinguishes write authorisations:
+
+      - ``"add"``: covers stage/promote of facts into the live file.
+      - ``"delete"``: covers the synchronous DELETE flow that moves a
+        whole H2 block to RELATIONSHIPS-ARCHIVE.md and removes it
+        from RELATIONSHIPS.md. ADD call sites refuse delete tokens
+        and vice versa, so an ADD token can't authorise a deletion
+        even if the slugs happen to match.
+
+    DELETE tokens carry an empty ``fact_ids`` tuple — a deletion
+    authorises removal of the whole person record by slug, not of
+    any specific fact subset. The ``verify_for_promotion`` check is
+    relaxed for delete tokens (slug match only).
     """
 
     session_uuid: str
@@ -70,12 +91,13 @@ class ConsentToken:
     person_slug: str
     fact_ids: tuple[str, ...]
     issued_at: datetime
+    action: TokenAction = "add"
 
     def __repr__(self) -> str:  # avoid leaking facts in logs
         return (
             f"ConsentToken(person={self.person_slug!r}, "
             f"turn={self.turn_index}, n_facts={len(self.fact_ids)}, "
-            f"verdict={self.classifier_verdict})"
+            f"verdict={self.classifier_verdict}, action={self.action})"
         )
 
 
@@ -90,6 +112,7 @@ def mint(
     classifier_verdict: str,
     person_slug: str,
     facts: list[str],
+    action: TokenAction = "add",
 ) -> ConsentToken:
     """Construct a ConsentToken from a verified-trigger turn.
 
@@ -99,6 +122,12 @@ def mint(
     the fact that ``ConsentToken`` is named-imported only inside
     ``core/relationships/`` is the boundary. A fuzz test asserts
     callers outside this package don't construct tokens directly.
+
+    ``action`` defaults to ``"add"`` for backwards compatibility
+    with Day 2 call sites. ``"delete"`` is for the synchronous
+    DELETE flow and accepts an empty ``facts`` list (deletion
+    authorises removal of a whole person record by slug, not of
+    any specific fact subset).
     """
     if not session_uuid or not isinstance(session_uuid, str):
         raise ConsentError("mint: session_uuid required")
@@ -111,18 +140,24 @@ def mint(
         )
     if not person_slug or not isinstance(person_slug, str):
         raise ConsentError("mint: person_slug required")
-    if not facts:
+    if action not in _ALLOWED_ACTIONS:
         raise ConsentError(
-            "mint: facts list must contain at least one fact "
+            f"mint: action must be one of {_ALLOWED_ACTIONS}, got {action!r}"
+        )
+    if action == "add" and not facts:
+        raise ConsentError(
+            "mint: ADD action requires at least one fact "
             "(zero-fact triggers are routed as NONE upstream)"
         )
+    fact_ids = derive_fact_ids(facts) if facts else ()
     return ConsentToken(
         session_uuid=session_uuid,
         turn_index=turn_index,
         classifier_verdict=classifier_verdict,
         person_slug=person_slug,
-        fact_ids=derive_fact_ids(facts),
+        fact_ids=fact_ids,
         issued_at=datetime.now(timezone.utc),
+        action=action,
     )
 
 
@@ -131,25 +166,41 @@ def verify_for_promotion(
     *,
     person_slug: str,
     facts: list[str],
+    expected_action: TokenAction = "add",
 ) -> None:
-    """Raise ConsentError if the token doesn't cover this promotion.
+    """Raise ConsentError if the token doesn't cover this write.
 
-    Checks: token presence, person_slug match, fact_ids superset
-    (every fact in ``facts`` must be covered by the token; extra
-    tokens-covered facts are fine — promotion of a subset is
-    allowed). The check is "every shadow fact has a covering
-    token entry" so a tampered shadow file with an extra fact
-    fails fast.
+    Checks (ADD path, ``expected_action="add"``): token presence,
+    action match, person_slug match, fact_ids superset (every fact
+    in ``facts`` must be covered by the token; extra tokens-covered
+    facts are fine — promotion of a subset is allowed).
+
+    Checks (DELETE path, ``expected_action="delete"``): token
+    presence, action match, person_slug match. ``facts`` is ignored
+    — a deletion is authorised at the slug level, not the fact
+    level.
+
+    The action check happens BEFORE slug/fact checks so an ADD
+    call site presented with a delete token (or vice versa) gets
+    the most informative error.
     """
     if token is None:
         raise ConsentError(
             f"no consent token for relationships write (person_slug={person_slug!r})"
+        )
+    if token.action != expected_action:
+        raise ConsentError(
+            f"consent token action mismatch: "
+            f"token={token.action!r}, expected={expected_action!r}"
         )
     if token.person_slug != person_slug:
         raise ConsentError(
             f"consent token person_slug mismatch: "
             f"token={token.person_slug!r}, requested={person_slug!r}"
         )
+    if expected_action == "delete":
+        # Slug-level authorisation; no fact check.
+        return
     if not facts:
         raise ConsentError("verify_for_promotion: facts list is empty")
     token_set = set(token.fact_ids)

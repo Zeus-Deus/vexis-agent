@@ -9,7 +9,8 @@ Covers:
 - Missing token BLOCKS this tick (entry stays in shadow for restart-recovery).
 - Restart recovery: classifier verdict matches → re-mint;
   classifier verdict mismatches → drop with REPORT.md row.
-- DELETE/SUPERSEDE raise NotImplementedError per Day 2 scope.
+- DELETE wired in 3a (covered in test_delete_path.py).
+- SUPERSEDE raises NotImplementedError per 3a scope.
 """
 
 from __future__ import annotations
@@ -176,9 +177,11 @@ def test_turn_level_no_trigger_returns_no_op(workspace: Path):
     assert curator.store.list_shadow() == []
 
 
-def test_turn_level_delete_raises_not_implemented(workspace: Path):
+def test_turn_level_supersede_raises_not_implemented(workspace: Path):
+    """SUPERSEDE remains 3b scope; DELETE was wired in 3a (see
+    tests/relationships/test_delete_path.py)."""
     classifier_verdict = TriggerVerdict(
-        verdict="DELETE",
+        verdict="SUPERSEDE",
         person_name="Sarah",
         confidence=0.95,
     )
@@ -189,8 +192,8 @@ def test_turn_level_delete_raises_not_implemented(workspace: Path):
     with pytest.raises(NotImplementedError):
         asyncio.run(
             curator.process_user_turn(
-                "forget Sarah",
-                session_uuid="sess-d",
+                "update what you know about Sarah",
+                session_uuid="sess-s",
                 turn_index=1,
             )
         )
