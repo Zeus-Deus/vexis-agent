@@ -128,3 +128,55 @@ Surfaces:
   promoted entries on demand (degraded mode — no transcript)
 
 Full design and prompts: `.plans/coherence-curator-research.md`.
+
+## Relationships (v3c)
+
+Vexis silently extracts third-party facts from your conversations
+and queues them for your approval. Approved facts land in
+`<workspace>/RELATIONSHIPS.md`, which the brain reads on its
+next session spawn. The brain never sees the candidate queue.
+
+**Default flow.** A relationships extractor (`claude -p`,
+haiku-default) runs at every learning-curator tick over each
+session that passed triage. Extracted facts get tiered eligibility
+per `core/relationships/candidate_store.py`:
+
+- **Strong qualifier cues** (mom, dad, partner, sibling, child,
+  etc.): eligible after 1 session.
+- **Soft + weak cues**: eligible after ≥2 distinct sessions in
+  30 days.
+
+Approve via dashboard (Learning tab → Relationships panel) for
+per-fact granularity, or via Telegram:
+
+- `/learning relationships-pending` — list pending candidates.
+- `/learning relationships-approve <slug>` — whole-person.
+- `/learning relationships-reject <slug>` — tombstone.
+- `/learning relationships-digest` — formatted summary.
+
+**Brain-cache hint.** Approval takes effect on the brain's *next*
+session — the running session has a cached system prompt. Vexis
+appends a `/clear` reminder after each approve. Suppressible via
+`relationships.approval_hint_enabled: false` in
+`~/.vexis/config.yaml`.
+
+**Explicit-consent fast lane (legacy).** v3b's "remember
+that..." path is shipped but runtime-disabled by default. Enable
+with `relationships.explicit_consent_enabled: true` if you want
+phrasings like "remember that Sarah likes mystery novels" to save
+immediately without going through the candidate queue.
+
+**Eval gate.** The haiku-default extractor has an integration
+eval at `tests/relationships/test_extractor_eval.py`. Run
+deliberately (real `claude -p` calls):
+
+```
+pytest tests/relationships/ -m eval
+```
+
+Thresholds: ≥85% positive accuracy, ≥95% negative accuracy,
+**zero** sensitive-content leaks. Below threshold, flip
+`models.relationships_extractor: sonnet` in
+`~/.vexis/config.yaml` and re-run.
+
+Full design: `.plans/relationships-v3c-research.md`.

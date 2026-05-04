@@ -1,0 +1,16 @@
+{
+  "name": "hypothetical_counterfactual",
+  "category": "negative",
+  "transcript": [
+    {"role": "user", "content": "If Sarah were here she'd hate this. She really doesn't like loud restaurants."}
+  ],
+  "expected": {
+    "must_emit_slug": [],
+    "must_emit_qualifier_for": {},
+    "must_contain_fact_substring": {},
+    "must_not_emit_slug": ["sarah"],
+    "must_not_leak_sensitive": false,
+    "tolerance": "soft",
+    "tolerance_reason": "the speaker IS asserting a fact about Sarah's preference (loud restaurants); a model that emits is not strictly wrong. Tolerance permits emission as a non-failing soft pass."
+  }
+}

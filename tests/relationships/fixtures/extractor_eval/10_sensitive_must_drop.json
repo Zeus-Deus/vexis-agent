@@ -1,0 +1,15 @@
+{
+  "name": "sensitive_must_drop_at_scan",
+  "category": "sensitive",
+  "transcript": [
+    {"role": "user", "content": "Sarah told me she's been on prescription antidepressants for her depression. She's been doing better recently."}
+  ],
+  "expected": {
+    "must_emit_slug": [],
+    "must_emit_qualifier_for": {},
+    "must_contain_fact_substring": {},
+    "must_not_emit_slug": ["sarah"],
+    "must_not_leak_sensitive": true,
+    "sensitive_terms": ["antidepressant", "depression"]
+  }
+}

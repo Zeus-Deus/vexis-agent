@@ -373,6 +373,25 @@ def relationships_explicit_consent_enabled() -> bool:
     return False
 
 
+def relationships_approval_hint_enabled() -> bool:
+    """Default: ``True``. After a successful approval (slash command
+    or dashboard), Vexis appends a one-line hint reminding the user
+    that the new fact takes effect on the next session — they may
+    want to ``/clear`` to flush the brain's cached prompt. Once the
+    user has the mental model, they can flip this off via
+    ``relationships.approval_hint_enabled: false`` in
+    ``~/.vexis/config.yaml``.
+    """
+    raw = _section("relationships").get("approval_hint_enabled", True)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and raw.strip().lower() in (
+        "false", "no", "0", "off",
+    ):
+        return False
+    return True
+
+
 def resolve_model_flag(tier: str) -> list[str]:
     """Translate a model-tier string into ``claude -p`` argv flags.
 

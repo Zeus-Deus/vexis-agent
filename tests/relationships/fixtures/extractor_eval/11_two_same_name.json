@@ -1,0 +1,16 @@
+{
+  "name": "two_same_name_people",
+  "category": "positive",
+  "transcript": [
+    {"role": "user", "content": "Sarah from work disagreed with my sister Sarah at dinner last night. Work-Sarah thinks the team needs more structure; sister-Sarah thinks the opposite. Anyway, work-Sarah just got promoted to senior PM."}
+  ],
+  "expected": {
+    "must_emit_slug": ["sarah"],
+    "must_emit_qualifier_for": {},
+    "must_contain_fact_substring": {"sarah": ["promot"]},
+    "must_not_emit_slug": [],
+    "must_not_leak_sensitive": false,
+    "tolerance": "soft",
+    "tolerance_reason": "two distinct Sarahs in one transcript. Extractor emits at slug='sarah'; queue-level disambiguation accumulates qualifier_candidates ['coworker', 'sister']. Eval passes if at least one Sarah-fact emits with the expected qualifier in qualifier_candidates."
+  }
+}

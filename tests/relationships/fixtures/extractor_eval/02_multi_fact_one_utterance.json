@@ -1,0 +1,15 @@
+{
+  "name": "multi_fact_one_utterance",
+  "category": "positive",
+  "transcript": [
+    {"role": "user", "content": "I had a good chat with Sarah today. She uses Vim and prefers tabs over spaces."}
+  ],
+  "expected": {
+    "must_emit_slug": ["sarah"],
+    "must_emit_qualifier_for": {},
+    "must_contain_fact_substring": {"sarah": ["vim", "tab"]},
+    "must_not_emit_slug": [],
+    "must_not_leak_sensitive": false,
+    "min_facts_per_slug": {"sarah": 2}
+  }
+}

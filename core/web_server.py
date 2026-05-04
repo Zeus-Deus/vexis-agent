@@ -741,11 +741,21 @@ class WebDashboard:
                 },
             )
             if result.ok:
+                # v3c Day 4c: surface the brain-cache invalidation
+                # hint as a separate field so the React panel can
+                # render it as an inline toast. Flag-gated.
+                hint: str | None = None
+                if yaml_config.relationships_approval_hint_enabled():
+                    hint = (
+                        "Saved. Active in Vexis's next session — "
+                        "run `/clear` in Telegram to start fresh."
+                    )
                 return JSONResponse(
                     {
                         "ok": True,
                         "slug": result.slug,
                         "reply_text": result.reply_text,
+                        "approval_hint": hint,
                     }
                 )
             if result.blocked_by == "missing_existing_qualifier":

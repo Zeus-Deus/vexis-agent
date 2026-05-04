@@ -29,4 +29,7 @@ include = ["brains*", "transports*", "tools*", "core*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not eval'"
+markers = [
+    "eval: integration eval that calls real claude -p (cost/network); opt-in via -m eval",
+]

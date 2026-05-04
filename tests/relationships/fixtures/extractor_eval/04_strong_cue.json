@@ -1,0 +1,14 @@
+{
+  "name": "strong_cue_qualifier",
+  "category": "positive",
+  "transcript": [
+    {"role": "user", "content": "My mom called this morning. She's coming over for dinner Saturday."}
+  ],
+  "expected": {
+    "must_emit_slug": ["mom"],
+    "must_emit_qualifier_for": {"mom": "mom"},
+    "must_contain_fact_substring": {"mom": ["dinner"]},
+    "must_not_emit_slug": [],
+    "must_not_leak_sensitive": false
+  }
+}

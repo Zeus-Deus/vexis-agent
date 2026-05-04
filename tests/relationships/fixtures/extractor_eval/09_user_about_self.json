@@ -1,0 +1,16 @@
+{
+  "name": "user_about_self",
+  "category": "negative",
+  "transcript": [
+    {"role": "user", "content": "I prefer Vim, always have. Tabs over spaces, two-space indent, the works."},
+    {"role": "assistant", "content": "Got it."},
+    {"role": "user", "content": "Anyway, just wanted to note that for the future."}
+  ],
+  "expected": {
+    "must_emit_slug": [],
+    "must_emit_qualifier_for": {},
+    "must_contain_fact_substring": {},
+    "must_not_emit_slug": ["i"],
+    "must_not_leak_sensitive": false
+  }
+}
