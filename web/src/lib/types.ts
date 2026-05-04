@@ -386,3 +386,42 @@ export interface ApproveSensitivePayload {
   reply_text: string;
   detail: string;
 }
+
+// ---- Tailscale visibility tab -----------------------------------
+
+export interface TailscaleNode {
+  hostname: string;
+  ip: string;
+  online: boolean;
+}
+
+export interface TailscaleServe {
+  port: number;
+  mount: string;
+  target: string;
+  tls: boolean;
+  funnel: boolean;
+}
+
+export interface TailscaleFunnel {
+  port: number;
+  mount: string;
+  target: string;
+  tls: boolean;
+}
+
+export interface TailscalePeer {
+  hostname: string;
+  ip: string;
+  online: boolean;
+  last_seen: string | null;
+  os: string;
+}
+
+export interface TailscaleStatus {
+  node: TailscaleNode | null;
+  serves: TailscaleServe[];
+  funnels: TailscaleFunnel[];
+  peers: TailscalePeer[];
+  error: string | null;
+}

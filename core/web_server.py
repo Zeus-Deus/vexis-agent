@@ -72,6 +72,7 @@ from core.skills import (
     restore_skill,
 )
 from core.subprocess import run as run_subprocess
+from core import tailscale as tailscale_mod
 from core import yaml_config
 from core.yaml_config import (
     curator_archive_after_days,
@@ -990,6 +991,15 @@ class WebDashboard:
             }
             return await asyncio.to_thread(self._learning.judge_entry, entry)
 
+        # ----- Tailscale visibility -----
+
+        @app.get(
+            "/api/v1/tailscale/status",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_tailscale_status() -> dict:
+            return await asyncio.to_thread(self._tailscale_payload)
+
         # ----- frontend bootstrap -----
 
         index_html = self._config.web_dist / "index.html"
@@ -1306,6 +1316,65 @@ class WebDashboard:
             "next_eligible_at": next_eligible,
             "summary": state.get("last_run_summary") or "no runs yet",
             "interval_label": f"{curator_interval_hours()}h",
+        }
+
+    def _tailscale_payload(self) -> dict:
+        """Best-effort merge of the four ``core.tailscale`` calls.
+
+        Each sub-call returns its own typed error string; we surface
+        the first one we hit on the top-level ``error`` field so the
+        frontend can render a single banner. The remaining sections
+        still populate from whatever succeeded — a tailscaled hiccup
+        on ``serve status`` shouldn't blank out the peer table when
+        ``status --json`` is fine.
+        """
+        serve = tailscale_mod.get_serve_status()
+        funnel = tailscale_mod.get_funnel_status()
+        node = tailscale_mod.get_node_info()
+        peers = tailscale_mod.get_peers()
+        first_error = (
+            node.error or serve.error or funnel.error or peers.error
+        )
+        return {
+            "node": (
+                {
+                    "hostname": node.node.hostname,
+                    "ip": node.node.ip,
+                    "online": node.node.online,
+                }
+                if node.node is not None
+                else None
+            ),
+            "serves": [
+                {
+                    "port": s.port,
+                    "mount": s.mount,
+                    "target": s.target,
+                    "tls": s.tls,
+                    "funnel": s.funnel,
+                }
+                for s in serve.serves
+            ],
+            "funnels": [
+                {
+                    "port": f.port,
+                    "mount": f.mount,
+                    "target": f.target,
+                    "tls": f.tls,
+                }
+                for f in funnel.funnels
+            ],
+            "peers": [
+                {
+                    "hostname": p.hostname,
+                    "ip": p.ip,
+                    "online": p.online,
+                    "last_seen": p.last_seen,
+                    "os": p.os,
+                }
+                for p in peers.peers
+            ],
+            "error": first_error,
         }
 
     def _browser_payload(self) -> dict:

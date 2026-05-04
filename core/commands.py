@@ -45,4 +45,5 @@ COMMANDS: tuple[BotCommand, ...] = (
     BotCommand("curator", "Curator status / pause / resume / run / restore"),
     BotCommand("learning", "Learning curator status / pause / resume / run / audit"),
     BotCommand("dashboard", "Open the web dashboard (Tailscale URL + token)"),
+    BotCommand("tailscale", "Show Tailscale status (serves, funnels, peers)"),
 )
