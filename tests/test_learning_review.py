@@ -91,6 +91,16 @@ def _spawn_returning(stdout: str, *, returncode: int = 0, stderr: str = ""):
     return spawn, captured
 
 
+@pytest.fixture(autouse=True)
+def _triage_disabled_by_default(monkeypatch):
+    """Most pre-existing tests in this module were written before the
+    two-tier triage gate landed and assume a single subprocess spawn
+    (the full review). Default-disable triage here so those assertions
+    still hold; the tests that exercise triage explicitly re-enable it
+    via monkeypatch and provide a multi-call spawn."""
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: False)
+
+
 # --------------------------------------------------------------------
 # _format_transcript
 # --------------------------------------------------------------------
@@ -1442,3 +1452,347 @@ def test_build_review_prompt_v2_sections_present():
     assert "Existing memory entries — avoid duplicates" in prompt
     assert "origin: learning-curator" in prompt
     assert "max-1" in prompt or "at MOST one S3" in prompt
+
+
+# --------------------------------------------------------------------
+# Two-tier triage: cheap haiku skim before sonnet
+# --------------------------------------------------------------------
+
+
+def _spawn_sequence(*responses):
+    """Build a fake spawn callable that yields one response per call.
+
+    Each entry is either a (stdout, returncode, stderr) tuple or a
+    plain string treated as stdout/exit-0. Callable raises if the test
+    consumes more responses than supplied — easier to debug than an
+    IndexError. Returns the spawn callable plus a list capturing the
+    argv of each call so tests can assert which subprocess fired
+    first.
+    """
+    queue = list(responses)
+    calls: list[dict[str, Any]] = []
+
+    def spawn(argv, env):
+        if not queue:
+            raise AssertionError(
+                f"spawn called more times than expected; argv={argv}"
+            )
+        item = queue.pop(0)
+        if isinstance(item, str):
+            stdout, returncode, stderr = item, 0, ""
+        else:
+            stdout, returncode, stderr = item
+        calls.append({"argv": argv, "env": env})
+        return subprocess.CompletedProcess(
+            args=argv, returncode=returncode,
+            stdout=stdout.encode(), stderr=stderr.encode(),
+        )
+
+    return spawn, calls
+
+
+def test_parse_triage_response_yes_no_garbage():
+    from core.learning_review import _parse_triage_response
+    assert _parse_triage_response("YES") is True
+    assert _parse_triage_response(" yes ") is True
+    assert _parse_triage_response("Yes.") is True
+    assert _parse_triage_response("YES — looks like a correction") is True
+    assert _parse_triage_response("NO") is False
+    assert _parse_triage_response("no") is False
+    assert _parse_triage_response("No.") is False
+    assert _parse_triage_response("maybe") is None
+    assert _parse_triage_response("") is None
+    assert _parse_triage_response("  ") is None
+    assert _parse_triage_response(None) is None  # type: ignore[arg-type]
+
+
+def test_build_triage_prompt_has_yes_no_question():
+    from core.learning_review import _build_triage_prompt
+    out = _build_triage_prompt("transcript body here")
+    assert "YES" in out and "NO" in out
+    assert "transcript body here" in out
+    # Triage prompt is intentionally LIGHT — must not carry the full
+    # review's heavy context blocks (skill index / existing memory /
+    # USER queue). That's the whole point.
+    assert "<skill-index>" not in out
+    assert "<existing-memory>" not in out
+    assert "<user-candidates>" not in out
+
+
+def test_triage_no_skips_sonnet(tmp_path, monkeypatch):
+    """Triage returns NO → sonnet is never called → output marks
+    nothing-to-save with triage_skipped=True. Exactly one subprocess
+    spawn (the triage call)."""
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+    msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
+    spawn, calls = _spawn_sequence("NO")
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+
+    assert len(calls) == 1
+    assert output.nothing_to_save is True
+    assert output.triage_skipped is True
+    assert output.triage_result == "NO"
+    assert output.error is None
+    assert output.verified_lessons == []
+    assert output.parsed_lessons == []
+
+
+def test_triage_yes_runs_sonnet(tmp_path, monkeypatch):
+    """Triage returns YES → sonnet runs → output reflects sonnet's
+    response. Two spawns total."""
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+    msgs = [_msg("user", "list movies tonight"),
+            _msg("assistant", "[movies including past ones]"),
+            _msg("user", "you included past showings, filter to upcoming"),
+            _msg("assistant", "fixed")]
+    sonnet_response = (
+        '[{'
+        '"class": "PROCEDURAL", '
+        '"lesson": "When listing time-bound options, filter to '
+        'entries still ahead of the current time.", '
+        '"evidence": "you included past showings, filter to upcoming", '
+        '"scope": "time-bound listings", '
+        '"tier": "S3", '
+        '"target": {'
+        '"skill_name": "time-bound-listings", '
+        '"new_skill_body": "---\\nname: time-bound-listings\\n'
+        'description: Filter time-bound options.\\n'
+        'origin: learning-curator\\n---\\n\\nBody\\n"'
+        '}'
+        '}]'
+    )
+    spawn, calls = _spawn_sequence("YES", sonnet_response)
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+
+    assert len(calls) == 2
+    assert output.error is None
+    assert output.nothing_to_save is False
+    assert output.triage_skipped is False
+    assert output.triage_result == "YES"
+    assert len(output.verified_lessons) == 1
+
+
+def test_triage_disabled_skips_triage(tmp_path, monkeypatch):
+    """With learning.triage_enabled: false the triage call is bypassed
+    entirely — only one spawn (the full sonnet review)."""
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: False)
+    msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
+    spawn, calls = _spawn_sequence("Nothing to save.")
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+
+    assert len(calls) == 1
+    assert output.nothing_to_save is True
+    assert output.triage_skipped is False
+    assert output.triage_result == "DISABLED"
+
+
+def test_triage_garbage_output_fails_open(tmp_path, monkeypatch):
+    """Triage returns unparseable output → fall through to sonnet
+    (fail-open). triage_result records FAIL_OPEN for the audit
+    trail."""
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+    msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
+    spawn, calls = _spawn_sequence("maybe", "Nothing to save.")
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+
+    assert len(calls) == 2
+    assert output.triage_result == "FAIL_OPEN"
+    # Sonnet ran and said nothing-to-save, so output reflects that —
+    # but triage_skipped is False (we didn't skip on triage's word).
+    assert output.nothing_to_save is True
+    assert output.triage_skipped is False
+
+
+def test_triage_empty_output_fails_open(tmp_path, monkeypatch):
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+    msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
+    spawn, calls = _spawn_sequence("", "Nothing to save.")
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+
+    assert len(calls) == 2
+    assert output.triage_result == "FAIL_OPEN"
+    assert output.nothing_to_save is True
+    assert output.triage_skipped is False
+
+
+def test_triage_rate_limit_propagates(tmp_path, monkeypatch):
+    """Triage spawn returns rate-limit-shaped error → output.error is
+    set so the curator's tick-abort path triggers. Sonnet is NOT
+    called."""
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+    msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
+    spawn, calls = _spawn_sequence(
+        ("", 1, "anthropic: hit your limit, try again later")
+    )
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+
+    assert len(calls) == 1
+    assert output.error is not None
+    assert "hit your limit" in output.error
+    assert output.triage_result == "RATE_LIMITED"
+    assert output.nothing_to_save is False
+    assert output.triage_skipped is False
+    # Curator's _is_rate_limit_error must fire on this same string:
+    from core.learning_curator import _is_rate_limit_error
+    assert _is_rate_limit_error(f"error: {output.error}") is True
+
+
+def test_triage_rate_limit_other_marker(tmp_path, monkeypatch):
+    """Verify a couple of the other rate-limit markers also propagate
+    (rate-limit, 429, usage limit)."""
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+    msgs = [_msg("user", "hi")]
+    for marker in ("usage limit reached", "rate limit hit", "HTTP 429 returned"):
+        spawn, calls = _spawn_sequence(("", 1, marker))
+        output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+        assert len(calls) == 1
+        assert output.error is not None
+        assert output.triage_result == "RATE_LIMITED"
+
+
+def test_triage_spawn_oserror_fails_open(tmp_path, monkeypatch):
+    """Triage subprocess raises OSError (e.g. claude binary missing
+    transiently) → fall through to sonnet."""
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+    msgs = [_msg("user", "hi")]
+    sonnet_calls = {"n": 0}
+
+    def spawn(argv, env):
+        # First call is triage; OSError. Second call is sonnet; succeeds.
+        if sonnet_calls["n"] == 0:
+            sonnet_calls["n"] += 1
+            raise OSError("transient")
+        sonnet_calls["n"] += 1
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0,
+            stdout=b"Nothing to save.", stderr=b"",
+        )
+
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    assert sonnet_calls["n"] == 2
+    assert output.triage_result == "ERROR"
+    assert output.error is None
+    assert output.nothing_to_save is True
+    assert output.triage_skipped is False
+
+
+def test_triage_spawn_timeout_fails_open(tmp_path, monkeypatch):
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+    msgs = [_msg("user", "hi")]
+    n = {"calls": 0}
+
+    def spawn(argv, env):
+        if n["calls"] == 0:
+            n["calls"] += 1
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
+        n["calls"] += 1
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0,
+            stdout=b"Nothing to save.", stderr=b"",
+        )
+
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    assert n["calls"] == 2
+    assert output.triage_result == "ERROR"
+
+
+def test_triage_nonzero_exit_non_rate_limit_fails_open(tmp_path, monkeypatch):
+    """Non-zero exit that does NOT look like rate-limit fails open
+    rather than propagating as a review error — flaky triage shouldn't
+    burn the per-session retry budget."""
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+    msgs = [_msg("user", "hi")]
+    spawn, calls = _spawn_sequence(
+        ("", 1, "some unrelated stderr noise"),
+        "Nothing to save.",
+    )
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+
+    assert len(calls) == 2
+    assert output.triage_result == "ERROR"
+    assert output.error is None
+    assert output.nothing_to_save is True
+
+
+def test_triage_uses_recursion_env_var(tmp_path, monkeypatch):
+    """Both triage and sonnet must inherit VEXIS_LEARNING_REVIEW=1 so
+    nested spawn-detection works for either call."""
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+    msgs = [_msg("user", "hi")]
+    spawn, calls = _spawn_sequence("YES", "Nothing to save.")
+    run_review(tmp_path, _meta(), msgs, spawn=spawn)
+
+    assert calls[0]["env"][RECURSION_ENV_VAR] == "1"
+    assert calls[1]["env"][RECURSION_ENV_VAR] == "1"
+
+
+def test_triage_uses_triage_model_flag(tmp_path, monkeypatch):
+    """Triage subprocess argv must carry the triage model flag (default
+    haiku), distinct from the review model (default sonnet)."""
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+    monkeypatch.setattr(lr, "model_learning_triage", lambda: "haiku")
+    monkeypatch.setattr(lr, "model_learning_review", lambda: "sonnet")
+    msgs = [_msg("user", "hi")]
+    spawn, calls = _spawn_sequence("YES", "Nothing to save.")
+    run_review(tmp_path, _meta(), msgs, spawn=spawn)
+
+    triage_argv = calls[0]["argv"]
+    sonnet_argv = calls[1]["argv"]
+    assert "--model" in triage_argv
+    assert triage_argv[triage_argv.index("--model") + 1] == "haiku"
+    assert "--model" in sonnet_argv
+    assert sonnet_argv[sonnet_argv.index("--model") + 1] == "sonnet"
+
+
+def test_triage_skipped_for_oversized_transcript(tmp_path, monkeypatch):
+    """The size-decline gate fires BEFORE triage, so an oversized
+    transcript spawns nothing — triage_result stays None."""
+    monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
+    from core.learning_review import LEARNING_TRANSCRIPT_DECLINE_CHARS
+    big_text = "x" * (LEARNING_TRANSCRIPT_DECLINE_CHARS + 100)
+    msgs = [_msg("user", big_text)]
+
+    def spawn(argv, env):
+        raise AssertionError("no subprocess should fire when declined")
+
+    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    assert output.declined_too_large is True
+    assert output.triage_result is None
+    assert output.triage_skipped is False
+
+
+def test_triage_yaml_config_default_haiku(tmp_path):
+    """yaml_config.model_learning_triage defaults to 'haiku' when no
+    config file exists. yaml_config.learning_triage_enabled defaults
+    to True."""
+    from unittest import mock
+    from core import yaml_config
+
+    def fake_vexis_dir() -> Path:
+        return tmp_path  # empty dir → no config.yaml → defaults
+
+    with mock.patch("core.yaml_config.vexis_dir", side_effect=fake_vexis_dir):
+        assert yaml_config.model_learning_triage() == "haiku"
+        assert yaml_config.learning_triage_enabled() is True
+
+
+def test_triage_yaml_config_overrides(tmp_path):
+    """Config file can override both the model and the feature gate."""
+    from unittest import mock
+    from core import yaml_config
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "models:\n"
+        "  learning_triage: sonnet\n"
+        "learning:\n"
+        "  triage_enabled: false\n",
+        encoding="utf-8",
+    )
+
+    def fake_vexis_dir() -> Path:
+        return tmp_path
+
+    with mock.patch("core.yaml_config.vexis_dir", side_effect=fake_vexis_dir):
+        assert yaml_config.model_learning_triage() == "sonnet"
+        assert yaml_config.learning_triage_enabled() is False

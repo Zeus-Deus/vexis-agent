@@ -254,7 +254,16 @@ def list_eligible_sessions(
         if _is_curator_owned(meta.jsonl_path):
             continue
         last_reviewed = reviewed.get(meta.session_uuid, epoch)
-        if meta.last_message_timestamp <= last_reviewed:
+        # Compare at whole-second precision: ReviewedStore historically
+        # serialized timestamps without microseconds, so an exact `<=`
+        # against a freshly-read JSONL timestamp (millisecond precision)
+        # would always re-trigger eligibility on the same content. The
+        # idle gate below ensures we don't review a session that's still
+        # actively appending, so sub-second precision adds no signal here.
+        if (
+            meta.last_message_timestamp.replace(microsecond=0)
+            <= last_reviewed.replace(microsecond=0)
+        ):
             continue
         if (now - meta.last_message_timestamp) < idle_threshold:
             continue
