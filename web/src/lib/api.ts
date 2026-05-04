@@ -2,6 +2,9 @@
 // 401 responses bubble up so the UI can drop back to the no-token state.
 
 import type {
+  ApproveCollisionPayload,
+  ApproveOkResponse,
+  ApproveSensitivePayload,
   BrowserState,
   CuratorRunDetail,
   CuratorState,
@@ -9,6 +12,8 @@ import type {
   LearningJudgeResult,
   LearningState,
   MemoryState,
+  RelationshipsCandidatesState,
+  RelationshipsLiveState,
   SkillBody,
   SkillsState,
   StatusState,
@@ -120,7 +125,99 @@ export const api = {
       method: "POST",
       body,
     }),
+  // v3c Day 4b: relationships dashboard surface.
+  relationshipsLive: (token: string) =>
+    call<RelationshipsLiveState>(token, "/relationships/live"),
+  relationshipsCandidates: (token: string, opts?: { includeRejected?: boolean }) =>
+    call<RelationshipsCandidatesState>(
+      token,
+      opts?.includeRejected
+        ? "/relationships/candidates?include_rejected=true"
+        : "/relationships/candidates",
+    ),
+  relationshipsApprove: (
+    token: string,
+    slug: string,
+    body: { fact_ids?: string[] | null; qualifier?: string | null },
+  ) =>
+    callWithErrorBody<ApproveOkResponse>(
+      token,
+      `/relationships/candidates/${encodeURIComponent(slug)}/approve`,
+      { method: "POST", body },
+    ),
+  relationshipsReject: (
+    token: string,
+    slug: string,
+    body: { fact_ids?: string[] | null } = {},
+  ) =>
+    call<{ ok: boolean; slug: string; reply_text: string }>(
+      token,
+      `/relationships/candidates/${encodeURIComponent(slug)}/reject`,
+      { method: "POST", body },
+    ),
+  relationshipsEdit: (
+    token: string,
+    slug: string,
+    body: { fact_id: string; new_text: string },
+  ) =>
+    call<{ ok: boolean; slug: string; old_fact_id: string; new_fact_id: string }>(
+      token,
+      `/relationships/candidates/${encodeURIComponent(slug)}/edit`,
+      { method: "POST", body },
+    ),
+  relationshipsResolveQualifier: (
+    token: string,
+    slug: string,
+    body: { existing_qualifier: string },
+  ) =>
+    call<{ ok: boolean; old_slug: string; new_slug: string; qualifier: string }>(
+      token,
+      `/relationships/candidates/${encodeURIComponent(slug)}/resolve_qualifier`,
+      { method: "POST", body },
+    ),
 };
+
+// ApproveError surfaces the typed 409 / 422 / 4xx body from the
+// approve endpoint so the panel can render the modal flow.
+export class ApproveError extends ApiError {
+  payload: ApproveCollisionPayload | ApproveSensitivePayload | { error: string; slug?: string; reply_text?: string; detail?: string };
+  constructor(
+    status: number,
+    payload: ApproveCollisionPayload | ApproveSensitivePayload | { error: string; slug?: string; reply_text?: string; detail?: string },
+  ) {
+    super(status, typeof payload === "object" && payload && "reply_text" in payload && payload.reply_text ? payload.reply_text : (payload.error ?? "approve failed"));
+    this.payload = payload;
+  }
+}
+
+async function callWithErrorBody<T>(
+  token: string,
+  path: string,
+  opts: FetchOptions = {},
+): Promise<T> {
+  const init: RequestInit = {
+    method: opts.method ?? "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+  };
+  if (opts.body !== undefined) init.body = JSON.stringify(opts.body);
+  const resp = await fetch(`${API_BASE}${path}`, init);
+  if (resp.status === 401) {
+    throw new TokenInvalidError();
+  }
+  if (!resp.ok) {
+    let body: any = null;
+    try {
+      body = await resp.json();
+    } catch {
+      body = { error: "unknown", reply_text: await resp.text().catch(() => "") };
+    }
+    throw new ApproveError(resp.status, body);
+  }
+  return resp.json() as Promise<T>;
+}
 
 // Build a screenshot URL with the bearer carried as a query parameter.
 // The auth dependency on the dashboard accepts ?token= as a fallback,
