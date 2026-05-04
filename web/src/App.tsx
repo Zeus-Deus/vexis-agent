@@ -7,6 +7,7 @@ import { CuratorPage } from "./pages/CuratorPage";
 import { StatusPage } from "./pages/StatusPage";
 import { BrowserPage } from "./pages/BrowserPage";
 import { LearningPage } from "./pages/LearningPage";
+import { TailscalePage } from "./pages/TailscalePage";
 
 type TabId =
   | "memory"
@@ -14,7 +15,8 @@ type TabId =
   | "curator"
   | "status"
   | "browser"
-  | "learning";
+  | "learning"
+  | "tailscale";
 
 const TABS: TabDef[] = [
   { id: "memory", label: "Memory", glyph: "§" },
@@ -23,6 +25,7 @@ const TABS: TabDef[] = [
   { id: "status", label: "Status", glyph: "●" },
   { id: "browser", label: "Browser", glyph: "◐" },
   { id: "learning", label: "Learning", glyph: "▲" },
+  { id: "tailscale", label: "Tailscale", glyph: "◈" },
 ];
 
 const HASH_TO_TAB: Record<string, TabId> = {
@@ -32,6 +35,7 @@ const HASH_TO_TAB: Record<string, TabId> = {
   "#status": "status",
   "#browser": "browser",
   "#learning": "learning",
+  "#tailscale": "tailscale",
 };
 
 function readTabFromHash(): TabId {
@@ -91,6 +95,9 @@ export function App() {
         {tab === "learning" && (
           <LearningPage token={token} onAuthFail={handleAuthFail} />
         )}
+        {tab === "tailscale" && (
+          <TailscalePage token={token} onAuthFail={handleAuthFail} />
+        )}
       </main>
       <Footer />
     </div>
@@ -143,7 +150,7 @@ function Footer() {
       <div className="max-w-[1400px] w-full mx-auto px-5 py-3 flex items-baseline gap-4 font-data text-[10px] text-[var(--color-fg-dim)] uppercase tracking-widest">
         <span>read-only · with six actions</span>
         <span className="ml-auto">
-          mem · skills · curator · status · browser · learning
+          mem · skills · curator · status · browser · learning · tailscale
         </span>
       </div>
     </footer>

@@ -33,6 +33,7 @@ from core.background_tasks import (
     TaskNotFound,
     TaskStatus,
 )
+from core import tailscale as tailscale_mod
 from core.commands import COMMANDS
 from core.curator import CuratorController
 from core.learning_curator import LearningController
@@ -326,6 +327,7 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("curator", self._on_curator))
         self._app.add_handler(CommandHandler("learning", self._on_learning))
         self._app.add_handler(CommandHandler("dashboard", self._on_dashboard))
+        self._app.add_handler(CommandHandler("tailscale", self._on_tailscale))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
 
     async def _run_relationships_hook(
@@ -929,6 +931,31 @@ class TelegramTransport:
             full += "this URL only resolves on this host."
         await msg.reply_text(full)
 
+    async def _on_tailscale(
+        self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Read-only `tailscale serve|funnel|status` summary.
+
+        Uses the same in-memory cache the dashboard endpoint hits, so
+        a `/tailscale` ping right after a dashboard refresh is free.
+        Subprocess work runs in a thread to keep the PTB event loop
+        responsive while ``tailscale`` shells out.
+        """
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /tailscale from user_id=%s", user.id)
+            return
+        node, serve, funnel, peers = await asyncio.gather(
+            asyncio.to_thread(tailscale_mod.get_node_info),
+            asyncio.to_thread(tailscale_mod.get_serve_status),
+            asyncio.to_thread(tailscale_mod.get_funnel_status),
+            asyncio.to_thread(tailscale_mod.get_peers),
+        )
+        await msg.reply_text(_format_tailscale_reply(node, serve, funnel, peers))
+
     async def _on_screenshot(
         self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1176,6 +1203,80 @@ def _format_status_reply(
     if last_idle_at is not None:
         return f"{_STATUS_IDLE} Idle for {_format_status_duration(now - last_idle_at)}."
     return _STATUS_IDLE
+
+
+def _format_tailscale_reply(
+    node: tailscale_mod.NodeStatus,
+    serve: tailscale_mod.ServeStatus,
+    funnel: tailscale_mod.FunnelStatus,
+    peers: tailscale_mod.PeersStatus,
+) -> str:
+    """Render the /tailscale plain-text reply.
+
+    The node call is the canonical health probe — if it failed, the
+    rest is almost certainly broken too, so we short-circuit with a
+    single error line. Any other section's error becomes an inline
+    "(error: ...)" so the user still sees what *did* work.
+    """
+    if node.error is not None:
+        return f"Tailscale status unavailable: {node.error}"
+
+    lines: list[str] = ["Tailscale status", ""]
+
+    if node.node is not None:
+        host = node.node.hostname or "(unknown)"
+        ip = node.node.ip or "(no IP)"
+        state = "online" if node.node.online else "offline"
+        lines.append(f"Node: {host} ({ip}) — {state}")
+    else:
+        lines.append("Node: (unavailable)")
+    lines.append("")
+
+    if serve.error is not None:
+        lines.append(f"Active serves: (error: {serve.error})")
+    else:
+        lines.append(f"Active serves ({len(serve.serves)}):")
+        if not serve.serves:
+            lines.append("  none")
+        else:
+            for s in serve.serves:
+                proto = "HTTPS" if s.tls else "HTTP"
+                lines.append(
+                    f"  • :{s.port} {s.mount} → {s.target} ({proto})"
+                )
+    lines.append("")
+
+    if funnel.error is not None:
+        lines.append(f"Active funnels: (error: {funnel.error})")
+    else:
+        lines.append(f"Active funnels ({len(funnel.funnels)}):")
+        if not funnel.funnels:
+            lines.append("  none")
+        else:
+            for f in funnel.funnels:
+                proto = "HTTPS" if f.tls else "HTTP"
+                lines.append(
+                    f"  • :{f.port} {f.mount} → {f.target} ({proto})"
+                )
+    lines.append("")
+
+    if peers.error is not None:
+        lines.append(f"Peers: (error: {peers.error})")
+    else:
+        online_peers = [p for p in peers.peers if p.online]
+        lines.append(
+            f"Peers online ({len(online_peers)} of {len(peers.peers)}):"
+        )
+        if not online_peers:
+            lines.append("  none")
+        else:
+            for p in online_peers:
+                lines.append(f"  • {p.hostname or '(unknown)'} ({p.ip or '—'})")
+
+    # Strip the trailing blank line for a cleaner Telegram message.
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
 
 
 async def _register_commands(application: Application) -> None:

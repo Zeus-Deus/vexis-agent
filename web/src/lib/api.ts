@@ -17,6 +17,7 @@ import type {
   SkillBody,
   SkillsState,
   StatusState,
+  TailscaleStatus,
 } from "./types";
 
 const API_BASE = "/api/v1";
@@ -165,6 +166,7 @@ export const api = {
       `/relationships/candidates/${encodeURIComponent(slug)}/edit`,
       { method: "POST", body },
     ),
+  tailscale: (token: string) => call<TailscaleStatus>(token, "/tailscale/status"),
   relationshipsResolveQualifier: (
     token: string,
     slug: string,
