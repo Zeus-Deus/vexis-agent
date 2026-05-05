@@ -157,6 +157,20 @@ def daemon_pid_path() -> Path:
     return vexis_dir() / "daemon.pid"
 
 
+def goals_path() -> Path:
+    """`~/.vexis/goals.json`. Per-session standing-goal state.
+
+    Single file keyed by Claude session UUID, holding the GoalState
+    record (goal text, status, turn budget, judge verdict cache) for
+    every session that has ever had a `/goal`. Same locking model as
+    spawned.json: sidecar `.lock` + ``fcntl.flock`` + atomic
+    temp-rename. Lives at the top level of ``vexis_dir()`` rather
+    than under ``learning/`` because goals are a Telegram-side
+    feature, orthogonal to the curator pipeline.
+    """
+    return vexis_dir() / "goals.json"
+
+
 def user_candidates_path() -> Path:
     """`~/.vexis/learning/user_candidates.json`. Day 3 queue file.
 

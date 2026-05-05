@@ -44,6 +44,13 @@ DEFAULT_LEARNING_TICK_INTERVAL_MINUTES = 5
 DEFAULT_LEARNING_IDLE_THRESHOLD_MINUTES = 25
 DEFAULT_LEARNING_FAILURE_COOLDOWN_HOURS = 1
 DEFAULT_LEARNING_MAX_ENTRIES_PER_SESSION = 2
+# /goal feature defaults. Disabled by default until Day 4 release-gate
+# eval runs green; flip via ``goals.enabled: true`` in
+# ``~/.vexis/config.yaml`` (or update DEFAULT_GOALS_ENABLED on the
+# release commit). 20-turn budget mirrors Hermes
+# (`hermes_cli/config.py`) and matches `core.goal_state.DEFAULT_MAX_TURNS`.
+DEFAULT_GOALS_ENABLED = False
+DEFAULT_GOALS_MAX_TURNS = 20
 # Day 4 v2 calibration: raised from 280 → 400. Day 4 eval surfaced
 # the LLM consistently producing 290-340 char lessons for technical
 # content (multilingual RAG, cinema-time-bound, code-review brevity).
@@ -254,6 +261,34 @@ def learning_triage_enabled() -> bool:
     return bool(raw)
 
 
+def goals_enabled() -> bool:
+    """/goal feature gate. Default OFF (Day 1-3 development). Day 4
+    release flips ``DEFAULT_GOALS_ENABLED`` to True after the eval
+    gate passes. Until then, the goal hook in the drain loop and the
+    ``/goal`` slash command are no-ops at the daemon-config level so
+    a user who finds the partially-shipped feature can't accidentally
+    invoke it.
+    """
+    raw = _section("goals").get("enabled", DEFAULT_GOALS_ENABLED)
+    return bool(raw)
+
+
+def goals_max_turns() -> int:
+    """Max continuation turns before /goal auto-pauses the loop.
+
+    Protects against judge false negatives (goal actually done but
+    judge says continue) and unbounded model spend on fuzzy /
+    unachievable goals. ``/goal resume`` resets the counter to 0
+    (per `.plans/goal-command-research.md` §4) so the user gets
+    another budget without manual config edits.
+    """
+    return _int_or_default(
+        _section("goals").get("max_turns"),
+        DEFAULT_GOALS_MAX_TURNS,
+        minimum=1,
+    )
+
+
 def browser_screenshot_include_base64() -> bool:
     """Whether ``vexis-browse screenshot`` includes ``image_base64`` by
     default. Off because most harnesses (including Claude Code) read
@@ -288,6 +323,14 @@ DEFAULT_MODEL_LEARNING_TRIAGE = "haiku"
 DEFAULT_MODEL_COHERENCE_JUDGE = "sonnet"
 DEFAULT_MODEL_MIGRATION_CLASSIFIER = "sonnet"
 DEFAULT_MODEL_RELATIONSHIPS_CLASSIFIER = "sonnet"
+# /goal judge — runs after every brain turn in a chat with an active
+# standing goal. Sonnet is the right tier here: the judgment is a
+# strict yes/no over a (sometimes long) assistant response, and a
+# false-positive "done" silently stalls the loop, so we don't want
+# haiku-level reliability. Override to ``haiku`` via
+# ``models.goal_judge`` in ``~/.vexis/config.yaml`` if the workspace
+# values cost over reliability.
+DEFAULT_MODEL_GOAL_JUDGE = "sonnet"
 # v3c silent-extraction default. Originally haiku per the §4.1
 # patch (cheap-model preference). Flipped to sonnet at v3c Day 5
 # release gate after eval runs at haiku stalled at 83% positive
@@ -344,6 +387,10 @@ def model_relationships_classifier() -> str:
     return _model_tier(
         "relationships_classifier", DEFAULT_MODEL_RELATIONSHIPS_CLASSIFIER
     )
+
+
+def model_goal_judge() -> str:
+    return _model_tier("goal_judge", DEFAULT_MODEL_GOAL_JUDGE)
 
 
 def model_relationships_extractor() -> str:

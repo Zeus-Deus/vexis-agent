@@ -184,27 +184,36 @@ def iter_session_metas(workspace: Path) -> Iterator[SessionMeta]:
 
 
 def _is_curator_owned(jsonl_path: Path) -> bool:
-    """Return True iff the first non-sidechain user turn is the
-    curator's review prompt.
+    """Return True iff the first non-sidechain user turn is one of
+    the auxiliary-prompt openings the daemon spawns itself.
 
     Belt-and-braces filter alongside the persistent spawned-UUIDs
     registry: catches legacy backlog (JSONLs spawned before the
     persistent guard landed), eval workspaces the daemon never
-    learned about, and any case where ``spawned.json`` got lost or
-    corrupted. Costs one JSONL open per eligible candidate; we break
-    on the first match so the cost is bounded by the position of the
-    first user turn (typically near the head of the file).
+    learned about, any case where ``spawned.json`` got lost or
+    corrupted, AND auxiliary spawns that happen *outside* the
+    curator's tick (the goal judge in particular — it runs in the
+    Telegram drain loop, so the curator's tick-time scan-diff at
+    ``learning_curator.py:_review_one`` doesn't catch it). Costs one
+    JSONL open per eligible candidate; we break on the first match
+    so the cost is bounded by the position of the first user turn
+    (typically near the head of the file).
 
-    Lazy-imports the prompt prefix to avoid a circular import — the
-    curator imports from this module, and the prompt constant lives
-    next to the prompt builder in ``core.learning_review``.
+    Lazy-imports the prompt prefixes to avoid circular imports — the
+    curator imports from this module, and each prefix constant lives
+    next to its prompt builder.
     """
     from core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX
+    from core.goal_judge import GOAL_JUDGE_PROMPT_PREFIX
 
     for msg in iter_messages(jsonl_path):
         if msg.role != "user":
             continue
-        return msg.text.startswith(CURATOR_REVIEW_PROMPT_PREFIX)
+        text = msg.text
+        return (
+            text.startswith(CURATOR_REVIEW_PROMPT_PREFIX)
+            or text.startswith(GOAL_JUDGE_PROMPT_PREFIX)
+        )
     return False
 
 
