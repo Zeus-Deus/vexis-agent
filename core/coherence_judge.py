@@ -92,6 +92,15 @@ EVIDENCE_BODY_TRUNCATE_SUFFIX = 1_000
 # the next tick. Distinct from ``RECURSION_ENV_VAR`` in
 # ``core/learning_review.py`` so audit logs can tell which subsystem
 # spawned what.
+#
+# NOTE (audited during /goal Day 1, 2026-05-05): no curator code path
+# actually reads this env var for filtering. Coherence-judge JSONLs
+# are excluded incidentally — the judge runs *inside* the curator's
+# review fork, so ``learning_curator.py:_review_one`` (scan-diff at
+# :2102-2138) captures the new UUID via directory snapshot and adds
+# it to ``_spawned_uuids``. The real filter machinery is the
+# content-prefix check in ``core/transcripts.py:_is_curator_owned``;
+# this constant is currently audit/forensics only.
 COHERENCE_JUDGE_ENV_VAR = "VEXIS_COHERENCE_JUDGE"
 
 
