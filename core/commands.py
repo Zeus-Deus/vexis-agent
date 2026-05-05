@@ -44,6 +44,7 @@ COMMANDS: tuple[BotCommand, ...] = (
     BotCommand("unpin", "Allow edits to a previously pinned skill"),
     BotCommand("curator", "Curator status / pause / resume / run / restore"),
     BotCommand("learning", "Learning curator status / pause / resume / run / audit"),
+    BotCommand("goal", "Set a goal Vexis works on across turns"),
     BotCommand("dashboard", "Open the web dashboard (Tailscale URL + token)"),
     BotCommand("tailscale", "Show Tailscale status (serves, funnels, peers)"),
 )

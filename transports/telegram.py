@@ -80,6 +80,41 @@ _INCOMING_PHOTO_CLEANUP_INTERVAL_SECONDS = 600
 _INCOMING_BRAIN_PREFIX = "[user sent image: {path}]"
 _CANCEL_OK = "Cancelled, sir. What next?"
 _NOTHING_TO_CANCEL = "Nothing to cancel — I'm not working on anything right now."
+# /goal user-facing strings. Kept module-level so tests can import
+# them without rendering their own copies. The §4 command matrix in
+# `.plans/goal-command-research.md` is the source of truth for the
+# wording — drift surfaces as a test failure.
+_GOAL_DISABLED_NOTE = (
+    "/goal is disabled. Set goals.enabled: true in ~/.vexis/config.yaml "
+    "to turn it on."
+)
+_GOAL_NO_ACTIVE = "No active goal. Set one with /goal <text>."
+_GOAL_NO_GOAL_TO_PAUSE = "No goal set."
+_GOAL_NO_GOAL_TO_RESUME = "No goal to resume."
+_GOAL_ALREADY_PAUSED = "Already paused."
+_GOAL_PAUSE_REPLY_TMPL = (
+    "⏸ Goal paused. (Current turn finishes first; loop won't auto-continue after.)\n{status}"
+)
+_GOAL_RESUME_REPLY_TMPL = "▶ Goal resumed: {goal}"
+_GOAL_CLEAR_REPLY = "✓ Goal cleared."
+_GOAL_KICKOFF_REPLY_TMPL = (
+    "⊙ Goal set ({budget}-turn budget): {goal}\n"
+    "I'll keep working until the goal is done, you pause/clear it, or "
+    "the budget is exhausted.\n"
+    "Controls: /goal status · /goal pause · /goal resume · /goal clear"
+)
+_GOAL_REJECT_ALREADY_ACTIVE = (
+    "Goal already active. /goal clear it first or wait for the current "
+    "loop to finish."
+)
+_GOAL_REJECT_MIDRUN = (
+    "Brain is busy. /cancel first, then /goal <text>."
+)
+_GOAL_INVALID_TMPL = "Invalid goal: {reason}"
+_CANCEL_OK_GOAL_PAUSED_TMPL = (
+    "Cancelled, sir. (Goal paused at {turns}/{budget} turns — "
+    "/goal resume to keep going.)"
+)
 _STATUS_IDLE = "Nothing running, sir."
 _STATUS_NO_TOOLS_YET = "No tool activity yet."
 
@@ -326,6 +361,7 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("unpin", self._on_unpin))
         self._app.add_handler(CommandHandler("curator", self._on_curator))
         self._app.add_handler(CommandHandler("learning", self._on_learning))
+        self._app.add_handler(CommandHandler("goal", self._on_goal))
         self._app.add_handler(CommandHandler("dashboard", self._on_dashboard))
         self._app.add_handler(CommandHandler("tailscale", self._on_tailscale))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
@@ -495,6 +531,12 @@ class TelegramTransport:
                     log.exception(
                         "Failed to send brain reply for chat %s", chat_id
                     )
+            # /goal post-turn hook: for chats with an active standing
+            # goal, judge whether the reply satisfies the goal and
+            # (if not + under budget) enqueue a continuation. No-op
+            # when goals.enabled is False or no active goal is set
+            # for the current session UUID.
+            await self._run_goal_hook(bot, chat_id, reply or "")
             next_msg = await self._running_tasks.pop_or_release(chat_id)
             if next_msg is None:
                 # If pop_or_release released because /cancel fired and a
@@ -786,7 +828,31 @@ class TelegramTransport:
         log.info("Received /cancel (foreground) from chat %d", msg.chat_id)
         cancelled = await self._running_tasks.cancel(msg.chat_id)
         log.info("Cancel result for chat %d: %s", msg.chat_id, cancelled)
-        await msg.reply_text(_CANCEL_OK if cancelled else _NOTHING_TO_CANCEL)
+        # /cancel auto-pauses an active goal — see §4 of the goal
+        # research doc for the trade-off (avoids surprise-continuation
+        # when the user cancels mid-goal and re-engages later). Emits
+        # the paused-state reply when a goal was active; otherwise the
+        # existing _CANCEL_OK / _NOTHING_TO_CANCEL paths stand.
+        reply_text = _CANCEL_OK if cancelled else _NOTHING_TO_CANCEL
+        try:
+            from core.yaml_config import goals_enabled
+            if goals_enabled():
+                session_uuid = self._handler.current_session_uuid()
+                mgr = self._build_goal_manager(session_uuid)
+                if mgr.is_active():
+                    state = mgr.pause(reason="user-cancelled")
+                    await self._running_tasks.drop_messages_matching(
+                        msg.chat_id,
+                        lambda m: m.origin == "goal_continuation",
+                    )
+                    if state is not None:
+                        reply_text = _CANCEL_OK_GOAL_PAUSED_TMPL.format(
+                            turns=state.turns_used,
+                            budget=state.max_turns,
+                        )
+        except Exception:
+            log.exception("goal auto-pause on /cancel failed for chat %d", msg.chat_id)
+        await msg.reply_text(reply_text)
 
     async def _on_tasks(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
@@ -900,6 +966,218 @@ class TelegramTransport:
             reply = "⚠️ Learning curator command failed; check the logs."
         if reply is not None:
             await msg.reply_text(reply)
+
+    # ────────────────────────────────────────────────────────────────
+    # /goal — persistent cross-turn goals (Ralph-style loop, port of
+    # Hermes' /goal). Source of truth: `.plans/goal-command-research.md`.
+    # ────────────────────────────────────────────────────────────────
+
+    def _build_goal_manager(self, session_uuid: str):
+        """Construct a GoalManager bound to the given session UUID.
+
+        Lazy-imports the goal modules so daemons with goals disabled
+        never pay the import cost. ``self._workspace`` is the path
+        ``MessageHandler`` already holds; we read it via the handler
+        rather than threading another constructor arg.
+        """
+        from core.goal_manager import GoalManager
+        from core.goal_state import GoalStateStore
+        from core.paths import goals_path
+        from core.yaml_config import goals_max_turns
+
+        workspace = getattr(self._handler, "_workspace", None) or Path.cwd()
+        store = GoalStateStore(goals_path())
+        return GoalManager(
+            session_uuid=session_uuid,
+            workspace=workspace,
+            store=store,
+            default_max_turns=goals_max_turns(),
+        )
+
+    async def _on_goal(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Dispatch /goal [status|pause|resume|clear|<text>].
+
+        Behind ``goals_enabled()`` — reply with the disabled-note when
+        off so the user finds out via the slash menu rather than
+        silent no-op. Subcommands ``status``/``pause``/``resume``/
+        ``clear`` are control-plane and safe mid-run; ``/goal <text>``
+        is rejected mid-run with the §4 reject string and otherwise
+        sets the goal + kicks off the first turn through the same
+        drain machinery that user messages use.
+        """
+        from core.goal_manager import GoalAlreadyActiveError
+        from core.yaml_config import goals_enabled
+
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /goal from user_id=%s", user.id)
+            return
+
+        if not goals_enabled():
+            await msg.reply_text(_GOAL_DISABLED_NOTE)
+            return
+
+        # Reassemble the user's args. PTB's ctx.args splits on
+        # whitespace; we rejoin for the goal-text path. The
+        # subcommand keywords are single tokens so the split is fine
+        # for them.
+        args = ctx.args or []
+        if not args:
+            sub = "status"
+            rest_text = ""
+        else:
+            sub = args[0].lower()
+            rest_text = " ".join(args[1:]) if len(args) > 1 else ""
+
+        session_uuid = self._handler.current_session_uuid()
+        mgr = self._build_goal_manager(session_uuid)
+
+        # Control-plane: always safe, no drain interaction.
+        if sub == "status":
+            await msg.reply_text(mgr.status_line())
+            return
+
+        if sub == "pause":
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                await msg.reply_text(_GOAL_NO_GOAL_TO_PAUSE)
+                return
+            # Drop any pending goal continuations from this chat's
+            # queue so the loop doesn't run "one more" after the user
+            # hit pause. User messages survive the predicate.
+            await self._running_tasks.drop_messages_matching(
+                msg.chat_id,
+                lambda m: m.origin == "goal_continuation",
+            )
+            await msg.reply_text(
+                _GOAL_PAUSE_REPLY_TMPL.format(status=mgr.status_line())
+            )
+            return
+
+        if sub == "resume":
+            state = mgr.resume()
+            if state is None:
+                await msg.reply_text(_GOAL_NO_GOAL_TO_RESUME)
+                return
+            await msg.reply_text(_GOAL_RESUME_REPLY_TMPL.format(goal=state.goal))
+            return
+
+        if sub == "clear":
+            had = mgr.has_goal()
+            mgr.clear()
+            await self._running_tasks.drop_messages_matching(
+                msg.chat_id,
+                lambda m: m.origin == "goal_continuation",
+            )
+            await msg.reply_text(_GOAL_CLEAR_REPLY if had else _GOAL_NO_ACTIVE)
+            return
+
+        # Otherwise — treat the entire arg blob as the new goal text.
+        # Reconstruct from the raw command tail so we don't lose
+        # punctuation; ``message.text`` looks like "/goal foo bar".
+        raw_text = (msg.text or "").strip()
+        # Strip the "/goal" prefix (handles "/goal", "/goal@bot", etc.).
+        if raw_text.startswith("/"):
+            after_slash = raw_text[1:]
+            space_idx = after_slash.find(" ")
+            goal_text = after_slash[space_idx + 1:] if space_idx >= 0 else ""
+        else:
+            goal_text = " ".join(args)
+        goal_text = goal_text.strip()
+        if not goal_text:
+            await msg.reply_text(_GOAL_INVALID_TMPL.format(reason="goal text is empty"))
+            return
+
+        # Mid-run reject: a drain is already processing this chat.
+        # Setting a new goal would race a continuation against the
+        # in-flight turn. /cancel is the way out (which auto-pauses
+        # any active goal — see _on_cancel below).
+        if self._running_tasks.is_running(msg.chat_id):
+            await msg.reply_text(_GOAL_REJECT_MIDRUN)
+            return
+
+        try:
+            state = mgr.set(goal_text)
+        except GoalAlreadyActiveError:
+            await msg.reply_text(_GOAL_REJECT_ALREADY_ACTIVE)
+            return
+        except ValueError as exc:
+            await msg.reply_text(_GOAL_INVALID_TMPL.format(reason=str(exc)))
+            return
+
+        # Acknowledge the set first so the user sees confirmation
+        # before the brain starts working. The kickoff turn can take
+        # 30+ seconds — the user shouldn't be left guessing.
+        await msg.reply_text(
+            _GOAL_KICKOFF_REPLY_TMPL.format(budget=state.max_turns, goal=state.goal)
+        )
+
+        # Kick off the first turn through the same path a normal
+        # message would take. The text fed to the brain is just the
+        # goal text — the continuation prompt template only applies
+        # to subsequent turns.
+        await self._dispatch_to_brain(
+            msg.get_bot(), msg.chat_id, user.id, goal_text
+        )
+
+    async def _run_goal_hook(self, bot, chat_id: int, last_response: str) -> None:
+        """After-each-turn hook called inside ``_drain_chat``.
+
+        Skipped entirely when ``goals.enabled`` is False (so the
+        feature stays dormant in production until the Day 4
+        release-gate flip). When on, loads the goal for the current
+        session UUID, calls :meth:`GoalManager.evaluate_after_turn`,
+        sends the user-visible status line, and enqueues the
+        continuation prompt (tagged ``origin="goal_continuation"``)
+        when the judge says continue.
+
+        Failures are isolated — a broken judge or store I/O error
+        logs and returns, never breaks the drain loop.
+        """
+        try:
+            from core.yaml_config import goals_enabled
+            if not goals_enabled():
+                return
+
+            session_uuid = self._handler.current_session_uuid()
+            mgr = self._build_goal_manager(session_uuid)
+            if not mgr.is_active():
+                return
+
+            decision = mgr.evaluate_after_turn(last_response or "")
+        except Exception:
+            log.exception("goal hook failed before/at evaluate; chat %s", chat_id)
+            return
+
+        msg_text = decision.get("message") or ""
+        if msg_text:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id, text=msg_text, parse_mode=None
+                )
+            except Exception:
+                log.exception("goal hook: status send failed for chat %s", chat_id)
+
+        if not decision.get("should_continue"):
+            return
+
+        prompt = decision.get("continuation_prompt")
+        if not prompt:
+            return
+        try:
+            await self._running_tasks.enqueue(
+                chat_id,
+                self._allowed_user_id,
+                prompt,
+                origin="goal_continuation",
+            )
+        except Exception:
+            log.exception(
+                "goal hook: continuation enqueue failed for chat %s", chat_id
+            )
 
     async def _on_dashboard(
         self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE

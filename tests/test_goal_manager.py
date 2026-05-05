@@ -1,0 +1,324 @@
+"""Tests for ``core/goal_manager.py`` — the per-session GoalManager."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+from core.goal_judge import judge_goal as _real_judge_goal  # noqa: F401  # ensure module is loadable
+from core.goal_manager import (
+    CONTINUATION_PROMPT_TEMPLATE,
+    GoalAlreadyActiveError,
+    GoalManager,
+)
+from core.goal_state import GoalState, GoalStateStore
+
+
+# ──────────────────────────────────────────────────────────────────
+# Fixtures
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> GoalStateStore:
+    return GoalStateStore(tmp_path / "goals.json")
+
+
+def _mgr(store: GoalStateStore, session_uuid: str = "sid", *, max_turns: int = 20) -> GoalManager:
+    return GoalManager(
+        session_uuid=session_uuid,
+        workspace=Path("/tmp"),
+        store=store,
+        default_max_turns=max_turns,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# set / pause / resume / clear lifecycle
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_set_creates_active_goal(store: GoalStateStore) -> None:
+    mgr = _mgr(store, max_turns=5)
+    state = mgr.set("port the goal command")
+    assert state.goal == "port the goal command"
+    assert state.status == "active"
+    assert state.max_turns == 5
+    assert state.turns_used == 0
+    assert state.created_at is not None
+    assert mgr.is_active()
+    assert mgr.has_goal()
+    assert "port the goal command" in mgr.status_line()
+    assert "active" in mgr.status_line()
+
+
+def test_set_rejects_empty_text(store: GoalStateStore) -> None:
+    mgr = _mgr(store)
+    with pytest.raises(ValueError):
+        mgr.set("")
+    with pytest.raises(ValueError):
+        mgr.set("   \n  ")
+    assert mgr.state is None
+
+
+def test_set_rejects_when_already_active(store: GoalStateStore) -> None:
+    """A goal already active or paused for the session blocks a new
+    /goal <text>. Hermes' equivalent rejects via the slash handler;
+    we surface a typed exception so the transport renders the right
+    string."""
+    mgr = _mgr(store)
+    mgr.set("first")
+    with pytest.raises(GoalAlreadyActiveError):
+        mgr.set("second")
+    # Even when paused — the user must /goal clear first.
+    mgr.pause()
+    with pytest.raises(GoalAlreadyActiveError):
+        mgr.set("third")
+
+
+def test_set_replaces_done_or_cleared_record(store: GoalStateStore) -> None:
+    """Once a goal is done or cleared, the user can /goal <text> a
+    new one without typing /goal clear first."""
+    mgr = _mgr(store)
+    mgr.set("first")
+    mgr.mark_done("delivered")
+    # mark_done leaves status=done; has_goal is False so set() is allowed.
+    assert not mgr.has_goal()
+    state = mgr.set("second")
+    assert state.goal == "second"
+    assert state.status == "active"
+
+
+def test_pause_writes_state_and_renders_status(store: GoalStateStore) -> None:
+    mgr = _mgr(store)
+    mgr.set("port goal")
+    state = mgr.pause(reason="user-paused")
+    assert state is not None
+    assert state.status == "paused"
+    assert state.paused_reason == "user-paused"
+    assert "paused" in mgr.status_line()
+    assert "user-paused" in mgr.status_line()
+    # has_goal is True (paused records are still goals); is_active is False.
+    assert mgr.has_goal()
+    assert not mgr.is_active()
+
+
+def test_pause_with_no_goal_returns_none(store: GoalStateStore) -> None:
+    mgr = _mgr(store)
+    assert mgr.pause() is None
+
+
+def test_resume_resets_turns_used(store: GoalStateStore) -> None:
+    """The §4 invariant: resume zeros the budget so a goal paused at
+    20/20 can run another 20 without manual config edits."""
+    mgr = _mgr(store, max_turns=5)
+    mgr.set("port goal")
+    # Simulate prior turns burning budget.
+    state = mgr.state
+    assert state is not None
+    state.turns_used = 3
+    store.save("sid", state)
+    # Re-bind manager to flush the in-memory state.
+    mgr = _mgr(store, max_turns=5)
+    mgr.pause(reason="budget exhausted (3/5)")
+
+    resumed = mgr.resume()
+    assert resumed is not None
+    assert resumed.status == "active"
+    assert resumed.turns_used == 0  # ← the invariant
+    assert resumed.paused_reason is None
+
+
+def test_clear_marks_status_and_drops_in_memory(store: GoalStateStore) -> None:
+    mgr = _mgr(store)
+    mgr.set("port goal")
+    mgr.clear()
+    # Status persisted on disk for audit, but the manager treats
+    # itself as goal-less.
+    assert mgr.state is None
+    assert not mgr.has_goal()
+    assert "No active goal" in mgr.status_line()
+    # On disk, the cleared record is still there.
+    raw = store.load("sid")
+    assert raw is not None
+    assert raw.status == "cleared"
+
+
+def test_mark_done_writes_status(store: GoalStateStore) -> None:
+    mgr = _mgr(store)
+    mgr.set("ship")
+    mgr.mark_done("shipped")
+    assert mgr.state is not None
+    assert mgr.state.status == "done"
+    assert mgr.state.last_verdict == "done"
+    assert mgr.state.last_reason == "shipped"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Persistence across managers (Hermes' load-bearing invariant)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_persistence_across_managers(store: GoalStateStore) -> None:
+    """Two managers on the same session UUID see each other's writes
+    via the store. This is what makes daemon restart and the per-call
+    manager-rebuild pattern in `_on_goal` / `_run_goal_hook` work."""
+    m1 = _mgr(store)
+    m1.set("first goal")
+
+    m2 = _mgr(store)
+    assert m2.state is not None
+    assert m2.state.goal == "first goal"
+    assert m2.is_active()
+
+    m2.pause(reason="m2 paused it")
+    m3 = _mgr(store)
+    assert m3.state is not None
+    assert m3.state.status == "paused"
+    assert m3.state.paused_reason == "m2 paused it"
+
+
+# ──────────────────────────────────────────────────────────────────
+# evaluate_after_turn outcomes
+# ──────────────────────────────────────────────────────────────────
+
+
+def _patch_judge(verdict: str, reason: str):
+    """Patch ``core.goal_manager.judge_goal`` (the import the manager
+    uses) to return a fixed verdict. Local helper because every
+    evaluate test needs it."""
+    return mock.patch(
+        "core.goal_manager.judge_goal", return_value=(verdict, reason)
+    )
+
+
+def test_evaluate_done_marks_goal_done(store: GoalStateStore) -> None:
+    mgr = _mgr(store)
+    mgr.set("ship")
+    with _patch_judge("done", "delivered"):
+        decision = mgr.evaluate_after_turn("I shipped it.")
+    assert decision["verdict"] == "done"
+    assert decision["should_continue"] is False
+    assert decision["continuation_prompt"] is None
+    assert "Goal achieved" in decision["message"]
+    assert mgr.state is not None
+    assert mgr.state.status == "done"
+    assert mgr.state.turns_used == 1
+
+
+def test_evaluate_continue_under_budget_emits_continuation(
+    store: GoalStateStore,
+) -> None:
+    mgr = _mgr(store, max_turns=5)
+    mgr.set("port the goal command")
+    with _patch_judge("continue", "made progress"):
+        decision = mgr.evaluate_after_turn("started Day 2 work")
+    assert decision["verdict"] == "continue"
+    assert decision["should_continue"] is True
+    assert decision["continuation_prompt"] is not None
+    assert "port the goal command" in decision["continuation_prompt"]
+    assert "Continuing toward goal" in decision["message"]
+    assert mgr.state is not None
+    assert mgr.state.status == "active"
+    assert mgr.state.turns_used == 1
+
+
+def test_evaluate_budget_exhaustion_auto_pauses(store: GoalStateStore) -> None:
+    """When ``turns_used`` reaches ``max_turns``, the manager flips to
+    paused with a budget-exhausted reason and stops emitting
+    continuations."""
+    mgr = _mgr(store, max_turns=2)
+    mgr.set("hard goal")
+    with _patch_judge("continue", "not yet"):
+        d1 = mgr.evaluate_after_turn("step 1")
+        assert d1["should_continue"] is True
+        assert mgr.state is not None
+        assert mgr.state.turns_used == 1
+        assert mgr.state.status == "active"
+
+        d2 = mgr.evaluate_after_turn("step 2")
+        # turns_used hits max_turns after this call.
+        assert d2["should_continue"] is False
+        assert d2["continuation_prompt"] is None
+        assert mgr.state.status == "paused"
+        assert mgr.state.turns_used == 2
+        assert "budget" in (mgr.state.paused_reason or "").lower()
+        assert "paused" in d2["message"].lower()
+
+
+def test_evaluate_inactive_when_no_goal(store: GoalStateStore) -> None:
+    mgr = _mgr(store)
+    decision = mgr.evaluate_after_turn("anything")
+    assert decision["verdict"] == "inactive"
+    assert decision["should_continue"] is False
+
+
+def test_evaluate_inactive_when_paused(store: GoalStateStore) -> None:
+    mgr = _mgr(store)
+    mgr.set("goal")
+    mgr.pause()
+    decision = mgr.evaluate_after_turn("anything")
+    assert decision["verdict"] == "inactive"
+    assert decision["should_continue"] is False
+    # Turn count not incremented when goal isn't active.
+    assert mgr.state is not None
+    assert mgr.state.turns_used == 0
+
+
+def test_evaluate_skipped_folded_into_continue(store: GoalStateStore) -> None:
+    """The §3 invariant: when judge_goal returns ('skipped', ...) for
+    any reason, the manager treats it as continue — the brain turn
+    that preceded the call already consumed budget, so the count
+    increments and a continuation is enqueued."""
+    mgr = _mgr(store, max_turns=5)
+    mgr.set("g")
+    with _patch_judge("skipped", "empty goal"):
+        decision = mgr.evaluate_after_turn("reply")
+    assert decision["should_continue"] is True
+    assert decision["continuation_prompt"] is not None
+    assert mgr.state is not None
+    assert mgr.state.turns_used == 1
+    # The verdict is recorded as "skipped" for forensics.
+    assert mgr.state.last_verdict == "skipped"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Continuation prompt cache invariant
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_continuation_prompt_contains_goal_text(store: GoalStateStore) -> None:
+    mgr = _mgr(store)
+    mgr.set("port goal command to vexis")
+    prompt = mgr.next_continuation_prompt()
+    assert prompt is not None
+    assert "port goal command to vexis" in prompt
+
+
+def test_continuation_prompt_no_system_prompt_leak(store: GoalStateStore) -> None:
+    """**Load-bearing prompt-cache invariant** from §3 / §5 of the
+    research doc. The continuation prompt is fed to the brain as a
+    plain user-role message; if it ever contained system-prompt-shaped
+    content (``"You are"`` framings or our ``[SYSTEM CONTEXT]``
+    notifier header), Anthropic prompt caching would invalidate and
+    cost would spike. This test catches that drift."""
+    mgr = _mgr(store)
+    mgr.set("port goal command")
+    prompt = mgr.next_continuation_prompt()
+    assert prompt is not None
+    assert "You are" not in prompt
+    assert "[SYSTEM CONTEXT]" not in prompt
+    # And the template constant itself doesn't leak — guards the
+    # static side too in case a future test stub mocks the manager.
+    assert "You are" not in CONTINUATION_PROMPT_TEMPLATE
+    assert "[SYSTEM CONTEXT]" not in CONTINUATION_PROMPT_TEMPLATE
+
+
+def test_continuation_prompt_none_when_inactive(store: GoalStateStore) -> None:
+    mgr = _mgr(store)
+    assert mgr.next_continuation_prompt() is None
+    mgr.set("g")
+    mgr.pause()
+    assert mgr.next_continuation_prompt() is None

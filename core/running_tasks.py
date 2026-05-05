@@ -35,6 +35,7 @@ import signal
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Callable, Literal
 
 log = logging.getLogger(__name__)
 
@@ -52,10 +53,21 @@ class Reservation:
 
 @dataclass(frozen=True)
 class QueuedMessage:
-    """One pending follow-up awaiting its turn in the drain loop."""
+    """One pending follow-up awaiting its turn in the drain loop.
+
+    ``origin`` distinguishes a user-typed message (default) from a
+    daemon-generated continuation enqueued by the /goal post-turn
+    hook. /goal pause and /goal clear use it as a predicate to drop
+    pending continuations from the deque without disturbing real
+    user messages. Real user messages keep ``user_id`` set to the
+    actual sender so the auth gate at ``MessageHandler.handle`` works
+    unchanged; goal continuations also carry the allowed user id —
+    the field is purely a tag, never a substitute for the auth check.
+    """
 
     user_id: int
     text: str
+    origin: Literal["user", "goal_continuation"] = "user"
 
 
 @dataclass
@@ -102,15 +114,73 @@ class RunningTasks:
         log.info("Claimed drain for chat %d", chat_id)
         return True
 
-    async def enqueue(self, chat_id: int, user_id: int, text: str) -> int:
+    async def enqueue(
+        self,
+        chat_id: int,
+        user_id: int,
+        text: str,
+        *,
+        origin: Literal["user", "goal_continuation"] = "user",
+    ) -> int:
         """Append a follow-up message to the chat's queue. Should only be
-        called after ``claim`` returned False. Returns the new depth."""
+        called after ``claim`` returned False. Returns the new depth.
+
+        ``origin`` tags the message so /goal pause / /goal clear /
+        /cancel can drop pending goal continuations without touching
+        real user messages. Default is ``"user"`` so existing call
+        sites work unchanged. The /goal post-turn hook passes
+        ``origin="goal_continuation"`` (and the kickoff path does the
+        same — see `.plans/goal-command-research.md` §3).
+        """
         async with self._lock:
             state = self._chats.setdefault(chat_id, _ChatState())
-            state.queue.append(QueuedMessage(user_id=user_id, text=text))
+            state.queue.append(
+                QueuedMessage(user_id=user_id, text=text, origin=origin)
+            )
             depth = len(state.queue)
-        log.info("Enqueued message for chat %d (depth=%d)", chat_id, depth)
+        log.info(
+            "Enqueued message for chat %d (depth=%d, origin=%s)",
+            chat_id,
+            depth,
+            origin,
+        )
         return depth
+
+    async def drop_messages_matching(
+        self,
+        chat_id: int,
+        predicate: Callable[[QueuedMessage], bool],
+    ) -> int:
+        """Remove queued messages for ``chat_id`` where ``predicate(msg)``
+        is True. Returns the number dropped.
+
+        Walks the deque under ``_lock`` and rebuilds it in place so
+        FIFO order of survivors is preserved. Used by /goal pause /
+        /goal clear / /cancel-with-active-goal to drop pending
+        continuations (`predicate = lambda m: m.origin == "goal_continuation"`)
+        without disturbing user messages that happened to be queued
+        behind a continuation. No-op when the chat has no state or
+        an empty queue.
+        """
+        async with self._lock:
+            state = self._chats.get(chat_id)
+            if state is None or not state.queue:
+                return 0
+            survivors: deque[QueuedMessage] = deque()
+            dropped = 0
+            for msg in state.queue:
+                if predicate(msg):
+                    dropped += 1
+                else:
+                    survivors.append(msg)
+            state.queue = survivors
+        if dropped:
+            log.info(
+                "Dropped %d queued message(s) for chat %d via predicate",
+                dropped,
+                chat_id,
+            )
+        return dropped
 
     async def pop_or_release(self, chat_id: int) -> QueuedMessage | None:
         """Pop the next queued message, or release drain ownership.
