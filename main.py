@@ -273,7 +273,9 @@ async def _run() -> None:
         workspace=workspace,
     )
     curator = CuratorController(workspace=workspace, notifier=notifier)
-    learning_curator = LearningController(workspace=workspace, notifier=notifier)
+    learning_curator = LearningController(
+        workspace=workspace, notifier=notifier, brain=brain,
+    )
 
     dashboard_port = _dashboard_port_from_env()
     dashboard = WebDashboard(

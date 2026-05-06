@@ -757,8 +757,19 @@ def run_coherence_eval(workspace: Path) -> CoherenceEvalReport:
         print(f"  [{cat}] {fid} ...", flush=True)
         messages = _fixture_to_messages(fixture.get("synthetic_transcript") or [])
         try:
+            # Eval script: build a real ClaudeCodeBrain pointed at
+            # the eval workspace so spawn_aux fires the actual claude
+            # subprocess (the eval expects real model calls).
+            from core.brain.claude_code import ClaudeCodeBrain
+            from core.running_tasks import RunningTasks
+            from core.sessions import SessionStore
+            eval_brain = ClaudeCodeBrain(
+                workspace=workspace,
+                session=SessionStore(workspace / ".vexis" / "sessions.json"),
+                running_tasks=RunningTasks(),
+            )
             verdict = run_coherence_judge(
-                workspace, fixture["lesson"], messages,
+                workspace, fixture["lesson"], messages, eval_brain,
             )
             judge_err = None
         except Exception as exc:  # noqa: BLE001

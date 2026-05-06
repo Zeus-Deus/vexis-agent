@@ -47,7 +47,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from core.brain.base import Brain
 
 from core.coherence_judge import (
     CoherenceVerdict,
@@ -1083,6 +1086,7 @@ def _attach_coherence_verdict(
     messages: list,
     meta: SessionMeta,
     summary: WriteSummary,
+    brain: "Brain",
 ) -> None:
     """Run the v3a coherence judge on one verified lesson.
 
@@ -1107,7 +1111,7 @@ def _attach_coherence_verdict(
     NEAR_MISS_REVIEW with reason=other, so any failure of the judge
     itself surfaces as a soft flag the user reviews.
     """
-    verdict = run_coherence_judge(workspace, lesson, messages)
+    verdict = run_coherence_judge(workspace, lesson, messages, brain)
     lesson["coherence"] = verdict
     if verdict.verdict == "COHERENT":
         return
@@ -1141,6 +1145,7 @@ def _write_verified(
     meta: SessionMeta,
     shadow: bool,
     messages: list[Any] | None = None,
+    brain: "Brain | None" = None,
 ) -> WriteSummary:
     """Persist verified lessons. Returns a WriteSummary breakdown
     (Day 5: detailed counts per class / tier / outcome — see the
@@ -1196,7 +1201,17 @@ def _write_verified(
         # ``messages`` is None/empty (test seam — production always
         # passes the parsed session transcript via _real_review).
         if messages:
-            _attach_coherence_verdict(workspace, lesson, messages, meta, summary)
+            # Phase B: thread the brain into the coherence judge.
+            # Tests may pass brain=None (most don't reach the spawn
+            # path because they mock run_coherence_judge directly);
+            # when that happens, fall back to a BrainNull so the
+            # call shape is uniform. Production always passes the
+            # real brain via the controller's review_fn wrapper.
+            from core.brain.null import BrainNull
+            _b = brain if brain is not None else BrainNull()
+            _attach_coherence_verdict(
+                workspace, lesson, messages, meta, summary, _b
+            )
         class_ = lesson.get("class")
         if class_ in {"PROCEDURAL", "IDENTITY", "SITUATIONAL", "VOLATILE"}:
             summary.by_class[class_] = summary.by_class.get(class_, 0) + 1
@@ -1533,7 +1548,7 @@ def _stage_procedural_lesson(
 
 
 def _real_review(
-    workspace: Path, meta: SessionMeta
+    workspace: Path, meta: SessionMeta, brain: "Brain | None" = None
 ) -> tuple[str, WriteSummary]:
     """Production review path: parse the JSONL, run claude -p, verify,
     write. Returns ``(outcome_str, summary)``.
@@ -1584,6 +1599,7 @@ def _real_review(
         meta=meta,
         shadow=learning_shadow_mode(),
         messages=messages,
+        brain=brain,
     )
     return (
         _summarize_outcome(output, written=summary.written),
@@ -1625,9 +1641,22 @@ class LearningController:
         notifier: Notifier | None = None,
         *,
         review_fn: ReviewFn | None = None,
+        brain: "Brain | None" = None,
     ) -> None:
         self._workspace = workspace
         self._notifier = notifier
+        # Phase B: the brain is the aux-spawn surface for the
+        # coherence judge, learning review, and relationships
+        # extractor. Production threads the real brain in via
+        # ``main.py``; tests that don't reach the spawn path can
+        # leave it ``None`` (the controller falls back to
+        # ``BrainNull()`` lazily when a real spawn is needed —
+        # which only happens if the test forgot to mock out the
+        # downstream functions). Required-kwarg in production
+        # call sites; default-None for test ergonomics.
+        from core.brain.null import BrainNull
+
+        self._brain: Brain = brain or BrainNull()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._busy_per_session: set[str] = set()
@@ -1657,14 +1686,23 @@ class LearningController:
         self._tick_count: int = 0
         # Dependency injection for tests: pass ``review_fn`` to
         # short-circuit the real subprocess pipeline. Production
-        # leaves it None and the controller calls ``_real_review``.
-        self._review_fn = review_fn or _real_review
+        # leaves it None and the controller wraps ``_real_review``
+        # with the brain reference (Phase B — _real_review threads
+        # the brain into _write_verified → _attach_coherence_verdict
+        # → run_coherence_judge so the coherence judge spawns
+        # through the brain abstraction)."""
+        if review_fn is not None:
+            self._review_fn = review_fn
+        else:
+            _brain = self._brain
+            self._review_fn = lambda ws, m: _real_review(ws, m, _brain)
         # v3b Day 2: relationships curator hangs off the same
         # workspace + tick. Lazy-imported to avoid the optional-
         # dependency churn that would come from a top-level import.
         from core.relationships.curator import RelationshipsCurator
         self._relationships_curator = RelationshipsCurator(
             workspace=workspace,
+            brain=self._brain,
         )
 
     # ---------- lifecycle ----------
@@ -3045,6 +3083,7 @@ class LearningController:
                     "tier": entry.get("tier"),
                 },
                 [],  # degraded mode — no source transcript
+                self._brain,
             )
             results.append({
                 "file": label,
@@ -3497,6 +3536,7 @@ class LearningController:
                 "tier": entry.get("tier"),
             },
             [],  # degraded mode — no source transcript
+            self._brain,
         )
         judged_at = _iso(_utc_now())
         result = {

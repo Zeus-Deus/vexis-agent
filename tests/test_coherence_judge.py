@@ -1,26 +1,22 @@
 """Day 1 tests for core/coherence_judge.
 
-Coverage matches the §7 Day 1 checkpoint:
-  - find_evidence_message_index: hit, miss, empty, ignores assistant
-  - _find_window_bounds: ±N user turns, clamped at extents, single-message
-  - _render_transcript_window: default window, fallback to ±2 on cap,
-    evidence-body truncation when still over, evidence quote retained,
-    out-of-bounds index returns ""
-  - _build_judge_prompt: standard shape, with target_body, degraded mode
-  - _extract_verdict: bare JSON, code-fenced JSON, prose-wrapped object,
-    COHERENT shorthand, INCOHERENT requires reason+explanation,
-    NEAR_MISS_REVIEW with unknown reason coerces to None, malformed
-    returns None, empty/None returns None
-  - run_coherence_judge: success path with mocked spawn, INCOHERENT
-    shortcut on missing evidence, degraded mode (empty messages),
-    timeout/spawn-error/non-zero-exit/parse-failure → NEAR_MISS_REVIEW
-    with reason=other, --model flag wired in argv, recursion env set
+Coverage matches the §7 Day 1 checkpoint, updated for Phase B of the
+brain abstraction:
+  - run_coherence_judge: success path with BrainNull seam (replaces
+    the pre-Phase-B spawn-callable seam), INCOHERENT shortcut on
+    missing evidence, degraded mode (empty messages), timeout /
+    spawn-error / non-zero-exit / parse-failure → NEAR_MISS_REVIEW
+    with reason=other.
+
+Argv-shape and env-override invariants now live in
+``tests/test_brain_contract.py`` against ``ClaudeCodeBrain.spawn_aux``;
+this file asserts on ``brain.aux_call_records()`` for the judge's
+contract with the brain (prompt content, env-override key, tier name).
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,6 +25,13 @@ from unittest import mock
 import pytest
 
 from core import coherence_judge as cj
+from core.brain.base import (
+    AuxResult,
+    BrainError,
+    BrainNotInstalled,
+    BrainTimeoutError,
+)
+from core.brain.null import BrainNull
 from core.coherence_judge import (
     COHERENCE_JUDGE_ENV_VAR,
     CoherenceVerdict,
@@ -66,23 +69,30 @@ def _msg(
     )
 
 
-def _spawn_returning(stdout: str, *, returncode: int = 0, stderr: str = ""):
-    """Build a fake spawn callable that returns a CompletedProcess.
-    Captures argv/env so tests can assert what was sent."""
-    captured: dict[str, Any] = {}
+def _brain_returning(stdout: str, *, returncode: int = 0, stderr: str = "") -> BrainNull:
+    """Build a BrainNull pre-loaded with one AuxResult — the judge
+    consumes one ``spawn_aux`` per call. Phase B replacement for the
+    old ``_spawn_returning`` helper."""
+    return BrainNull(
+        aux_results=[
+            AuxResult(stdout=stdout, stderr=stderr, returncode=returncode)
+        ]
+    )
 
-    def spawn(argv, env):
-        captured["argv"] = argv
-        captured["env"] = env
-        cp = subprocess.CompletedProcess(
-            args=argv,
-            returncode=returncode,
-            stdout=stdout.encode(),
-            stderr=stderr.encode(),
-        )
-        return cp
 
-    return spawn, captured
+@pytest.fixture(autouse=True)
+def isolated_yaml_config(monkeypatch, tmp_path):
+    """Phase B: tier resolution reads ``~/.vexis/config.yaml``. Tests
+    must not see the user's real config — otherwise the
+    ``models.coherence_judge`` legacy raw-string would override the
+    default tier and confuse assertions on ``model_tier``. Point the
+    config path at a fresh tmp file for every test."""
+    from core import yaml_config
+
+    cfg_dir = tmp_path / "vexis-config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(yaml_config, "_config_path", lambda: cfg_dir / "config.yaml")
+    yield
 
 
 # --------------------------------------------------------------------
@@ -492,7 +502,7 @@ def test_validate_verdict_dict_accepts_all_known_reasons():
 
 
 # --------------------------------------------------------------------
-# run_coherence_judge — full pipeline with mocked spawn
+# run_coherence_judge — full pipeline with BrainNull seam
 # --------------------------------------------------------------------
 
 
@@ -509,23 +519,23 @@ def test_run_coherence_judge_success_path(tmp_path):
         "scope": "evidence-related tasks",
         "evidence": "actual evidence here",
     }
-    spawn, captured = _spawn_returning(
+    brain = _brain_returning(
         '{"verdict": "COHERENT", "reason": null, "explanation": null}'
     )
-    out = run_coherence_judge(tmp_path, lesson, msgs, spawn=spawn)
+    out = run_coherence_judge(tmp_path, lesson, msgs, brain)
 
     assert out.verdict == "COHERENT"
     assert out.degraded is False
-    # argv shape: claude -p [--model sonnet] <prompt>
-    assert captured["argv"][0] == "claude"
-    assert captured["argv"][1] == "-p"
-    assert "--model" in captured["argv"]
-    # Recursion guard env set so the curator won't re-review the
-    # judge's own session JSONL
-    assert captured["env"][COHERENCE_JUDGE_ENV_VAR] == "1"
-    # Evidence reaches the prompt
-    prompt = captured["argv"][-1]
-    assert "actual evidence here" in prompt
+    record = brain.aux_call_records()[0]
+    # Recursion-guard env set so the curator won't re-review the
+    # judge's own session JSONL.
+    assert record["env_overrides"] == {COHERENCE_JUDGE_ENV_VAR: "1"}
+    # Tier defaults to "small" per DEFAULT_SUBSYSTEM_TIERS.
+    assert record["model_tier"] == "small"
+    # Evidence reaches the prompt.
+    assert "actual evidence here" in record["prompt"]
+    # cwd routed correctly (recursion-guard JSONL placement).
+    assert record["cwd"] == tmp_path
 
 
 def test_run_coherence_judge_returns_incoherent_on_missing_evidence(tmp_path):
@@ -539,14 +549,14 @@ def test_run_coherence_judge_returns_incoherent_on_missing_evidence(tmp_path):
         "scope": "y",
         "evidence": "this string is not in the transcript",
     }
-    # Spawn shouldn't be called — guard with a raising stub
-    def fail_spawn(*_args):
-        raise AssertionError("spawn should not be called when evidence missing")
-
-    out = run_coherence_judge(tmp_path, lesson, msgs, spawn=fail_spawn)
+    # Brain shouldn't be called; an empty BrainNull would return a
+    # default empty AuxResult, but the judge short-circuits before.
+    brain = BrainNull()
+    out = run_coherence_judge(tmp_path, lesson, msgs, brain)
     assert out.verdict == "INCOHERENT"
     assert out.reason == "hallucinated-inference"
     assert "not found" in out.explanation
+    assert brain.aux_calls() == []  # never spawned
 
 
 def test_run_coherence_judge_degraded_mode_empty_messages(tmp_path):
@@ -559,17 +569,17 @@ def test_run_coherence_judge_degraded_mode_empty_messages(tmp_path):
         "scope": "y",
         "evidence": "ev",
     }
-    spawn, captured = _spawn_returning(
+    brain = _brain_returning(
         '{"verdict": "NEAR_MISS_REVIEW", "reason": "other", '
         '"explanation": "thin grounding without transcript"}'
     )
-    out = run_coherence_judge(tmp_path, lesson, [], spawn=spawn)
+    out = run_coherence_judge(tmp_path, lesson, [], brain)
 
     assert out.verdict == "NEAR_MISS_REVIEW"
     assert out.degraded is True
-    # Prompt mentions the degraded-mode note
-    prompt = captured["argv"][-1]
-    assert "transcript window unavailable" in prompt
+    # Prompt mentions the degraded-mode note.
+    record = brain.aux_call_records()[0]
+    assert "transcript window unavailable" in record["prompt"]
 
 
 def test_run_coherence_judge_timeout_returns_near_miss(tmp_path):
@@ -578,11 +588,9 @@ def test_run_coherence_judge_timeout_returns_near_miss(tmp_path):
         "class": "PROCEDURAL", "tier": "S3",
         "lesson": "x", "scope": "y", "evidence": "evidence here",
     }
-
-    def spawn(argv, env):
-        raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
-
-    out = run_coherence_judge(tmp_path, lesson, msgs, spawn=spawn)
+    brain = BrainNull()
+    brain.next_aux_raises(BrainTimeoutError("aux timed out"))
+    out = run_coherence_judge(tmp_path, lesson, msgs, brain)
     assert out.verdict == "NEAR_MISS_REVIEW"
     assert out.reason == "other"
     assert "timed out" in out.explanation
@@ -594,11 +602,23 @@ def test_run_coherence_judge_spawn_failure_returns_near_miss(tmp_path):
         "class": "PROCEDURAL", "tier": "S3",
         "lesson": "x", "scope": "y", "evidence": "evidence here",
     }
+    brain = BrainNull()
+    brain.next_aux_raises(BrainNotInstalled("claude binary missing"))
+    out = run_coherence_judge(tmp_path, lesson, msgs, brain)
+    assert out.verdict == "NEAR_MISS_REVIEW"
+    assert "spawn failed" in out.explanation
 
-    def spawn(argv, env):
-        raise FileNotFoundError("claude binary missing")
 
-    out = run_coherence_judge(tmp_path, lesson, msgs, spawn=spawn)
+def test_run_coherence_judge_brain_error_returns_near_miss(tmp_path):
+    """Catch-all for OSError-shaped failures inside spawn_aux."""
+    msgs = [_msg("user", "evidence here")]
+    lesson = {
+        "class": "PROCEDURAL", "tier": "S3",
+        "lesson": "x", "scope": "y", "evidence": "evidence here",
+    }
+    brain = BrainNull()
+    brain.next_aux_raises(BrainError("opaque subprocess failure"))
+    out = run_coherence_judge(tmp_path, lesson, msgs, brain)
     assert out.verdict == "NEAR_MISS_REVIEW"
     assert "spawn failed" in out.explanation
 
@@ -609,8 +629,8 @@ def test_run_coherence_judge_nonzero_exit_returns_near_miss(tmp_path):
         "class": "PROCEDURAL", "tier": "S3",
         "lesson": "x", "scope": "y", "evidence": "evidence here",
     }
-    spawn, _ = _spawn_returning("oops", returncode=1, stderr="claude failed")
-    out = run_coherence_judge(tmp_path, lesson, msgs, spawn=spawn)
+    brain = _brain_returning("oops", returncode=1, stderr="claude failed")
+    out = run_coherence_judge(tmp_path, lesson, msgs, brain)
     assert out.verdict == "NEAR_MISS_REVIEW"
     assert "exited 1" in out.explanation
 
@@ -621,8 +641,8 @@ def test_run_coherence_judge_malformed_response_returns_near_miss(tmp_path):
         "class": "PROCEDURAL", "tier": "S3",
         "lesson": "x", "scope": "y", "evidence": "evidence here",
     }
-    spawn, _ = _spawn_returning("complete prose with no json")
-    out = run_coherence_judge(tmp_path, lesson, msgs, spawn=spawn)
+    brain = _brain_returning("complete prose with no json")
+    out = run_coherence_judge(tmp_path, lesson, msgs, brain)
     assert out.verdict == "NEAR_MISS_REVIEW"
     assert out.reason == "other"
     assert "malformed" in out.explanation
@@ -634,15 +654,14 @@ def test_run_coherence_judge_passes_target_body_to_prompt(tmp_path):
         "class": "PROCEDURAL", "tier": "S1",
         "lesson": "x", "scope": "y", "evidence": "evidence here",
     }
-    spawn, captured = _spawn_returning(
+    brain = _brain_returning(
         '{"verdict": "COHERENT", "reason": null, "explanation": null}'
     )
     run_coherence_judge(
-        tmp_path, lesson, msgs,
+        tmp_path, lesson, msgs, brain,
         target_body="## Existing skill body\n\ndo Y when Z\n",
-        spawn=spawn,
     )
-    prompt = captured["argv"][-1]
+    prompt = brain.aux_call_records()[0]["prompt"]
     assert "Existing skill body" in prompt
     assert "do Y when Z" in prompt
 

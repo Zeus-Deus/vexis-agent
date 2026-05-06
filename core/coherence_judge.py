@@ -54,20 +54,22 @@ Day 3 adds eval grades.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import os
 import re
-import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable
 
-from core.transcripts import TranscriptMessage
-from core.yaml_config import (
-    model_coherence_judge,
-    resolve_model_flag,
+from core.brain.base import (
+    Brain,
+    BrainAuthRequired,
+    BrainError,
+    BrainNotInstalled,
+    BrainTimeoutError,
 )
+from core.transcripts import TranscriptMessage
+from core.yaml_config import subsystem_tier
 
 log = logging.getLogger(__name__)
 
@@ -149,9 +151,6 @@ class CoherenceVerdict:
             reason=reason,
             explanation=explanation,
         )
-
-
-SpawnFn = Callable[[list[str], dict[str, str]], subprocess.CompletedProcess]
 
 
 # --------------------------------------------------------------------
@@ -585,11 +584,11 @@ def run_coherence_judge(
     workspace: Path,
     lesson: dict,
     messages: list[TranscriptMessage],
+    brain: Brain,
     *,
     target_body: str | None = None,
-    spawn: SpawnFn | None = None,
 ) -> CoherenceVerdict:
-    """Spawn ``claude -p``, render the prompt, parse the verdict.
+    """Run the coherence judge through ``Brain.spawn_aux``.
 
     Returns a CoherenceVerdict in all cases — never raises. Failure
     paths (timeout, non-zero exit, parse failure) collapse to
@@ -608,9 +607,13 @@ def run_coherence_judge(
     write to (existing SKILL.md, MEMORY entry, etc.). Pass None when
     not available; the judge proceeds without that input.
 
-    ``spawn`` is a test seam — production passes None and we shell
-    out via ``subprocess.run``. Mirrors the shape of v2's
-    ``run_review`` (``learning_review.py:1149``).
+    ``brain`` is the aux-spawn surface — Phase B routes this site
+    through :meth:`Brain.spawn_aux` instead of building argv +
+    calling ``subprocess.run`` directly. Sync wrapper around the
+    async ``spawn_aux`` via ``asyncio.run`` because the curator
+    daemon thread (the only caller) has no running event loop;
+    keeping ``run_coherence_judge`` sync minimises the diff to the
+    caller and to test_coherence_judge.py.
     """
     evidence = str(lesson.get("evidence", ""))
 
@@ -641,27 +644,18 @@ def run_coherence_judge(
         target_body=target_body,
         degraded=degraded,
     )
-    argv = [
-        "claude",
-        "-p",
-        *resolve_model_flag(model_coherence_judge()),
-        prompt,
-    ]
-    env = {**os.environ, COHERENCE_JUDGE_ENV_VAR: "1"}
 
     try:
-        if spawn is not None:
-            cp = spawn(argv, env)
-        else:
-            cp = subprocess.run(
-                argv,
-                env=env,
-                cwd=str(workspace),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=COHERENCE_JUDGE_TIMEOUT_SECONDS,
+        result = asyncio.run(
+            brain.spawn_aux(
+                prompt,
+                model_tier=subsystem_tier("coherence_judge"),
+                timeout_seconds=COHERENCE_JUDGE_TIMEOUT_SECONDS,
+                env_overrides={COHERENCE_JUDGE_ENV_VAR: "1"},
+                cwd=workspace,
             )
-    except subprocess.TimeoutExpired:
+        )
+    except BrainTimeoutError:
         return _maybe_degrade(
             CoherenceVerdict.near_miss(
                 reason="other",
@@ -672,7 +666,15 @@ def run_coherence_judge(
             ),
             degraded=degraded,
         )
-    except (OSError, FileNotFoundError) as exc:
+    except (BrainNotInstalled, BrainAuthRequired) as exc:
+        return _maybe_degrade(
+            CoherenceVerdict.near_miss(
+                reason="other",
+                explanation=f"judge spawn failed: {exc}",
+            ),
+            degraded=degraded,
+        )
+    except BrainError as exc:
         return _maybe_degrade(
             CoherenceVerdict.near_miss(
                 reason="other",
@@ -681,36 +683,26 @@ def run_coherence_judge(
             degraded=degraded,
         )
 
-    stdout = (
-        cp.stdout.decode("utf-8", errors="replace")
-        if isinstance(cp.stdout, bytes)
-        else cp.stdout or ""
-    )
-    if cp.returncode != 0:
-        stderr = (
-            cp.stderr.decode("utf-8", errors="replace")
-            if isinstance(cp.stderr, bytes)
-            else cp.stderr or ""
-        )
-        body = (stderr or stdout).strip()
+    if result.returncode != 0:
+        body = (result.stderr or result.stdout).strip()
         return _maybe_degrade(
             CoherenceVerdict.near_miss(
                 reason="other",
                 explanation=(
-                    f"judge exited {cp.returncode}: {body[:300]}"
+                    f"judge exited {result.returncode}: {body[:300]}"
                 ),
             ),
             degraded=degraded,
         )
 
-    verdict = _extract_verdict(stdout)
+    verdict = _extract_verdict(result.stdout)
     if verdict is None:
         return _maybe_degrade(
             CoherenceVerdict.near_miss(
                 reason="other",
                 explanation=(
                     f"judge output malformed (could not parse verdict "
-                    f"JSON): {stdout.strip()[:300]}"
+                    f"JSON): {result.stdout.strip()[:300]}"
                 ),
             ),
             degraded=degraded,
@@ -741,7 +733,6 @@ __all__ = [
     "WINDOW_TURNS_FALLBACK",
     "WINDOW_MAX_CHARS",
     "CoherenceVerdict",
-    "SpawnFn",
     "find_evidence_message_index",
     "run_coherence_judge",
     # Internal helpers exported for direct unit testing:

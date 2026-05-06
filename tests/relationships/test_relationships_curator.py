@@ -55,8 +55,11 @@ def _stub_classifier(verdict: TriggerVerdict):
 
 
 def _stub_judge(verdict: CoherenceVerdict):
-    """Build a coherence-judge stub that returns the given verdict."""
-    def _judge(workspace, lesson, messages, **kwargs):
+    """Build a coherence-judge stub that returns the given verdict.
+    Phase B: the judge accepts ``brain`` as the 4th positional, so
+    the stub signature must accept it (test stubs ignore the brain
+    reference and return a pre-decided verdict)."""
+    def _judge(workspace, lesson, messages, brain=None, **kwargs):
         return verdict
     return _judge
 

@@ -46,7 +46,10 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
+
+if TYPE_CHECKING:
+    from core.brain.base import Brain
 
 from core.coherence_judge import (
     CoherenceVerdict,
@@ -286,7 +289,17 @@ class RelationshipsCurator:
         ) = None,
         pending_disambiguation: PendingDisambiguationStore | None = None,
         candidate_store: "RelationshipsCandidateStore | None" = None,
+        brain: "Brain | None" = None,
     ) -> None:
+        # Phase B: brain is the aux-spawn surface. Threaded into the
+        # extractor and the coherence judge. Tests that don't reach
+        # the spawn path can leave it None — we fall back to a
+        # ``BrainNull()`` so the cached callable still has something
+        # to invoke when a downstream code path inadvertently asks
+        # for a real spawn.
+        from core.brain.null import BrainNull
+
+        self._brain: "Brain" = brain or BrainNull()
         self._workspace = workspace
         self._store = store or RelationshipsStore(workspace)
         self._tokens = pending_tokens or PendingTokens()
@@ -861,7 +874,7 @@ class RelationshipsCurator:
         }
         try:
             return self._coherence_judge(
-                self._workspace, synthetic_lesson, messages,
+                self._workspace, synthetic_lesson, messages, self._brain,
             )
         except Exception as exc:
             log.warning(
@@ -1608,7 +1621,7 @@ class RelationshipsCurator:
         }
         try:
             verdict = self._coherence_judge(
-                self._workspace, synthetic_lesson, messages,
+                self._workspace, synthetic_lesson, messages, self._brain,
             )
         except Exception as exc:  # judge is supposed to never raise
             log.warning(
