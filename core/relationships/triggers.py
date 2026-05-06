@@ -31,22 +31,27 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
-import subprocess
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, Literal
+from typing import TYPE_CHECKING, Awaitable, Callable, Literal
 
 log = logging.getLogger(__name__)
 
+from core.brain.base import (
+    BrainAuthRequired,
+    BrainError,
+    BrainNotInstalled,
+    BrainTimeoutError,
+)
+
+if TYPE_CHECKING:
+    from core.brain.base import Brain
+
 from core.identity_threat import check_named_third_party
 from core.relationships.quoted import strip_quoted_blocks
-from core.yaml_config import (
-    model_relationships_classifier,
-    resolve_model_flag,
-)
+from core.yaml_config import subsystem_tier
 
 CLASSIFIER_TIMEOUT_SECONDS = 12.0
 CLASSIFIER_CONFIDENCE_THRESHOLD = 0.75
@@ -203,23 +208,6 @@ Output the JSON object now, nothing else.
 """
 
 
-SpawnFn = Callable[[list[str], dict[str, str]], "subprocess.CompletedProcess[bytes]"]
-
-
-def _build_classifier_argv(workspace: Path) -> list[str]:
-    return [
-        "claude",
-        "-p",
-        *resolve_model_flag(model_relationships_classifier()),
-    ]
-
-
-def _build_classifier_env() -> dict[str, str]:
-    env = {**os.environ}
-    env[RELATIONSHIPS_CLASSIFIER_ENV_VAR] = "1"
-    return env
-
-
 def _parse_classifier_output(stdout: str) -> TriggerVerdict:
     """Parse the classifier's JSON response into a TriggerVerdict.
 
@@ -275,81 +263,63 @@ def _parse_classifier_output(stdout: str) -> TriggerVerdict:
     )
 
 
-def _spawn_default(
-    argv: list[str], env: dict[str, str]
-) -> "subprocess.CompletedProcess[bytes]":
-    return subprocess.run(
-        argv,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=CLASSIFIER_TIMEOUT_SECONDS,
-    )
-
-
 async def _classifier_call(
     text: str,
     *,
     session_uuid: str,
     turn_index: int,
     workspace: Path | None = None,
-    spawn: SpawnFn | None = None,
+    brain: "Brain",
 ) -> TriggerVerdict:
-    """Spawn ``claude -p --model <relationships_classifier>`` with
-    the canonical prompt; parse the JSON output; return the verdict.
+    """Spawn the classifier through ``Brain.spawn_aux``, parse the
+    JSON output, return the verdict.
 
     Wrapped by ``detect()`` in ``asyncio.wait_for(...,
     timeout=CLASSIFIER_TIMEOUT_SECONDS)`` and a broad ``except
     Exception:`` that returns NONE on any failure (transport,
-    spawn, exit-nonzero, parse). Tests inject ``spawn`` to
-    deterministically return canned subprocess results.
+    spawn, exit-nonzero, parse). Phase B routes through
+    ``brain.spawn_aux`` instead of an inline ``subprocess.run``;
+    the brain abstraction owns argv composition and tier
+    resolution.
     """
     if workspace is None:
         workspace = Path.cwd()
-    argv = _build_classifier_argv(workspace)
-    env = _build_classifier_env()
     prompt = _CLASSIFIER_PROMPT_TEMPLATE.format(
         session_uuid=session_uuid,
         turn_index=turn_index,
         user_turn=text,
     )
-    argv = argv + [prompt]
 
-    spawn_fn: SpawnFn = spawn or _spawn_default
-
-    def _run() -> TriggerVerdict:
-        try:
-            cp = spawn_fn(argv, env)
-        except subprocess.TimeoutExpired:
-            log.warning("relationships.classifier_subprocess_timeout")
-            classifier_errors.incr("subprocess_timeout")
-            return _NONE
-        except (OSError, FileNotFoundError) as exc:
-            log.warning("relationships.classifier_spawn_failed: %s", exc)
-            classifier_errors.incr("spawn_failed")
-            return _NONE
-        stdout = (
-            cp.stdout.decode("utf-8", errors="replace")
-            if isinstance(cp.stdout, bytes)
-            else (cp.stdout or "")
+    try:
+        result = await brain.spawn_aux(
+            prompt,
+            model_tier=subsystem_tier("relationships_classifier"),
+            timeout_seconds=CLASSIFIER_TIMEOUT_SECONDS,
+            env_overrides={RELATIONSHIPS_CLASSIFIER_ENV_VAR: "1"},
+            cwd=workspace,
         )
-        if cp.returncode != 0:
-            stderr = (
-                cp.stderr.decode("utf-8", errors="replace")
-                if isinstance(cp.stderr, bytes)
-                else (cp.stderr or "")
-            )
-            log.warning(
-                "relationships.classifier_nonzero_exit code=%s body=%s",
-                cp.returncode, (stderr or stdout)[:300],
-            )
-            classifier_errors.incr("nonzero_exit")
-            return _NONE
-        return _parse_classifier_output(stdout)
+    except BrainTimeoutError:
+        log.warning("relationships.classifier_subprocess_timeout")
+        classifier_errors.incr("subprocess_timeout")
+        return _NONE
+    except (BrainNotInstalled, BrainAuthRequired) as exc:
+        log.warning("relationships.classifier_spawn_failed: %s", exc)
+        classifier_errors.incr("spawn_failed")
+        return _NONE
+    except BrainError as exc:
+        log.warning("relationships.classifier_spawn_failed: %s", exc)
+        classifier_errors.incr("spawn_failed")
+        return _NONE
 
-    # Run the blocking subprocess in a thread so the asyncio event
-    # loop isn't blocked.
-    return await asyncio.to_thread(_run)
+    if result.returncode != 0:
+        log.warning(
+            "relationships.classifier_nonzero_exit code=%s body=%s",
+            result.returncode,
+            (result.stderr or result.stdout)[:300],
+        )
+        classifier_errors.incr("nonzero_exit")
+        return _NONE
+    return _parse_classifier_output(result.stdout)
 
 
 # --------------------------------------------------------------------
@@ -368,6 +338,7 @@ async def detect(
     classifier_call: (
         Callable[..., Awaitable[TriggerVerdict]] | None
     ) = None,
+    brain: "Brain | None" = None,
 ) -> TriggerVerdict:
     """Run the consent-trigger detector against one user turn.
 
@@ -416,7 +387,25 @@ async def detect(
     if regex_result.verdict == "NONE" and not has_third_party:
         return _NONE
 
-    call = classifier_call or _classifier_call
+    # When a custom ``classifier_call`` is supplied (test seam), it
+    # takes precedence and may not need a brain. The default
+    # ``_classifier_call`` requires one — fall back to a BrainNull
+    # if the caller passed None and we're using the default, so
+    # tests that don't pass brain still work (the BrainNull will
+    # raise on exhaustion if anything actually reaches the spawn,
+    # surfacing the missing brain rather than silently returning).
+    call = classifier_call
+    if call is None:
+        from core.brain.null import BrainNull
+        _b = brain or BrainNull()
+        async def call(text_, *, session_uuid, turn_index, workspace):
+            return await _classifier_call(
+                text_,
+                session_uuid=session_uuid,
+                turn_index=turn_index,
+                workspace=workspace,
+                brain=_b,
+            )
     try:
         verdict = await asyncio.wait_for(
             call(

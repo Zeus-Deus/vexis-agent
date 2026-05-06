@@ -439,6 +439,7 @@ class RelationshipsCurator:
             turn_index=turn_index,
             workspace=self._workspace,
             classifier_call=self._classifier_call,
+            brain=self._brain,
         )
         return await self._dispatch_verdict(
             verdict=verdict,
@@ -1165,6 +1166,7 @@ class RelationshipsCurator:
             turn_index=pending.turn_index,
             workspace=self._workspace,
             classifier_call=self._classifier_call,
+            brain=self._brain,
         )
         if merge_verdict.verdict == "NONE":
             # Unrelated message — drop pending silently, fall through.
@@ -1737,6 +1739,7 @@ class RelationshipsCurator:
             turn_index=person.source_turn_index or 0,
             workspace=self._workspace,
             classifier_call=self._classifier_call,
+            brain=self._brain,
         )
         if verdict.verdict != "ADD":
             self._store.drop_shadow(
