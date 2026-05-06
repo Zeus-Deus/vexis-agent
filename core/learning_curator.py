@@ -911,49 +911,53 @@ def _append_to_shadow_file(path: Path, content: str) -> None:
     """Shared §-delimited-append + atomic-write helper for both
     shadow files. Same pattern, two destinations.
 
-    TODO(shadow-truncation-bug): observed 2026-05-03 during the v2
-    live flip. MEMORY-SHADOW.md went from 14,351 bytes (28 v1
-    entries) to 748 bytes (1 v2 entry) sometime between snapshot
-    and ~14:54. The append path is supposed to read existing →
-    concat with delimiter → atomic temp+rename, which should
-    preserve prior content. Either:
-      (a) a read-then-write race where two threads/processes
-          read the empty/stale state and the last writer's tiny
-          contents won (no fcntl.flock here unlike MemoryStore;
-          ReviewedStore-style locking would fix this);
-      (b) the read happened against a missing/empty file at the
-          moment of write — possibly a TOCTOU between path.exists()
-          and path.read_text(), or another process briefly removed
-          the file between checks; or
-      (c) some other code path (yet unidentified) wrote a fresh
-          file from scratch — needs a grep audit of any open(...,
-          'w') against MEMORY-SHADOW.md / USER-SHADOW.md targets.
-    The lost v1 content is preserved (single-entry fragment) at
-    ~/vexis-workspace/memories/MEMORY-SHADOW.archived-2026-05-03.md
-    for forensic reference. The migrated lessons are intact in the
-    live skill tree; only the v1 alternative-wording variants are
-    permanently lost.
-
-    Fix shape (NOT implemented; left for next investigation):
-    add fcntl.flock on a sidecar ``.lock`` file mirroring the
-    MemoryStore / ReviewedStore pattern, plus a defensive read-
-    after-rename check that confirms the new file size >= old. If
-    size shrunk, restore from a temp backup the writer kept of
-    pre-mutation contents.
+    Atomicity model: sidecar ``.lock`` file + ``fcntl.flock(LOCK_EX)``
+    around the read-modify-write window, plus tmp+fsync+rename for
+    the write itself. Mirrors :class:`ReviewedStore` /
+    :class:`SpawnedStore` in this module — see those for the
+    reference implementation. After ``os.replace`` a defensive
+    size-shrunk guard catches the edge case where an unidentified
+    writer truncated the file outside our lock (the original
+    2026-05-03 truncation bug's hypothetical cause-(c)) and turns
+    silent data loss into a loud ``RuntimeError`` naming both
+    paths.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    existing = existing.rstrip("\n")
-    if existing:
-        new = existing + ENTRY_DELIMITER + content + "\n"
-    else:
-        new = content + "\n"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        fh.write(new)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        # Capture the on-disk size BEFORE we read — the
+        # size-shrunk guard compares this against the post-replace
+        # size to catch a stale/empty read overwriting real content.
+        actual_pre = path.stat().st_size if path.exists() else 0
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        existing = existing.rstrip("\n")
+        if existing:
+            new = existing + ENTRY_DELIMITER + content + "\n"
+        else:
+            new = content + "\n"
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(new)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        actual_post = path.stat().st_size
+        if actual_post < actual_pre:
+            raise RuntimeError(
+                f"shadow-file truncation detected after append: "
+                f"path={path} lock={lock_path} "
+                f"size_pre={actual_pre} size_post={actual_post} "
+                f"appended_bytes={len(content.encode('utf-8'))} — "
+                f"a writer outside the lock truncated the file or "
+                f"path.read_text returned stale empty state"
+            )
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def _format_lesson_entry(lesson: dict, meta: SessionMeta | None = None) -> str:
