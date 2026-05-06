@@ -33,16 +33,17 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import subprocess
 from pathlib import Path
-from typing import Callable
 
-from core.yaml_config import (
-    model_goal_judge,
-    resolve_model_flag,
+from core.brain.base import (
+    Brain,
+    BrainAuthRequired,
+    BrainError,
+    BrainNotInstalled,
+    BrainTimeoutError,
 )
+from core.yaml_config import subsystem_tier
 
 log = logging.getLogger(__name__)
 
@@ -195,9 +196,6 @@ def _parse_judge_response(raw: str) -> tuple[bool, str]:
 # ──────────────────────────────────────────────────────────────────
 
 
-SpawnFn = Callable[[list[str], dict[str, str]], subprocess.CompletedProcess]
-
-
 def _render_prompt(goal: str, last_response: str) -> str:
     """Compose the full prompt sent to ``claude -p``.
 
@@ -219,12 +217,11 @@ def _render_prompt(goal: str, last_response: str) -> str:
     return f"{JUDGE_SYSTEM_PROMPT}\n\n{user_section}"
 
 
-def judge_goal(
+async def judge_goal(
     workspace: Path,
     goal: str,
     last_response: str,
-    *,
-    spawn: SpawnFn | None = None,
+    brain: Brain,
 ) -> tuple[str, str]:
     """Ask the auxiliary judge whether ``goal`` is satisfied by ``last_response``.
 
@@ -241,11 +238,18 @@ def judge_goal(
         this call still happened, so the manager folds skipped into
         ``continue`` for budget accounting.
 
-    ``workspace`` is passed as ``cwd`` to the subprocess so spawned
-    JSONLs land in the workspace's projects directory (where the
-    curator scans). ``spawn`` is the test seam — production passes
-    None and we shell out via :func:`subprocess.run`. Mirrors the
-    shape of :func:`core.coherence_judge.run_coherence_judge` (`:586`).
+    ``workspace`` is passed as ``cwd`` to ``brain.spawn_aux`` so
+    spawned JSONLs land in the workspace's transcript directory
+    (where the curator's recursion guard scans). ``brain`` is the
+    aux-spawn surface — Phase B routes this site through
+    :meth:`Brain.spawn_aux` instead of building argv + calling
+    ``subprocess.run`` directly.
+
+    Async because :meth:`Brain.spawn_aux` is async; the post-turn
+    hook in ``transports/telegram.py:_run_goal_hook`` already runs
+    in the event loop, so the caller awaits directly without a
+    ``to_thread`` wrapper. The fail-open semantics for timeouts
+    and spawn errors are unchanged from pre-Phase-B.
     """
     if not goal.strip():
         return "skipped", "empty goal"
@@ -256,48 +260,29 @@ def judge_goal(
         return "continue", "empty response (nothing to evaluate)"
 
     prompt = _render_prompt(goal, last_response)
-    argv = [
-        "claude",
-        "-p",
-        *resolve_model_flag(model_goal_judge()),
-        prompt,
-    ]
-    env = {**os.environ, GOAL_JUDGE_ENV_VAR: "1"}
 
     try:
-        if spawn is not None:
-            cp = spawn(argv, env)
-        else:
-            cp = subprocess.run(
-                argv,
-                env=env,
-                cwd=str(workspace),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=GOAL_JUDGE_TIMEOUT_SECONDS,
-            )
-    except subprocess.TimeoutExpired:
+        result = await brain.spawn_aux(
+            prompt,
+            model_tier=subsystem_tier("goal_judge"),
+            timeout_seconds=GOAL_JUDGE_TIMEOUT_SECONDS,
+            env_overrides={GOAL_JUDGE_ENV_VAR: "1"},
+            cwd=workspace,
+        )
+    except BrainTimeoutError:
         return "continue", (
             f"judge timed out after {GOAL_JUDGE_TIMEOUT_SECONDS}s"
         )
-    except (OSError, FileNotFoundError) as exc:
+    except (BrainNotInstalled, BrainAuthRequired) as exc:
+        return "continue", f"judge spawn failed: {exc}"
+    except BrainError as exc:
         return "continue", f"judge spawn failed: {exc}"
 
-    stdout = (
-        cp.stdout.decode("utf-8", errors="replace")
-        if isinstance(cp.stdout, bytes)
-        else (cp.stdout or "")
-    )
-    if cp.returncode != 0:
-        stderr = (
-            cp.stderr.decode("utf-8", errors="replace")
-            if isinstance(cp.stderr, bytes)
-            else (cp.stderr or "")
-        )
-        body = (stderr or stdout).strip()
-        return "continue", f"judge exited {cp.returncode}: {body[:300]}"
+    if result.returncode != 0:
+        body = (result.stderr or result.stdout).strip()
+        return "continue", f"judge exited {result.returncode}: {body[:300]}"
 
-    done, reason = _parse_judge_response(stdout)
+    done, reason = _parse_judge_response(result.stdout)
     verdict = "done" if done else "continue"
     log.info(
         "goal judge: verdict=%s reason=%s", verdict, _truncate(reason, 120)
@@ -310,7 +295,6 @@ __all__ = [
     "GOAL_JUDGE_PROMPT_PREFIX",
     "GOAL_JUDGE_TIMEOUT_SECONDS",
     "JUDGE_SYSTEM_PROMPT",
-    "SpawnFn",
     "judge_goal",
     # Internal helpers exported for direct unit testing.
     "_DONE_OBJ_RE",

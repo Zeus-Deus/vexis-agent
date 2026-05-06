@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
 
+from core.brain.null import BrainNull
 from core.goal_judge import judge_goal as _real_judge_goal  # noqa: F401  # ensure module is loadable
 from core.goal_manager import (
     CONTINUATION_PROMPT_TEMPLATE,
@@ -14,6 +17,20 @@ from core.goal_manager import (
     GoalManager,
 )
 from core.goal_state import GoalState, GoalStateStore, TerminalGoalError
+
+
+# ──────────────────────────────────────────────────────────────────
+# Phase B helpers — evaluate_after_turn is now async
+# ──────────────────────────────────────────────────────────────────
+
+
+def _evaluate_sync(mgr: GoalManager, last_response: str) -> dict[str, Any]:
+    """Sync wrapper around ``GoalManager.evaluate_after_turn`` for
+    test bodies that stay synchronous (codebase convention). Passes
+    a placeholder ``BrainNull`` because every test that calls this
+    has the judge patched to a fixed return value via ``_patch_judge``
+    — the brain reference is never actually used."""
+    return asyncio.run(mgr.evaluate_after_turn(last_response, BrainNull()))
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -188,9 +205,12 @@ def test_persistence_across_managers(store: GoalStateStore) -> None:
 def _patch_judge(verdict: str, reason: str):
     """Patch ``core.goal_manager.judge_goal`` (the import the manager
     uses) to return a fixed verdict. Local helper because every
-    evaluate test needs it."""
+    evaluate test needs it. Phase B: ``judge_goal`` is async, so we
+    use ``AsyncMock`` to make ``await judge_goal(...)`` resolve to
+    the fixed tuple."""
     return mock.patch(
-        "core.goal_manager.judge_goal", return_value=(verdict, reason)
+        "core.goal_manager.judge_goal",
+        new=mock.AsyncMock(return_value=(verdict, reason)),
     )
 
 
@@ -198,7 +218,7 @@ def test_evaluate_done_marks_goal_done(store: GoalStateStore) -> None:
     mgr = _mgr(store)
     mgr.set("ship")
     with _patch_judge("done", "delivered"):
-        decision = mgr.evaluate_after_turn("I shipped it.")
+        decision = _evaluate_sync(mgr, "I shipped it.")
     assert decision["verdict"] == "done"
     assert decision["should_continue"] is False
     assert decision["continuation_prompt"] is None
@@ -214,7 +234,7 @@ def test_evaluate_continue_under_budget_emits_continuation(
     mgr = _mgr(store, max_turns=5)
     mgr.set("port the goal command")
     with _patch_judge("continue", "made progress"):
-        decision = mgr.evaluate_after_turn("started Day 2 work")
+        decision = _evaluate_sync(mgr, "started Day 2 work")
     assert decision["verdict"] == "continue"
     assert decision["should_continue"] is True
     assert decision["continuation_prompt"] is not None
@@ -232,13 +252,13 @@ def test_evaluate_budget_exhaustion_auto_pauses(store: GoalStateStore) -> None:
     mgr = _mgr(store, max_turns=2)
     mgr.set("hard goal")
     with _patch_judge("continue", "not yet"):
-        d1 = mgr.evaluate_after_turn("step 1")
+        d1 = _evaluate_sync(mgr, "step 1")
         assert d1["should_continue"] is True
         assert mgr.state is not None
         assert mgr.state.turns_used == 1
         assert mgr.state.status == "active"
 
-        d2 = mgr.evaluate_after_turn("step 2")
+        d2 = _evaluate_sync(mgr, "step 2")
         # turns_used hits max_turns after this call.
         assert d2["should_continue"] is False
         assert d2["continuation_prompt"] is None
@@ -250,7 +270,7 @@ def test_evaluate_budget_exhaustion_auto_pauses(store: GoalStateStore) -> None:
 
 def test_evaluate_inactive_when_no_goal(store: GoalStateStore) -> None:
     mgr = _mgr(store)
-    decision = mgr.evaluate_after_turn("anything")
+    decision = _evaluate_sync(mgr, "anything")
     assert decision["verdict"] == "inactive"
     assert decision["should_continue"] is False
 
@@ -259,7 +279,7 @@ def test_evaluate_inactive_when_paused(store: GoalStateStore) -> None:
     mgr = _mgr(store)
     mgr.set("goal")
     mgr.pause()
-    decision = mgr.evaluate_after_turn("anything")
+    decision = _evaluate_sync(mgr, "anything")
     assert decision["verdict"] == "inactive"
     assert decision["should_continue"] is False
     # Turn count not incremented when goal isn't active.
@@ -275,7 +295,7 @@ def test_evaluate_skipped_folded_into_continue(store: GoalStateStore) -> None:
     mgr = _mgr(store, max_turns=5)
     mgr.set("g")
     with _patch_judge("skipped", "empty goal"):
-        decision = mgr.evaluate_after_turn("reply")
+        decision = _evaluate_sync(mgr, "reply")
     assert decision["should_continue"] is True
     assert decision["continuation_prompt"] is not None
     assert mgr.state is not None

@@ -1281,7 +1281,9 @@ class TelegramTransport:
             if not mgr.is_active():
                 return
 
-            decision = mgr.evaluate_after_turn(last_response or "")
+            decision = await mgr.evaluate_after_turn(
+                last_response or "", self._handler._brain
+            )
         except Exception:
             log.exception("goal hook failed before/at evaluate; chat %s", chat_id)
             return

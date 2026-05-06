@@ -95,13 +95,41 @@ class _FakeCtx:
 
 class _FakeHandler:
     """Minimal MessageHandler stub. Provides what /goal touches:
-    ``current_session_uuid`` plus a ``_workspace`` attribute the
-    transport reads via ``getattr`` when building a GoalManager."""
+    ``current_session_uuid``, a ``_workspace`` attribute the
+    transport reads via ``getattr`` when building a GoalManager,
+    and a ``_brain`` attribute the goal hook threads into
+    ``GoalManager.evaluate_after_turn`` (Phase B of the brain
+    abstraction — the post-turn hook spawns the goal judge via
+    ``brain.spawn_aux``, so tests need a brain reference). The
+    default ``_brain`` is a ``BrainNull`` configured to return
+    ``"continue"`` for every judge call so existing tests that
+    don't care about judge behaviour see the default
+    keep-going outcome."""
 
-    def __init__(self, reply: str | None = "brain reply", workspace: Path | None = None) -> None:
+    def __init__(
+        self,
+        reply: str | None = "brain reply",
+        workspace: Path | None = None,
+        brain=None,
+    ) -> None:
+        from core.brain.base import AuxResult
+        from core.brain.null import BrainNull
+
         self.reply = reply
         self._workspace = workspace or Path("/tmp")
         self.calls: list[tuple[int, int, str]] = []
+        # Default: every judge call returns "continue" (done=false).
+        # Tests that need different verdicts pass an explicit brain.
+        self._brain = brain or BrainNull(
+            aux_results=[
+                AuxResult(
+                    stdout='{"done": false, "reason": "test default"}',
+                    stderr="",
+                    returncode=0,
+                )
+            ]
+            * 50  # plenty for any test's judge-call volume
+        )
 
     async def handle(self, user_id: int, chat_id: int, text: str) -> str | None:
         self.calls.append((user_id, chat_id, text))
@@ -532,11 +560,17 @@ def test_pause_during_judge_call_drops_continuation(
 
     from core.goal_manager import CONTINUATION_PROMPT_TEMPLATE, GoalManager as _GM
 
-    def evaluate_with_concurrent_pause(self, last_response: str) -> dict:
+    async def evaluate_with_concurrent_pause(self, last_response: str, brain) -> dict:
         # Stand in for evaluate_after_turn: do the manager's work
         # (turns_used++, save), then perform a paused-status write
         # via a separate manager instance to mimic /goal pause
         # arriving from another handler.
+        #
+        # ``brain`` parameter ignored — the mock pre-decides "continue"
+        # without spawning an aux call. Phase B widened
+        # evaluate_after_turn's signature to accept the brain; the
+        # mock matches that signature so the transport's call site
+        # binds correctly.
         state = self._state
         assert state is not None
         state.turns_used += 1
@@ -713,8 +747,11 @@ def test_user_message_arrives_first_during_goal_hook(
             _CHAT, _USER, "user follow-up", origin="user"
         )
         # Brain returns reply; hook fires with judge=continue.
+        # Phase B: judge_goal is async — use AsyncMock so the awaited
+        # call returns the (verdict, reason) tuple.
         with mock.patch(
-            "core.goal_manager.judge_goal", return_value=("continue", "more")
+            "core.goal_manager.judge_goal",
+            new=mock.AsyncMock(return_value=("continue", "more")),
         ):
             await transport._run_goal_hook(bot, _CHAT, "brain reply")
 
@@ -754,7 +791,11 @@ def test_continuation_arrives_first_then_user_message(
     bot = _FakeBot()
     judge_calls: list[str] = []
 
-    def judge_capture(workspace, goal, last_response, **_kw):
+    async def judge_capture(workspace, goal, last_response, brain):
+        # Phase B: judge_goal is async and accepts ``brain`` as the
+        # 4th positional. The captured ``brain`` is a ``BrainNull``
+        # from the FakeHandler; this mock ignores it and returns a
+        # pre-decided verdict so the test stays deterministic.
         judge_calls.append(last_response)
         # First call: continue. Second (after user turn): done.
         if len(judge_calls) == 1:
@@ -845,7 +886,8 @@ def test_post_cancel_resume_kicks_loop_again(
         # 3) Next post-turn hook now DOES enqueue a continuation.
         await transport._running_tasks.claim(_CHAT)
         with mock.patch(
-            "core.goal_manager.judge_goal", return_value=("continue", "more")
+            "core.goal_manager.judge_goal",
+            new=mock.AsyncMock(return_value=("continue", "more")),
         ):
             await transport._run_goal_hook(bot, _CHAT, "brain reply after resume")
         # Continuation is in the queue.
@@ -949,7 +991,8 @@ def test_budget_exhaustion_renders_pause_message_at_transport_layer(
     async def scenario() -> None:
         await transport._running_tasks.claim(_CHAT)
         with mock.patch(
-            "core.goal_manager.judge_goal", return_value=("continue", "not yet")
+            "core.goal_manager.judge_goal",
+            new=mock.AsyncMock(return_value=("continue", "not yet")),
         ):
             # Turn 1 → continue, enqueues continuation.
             await transport._run_goal_hook(bot, _CHAT, "reply 1")

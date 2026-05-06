@@ -45,7 +45,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.goal_judge import judge_goal
 from core.goal_state import (
@@ -54,6 +54,9 @@ from core.goal_state import (
     GoalStateStore,
     TerminalGoalError,
 )
+
+if TYPE_CHECKING:
+    from core.brain.base import Brain
 
 log = logging.getLogger(__name__)
 
@@ -303,7 +306,9 @@ class GoalManager:
 
     # ----- the post-turn entry point ---------------------------------
 
-    def evaluate_after_turn(self, last_response: str) -> dict[str, Any]:
+    async def evaluate_after_turn(
+        self, last_response: str, brain: "Brain"
+    ) -> dict[str, Any]:
         """Run the judge, update state, return a decision dict.
 
         Called by the goal hook in ``transports/telegram.py:_drain_chat``
@@ -325,6 +330,12 @@ class GoalManager:
         ``"skipped"`` from :func:`judge_goal` is folded into
         ``"continue"`` here — the brain turn that preceded the judge
         already consumed budget, so we keep accounting consistent.
+
+        ``brain`` is the aux-spawn surface — Phase B threads it from
+        the transport (telegram's ``_run_goal_hook``) through to
+        :func:`judge_goal`. Stored as a parameter rather than on the
+        manager so the dashboard's read-only ``GoalManager`` doesn't
+        need a brain reference.
         """
         state = self._state
         if state is None or state.status != "active":
@@ -344,7 +355,9 @@ class GoalManager:
         state.turns_used += 1
         state.last_turn_at = datetime.now(timezone.utc)
 
-        verdict, reason = judge_goal(self._workspace, state.goal, last_response)
+        verdict, reason = await judge_goal(
+            self._workspace, state.goal, last_response, brain
+        )
         # Cache the cited verdict on disk so /goal status can show it
         # without re-running the judge. ``"skipped"`` is recorded as-is
         # for forensics even though we fold it into the continue path

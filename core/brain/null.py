@@ -61,7 +61,12 @@ class BrainNull(Brain):
         self._pending_aux_exc: BrainError | None = None
         # Call recorder for test assertions.
         self._respond_calls: list[tuple[str, int]] = []
-        self._aux_calls: list[tuple[str, str | None]] = []
+        # Aux call records: full kwarg snapshot so tests can assert on
+        # ``env_overrides``, ``allow_tools``, ``timeout_seconds``, etc.
+        # ``aux_calls()`` returns a list of (prompt, tier) tuples for
+        # the simple-shape assertions; ``aux_call_records()`` returns
+        # the full dict list for tests that need every parameter.
+        self._aux_records: list[dict[str, Any]] = []
         # Recorded MCP-config writes so tests can assert what the
         # caller passed without inspecting filesystem state.
         self._mcp_writes: list[list[McpServerSpec]] = []
@@ -87,8 +92,17 @@ class BrainNull(Brain):
 
     def aux_calls(self) -> list[tuple[str, str | None]]:
         """Return ``(prompt, model_tier)`` pairs ``spawn_aux()`` was
-        called with, in order."""
-        return list(self._aux_calls)
+        called with, in order. Convenience for the common
+        "did the caller use the right tier?" assertion shape."""
+        return [(r["prompt"], r["model_tier"]) for r in self._aux_records]
+
+    def aux_call_records(self) -> list[dict[str, Any]]:
+        """Return the full kwarg snapshot for every ``spawn_aux()``
+        call. Each dict has keys: ``prompt``, ``model_tier``,
+        ``timeout_seconds``, ``env_overrides``, ``allow_tools``,
+        ``cwd``. Tests that need to assert on env-override merging,
+        tool-permission flag, or per-call timeout use this."""
+        return [dict(r) for r in self._aux_records]
 
     def mcp_writes(self) -> list[list[McpServerSpec]]:
         """Return the list of server-spec lists ``write_mcp_config()``
@@ -121,7 +135,14 @@ class BrainNull(Brain):
         allow_tools: bool = False,
         cwd: Path | None = None,
     ) -> AuxResult:
-        self._aux_calls.append((prompt, model_tier))
+        self._aux_records.append({
+            "prompt": prompt,
+            "model_tier": model_tier,
+            "timeout_seconds": timeout_seconds,
+            "env_overrides": dict(env_overrides) if env_overrides else None,
+            "allow_tools": allow_tools,
+            "cwd": cwd,
+        })
         if self._pending_aux_exc is not None:
             exc = self._pending_aux_exc
             self._pending_aux_exc = None
