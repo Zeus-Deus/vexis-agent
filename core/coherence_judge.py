@@ -87,20 +87,15 @@ EVIDENCE_BODY_TRUNCATE_PREFIX = 4_000
 EVIDENCE_BODY_TRUNCATE_SUFFIX = 1_000
 
 # Recursion guard env var. The judge spawns its own ``claude -p``;
-# the spawned process inherits this so the learning curator's
-# eligibility filter knows to ignore the judge's session JSONL on
-# the next tick. Distinct from ``RECURSION_ENV_VAR`` in
-# ``core/learning_review.py`` so audit logs can tell which subsystem
-# spawned what.
+# the spawned process inherits this so audit logs can tell which
+# subsystem spawned what. Distinct from ``RECURSION_ENV_VAR`` in
+# ``core/learning_review.py``.
 #
-# NOTE: no curator code path actually reads this env var for
-# filtering. Coherence-judge JSONLs are excluded incidentally —
-# the judge runs *inside* the curator's review fork, so
-# ``learning_curator.py:_review_one`` (scan-diff at :2102-2138)
-# captures the new UUID via directory snapshot and adds it to
-# ``_spawned_uuids``. The real filter machinery is the content-
-# prefix check in ``core/transcripts.py:_is_curator_owned``; this
-# constant is currently audit/forensics only.
+# NOTE: no curator code reads this env var for filtering. The
+# real filter is the content-prefix check at
+# ``core/transcripts.py:_is_curator_owned`` — same pattern the
+# /goal judge uses via ``core.goal_judge.GOAL_JUDGE_PROMPT_PREFIX``.
+# This env var is audit/forensics only.
 COHERENCE_JUDGE_ENV_VAR = "VEXIS_COHERENCE_JUDGE"
 
 

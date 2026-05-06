@@ -466,16 +466,26 @@ def test_take_over_returns_none_when_queue_empty():
     assert asyncio.run(scenario()) is None
 
 
-def test_take_over_blocked_when_slot_still_in_flight():
+def test_take_over_blocked_when_slot_still_in_flight(patch_killpg):
     """Defensive: if a previous spawn slot hasn't been unregistered yet
     (e.g., proc still being killed), take_over must back off. Otherwise
-    a fresh reserve() would race against the not-yet-cleared slot."""
+    a fresh reserve() would race against the not-yet-cleared slot.
+
+    Uses ``patch_killpg`` so the cancel's ``_kill_group`` sees a fake
+    killpg that delivers SIGTERM cleanly. Previously this test relied
+    on real ``os.killpg(999, …)`` raising ``ProcessLookupError`` — but
+    on hosts where pid 999 is allocated to another user, killpg raises
+    ``PermissionError`` instead and the test fails. The fixture makes
+    the test deterministic regardless of the host's pid allocation.
+    """
 
     async def scenario() -> QueuedMessage | None:
         reg = RunningTasks()
+        proc = FakeProc(pid=999)
+        patch_killpg[999] = proc
         await reg.claim(93)
         reservation = await reg.reserve(93)
-        await reg.attach(reservation, FakeProc(pid=999))
+        await reg.attach(reservation, proc)
         await reg.cancel(93)
         await reg.enqueue(93, user_id=1, text="post-cancel")
         # Pop_or_release while slot still attached — it can run because
@@ -484,10 +494,6 @@ def test_take_over_blocked_when_slot_still_in_flight():
         # Slot still has the (dying) proc; take_over must refuse.
         return await reg.take_over_if_pending(93)
 
-    # Set up patch_killpg so cancel can SIGTERM the fake proc.
-    # The previous test functions used the patch_killpg fixture; here
-    # we don't have it, so the cancel's _kill_group will hit a real
-    # os.killpg with pid 999 and ProcessLookupError. That's fine.
     assert asyncio.run(scenario()) is None
 
 
