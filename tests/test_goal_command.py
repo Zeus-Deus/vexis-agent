@@ -984,3 +984,130 @@ def test_budget_exhaustion_renders_pause_message_at_transport_layer(
         assert transport._running_tasks.queue_depth(_CHAT) == 0
 
     asyncio.run(scenario())
+
+
+# ──────────────────────────────────────────────────────────────────
+# Day 3.5 — soft-pause invariant
+# ──────────────────────────────────────────────────────────────────
+
+
+class _FakeBrainProc:
+    """Stand-in for ``asyncio.subprocess.Process`` that records every
+    kill / terminate call so the test can assert no proc-control
+    happened. Only the surface ``RunningTasks`` and ``_kill_group``
+    might touch is implemented (pid, returncode, kill, terminate)."""
+
+    def __init__(self, pid: int = 12345) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+        self.kill_calls: int = 0
+        self.terminate_calls: int = 0
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+    async def wait(self) -> int:
+        return 0
+
+
+def test_pause_does_not_cancel_running_brain_proc(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    """**Soft-pause invariant** (§4): /goal pause is queue + state
+    only. It MUST NOT kill an in-flight brain subprocess, and it
+    MUST NOT call ``running_tasks.cancel`` (which would tear the
+    proc down via SIGTERM). The user's intent in pausing mid-turn
+    is "let this turn finish, just don't auto-continue after" —
+    not "kill the work in flight".
+
+    Setup:
+      - Active goal in the store.
+      - Drain claimed and a brain "subprocess" attached to the
+        running_tasks slot — mimics the moment the user types
+        /goal pause while the brain is processing the previous
+        turn.
+      - Spy on ``RunningTasks.cancel`` via mock to detect any
+        accidental call. Spy on ``_kill_group`` (the SIGTERM
+        helper) too — defense in depth in case a future refactor
+        bypasses ``cancel`` and calls the killer directly.
+
+    Action: /goal pause via the transport handler.
+
+    Assert:
+      - Goal state on disk: status=paused, reason=user-paused.
+      - ``drop_messages_matching`` ran (queue continuations cleared
+        — verified by enqueueing a continuation pre-pause and
+        observing it dropped).
+      - ``RunningTasks.cancel`` was NEVER called.
+      - ``_kill_group`` was NEVER called.
+      - The fake brain proc records zero kill / terminate calls.
+      - The slot is still attached after the pause — the brain
+        keeps running until the drain naturally reaches it.
+    """
+    store = GoalStateStore(goals_file)
+    GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    ).set("port goal command")
+
+    fake_proc = _FakeBrainProc(pid=42424)
+
+    async def scenario() -> None:
+        # Mimic a brain turn in flight: drain claimed, slot reserved,
+        # proc attached. Mirrors the state transports/telegram.py
+        # leaves behind during a normal brain dispatch (`_dispatch_to_brain`
+        # → `running_tasks.reserve` → `running_tasks.attach`).
+        await transport._running_tasks.claim(_CHAT)
+        reservation = await transport._running_tasks.reserve(_CHAT)
+        attached = await transport._running_tasks.attach(reservation, fake_proc)
+        assert attached is True
+
+        # Queue a continuation that the pause should drop, so the
+        # drop_messages_matching contract is exercised end-to-end.
+        await transport._running_tasks.enqueue(
+            _CHAT, _USER, "stale continuation",
+            origin="goal_continuation",
+        )
+        assert transport._running_tasks.queue_depth(_CHAT) == 1
+
+        # Spy on cancel + the proc-killer. Either firing during a
+        # pause would be a regression of the soft-pause invariant.
+        with mock.patch.object(
+            transport._running_tasks, "cancel", wraps=transport._running_tasks.cancel
+        ) as cancel_spy, \
+                mock.patch("core.running_tasks._kill_group") as kill_spy:
+            upd, _bot, msg = _update("/goal pause")
+            await transport._on_goal(upd, _ctx("pause"))
+
+            # Hard invariants — neither path may run on /goal pause.
+            cancel_spy.assert_not_called()
+            kill_spy.assert_not_called()
+
+        # State: paused on disk with the user-paused reason.
+        state = store.load(_SESSION)
+        assert state is not None
+        assert state.status == "paused"
+        assert state.paused_reason == "user-paused"
+
+        # Queue continuation was dropped (drop_messages_matching ran).
+        assert transport._running_tasks.queue_depth(_CHAT) == 0
+
+        # The fake brain proc saw zero kill / terminate calls — the
+        # in-flight turn is preserved.
+        assert fake_proc.kill_calls == 0
+        assert fake_proc.terminate_calls == 0
+
+        # Slot is still attached. The drain owns the chat, the brain
+        # is still "running" (in our fake sense). Pause has not
+        # touched the spawn machinery at all.
+        snapshot = await transport._running_tasks.snapshot()
+        chat_entry = next((e for e in snapshot if e["chat_id"] == _CHAT), None)
+        assert chat_entry is not None
+        assert chat_entry["slot_reserved"] is True
+        assert chat_entry["slot_pid"] == 42424
+        assert chat_entry["cancelled"] is False
+        assert chat_entry["drain_active"] is True
+
+    asyncio.run(scenario())

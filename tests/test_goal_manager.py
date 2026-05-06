@@ -322,3 +322,31 @@ def test_continuation_prompt_none_when_inactive(store: GoalStateStore) -> None:
     mgr.set("g")
     mgr.pause()
     assert mgr.next_continuation_prompt() is None
+
+
+def test_continuation_prompt_starts_with_verbatim_prefix(
+    store: GoalStateStore,
+) -> None:
+    """Pin the §3 verbatim prefix as a downstream contract.
+
+    Coupled with :func:`test_continuation_prompt_no_system_prompt_leak`
+    (no system-prompt-shaped strings) and
+    :func:`test_continuation_prompt_contains_goal_text` (goal text
+    present), this locks in the §3 template structurally. The prefix
+    is what the user sees in the "Picking up:" preview when the
+    drain processes a continuation, so any drift here would change
+    user-visible behaviour silently.
+    """
+    mgr = _mgr(store)
+    mgr.set("port goal command to vexis")
+    prompt = mgr.next_continuation_prompt()
+    assert prompt is not None
+    assert prompt.startswith("[Continuing toward your standing goal]"), (
+        f"continuation prompt drift: expected verbatim §3 prefix, got "
+        f"{prompt[:80]!r}"
+    )
+    # And the template constant itself starts with the prefix —
+    # guards the static side too.
+    assert CONTINUATION_PROMPT_TEMPLATE.startswith(
+        "[Continuing toward your standing goal]"
+    )
