@@ -182,3 +182,45 @@ For the full design rationale, see the planning doc lifecycle:
   through `brain.spawn_aux`
 - Phase C (opencode) — Days 3–6 land scaffold, session resume,
   SQL transcript reader, stream resilience, install hook
+
+## Phase C close — flag posture
+
+`brain.kind: claude-code` is the default and stays the default.
+Opencode is opt-in. Three reasons this is the right posture for
+Phase C:
+
+1. **Existing user base is on claude-code.** Flipping the default
+   would force every existing install through the
+   legacy-keys → tier-schema config migration documented in
+   [`docs/migration.md`](migration.md) without warning. That's a
+   surprise. Opt-in keeps the migration intentional.
+2. **Full opencode dogfood is deferred** until the `/model`
+   slash-command UX ships (next research after this rollout
+   closes). Switching brains via YAML is too high-friction for
+   productive end-to-end dogfood — the 12-flow checklist takes
+   an evening of real Telegram use, and clicking through a
+   text-editor → daemon-restart loop per flow is dispiriting
+   enough that the dogfood gets cut short. `/model` UX makes the
+   switch productive enough to dogfood properly.
+3. **The goal of this rollout was opt-in support, not a default
+   flip.** Phase C enables opencode users to install vexis and
+   point it at their existing OpenCode auth + provider mix. That
+   ship has sailed; flipping the default for existing users is a
+   separate decision that depends on the dogfood pass that's
+   blocked on `/model` UX.
+
+Phase D (or whenever the dogfood pass clears) is the right time
+to revisit the default.
+
+Verification at Phase C close (Day 8):
+
+- Default test suite: 1441 pass (1438 from Day 7 + 3 new
+  claude-code smoke tests gated by `-m brain_smoke`).
+- Smoke runs: claude-code happy path / resume / cancel-mid-turn
+  all pass against the real `claude` binary; opencode equivalent
+  passes against the real `opencode` binary.
+- Curator tick benchmark (`scripts/bench_curator_tick.py`):
+  ~4.45 ms/tick mean over five 500-sample runs vs. the 4.40 ms
+  Day 5 baseline → +1.0% delta, well within the 5% §8 risk #7
+  budget. The brain-abstraction layer adds no measurable
+  per-tick overhead.
