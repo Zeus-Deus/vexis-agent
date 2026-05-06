@@ -1313,6 +1313,23 @@ class TelegramTransport:
         # evaluate_after_turn and here means the user already saw
         # their own /goal reply; tacking a "Continuing" message on
         # top would contradict it.
+        #
+        # TODO(brain-abstraction): Phase B's async migration of
+        # evaluate_after_turn (commit 962dd71) widened the race
+        # window — /cancel can now land while ``await
+        # brain.spawn_aux(...)`` is awaiting. A planned automated
+        # test ``test_cancel_during_async_judge_drops_continuation``
+        # was prototyped in commit f07bdc7 and pulled because it
+        # required coordinating three event-loop-aware actors that
+        # the existing test harness doesn't model cleanly. Coverage
+        # currently relies on the Day 8 dogfood checklist step #12
+        # (``.plans/brain-abstraction-research.md`` §7). If a real
+        # regression slips through — symptom: a "Continuing"
+        # continuation arrives after a /cancel mid-judge — the bug
+        # is likely in evaluate_after_turn's save path overwriting
+        # the cancel-induced paused state; fix would be a
+        # read-and-update CAS inside the save (or a reload-and-
+        # bail INSIDE evaluate_after_turn's save block).
         try:
             mgr.reload()
         except Exception:
