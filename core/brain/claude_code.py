@@ -33,9 +33,9 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Literal
 
 from core.brain.base import (
     AuxResult,
@@ -500,21 +500,83 @@ class ClaudeCodeBrain(Brain):
         self,
         prompt: str,
         *,
-        model_tier: Literal["tiny", "small", "medium", "large"] | None = None,
+        model_tier: str | None = None,
         timeout_seconds: float = 60.0,
         env_overrides: dict[str, str] | None = None,
+        allow_tools: bool = False,
+        cwd: Path | None = None,
     ) -> AuxResult:
-        """Phase B will route the curator, judges, and extractors
-        through this method. Today (Phase A) those subsystems still
-        spawn ``claude -p`` directly via their own subprocess
-        helpers — no behaviour change. Calling this method now is a
-        programming error, not a runtime failure mode."""
-        raise NotImplementedError(
-            "ClaudeCodeBrain.spawn_aux is wired in Phase B; "
-            "today the curator, judges, and extractors spawn "
-            "`claude -p` directly via their own subprocess helpers. "
-            "See .plans/brain-abstraction-research.md §5 Day 2."
-        )
+        """Phase B implementation. Spawns ``claude -p`` synchronously
+        via :func:`subprocess.run` (wrapped in :func:`asyncio.to_thread`
+        for the async contract). Used by every aux subsystem — curator,
+        judges, extractors — instead of each one shelling out itself.
+
+        ``model_tier`` is resolved via
+        :func:`core.yaml_config.model_for_tier` for ``"claude-code"``;
+        the resolution accepts both abstract tiers (``small``,
+        ``large``) and legacy raw model names (``haiku``,
+        ``claude-sonnet-4-6``) for back-compat with existing
+        ``models.<subsystem>`` keys. ``None`` → no ``--model`` flag,
+        let claude-code pick its native default.
+
+        ``allow_tools=True`` adds ``--permission-mode bypassPermissions``
+        so the spawned brain can use tools without an interactive
+        prompt (used by the skill curator and learning review). Off
+        by default so judges and classifiers — which expect text-only
+        verdicts — fail loud if the model unexpectedly tries a tool.
+
+        On a non-zero exit, returns the ``AuxResult`` with the
+        non-zero ``returncode``; subsystems decide how to handle it.
+        Timeout raises :class:`BrainTimeoutError`.
+        """
+        from core.yaml_config import model_for_tier
+
+        argv: list[str] = ["claude", "-p"]
+        model_id = model_for_tier("claude-code", model_tier)
+        if model_id:
+            argv += ["--model", model_id]
+        argv.append(prompt)
+        if allow_tools:
+            argv += ["--permission-mode", "bypassPermissions"]
+
+        env = dict(os.environ)
+        if env_overrides:
+            env.update(env_overrides)
+
+        workdir = str(cwd if cwd is not None else self._workspace)
+
+        def _run() -> AuxResult:
+            try:
+                cp = subprocess.run(
+                    argv,
+                    env=env,
+                    cwd=workdir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise BrainTimeoutError(
+                    f"claude -p aux call timed out after {timeout_seconds}s"
+                ) from exc
+            except FileNotFoundError as exc:
+                raise BrainNotInstalled(
+                    "`claude` not on PATH; install Claude Code: "
+                    "https://docs.anthropic.com/claude/claude-code"
+                ) from exc
+            except OSError as exc:
+                raise BrainError(f"claude -p aux spawn failed: {exc}") from exc
+
+            stdout = (cp.stdout or b"").decode("utf-8", errors="replace")
+            stderr = (cp.stderr or b"").decode("utf-8", errors="replace")
+            return AuxResult(
+                stdout=stdout,
+                stderr=stderr,
+                returncode=cp.returncode,
+            )
+
+        return await asyncio.to_thread(_run)
 
     def session_token(self) -> str | None:
         """Return the active SessionStore UUID. Always a string for

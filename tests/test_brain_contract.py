@@ -310,17 +310,176 @@ def test_kill_in_flight_returns_none(brain_under_test: Brain):
 
 
 # ──────────────────────────────────────────────────────────────────
-# Phase B/C deferred methods raise on ClaudeCodeBrain
+# ClaudeCodeBrain.spawn_aux — Phase B real implementation
 # ──────────────────────────────────────────────────────────────────
 
 
-def test_claude_code_spawn_aux_raises_not_implemented(
-    claude_brain: ClaudeCodeBrain,
+def test_claude_code_spawn_aux_argv_shape_with_tier(
+    claude_brain: ClaudeCodeBrain, monkeypatch
 ):
-    """Phase A safety: a stray spawn_aux call surfaces immediately,
-    not silently. Phase B will replace this with a real implementation."""
-    with pytest.raises(NotImplementedError, match="Phase B"):
-        asyncio.run(claude_brain.spawn_aux("test prompt", model_tier="small"))
+    """Phase B verifies spawn_aux's argv composition with a mocked
+    subprocess.run. Tier resolution: ``"small"`` → claude-code default
+    map → ``"haiku"`` → ``--model haiku`` flag added."""
+    captured: dict = {}
+
+    class _FakeCP:
+        stdout = b"verdict-stdout"
+        stderr = b""
+        returncode = 0
+
+    def _fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["env"] = kwargs.get("env")
+        captured["cwd"] = kwargs.get("cwd")
+        captured["timeout"] = kwargs.get("timeout")
+        return _FakeCP()
+
+    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    result = asyncio.run(
+        claude_brain.spawn_aux(
+            "test prompt",
+            model_tier="small",
+            timeout_seconds=12.0,
+            env_overrides={"X_TEST_FLAG": "1"},
+        )
+    )
+    assert isinstance(result, AuxResult)
+    assert result.stdout == "verdict-stdout"
+    assert result.returncode == 0
+    # Argv: claude -p --model haiku "test prompt"
+    assert captured["argv"][:2] == ["claude", "-p"]
+    assert "--model" in captured["argv"]
+    model_idx = captured["argv"].index("--model")
+    assert captured["argv"][model_idx + 1] == "haiku"  # small → haiku default
+    assert "test prompt" in captured["argv"]
+    # No bypassPermissions by default — judges don't allow tools.
+    assert "bypassPermissions" not in captured["argv"]
+    # env_overrides merged on top of os.environ.
+    assert captured["env"]["X_TEST_FLAG"] == "1"
+    assert captured["timeout"] == 12.0
+
+
+def test_claude_code_spawn_aux_allow_tools_adds_permission_flag(
+    claude_brain: ClaudeCodeBrain, monkeypatch
+):
+    """The skill curator passes ``allow_tools=True`` so its spawned
+    consolidation pass can write files. Verify the flag is present."""
+    captured: dict = {}
+
+    class _FakeCP:
+        stdout = b""
+        stderr = b""
+        returncode = 0
+
+    def _fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return _FakeCP()
+
+    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    asyncio.run(claude_brain.spawn_aux("p", model_tier=None, allow_tools=True))
+    assert "--permission-mode" in captured["argv"]
+    perm_idx = captured["argv"].index("--permission-mode")
+    assert captured["argv"][perm_idx + 1] == "bypassPermissions"
+
+
+def test_claude_code_spawn_aux_no_tier_omits_model_flag(
+    claude_brain: ClaudeCodeBrain, monkeypatch
+):
+    """``model_tier=None`` omits ``--model`` so claude picks its
+    account default. Same for the sentinel ``"default"``."""
+    captured: dict = {}
+
+    class _FakeCP:
+        stdout = b""
+        stderr = b""
+        returncode = 0
+
+    def _fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return _FakeCP()
+
+    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    asyncio.run(claude_brain.spawn_aux("p"))  # tier=None
+    assert "--model" not in captured["argv"]
+
+
+def test_claude_code_spawn_aux_legacy_raw_model_passes_through(
+    claude_brain: ClaudeCodeBrain, monkeypatch
+):
+    """Pre-Phase-B configs use ``models.<subsystem>: haiku`` raw
+    strings. The shim returns "haiku"; spawn_aux passes it through
+    to ``--model haiku`` directly (no abstract-tier translation,
+    since "haiku" isn't in ABSTRACT_TIERS)."""
+    captured: dict = {}
+
+    class _FakeCP:
+        stdout = b""
+        stderr = b""
+        returncode = 0
+
+    def _fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return _FakeCP()
+
+    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    asyncio.run(claude_brain.spawn_aux("p", model_tier="haiku"))
+    assert "--model" in captured["argv"]
+    model_idx = captured["argv"].index("--model")
+    assert captured["argv"][model_idx + 1] == "haiku"
+
+
+def test_claude_code_spawn_aux_timeout_raises_brain_timeout(
+    claude_brain: ClaudeCodeBrain, monkeypatch
+):
+    """``subprocess.TimeoutExpired`` translates to ``BrainTimeoutError``
+    so callers can ``except BrainTimeoutError`` uniformly."""
+    import subprocess as subprocess_module
+
+    def _fake_run(argv, **kwargs):
+        raise subprocess_module.TimeoutExpired(cmd=argv, timeout=1.0)
+
+    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    with pytest.raises(BrainTimeoutError, match="timed out"):
+        asyncio.run(claude_brain.spawn_aux("p", timeout_seconds=1.0))
+
+
+def test_claude_code_spawn_aux_missing_binary_raises_not_installed(
+    claude_brain: ClaudeCodeBrain, monkeypatch
+):
+    """``FileNotFoundError`` translates to ``BrainNotInstalled`` with
+    actionable hint text."""
+    def _fake_run(argv, **kwargs):
+        raise FileNotFoundError("[Errno 2] No such file: 'claude'")
+
+    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    with pytest.raises(BrainNotInstalled, match="not on PATH"):
+        asyncio.run(claude_brain.spawn_aux("p"))
+
+
+def test_claude_code_spawn_aux_returns_nonzero_returncode_without_raising(
+    claude_brain: ClaudeCodeBrain, monkeypatch
+):
+    """A non-zero exit (e.g. claude-side parse failure) is NOT a
+    ``BrainError`` — subsystems get the ``AuxResult`` and decide.
+    Lets fail-open patterns (judges) treat any non-success as
+    "skipped/continue" without claiming a brain crash."""
+    class _FakeCP:
+        stdout = b""
+        stderr = b"claude said no"
+        returncode = 2
+
+    def _fake_run(argv, **kwargs):
+        return _FakeCP()
+
+    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    result = asyncio.run(claude_brain.spawn_aux("p"))
+    assert result.returncode == 2
+    assert "claude said no" in result.stderr
+
+
+# ──────────────────────────────────────────────────────────────────
+# Phase C deferred methods raise on ClaudeCodeBrain
+# ──────────────────────────────────────────────────────────────────
 
 
 def test_claude_code_write_mcp_config_raises_not_implemented(

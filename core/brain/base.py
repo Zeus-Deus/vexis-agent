@@ -285,22 +285,58 @@ class Brain(ABC):
         self,
         prompt: str,
         *,
-        model_tier: Literal["tiny", "small", "medium", "large"] | None = None,
+        model_tier: str | None = None,
         timeout_seconds: float = 60.0,
         env_overrides: dict[str, str] | None = None,
+        allow_tools: bool = False,
+        cwd: Path | None = None,
     ) -> AuxResult:
         """Run a one-shot fresh-session aux call.
 
-        ``model_tier`` is an abstract size tier, not a raw model name;
-        the brain translates it via the per-brain mapping in
-        ``~/.vexis/config.yaml`` under ``models.tiers.<brain-kind>``.
-        ``model_tier=None`` means "let the brain pick its native
-        default model" (no ``--model`` flag).
+        ``model_tier`` is an abstract size tier (``"tiny"`` /
+        ``"small"`` / ``"medium"`` / ``"large"``), or a legacy raw
+        model name (e.g. ``"haiku"``, ``"claude-sonnet-4-6"``) for
+        back-compat with pre-Phase-B configs. The brain translates
+        via ``core.yaml_config.model_for_tier``; raw strings pass
+        through untranslated. ``model_tier=None`` (or the sentinel
+        ``"default"``) means "no ``--model`` flag — let the brain
+        CLI pick its native default."
+
+        ``timeout_seconds`` is the hard wall on the subprocess.
+        Exceeding it raises :class:`BrainTimeoutError`.
+
+        ``env_overrides`` are merged into the spawned subprocess's
+        environment on top of ``os.environ``. Used for recursion-guard
+        markers (``VEXIS_CURATOR=1``, ``COHERENCE_JUDGE_ENV_VAR=1``,
+        etc.) so the spawned process can self-identify in audit logs.
+
+        ``allow_tools`` controls whether the spawned brain can use
+        tools. ``False`` (the default for judges and extractors) means
+        the call is text-only — if the model tries a tool, the call
+        will hang waiting for a permission prompt. ``True`` adds the
+        appropriate "bypass permissions" flag so tool calls succeed
+        without prompting (used by the skill curator's consolidation
+        pass and the learning review).
+
+        ``cwd`` is the working directory for the spawned subprocess.
+        Defaults to the brain's workspace (so the spawned session's
+        on-disk artefacts land in the workspace's transcript
+        directory and the recursion guard can find them on the next
+        curator tick). Override only for cases where a different cwd
+        is meaningful (rare).
 
         Used by the learning curator, coherence judge, goal judge,
         relationships extractor, and relationships classifier — each
         consumes ``AuxResult.stdout`` and treats a non-zero
         ``returncode`` as failure.
+
+        Raises:
+            BrainTimeoutError: subprocess didn't exit in time.
+            BrainNotInstalled: brain binary missing from PATH.
+            BrainAuthRequired: brain binary present but not authed
+                (best-effort detection — depends on stderr shape).
+            BrainError: catch-all for other subprocess failures
+                (OSError, FileNotFoundError on the binary itself).
         """
 
     # ─── session model ───────────────────────────────────────────

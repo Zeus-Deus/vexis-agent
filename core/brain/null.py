@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from itertools import count
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from core.brain.base import (
     AuxResult,
@@ -115,9 +115,11 @@ class BrainNull(Brain):
         self,
         prompt: str,
         *,
-        model_tier: Literal["tiny", "small", "medium", "large"] | None = None,
+        model_tier: str | None = None,
         timeout_seconds: float = 60.0,
         env_overrides: dict[str, str] | None = None,
+        allow_tools: bool = False,
+        cwd: Path | None = None,
     ) -> AuxResult:
         self._aux_calls.append((prompt, model_tier))
         if self._pending_aux_exc is not None:
