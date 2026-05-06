@@ -27,7 +27,10 @@ anything, nothing changed.
    (OpenAI), GitHub Copilot, or any of 30+ API-key providers. See
    `docs/brains.md` for the full list.
 
-3. **Edit `~/.vexis/config.yaml`**:
+3. **Edit `~/.vexis/config.yaml`** — set `brain.kind` AND
+   migrate any legacy raw-string model keys to the abstract-tier
+   schema (see "Switching to opencode: minimal config" below for
+   why):
    ```yaml
    brain:
      kind: opencode
@@ -46,6 +49,108 @@ anything, nothing changed.
    ```bash
    # however you run vexis — systemctl, screen/tmux session, etc.
    ```
+
+## Switching to opencode: minimal config
+
+If your `~/.vexis/config.yaml` carries legacy raw-string model
+keys (the pre-Phase-B style, e.g. `models.learning_review:
+sonnet`), flipping `brain.kind: opencode` without also migrating
+those keys will fail at first aux spawn.
+
+**Why it fails.** Vexis's tier resolver passes legacy raw-string
+keys (anything not in `{tiny, small, medium, large}`) through
+unchanged to the brain — for back-compat with claude-code which
+accepts `claude --model sonnet` directly. opencode's `--model`
+flag requires `provider/model` shape (`anthropic/claude-sonnet-3-7`,
+`openai/gpt-4o`, etc.). A bare `sonnet` produces:
+
+```
+Error: Model not found: sonnet/.
+```
+
+**Minimal config that works on opencode.** Replace each legacy
+raw-string subsystem key with the abstract-tier equivalent under
+the new `models.subsystems` block:
+
+```yaml
+brain:
+  kind: opencode
+
+models:
+  brain: default                  # foreground brain — leave as default
+                                  # (display-only on the dashboard;
+                                  # the foreground turn never passes
+                                  # --model to the brain)
+
+  # NEW abstract-tier schema. Each subsystem picks a size tier;
+  # `models.tiers.opencode.<tier>` (or the built-in
+  # DEFAULT_TIER_MAP_OPENCODE) translates to the right
+  # provider/model id at spawn time.
+  subsystems:
+    learning_review: small        # was "sonnet"
+    learning_triage: tiny         # was "haiku"
+    coherence_judge: small        # was "sonnet"
+    relationships_extractor: medium
+    relationships_classifier: tiny
+    goal_judge: large
+    curator: small
+```
+
+The defaults this maps to (built-in `DEFAULT_TIER_MAP_OPENCODE`):
+
+| Tier   | Resolves to                          |
+|--------|--------------------------------------|
+| tiny   | `anthropic/claude-haiku-3-5`         |
+| small  | `anthropic/claude-haiku-3-5`         |
+| medium | `anthropic/claude-sonnet-3-7`        |
+| large  | `anthropic/claude-sonnet-4`          |
+
+**Override per tier** if you want different models (e.g. use GPT
+for the goal judge, Claude for everything else):
+
+```yaml
+models:
+  tiers:
+    opencode:
+      large: openai/gpt-4o            # goal_judge → GPT-4o
+      medium: anthropic/claude-sonnet-4
+```
+
+**Both brains in one config**. You can keep both legacy keys AND
+the new schema side-by-side. claude-code reads the legacy
+raw-string passthrough; opencode reads the
+`models.subsystems.*` block (which takes precedence). One config,
+two brains, switchable via `brain.kind` alone:
+
+```yaml
+brain:
+  kind: claude-code   # flip to opencode without other edits
+
+models:
+  # Legacy keys — claude-code reads these (raw-string passthrough).
+  learning_review: sonnet
+  learning_triage: haiku
+  coherence_judge: sonnet
+
+  # New schema — opencode reads these (resolves via tier map).
+  # Path 1 (subsystems block) wins over Path 2 (legacy keys) for
+  # any subsystem that appears in both.
+  subsystems:
+    learning_review: small
+    learning_triage: tiny
+    coherence_judge: small
+    relationships_extractor: medium
+    relationships_classifier: tiny
+    goal_judge: large
+    curator: small
+```
+
+**One known dead knob.** `models.migration_classifier` is declared
+but no live spawn caller reads it (it surfaces only on the
+dashboard's models display). Setting it has no runtime effect on
+either brain. Safe to leave or remove.
+
+---
 
 ## What persists across the switch
 
