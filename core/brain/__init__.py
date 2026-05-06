@@ -29,6 +29,7 @@ from core.brain.base import (
 )
 from core.brain.claude_code import ClaudeCodeBrain
 from core.brain.null import BrainNull
+from core.brain.opencode import OpenCodeBrain
 
 __all__ = [
     "AuxResult",
@@ -44,6 +45,7 @@ __all__ = [
     "ClaudeCodeBrain",
     "Finished",
     "McpServerSpec",
+    "OpenCodeBrain",
     "SessionEstablished",
     "SessionLost",
     "StreamError",

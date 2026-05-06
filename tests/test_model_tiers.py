@@ -196,11 +196,32 @@ def test_model_for_tier_empty_string_returns_none(monkeypatch):
 
 
 def test_model_for_tier_unknown_brain_kind_returns_none_for_abstract(monkeypatch):
-    """Abstract tiers + unknown brain → None. Phase C will add
-    ``models.tiers.opencode.<tier>`` defaults; until then, opencode
-    abstract-tier lookups return None and fall through to the brain's
-    native default."""
-    assert yaml_config.model_for_tier("opencode", "small") is None
+    """Abstract tiers + a brain that has no default map → None.
+    Phase C Day 3 added ``DEFAULT_TIER_MAP_OPENCODE``; the
+    "unknown brain" case now uses a truly-unknown kind to assert
+    the fall-through-to-None contract."""
+    assert yaml_config.model_for_tier("future-brain-codex", "small") is None
+
+
+def test_model_for_tier_opencode_default_map(monkeypatch):
+    """Phase C Day 3: opencode abstract-tier lookups now resolve
+    via ``DEFAULT_TIER_MAP_OPENCODE`` (provider/model strings)."""
+    assert (
+        yaml_config.model_for_tier("opencode", "tiny")
+        == "anthropic/claude-haiku-3-5"
+    )
+    assert (
+        yaml_config.model_for_tier("opencode", "small")
+        == "anthropic/claude-haiku-3-5"
+    )
+    assert (
+        yaml_config.model_for_tier("opencode", "medium")
+        == "anthropic/claude-sonnet-3-7"
+    )
+    assert (
+        yaml_config.model_for_tier("opencode", "large")
+        == "anthropic/claude-sonnet-4"
+    )
 
 
 def test_model_for_tier_unknown_brain_kind_passes_raw_through(monkeypatch):
@@ -278,3 +299,42 @@ def test_e2e_unknown_subsystem_returns_none_all_the_way(monkeypatch):
     tier = yaml_config.subsystem_tier("there_is_no_such_subsystem")
     assert tier is None
     assert yaml_config.model_for_tier("claude-code", tier) is None
+
+
+# ──────────────────────────────────────────────────────────────────
+# brain_kind — Phase C Day 3 config flag
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_brain_kind_default_is_claude_code(monkeypatch):
+    assert yaml_config.brain_kind() == "claude-code"
+
+
+def test_brain_kind_reads_opencode_from_config(monkeypatch):
+    _write_config(monkeypatch, "brain:\n  kind: opencode\n")
+    assert yaml_config.brain_kind() == "opencode"
+
+
+def test_brain_kind_reads_null_from_config(monkeypatch):
+    _write_config(monkeypatch, "brain:\n  kind: null-brain\n")  # invalid
+    # Invalid value falls back to default with a warning logged.
+    assert yaml_config.brain_kind() == "claude-code"
+
+
+def test_brain_kind_accepts_explicit_null(monkeypatch):
+    _write_config(monkeypatch, 'brain:\n  kind: "null"\n')
+    assert yaml_config.brain_kind() == "null"
+
+
+def test_brain_kind_strips_whitespace(monkeypatch):
+    _write_config(monkeypatch, 'brain:\n  kind: "  opencode  "\n')
+    assert yaml_config.brain_kind() == "opencode"
+
+
+def test_brain_kind_rejects_typo_and_falls_back(monkeypatch, caplog):
+    _write_config(monkeypatch, "brain:\n  kind: claudecode\n")  # missing dash
+    import logging
+    caplog.set_level(logging.WARNING)
+    assert yaml_config.brain_kind() == "claude-code"
+    # Warning surfaces the typo and the valid options.
+    assert any("Unknown brain.kind" in rec.message for rec in caplog.records)

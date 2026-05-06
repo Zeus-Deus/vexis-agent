@@ -281,14 +281,16 @@ def test_learning_review_routes_triage_with_tiny_then_review_with_small(
 
 
 @pytest.mark.parametrize(
-    "brain_under_test", ["null", "claude_code"], indirect=True
+    "brain_under_test",
+    ["null", "claude_code", "opencode"],
+    indirect=True,
 )
 def test_brain_under_test_implements_inspection_methods(brain_under_test):
-    """Smoke test the cross-brain fixture from conftest.py. Both
-    BrainNull and ClaudeCodeBrain expose the inspection-only ABC
-    methods correctly. The deeper contract is in
-    test_brain_contract.py; this test exists to pin the parameterised
-    fixture itself."""
+    """Smoke test the cross-brain fixture from conftest.py. All
+    three implementations (BrainNull, ClaudeCodeBrain, OpenCodeBrain)
+    expose the inspection-only ABC methods correctly. The deeper
+    contract is in test_brain_contract.py; this test exists to pin
+    the parameterised fixture itself."""
     from core.brain.base import Brain
 
     assert isinstance(brain_under_test, Brain)
@@ -297,6 +299,11 @@ def test_brain_under_test_implements_inspection_methods(brain_under_test):
     # session_token may be str or None; both are valid.
     tok = brain_under_test.session_token()
     assert tok is None or isinstance(tok, str)
+    # Day 3 transcript-readback stubs return empty (no SQL reader
+    # yet). Verify they don't raise.
+    assert list(brain_under_test.iter_session_metas()) == []
+    assert list(brain_under_test.iter_messages("nonexistent-id")) == []
+    assert brain_under_test.is_brain_owned_session("nonexistent-id") is False
 
 
 # ──────────────────────────────────────────────────────────────────

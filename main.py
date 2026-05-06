@@ -260,11 +260,35 @@ async def _run() -> None:
         _build_dispatch(background_tasks, browser_tools),
     )
 
-    brain = ClaudeCodeBrain(
-        workspace=workspace,
-        session=sessions,
-        running_tasks=running_tasks,
-    )
+    # Phase C Day 3: ``brain.kind`` selects the agent CLI to spawn
+    # under. Default ``claude-code`` keeps the pre-Phase-C path
+    # unchanged. ``opencode`` is opt-in (foreground turns work
+    # end-to-end Day 3; transcript readback lands Day 4).
+    # ``null`` is the test fake — useful for dashboard-only smoke.
+    from core.yaml_config import brain_kind as _brain_kind
+    _kind = _brain_kind()
+    if _kind == "opencode":
+        from core.brain.opencode import OpenCodeBrain
+        brain = OpenCodeBrain(
+            workspace=workspace,
+            session=sessions,
+            running_tasks=running_tasks,
+        )
+        log.info("Brain: OpenCodeBrain (brain.kind=opencode)")
+    elif _kind == "null":
+        from core.brain.null import BrainNull
+        brain = BrainNull()
+        log.warning(
+            "Brain: BrainNull (brain.kind=null) — no real model "
+            "calls will fire; this is a test/diagnostic mode."
+        )
+    else:
+        brain = ClaudeCodeBrain(
+            workspace=workspace,
+            session=sessions,
+            running_tasks=running_tasks,
+        )
+        log.info("Brain: ClaudeCodeBrain (brain.kind=claude-code)")
     handler = MessageHandler(
         brain=brain,
         sessions=sessions,

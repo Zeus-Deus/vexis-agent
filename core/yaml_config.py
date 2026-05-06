@@ -534,6 +534,22 @@ DEFAULT_TIER_MAP_CLAUDE_CODE: dict[str, str] = {
     "large": "sonnet",
 }
 
+# Default tier→model map for the opencode brain. OpenCode requires
+# ``provider/model`` shape rather than bare aliases — the resolved
+# string is passed verbatim to ``opencode run --model <id>``.
+# Override via ``models.tiers.opencode.<tier>`` in
+# ``~/.vexis/config.yaml``. Mirrors the claude-code defaults
+# (cheap-tier → haiku, mid+large → sonnet) since the cost / quality
+# story is symmetric across providers; a user paying for the
+# Anthropic OAuth subscription via OpenCode gets the same models as
+# claude-code does.
+DEFAULT_TIER_MAP_OPENCODE: dict[str, str] = {
+    "tiny": "anthropic/claude-haiku-3-5",
+    "small": "anthropic/claude-haiku-3-5",
+    "medium": "anthropic/claude-sonnet-3-7",
+    "large": "anthropic/claude-sonnet-4",
+}
+
 
 def subsystem_tier(name: str) -> str | None:
     """Return the configured tier (or legacy raw model) for a subsystem.
@@ -622,5 +638,57 @@ def model_for_tier(brain_kind: str, tier: str | None) -> str | None:
 
     if brain_kind == "claude-code":
         return DEFAULT_TIER_MAP_CLAUDE_CODE.get(cleaned)
+    if brain_kind == "opencode":
+        return DEFAULT_TIER_MAP_OPENCODE.get(cleaned)
 
     return None
+
+
+# --------------------------------------------------------------------
+# [brain] — which agent CLI to spawn under
+# --------------------------------------------------------------------
+#
+# ``brain.kind`` selects the implementation ``main.py`` instantiates.
+# Three values:
+#   - ``claude-code`` (default) — ``ClaudeCodeBrain`` against the
+#     ``claude`` CLI binary. Pre-Phase-C behaviour, unchanged.
+#   - ``opencode`` — ``OpenCodeBrain`` against the ``opencode`` CLI
+#     binary. Phase C scaffold (Day 3); transcript readback lands
+#     Day 4. Foreground turns work end-to-end on Day 3; the
+#     curator's per-tick eligibility scan sees no sessions until
+#     Day 4 lands the SQL reader, which is the right answer
+#     anyway since OpenCode hasn't run any vexis sessions yet at
+#     Day 3.
+#   - ``null`` — ``BrainNull``, the test fake. Useful for a vexis
+#     that's running but should never spawn a real model (e.g.
+#     dashboard-only smoke).
+#
+# The flag is read by ``main.py`` once at startup. Changes require
+# a daemon restart.
+
+VALID_BRAIN_KINDS: frozenset[str] = frozenset(
+    {"claude-code", "opencode", "null"}
+)
+
+
+def brain_kind() -> str:
+    """Read ``brain.kind`` from ``~/.vexis/config.yaml``.
+
+    Default ``"claude-code"``. Unknown values fall back to the
+    default with a warning so a typo can't strand a user without a
+    brain to spawn under. Validation happens here rather than at
+    construction time so the warning fires once at startup, not on
+    every brain method call.
+    """
+    raw = _section("brain").get("kind", "claude-code")
+    if not isinstance(raw, str) or not raw.strip():
+        return "claude-code"
+    cleaned = raw.strip()
+    if cleaned not in VALID_BRAIN_KINDS:
+        log.warning(
+            "Unknown brain.kind=%r in config.yaml; falling back to "
+            "'claude-code'. Valid values: %s",
+            cleaned, sorted(VALID_BRAIN_KINDS),
+        )
+        return "claude-code"
+    return cleaned
