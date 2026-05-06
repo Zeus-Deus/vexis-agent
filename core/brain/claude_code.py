@@ -621,16 +621,47 @@ class ClaudeCodeBrain(Brain):
         return _is_curator_owned(jsonl_path)
 
     def write_mcp_config(self, servers: list[McpServerSpec]) -> Path:
-        """Phase C will land this. Today vexis ships a static
-        ``.mcp.json`` checked into the repo; nothing programmatically
-        writes it. Calling this method now is a programming error,
-        not a runtime failure mode."""
-        raise NotImplementedError(
-            "ClaudeCodeBrain.write_mcp_config is wired in Phase C; "
-            "today vexis ships a static `.mcp.json` at the project "
-            "root and nothing rewrites it. See "
-            ".plans/brain-abstraction-research.md §5 Day 4."
+        """Write claude-code's MCP server config to
+        ``<workspace>/.mcp.json``.
+
+        Phase C Day 6: replaces the pre-Day-6 NotImplementedError
+        with the real writer. The format is claude-code's native
+        ``mcpServers`` shape:
+
+            {"mcpServers": {<name>: {"command", "args", "env"}}}
+
+        Strategy: replace-all rather than namespace-merge.
+        claude-code's ``.mcp.json`` is a workspace-scoped config
+        the user owns end-to-end; vexis's installer is the only
+        programmatic writer (the curator never rewrites it). If
+        the user maintains custom entries by hand, they live in
+        ``~/.claude/settings.json`` (per-user) or in a separate
+        ``.mcp.json`` outside the workspace — not here. This
+        keeps the writer simple and matches claude-code's own
+        installer convention.
+
+        Atomic write via tempfile + rename. Empty server list
+        produces ``{"mcpServers": {}}`` (still valid JSON
+        claude-code will read without error).
+        """
+        path = self._workspace / ".mcp.json"
+        servers_dict: dict = {}
+        for spec in servers:
+            entry: dict = {
+                "command": spec.command,
+                "args": list(spec.args),
+            }
+            if spec.env:
+                entry["env"] = dict(spec.env)
+            servers_dict[spec.name] = entry
+        merged = {"mcpServers": servers_dict}
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(merged, indent=2, sort_keys=False) + "\n",
+            encoding="utf-8",
         )
+        tmp.replace(path)
+        return path
 
     def instruction_file_name(self) -> str:
         return "CLAUDE.md"

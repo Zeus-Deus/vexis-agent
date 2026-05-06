@@ -509,13 +509,58 @@ def test_claude_code_spawn_aux_returns_nonzero_returncode_without_raising(
 # ──────────────────────────────────────────────────────────────────
 
 
-def test_claude_code_write_mcp_config_raises_not_implemented(
-    claude_brain: ClaudeCodeBrain,
+def test_claude_code_write_mcp_config_writes_mcp_json(
+    claude_brain: ClaudeCodeBrain, workspace: Path,
 ):
-    """Phase A safety: a stray write_mcp_config call surfaces
-    immediately. Phase C will land the writer."""
-    with pytest.raises(NotImplementedError, match="Phase C"):
-        claude_brain.write_mcp_config([])
+    """Phase C Day 6: ``write_mcp_config`` lands the real writer
+    (was NotImplementedError pre-Day-6). Empty server list produces
+    a valid ``{"mcpServers": {}}`` file at ``<workspace>/.mcp.json``."""
+    import json as _json
+    path = claude_brain.write_mcp_config([])
+    assert path == workspace / ".mcp.json"
+    assert path.is_file()
+    data = _json.loads(path.read_text(encoding="utf-8"))
+    assert data == {"mcpServers": {}}
+
+
+def test_claude_code_write_mcp_config_round_trips_servers(
+    claude_brain: ClaudeCodeBrain, workspace: Path,
+):
+    """Day 6: a non-empty server list lands as the canonical
+    claude-code shape (``mcpServers: {name: {command, args, env}}``)."""
+    import json as _json
+    spec = McpServerSpec(
+        name="codemux",
+        command="/usr/bin/codemux",
+        args=["mcp"],
+        env={"CODEMUX_WORKSPACE_ID": "ws-test"},
+    )
+    path = claude_brain.write_mcp_config([spec])
+    data = _json.loads(path.read_text(encoding="utf-8"))
+    assert data == {
+        "mcpServers": {
+            "codemux": {
+                "command": "/usr/bin/codemux",
+                "args": ["mcp"],
+                "env": {"CODEMUX_WORKSPACE_ID": "ws-test"},
+            }
+        }
+    }
+
+
+def test_claude_code_write_mcp_config_is_idempotent(
+    claude_brain: ClaudeCodeBrain, workspace: Path,
+):
+    """Day 6: re-running with the same servers produces a byte-
+    identical file. Important for the install script's idempotence
+    contract — re-running ``scripts/install.sh`` mustn't churn the
+    config."""
+    spec = McpServerSpec(name="x", command="/bin/x", args=["a"])
+    path1 = claude_brain.write_mcp_config([spec])
+    contents1 = path1.read_bytes()
+    path2 = claude_brain.write_mcp_config([spec])
+    contents2 = path2.read_bytes()
+    assert contents1 == contents2
 
 
 # ──────────────────────────────────────────────────────────────────
