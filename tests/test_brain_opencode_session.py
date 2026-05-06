@@ -217,16 +217,57 @@ def test_first_call_omits_session_flag_and_harvests_id(
     assert brain.session_token() == harvested_id
 
 
-def test_first_call_warns_when_no_session_id_in_stream(
+def test_first_call_raises_brain_error_on_empty_stream(
+    brain: OpenCodeBrain, session_store: SessionStore, monkeypatch
+):
+    """Day 5 stream-EOF resilience: an opencode that exits 0 but
+    emitted no events at all is a degraded state (transient SDK
+    glitch, model produced nothing, or worse). Raise BrainError
+    with diagnostic stderr so the transport surfaces something
+    actionable rather than echoing a blank reply.
+
+    Day 4 had this case silently warn-and-return-empty; Day 5
+    promotes it to a hard error per the research doc's stream-EOF
+    resilience requirement.
+    """
+    from core.brain.base import BrainError
+
+    spawner = _build_fake_spawner(
+        stdout_lines=[],  # empty — no events
+        stderr_lines=[b"some diagnostic from opencode\n"],
+    )
+    monkeypatch.setattr(
+        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+    )
+
+    with pytest.raises(BrainError) as ei:
+        asyncio.run(brain.respond("hi", chat_id=1))
+    # Error message includes the stderr context for debugging.
+    assert "no events" in str(ei.value)
+    assert "diagnostic from opencode" in str(ei.value)
+    # Initialisation flag NOT flipped — the call failed.
+    assert session_store.is_initialized() is False
+
+
+def test_first_call_warns_when_events_but_no_session_id(
     brain: OpenCodeBrain, session_store: SessionStore, monkeypatch, caplog
 ):
-    """If opencode replies but never emits an event with a
-    ``sessionID`` (degenerate empty stream), the brain should log
-    a warning and still mark initialised — refusing to mark would
-    loop on every subsequent call."""
+    """Distinct from the empty-stream case above. If opencode
+    emits events (so saw_any_event=True) but every event lacks a
+    ``sessionID`` field (e.g. malformed events that still parse as
+    JSON dicts), the harvest fails. Warn + mark initialised so the
+    next call doesn't infinitely re-create — same trade-off Day 4
+    chose. The reply text is still returned to the user.
+    """
     import logging
 
-    spawner = _build_fake_spawner(stdout_lines=[])  # empty — no events
+    # An event without sessionID — saw_any_event=True, but
+    # locked_session_id stays None.
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            (json.dumps({"type": "text", "part": {"text": "hello"}}) + "\n").encode(),
+        ],
+    )
     monkeypatch.setattr(
         "core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
@@ -234,7 +275,7 @@ def test_first_call_warns_when_no_session_id_in_stream(
 
     reply = asyncio.run(brain.respond("hi", chat_id=1))
 
-    assert reply == ""
+    assert reply == "hello"
     assert session_store.is_initialized() is True
     # Warning surfaces the degraded path so a real bug doesn't slip
     # past silently.
@@ -441,6 +482,146 @@ def test_rotate_session_clears_initialized(
 # ──────────────────────────────────────────────────────────────────
 # OPENCODE_CONFIG_CONTENT env injection always present
 # ──────────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────
+# Day 5 — session.error typed-event detection (belt-and-braces
+# alongside the stderr substring path Day 4 landed)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_session_error_event_triggers_session_lost(
+    brain: OpenCodeBrain, session_store: SessionStore, monkeypatch
+):
+    """When opencode's JSON event stream contains an ``error`` event
+    whose typed payload matches the session-not-found marker, the
+    brain rotates the session and raises SessionLost — same
+    contract as the stderr-substring path.
+
+    This is the case where the session was deleted mid-stream
+    (e.g. a ``opencode`` cleanup ran while our turn was in flight)
+    rather than at spawn time. The proc may still exit 0 in this
+    case because opencode's loop drains the bus before exiting.
+    """
+    sid = "ses_DEAD_mid_stream"
+    session_store.set(sid)
+    session_store.mark_initialized()
+
+    error_event = {
+        "type": "error",
+        "sessionID": sid,
+        "error": {
+            "name": "NotFoundError",
+            "data": {"message": f"Session not found: {sid}"},
+        },
+    }
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            (json.dumps(error_event) + "\n").encode(),
+        ],
+        stderr_lines=[],
+        returncode=0,  # opencode may exit 0 even with the typed error
+    )
+    monkeypatch.setattr(
+        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+    )
+
+    with pytest.raises(SessionLost):
+        asyncio.run(brain.respond("anyone home?", chat_id=7))
+
+    # Same rotation outcome as the stderr path.
+    assert session_store.get() != sid
+    assert session_store.is_initialized() is False
+
+
+def test_session_error_unrelated_does_not_trigger_session_lost(
+    brain: OpenCodeBrain, session_store: SessionStore, monkeypatch
+):
+    """An ``error`` event that's NOT session-not-found (e.g.
+    model timeout, tool failure) must not trigger SessionLost.
+    The brain logs it and continues — the underlying turn may
+    still produce text, and opencode emits soft errors mid-stream
+    without aborting the turn."""
+    sid = "ses_alive"
+    session_store.set(sid)
+    session_store.mark_initialized()
+
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            (json.dumps({
+                "type": "error",
+                "sessionID": sid,
+                "error": {
+                    "name": "ModelError",
+                    "data": {"message": "model timed out"},
+                },
+            }) + "\n").encode(),
+            (json.dumps({
+                "type": "text",
+                "sessionID": sid,
+                "part": {"text": "recovered"},
+            }) + "\n").encode(),
+        ],
+        returncode=0,
+    )
+    monkeypatch.setattr(
+        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+    )
+
+    # Should NOT raise SessionLost — proceeds and returns text.
+    reply = asyncio.run(brain.respond("hi", chat_id=1))
+    assert reply == "recovered"
+    # Session preserved.
+    assert session_store.get() == sid
+
+
+def test_session_error_event_on_uninitialised_does_not_rotate(
+    brain: OpenCodeBrain, session_store: SessionStore, monkeypatch
+):
+    """SessionLost rotation gates on ``is_initialized=True`` —
+    matches the stderr path (Day 4). A NotFoundError event on a
+    fresh-call respond is treated as a generic error rather than
+    a rotation trigger.
+
+    The event in this test omits ``sessionID`` so the brain doesn't
+    accidentally harvest "ses_fresh" as the new session id — the
+    isolated assertion here is "rotation didn't fire", separate
+    from the harvest path tested elsewhere.
+    """
+    initial_token = session_store.get()
+    # Fresh state: never initialised.
+    assert session_store.is_initialized() is False
+
+    error_event = {
+        "type": "error",
+        # No sessionID — so locked_session_id stays None and the
+        # "first-call success path" doesn't write anything.
+        "error": {
+            "name": "NotFoundError",
+            "data": {"message": "Session not found: ses_fresh"},
+        },
+    }
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            (json.dumps(error_event) + "\n").encode(),
+        ],
+        returncode=0,
+    )
+    monkeypatch.setattr(
+        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+    )
+
+    # Must NOT raise SessionLost — we don't have a session to
+    # rotate yet. Reply is empty (no text events).
+    reply = asyncio.run(brain.respond("hi", chat_id=1))
+    assert reply == ""
+    # Token preserved (no harvest happened — saw an event but no
+    # sessionID).
+    assert session_store.get() == initial_token
+    # First-call success path still flips initialised so the next
+    # call doesn't infinitely re-create — same trade-off as the
+    # warn-only "no sessionID" path.
+    assert session_store.is_initialized() is True
 
 
 def test_respond_sets_opencode_config_content_env(

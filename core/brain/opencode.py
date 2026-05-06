@@ -79,6 +79,7 @@ import sqlite3
 import subprocess
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -295,14 +296,47 @@ def _build_system_prompt_for_workspace(workspace: Path) -> str:
 # ──────────────────────────────────────────────────────────────────
 
 
+_SESSION_NOT_FOUND_RE = "session not found"
+
+
+@dataclass(frozen=True)
+class _StreamResult:
+    """Outcome of one ``_read_opencode_event_stream`` pass.
+
+    - ``final_text``: concatenated text-event payloads (the
+      assistant's reply body).
+    - ``harvested_session_id``: the ``sessionID`` we locked onto
+      (caller-supplied for resumes, harvested-from-first-event
+      for fresh spawns). ``None`` when the stream produced no
+      events at all.
+    - ``session_lost_via_event``: True when an ``error``-shaped
+      event arrived whose typed payload matches the
+      session-not-found marker. Belt-and-braces alongside the
+      stderr substring path that ``respond`` already covers —
+      catches the case where opencode emits the typed event
+      mid-stream (e.g. the session was deleted between the spawn
+      and our second message) BEFORE the process exits 1.
+    - ``saw_any_event``: False ⇒ stream EOF without any parseable
+      JSON event ⇒ ``respond`` raises BrainError with a
+      diagnostic stderr message rather than silently returning
+      "" (which would look like a clean turn that produced
+      empty text — masking real failures).
+    """
+
+    final_text: str
+    harvested_session_id: str | None
+    session_lost_via_event: bool
+    saw_any_event: bool
+
+
 async def _read_opencode_event_stream(
     stream: asyncio.StreamReader | None,
     status_file: StatusFile,
     target_session_id: str | None,
-) -> tuple[str, str | None]:
+) -> _StreamResult:
     """Consume ``opencode run --format json`` stdout, update the
     status file on tool events, accumulate the assistant's final
-    text, and return ``(final_text, harvested_session_id)``.
+    text.
 
     OpenCode's JSON event shape (verified at
     ``~/projects/_references/anomalyco-opencode/packages/opencode/src/cli/cmd/run.ts:435``):
@@ -316,29 +350,52 @@ async def _read_opencode_event_stream(
       - ``text``: ``{part: {text: "..."}}`` — emitted when a text
         block's ``time.end`` is set. Concatenated into the final
         reply.
-      - ``error``: ``{error: {...}}`` — soft error mid-stream;
-        logged, doesn't terminate.
+      - ``error``: ``{error: {name, data: {message}}}`` — typed
+        error event. We inspect the ``name`` + ``data.message``
+        for session-not-found markers and flag
+        ``session_lost_via_event=True`` for ``respond`` to
+        translate into a SessionLost rotation. Other errors are
+        logged.
       - ``session.status`` with ``status.type == "idle"`` and
-        matching ``sessionID`` — terminal. We break on this.
+        matching ``sessionID`` — defensive break. In practice
+        opencode's emit() doesn't write session.status events to
+        stdout (only tool_use / text / error pass through); the
+        terminator is stream EOF when the proc exits. Branch
+        kept for forward-compat with future SDK changes.
 
     ``target_session_id`` is the id we're listening for. On the
     first call (no prior session), pass ``None``; we harvest the
     first event's ``sessionID`` and lock onto it. On resumes, pass
     the stored id so events from unrelated concurrent sessions
     (rare but possible) are ignored.
-
-    Return ``(final_text, harvested_session_id)``. The harvested
-    id is None when the stream produced no events (e.g. the brain
-    crashed before emitting anything) and the original
-    ``target_session_id`` is None.
     """
     final_text_parts: list[str] = []
     locked_session_id: str | None = target_session_id
+    session_lost = False
+    saw_any_event = False
+
     if stream is None:
-        return "", locked_session_id
+        return _StreamResult(
+            final_text="",
+            harvested_session_id=locked_session_id,
+            session_lost_via_event=False,
+            saw_any_event=False,
+        )
+
     while True:
         try:
             line = await stream.readline()
+        except asyncio.LimitOverrunError as exc:
+            # A single JSON line bigger than 32 MiB — almost
+            # certainly a bug on opencode's side (we don't write
+            # multi-megabyte tool inputs). Log + break; better to
+            # surface a real failure than truncate silently.
+            log.error(
+                "opencode emitted line bigger than %d-byte limit "
+                "(consumed=%s); aborting stream read.",
+                _BRAIN_STREAM_LIMIT_BYTES, exc.consumed,
+            )
+            break
         except Exception:
             log.warning("opencode stream readline raised", exc_info=True)
             break
@@ -347,9 +404,15 @@ async def _read_opencode_event_stream(
         try:
             event = json.loads(line)
         except (json.JSONDecodeError, ValueError):
+            # Partial / malformed JSON line. Opencode writes one
+            # complete JSON object per line; a parse failure here
+            # likely means buffer truncation or a bug we can't
+            # recover from on this line. Skip and continue —
+            # other events on the stream may still parse cleanly.
             continue
         if not isinstance(event, dict):
             continue
+        saw_any_event = True
 
         evt_session = event.get("sessionID")
         if locked_session_id is None and isinstance(evt_session, str):
@@ -386,15 +449,61 @@ async def _read_opencode_event_stream(
             props = event.get("properties") or {}
             status = props.get("status") if isinstance(props, dict) else None
             if isinstance(status, dict) and status.get("type") == "idle":
-                # Terminal — but only when sessionID matches.
-                # ``opencode run`` emits this just before exit; the
-                # process will be reaped by ``proc.wait``.
+                # Terminal break — defensive; in practice
+                # opencode's stdout emit() doesn't write
+                # session.status events (only tool_use / text /
+                # error). Stream EOF is the real terminator.
                 break
         elif kind == "error":
             err = event.get("error")
             log.warning("opencode stream error event: %r", err)
+            if _is_session_not_found_error(err):
+                session_lost = True
+                # Don't break — let the stream drain naturally so
+                # we capture any trailing text the model produced
+                # before the error surfaced.
 
-    return "".join(final_text_parts), locked_session_id
+    return _StreamResult(
+        final_text="".join(final_text_parts),
+        harvested_session_id=locked_session_id,
+        session_lost_via_event=session_lost,
+        saw_any_event=saw_any_event,
+    )
+
+
+def _is_session_not_found_error(err: object) -> bool:
+    """Inspect an opencode ``error`` event payload for the
+    session-not-found marker.
+
+    Two surfaces:
+      - ``error.name == "NotFoundError"`` — the typed error class
+        opencode raises when ``--session <id>`` references a row
+        that's no longer in the DB
+        (``packages/opencode/src/session/projectors.ts:82``).
+      - ``error.data.message`` containing "Session not found" —
+        the human-facing text the SDK includes for that error.
+
+    Either match returns True. Defensive against schema drift —
+    if opencode renames the class or rewords the message, the
+    other detector still catches it.
+    """
+    if not isinstance(err, dict):
+        return False
+    name = err.get("name")
+    if isinstance(name, str) and name == "NotFoundError":
+        # NotFoundError covers "session not found" AND "message
+        # not found" — narrow via the message text.
+        data = err.get("data")
+        if isinstance(data, dict):
+            msg = data.get("message")
+            if isinstance(msg, str) and _SESSION_NOT_FOUND_RE in msg.lower():
+                return True
+    data = err.get("data")
+    if isinstance(data, dict):
+        msg = data.get("message")
+        if isinstance(msg, str) and _SESSION_NOT_FOUND_RE in msg.lower():
+            return True
+    return False
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -540,7 +649,6 @@ class OpenCodeBrain(Brain):
         status_file = StatusFile(chat_id)
         status_file.start()
 
-        final_text = ""
         stderr_bytes = b""
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -585,12 +693,17 @@ class OpenCodeBrain(Brain):
                 ) from exc
 
             try:
-                final_text, harvested_id = await stdout_task
+                stream_result = await stdout_task
             except Exception:
                 log.exception(
                     "OpenCode stdout reader failed for chat %d", chat_id
                 )
-                final_text, harvested_id = "", None
+                stream_result = _StreamResult(
+                    final_text="",
+                    harvested_session_id=None,
+                    session_lost_via_event=False,
+                    saw_any_event=False,
+                )
             try:
                 stderr_bytes = await stderr_task
             except Exception:
@@ -606,30 +719,58 @@ class OpenCodeBrain(Brain):
                 )
                 raise BrainCancelled("opencode run cancelled via /cancel")
 
+            err_text = stderr_bytes.decode(errors="replace").strip()
+
+            # SessionLost detection — two routes:
+            #   1. Stream's typed ``error`` event matched the
+            #      session-not-found marker
+            #      (``_is_session_not_found_error``).
+            #   2. Process exited 1 with "Session not found" on
+            #      stderr (the path opencode takes when
+            #      ``--session <dead_id>`` short-circuits before
+            #      ever entering the event loop — verified at
+            #      ``run.ts:632-634``).
+            # Either rotates the session token + raises SessionLost
+            # for the transport's existing recovery to retry on a
+            # fresh session.
+            stderr_session_marker = (
+                proc.returncode != 0
+                and "session not found" in err_text.lower()
+            )
+            if is_initialized and (
+                stream_result.session_lost_via_event or stderr_session_marker
+            ):
+                old = stored_token
+                new = self._session.rotate()
+                log.warning(
+                    "OpenCode lost session %s; rotated to %s "
+                    "(stream_event=%s, stderr=%s)",
+                    old, new,
+                    stream_result.session_lost_via_event,
+                    stderr_session_marker,
+                )
+                raise SessionLost(
+                    "OpenCode session was lost. Rotated to new session."
+                )
+
             if proc.returncode != 0:
-                err = stderr_bytes.decode(errors="replace").strip()
-                # SessionLost detection. ``opencode run --session
-                # <id>`` exits 1 with "Session not found" on stderr
-                # when the stored id no longer exists in
-                # ``opencode.db`` (DB pruning, manual DELETE,
-                # workspace migrated to a fresh install). Verified
-                # at ``packages/opencode/src/cli/cmd/run.ts:632-634``.
-                # We rotate the session token (clearing the dead id
-                # and the initialized flag) and raise so the
-                # transport-layer recovery can retry on a fresh
-                # session.
-                if is_initialized and "session not found" in err.lower():
-                    old = stored_token
-                    new = self._session.rotate()
-                    log.warning(
-                        "OpenCode lost session %s; rotated to %s", old, new
-                    )
-                    raise SessionLost(
-                        "OpenCode session was lost. Rotated to new session."
-                    )
                 raise BrainError(
                     f"opencode run exited {proc.returncode}: "
-                    f"{err or '(no stderr)'}"
+                    f"{err_text or '(no stderr)'}"
+                )
+
+            # Clean exit but the event stream produced nothing —
+            # opencode is supposed to emit at least one event per
+            # turn (the assistant's text). Empty stream + 0 exit
+            # is a degraded state: either a transient SDK glitch
+            # or the model produced no output. Raise BrainError
+            # with the stderr context so the transport surfaces
+            # something actionable rather than echoing a blank
+            # reply.
+            if not stream_result.saw_any_event:
+                raise BrainError(
+                    "opencode run exited 0 but emitted no events; "
+                    f"stderr: {err_text or '(empty)'}"
                 )
         finally:
             status_file.delete()
@@ -641,11 +782,11 @@ class OpenCodeBrain(Brain):
         # flips the session_token() reading to True; subsequent
         # rotations (after SessionLost) clear both via ``rotate``.
         if not is_initialized:
-            if harvested_id:
-                self._session.set(harvested_id)
+            if stream_result.harvested_session_id:
+                self._session.set(stream_result.harvested_session_id)
                 log.info(
                     "OpenCode session established and persisted: %s",
-                    harvested_id,
+                    stream_result.harvested_session_id,
                 )
             else:
                 log.warning(
@@ -656,7 +797,7 @@ class OpenCodeBrain(Brain):
                 )
             self._session.mark_initialized()
 
-        return (final_text or "").strip()
+        return (stream_result.final_text or "").strip()
 
     @staticmethod
     async def _kill_group(proc: asyncio.subprocess.Process) -> None:
