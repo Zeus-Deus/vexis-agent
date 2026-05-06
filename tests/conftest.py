@@ -32,9 +32,23 @@ import pytest
 from core.brain.base import Brain
 from core.brain.claude_code import ClaudeCodeBrain
 from core.brain.null import BrainNull
-from core.brain.opencode import OpenCodeBrain
+from core.brain.opencode import OpenCodeBrain, set_opencode_db_path_override
 from core.running_tasks import RunningTasks
 from core.sessions import SessionStore
+
+
+@pytest.fixture(autouse=True)
+def _isolate_opencode_db(tmp_path: Path):
+    """Phase C Day 4 safety: opencode's transcript reader queries
+    ``~/.local/share/opencode/opencode.db`` by default. Tests must
+    not see the user's real OpenCode history (false-positive
+    matches against real sessions, plus reading user data is
+    surprising). Point the reader at a guaranteed-nonexistent path
+    inside ``tmp_path``; tests that need a real DB construct one
+    and call ``set_opencode_db_path_override`` themselves."""
+    set_opencode_db_path_override(tmp_path / "no-opencode-db.db")
+    yield
+    set_opencode_db_path_override(None)
 
 
 def _make_brain(kind: str, tmp_path: Path) -> Brain:

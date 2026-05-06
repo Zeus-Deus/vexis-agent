@@ -1,12 +1,45 @@
 """Subprocess wrapper around the OpenCode CLI (``opencode run``).
 
 Phase C of the brain abstraction (.plans/brain-abstraction-research.md
-§5 Day 3). Provides ``OpenCodeBrain`` — a sibling implementation of
-``ClaudeCodeBrain`` against the OpenCode binary. Foreground turns
-and aux spawns work end-to-end on Day 3; transcript readback
-(``iter_session_metas``, ``iter_messages``, ``is_brain_owned_session``)
-returns empty/False stubs until Day 4 lands the SQLite reader
-against ``~/.local/share/opencode/opencode.db``.
+§5 Days 3-4). Provides ``OpenCodeBrain`` — a sibling implementation
+of ``ClaudeCodeBrain`` against the OpenCode binary. Day 3 shipped
+foreground turns + aux spawns + healthcheck + MCP config writer
+with empty-stub transcript readback; Day 4 lands session resume +
+SessionLost recovery + SQLite transcript reader against
+``~/.local/share/opencode/opencode.db``.
+
+Session model. OpenCode generates session ids itself (format
+``ses_<base32>``) — the brain doesn't get to pick. Vexis's
+``SessionStore`` carries an opaque token; for OpenCode the brain
+harvests the real id from the first ``sessionID`` field of the
+JSON event stream and writes it back via ``SessionStore.set``.
+Subsequent ``respond()`` calls pass ``--session <id>`` to resume.
+NOT ``--continue`` — that picks up the newest top-level session
+in the project directory which could be a session belonging to
+another tool (``opencode tui``, manual ``opencode run`` from a
+terminal). Pinning by id keeps vexis's resumes in vexis's lane.
+
+SessionLost detection. When ``--session <stored_id>`` references
+an id that no longer exists in ``opencode.db`` (DB pruning, manual
+``DELETE``, or a fresh install on the same workspace), opencode
+exits 1 with stderr ``"Session not found"`` and the run never
+streams JSON events. The brain catches that, calls ``rotate_session``
+to clear the dead id, and raises ``SessionLost``. The transport
+layer's existing recovery path takes over — same machinery
+``ClaudeCodeBrain`` already uses for the equivalent claude-code
+case.
+
+Transcript readback. ``opencode.db`` is a SQLite store with
+``session``, ``message``, ``part`` tables. Each session row pins
+to a project ``directory``; messages and parts join by
+``session_id``. Vexis's reader opens the DB read-only
+(``mode=ro`` URI + ``PRAGMA query_only=1`` belt-and-braces) and
+flattens the schema into ``TranscriptMessage`` objects matching
+the claude-code shape (role, text, timestamp, uuid, tool_calls,
+raw). Concurrency: the curator scan can overlap a foreground
+turn (which holds a write transaction); ``SQLITE_BUSY`` triggers
+a 5-attempt × 100 ms backoff before giving up and skipping the
+session this tick (per §8 risk #3 of the research doc).
 
 System-prompt injection. OpenCode's ``run`` command does NOT accept
 ``--append-system-prompt`` (claude-code's flag). Three production
@@ -32,13 +65,6 @@ Skill convention overlap. OpenCode auto-discovers
 and emits its own ``<available_skills>`` block in the system
 prompt. To avoid double-injection, ``BrainOpenCode.build_system_prompt``
 omits vexis's skill index — see §2 of the research doc.
-
-Day 3 caveats. Session resume is single-call only: every
-``respond()`` spawns a fresh session because we don't yet harvest
-the OpenCode-generated session id. Day 4 wires
-``--session <id>`` for subsequent calls. Day 3 also stubs the
-transcript-readback methods (curator scan returns empty, no crash);
-real SQL reader lands Day 4.
 """
 
 from __future__ import annotations
@@ -49,8 +75,11 @@ import logging
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
+import time
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 
 from core.brain.base import (
@@ -68,6 +97,7 @@ from core.brain.base import (
 from core.running_tasks import RunningTasks
 from core.sessions import SessionStore
 from core.status import StatusFile, extract_tool_target
+from core.transcripts import SessionMeta, TranscriptMessage
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +129,96 @@ VEXIS_AGENT_NAME = "vexis"
 # so a future debug-skin can override it without affecting the
 # foreground turn. Day 3 uses the same name; Day 4 may split.
 VEXIS_AUX_AGENT_NAME = "vexis-aux"
+
+# Default location for opencode's SQLite store on Linux. Verified
+# against the running install at startup; tests override via
+# ``_OPENCODE_DB_PATH_OVERRIDE`` set by the
+# ``opencode_db_path_override`` test fixture so the SQL reader can
+# point at a tmp-built DB instead of the user's real one.
+_DEFAULT_OPENCODE_DB_PATH = (
+    Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+)
+_OPENCODE_DB_PATH_OVERRIDE: Path | None = None
+
+
+def opencode_db_path() -> Path:
+    """Resolve the opencode SQLite path. Production: the default
+    XDG location. Tests: whatever ``set_opencode_db_path_override``
+    last wrote (cleared in the autouse fixture)."""
+    return _OPENCODE_DB_PATH_OVERRIDE or _DEFAULT_OPENCODE_DB_PATH
+
+
+def set_opencode_db_path_override(path: Path | None) -> None:
+    """Test hook. Set to None to revert to the default location.
+    Used by ``tests/test_brain_opencode_transcripts.py`` to point
+    the reader at a hand-built tmp DB."""
+    global _OPENCODE_DB_PATH_OVERRIDE
+    _OPENCODE_DB_PATH_OVERRIDE = path
+
+
+# SQLITE_BUSY retry. Per §8 risk #3 of the research doc: opencode
+# holds a write transaction open for the duration of a foreground
+# turn, so a curator scan that overlaps will hit SQLITE_BUSY most
+# of the time. 5 attempts × 100 ms = 500 ms tail-latency ceiling
+# per query before we give up and skip the session this tick (the
+# next curator tick will retry).
+_SQLITE_RETRIES = 5
+_SQLITE_RETRY_BACKOFF_S = 0.1
+
+
+def _run_db_query(
+    sql: str, params: tuple = (),
+) -> list[tuple] | None:
+    """Run one SELECT against opencode.db with read-only safety and
+    SQLITE_BUSY backoff. Returns the row list on success, ``None``
+    when:
+      - the DB file doesn't exist (fresh OpenCode install with no
+        sessions yet),
+      - the DB is persistently locked after the retry budget,
+      - any other ``OperationalError`` occurs.
+
+    Belt-and-braces against accidental writes:
+      - URI ``mode=ro`` — SQLite refuses any write at the engine
+        level.
+      - ``PRAGMA query_only = 1`` — defends against a cosmic-ray
+        case where the URI flag was somehow misset.
+
+    Each call opens and closes its own connection so the reader
+    cannot accidentally hold a long-lived FD against the user's
+    DB. Cheap on SQLite — open is ~microseconds.
+    """
+    db_path = opencode_db_path()
+    if not db_path.exists():
+        return None
+    last_exc: Exception | None = None
+    for attempt in range(_SQLITE_RETRIES):
+        try:
+            conn = sqlite3.connect(
+                f"file:{db_path}?mode=ro", uri=True
+            )
+            try:
+                conn.execute("PRAGMA query_only = 1")
+                cur = conn.execute(sql, params)
+                return cur.fetchall()
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "busy" in msg or "locked" in msg:
+                last_exc = exc
+                if attempt < _SQLITE_RETRIES - 1:
+                    time.sleep(_SQLITE_RETRY_BACKOFF_S)
+                    continue
+            log.warning(
+                "opencode.db query failed (sql=%s): %s", sql.split()[0], exc
+            )
+            return None
+    log.warning(
+        "opencode.db persistently busy after %d attempts; "
+        "skipping query (last: %s)",
+        _SQLITE_RETRIES, last_exc,
+    )
+    return None
 
 
 def _read_markdown(path: Path) -> str | None:
@@ -371,21 +491,23 @@ class OpenCodeBrain(Brain):
 
     async def respond(self, message: str, chat_id: int) -> str:
         log.info("OpenCodeBrain.respond starting for chat %d", chat_id)
-        session_id = self._session.get()
 
-        # Day 3 scaffold: every call is a fresh session because we
-        # don't yet harvest + persist the OpenCode-generated id
-        # across calls. Day 4 wires --session <id> for resumes.
-        # The ``session_id`` from SessionStore is currently a UUID
-        # we won't pass to opencode (it doesn't accept
-        # caller-supplied ids); kept for forward-compat with the
-        # Day-4 resume path.
+        # Phase C Day 4: ``is_initialized`` flips to True after the
+        # first successful ``respond``, at which point ``self._session.get()``
+        # returns the OpenCode-generated session id (harvested from
+        # the first event of the original spawn and persisted via
+        # ``SessionStore.set``). On subsequent calls we pass it as
+        # ``--session <id>`` to resume; on the first call we pass
+        # ``--title`` so opencode names the new session predictably
+        # (which makes it identifiable in ``opencode tui`` and
+        # avoids collision with sessions from other tools).
         is_initialized = self._session.is_initialized()
+        stored_token = self._session.get() if is_initialized else None
 
         from core.yaml_config import model_for_tier
         model = model_for_tier("opencode", None)  # default: brain's foreground choice
 
-        system_prompt = self._system_prompt_for(session_id)
+        system_prompt = self._system_prompt_for(stored_token or "fresh")
         config_content = _build_opencode_config_content(
             agent_name=VEXIS_AGENT_NAME,
             system_prompt=system_prompt,
@@ -398,20 +520,20 @@ class OpenCodeBrain(Brain):
             "--format", "json",
             "--agent", VEXIS_AGENT_NAME,
             "--dangerously-skip-permissions",
-            "--title", f"vexis-chat-{chat_id}",
-            message,
         ]
-        if is_initialized:
-            # Day 4: argv += ["--session", session_id]
-            # Day 3 placeholder: comment-only.
-            pass
+        if stored_token:
+            argv += ["--session", stored_token]
+        else:
+            argv += ["--title", f"vexis-chat-{chat_id}"]
+        argv.append(message)
 
         env = {**os.environ, "VEXIS_CHAT_ID": str(chat_id)}
         env["OPENCODE_CONFIG_CONTENT"] = config_content
 
         log.debug(
-            "Spawning opencode run (cwd=%s, agent=%s, fresh=True)",
+            "Spawning opencode run (cwd=%s, agent=%s, resume=%s)",
             self._workspace, VEXIS_AGENT_NAME,
+            stored_token if stored_token else "<fresh>",
         )
 
         reservation = await self._running_tasks.reserve(chat_id)
@@ -444,7 +566,9 @@ class OpenCodeBrain(Brain):
 
             stdout_task = asyncio.create_task(
                 _read_opencode_event_stream(
-                    proc.stdout, status_file, target_session_id=None,
+                    proc.stdout,
+                    status_file,
+                    target_session_id=stored_token,
                 )
             )
             stderr_task = asyncio.create_task(proc.stderr.read())
@@ -461,16 +585,12 @@ class OpenCodeBrain(Brain):
                 ) from exc
 
             try:
-                # ``harvested_id`` (Day 4) will be persisted via
-                # ``self._session.set`` once transcript readback lands;
-                # for now we drop it on the floor on purpose. The
-                # leading underscore silences F841.
-                final_text, _harvested_id = await stdout_task
+                final_text, harvested_id = await stdout_task
             except Exception:
                 log.exception(
                     "OpenCode stdout reader failed for chat %d", chat_id
                 )
-                final_text, _harvested_id = "", None
+                final_text, harvested_id = "", None
             try:
                 stderr_bytes = await stderr_task
             except Exception:
@@ -488,16 +608,18 @@ class OpenCodeBrain(Brain):
 
             if proc.returncode != 0:
                 err = stderr_bytes.decode(errors="replace").strip()
-                # Best-effort session-lost detection. Day 4 will
-                # pin the exact ``session.error`` event payload
-                # shape; Day 3 just looks for the substring in
-                # stderr.
-                if (
-                    is_initialized
-                    and "session" in err.lower()
-                    and "not found" in err.lower()
-                ):
-                    old = self._session.get()
+                # SessionLost detection. ``opencode run --session
+                # <id>`` exits 1 with "Session not found" on stderr
+                # when the stored id no longer exists in
+                # ``opencode.db`` (DB pruning, manual DELETE,
+                # workspace migrated to a fresh install). Verified
+                # at ``packages/opencode/src/cli/cmd/run.ts:632-634``.
+                # We rotate the session token (clearing the dead id
+                # and the initialized flag) and raise so the
+                # transport-layer recovery can retry on a fresh
+                # session.
+                if is_initialized and "session not found" in err.lower():
+                    old = stored_token
                     new = self._session.rotate()
                     log.warning(
                         "OpenCode lost session %s; rotated to %s", old, new
@@ -513,10 +635,25 @@ class OpenCodeBrain(Brain):
             status_file.delete()
             await self._running_tasks.unregister(chat_id)
 
-        # Day 3: always mark initialised after first success so
-        # Day 4 wiring of --session <id> activates correctly. The
-        # ``harvested_id`` will be persisted in Day 4.
-        if not self._session.is_initialized():
+        # First-call success path: harvest the OpenCode-generated
+        # session id and persist it so the next ``respond()`` call
+        # can resume via ``--session <id>``. ``mark_initialized``
+        # flips the session_token() reading to True; subsequent
+        # rotations (after SessionLost) clear both via ``rotate``.
+        if not is_initialized:
+            if harvested_id:
+                self._session.set(harvested_id)
+                log.info(
+                    "OpenCode session established and persisted: %s",
+                    harvested_id,
+                )
+            else:
+                log.warning(
+                    "OpenCode reply succeeded but no sessionID was "
+                    "harvested from the event stream. Subsequent "
+                    "turns will start a new session — chat will "
+                    "feel context-less."
+                )
             self._session.mark_initialized()
 
         return (final_text or "").strip()
@@ -665,42 +802,229 @@ class OpenCodeBrain(Brain):
     # ─── session model ───────────────────────────────────────────
 
     def session_token(self) -> str | None:
-        """Day 3 placeholder: returns whatever ``SessionStore`` has
-        (a UUID generated at first construction). Day 4 will swap
-        this for the OpenCode-generated session id harvested from
-        ``respond``'s first event."""
+        """Returns the current opencode session id (format
+        ``ses_<base32>``) once ``respond`` has harvested + persisted
+        it, or the SessionStore-minted placeholder UUID before that
+        first call. ``SessionStore`` doesn't distinguish — the token
+        is opaque per the brain ABC contract."""
         return self._session.get()
 
     def rotate_session(self) -> str:
-        """Mint a fresh placeholder UUID. After a Day-4
-        ``SessionLost`` recovery, this resets the ``--session``
-        flag so the next ``respond`` call creates a new session.
-        Returns the new placeholder; the real id arrives on the
-        first event of the next ``respond``."""
+        """Mint a fresh placeholder. ``SessionStore.rotate`` flips
+        ``initialized`` back to False so the next ``respond`` call
+        spawns without ``--session`` and harvests a new id. Used by
+        the SessionLost recovery path."""
         return self._session.rotate()
 
-    # ─── transcript readback (Day 3 stubs) ───────────────────────
+    # ─── transcript readback (real on Day 4) ─────────────────────
 
-    def iter_session_metas(self) -> Iterator:
-        """Day 3: returns an empty iterator. Curator scans see no
-        sessions — correct, because OpenCode hasn't run any vexis
-        sessions yet at Day 3 (the first run will write a row to
-        ``opencode.db`` but Day 3 lacks the SQL reader). Day 4
-        swaps this for ``SELECT id, time_updated FROM session
-        WHERE directory = ?`` against
-        ``~/.local/share/opencode/opencode.db``."""
-        return iter(())
+    def iter_session_metas(self) -> Iterator[SessionMeta]:
+        """Enumerate sessions in ``opencode.db`` whose ``directory``
+        column matches this brain's workspace.
 
-    def iter_messages(self, session_id: str) -> Iterator:
-        """Day 3: empty iterator. Day 4 swaps for SQL read."""
-        return iter(())
+        Issues one ``SELECT … LEFT JOIN message …`` to fetch session
+        metadata + per-session message count in a single query;
+        opens a fresh read-only connection (``mode=ro`` URI +
+        ``PRAGMA query_only=1``). Returns ``SessionMeta`` objects
+        with ``jsonl_path=None`` to flag "transcript reads for this
+        session must go through ``brain.iter_messages``" — the
+        learning curator's two ``iter_messages(meta.jsonl_path)``
+        sites at ``learning_curator.py:1572,2223`` branch on this
+        Optional path.
+
+        ``last_message_timestamp`` comes from the session row's
+        ``time_updated`` column (millisecond Unix epoch) — opencode
+        bumps that on every message write, so it's a reliable proxy
+        for "when did this session last see activity". No need to
+        round-trip the ``message`` table for a MAX(time_created)
+        per session.
+
+        Returns an empty iterator when:
+          - ``opencode.db`` doesn't exist (fresh install, no
+            sessions yet);
+          - the DB is persistently locked (5×100 ms backoff blown);
+          - the schema is unreadable / corrupt.
+
+        In every empty case the curator's eligibility scan continues
+        silently rather than crashing — same safety guarantee as
+        Day 3's stub.
+        """
+        workspace_str = str(self._workspace.resolve())
+        rows = _run_db_query(
+            """
+            SELECT s.id, s.time_updated, COUNT(m.id) AS msg_count
+            FROM session s
+            LEFT JOIN message m ON s.id = m.session_id
+            WHERE s.directory = ?
+            GROUP BY s.id, s.time_updated
+            ORDER BY s.time_updated DESC
+            """,
+            (workspace_str,),
+        )
+        if rows is None:
+            return
+        for sid, time_updated_ms, msg_count in rows:
+            ts: datetime | None = None
+            if isinstance(time_updated_ms, int):
+                try:
+                    ts = datetime.fromtimestamp(
+                        time_updated_ms / 1000, tz=timezone.utc
+                    )
+                except (OverflowError, OSError, ValueError):
+                    ts = None
+            yield SessionMeta(
+                session_uuid=str(sid),
+                jsonl_path=None,
+                last_message_timestamp=ts,
+                message_count_estimate=int(msg_count or 0),
+            )
+
+    def iter_messages(self, session_id: str) -> Iterator[TranscriptMessage]:
+        """Stream user + assistant turns from one opencode session.
+
+        Two queries (one for messages, one for parts) — cheaper
+        than a JOIN that would explode the row count by tool-call
+        + step events. Parts are grouped by ``message_id`` in
+        Python so each ``TranscriptMessage`` carries its full text
+        + tool-call payload in the shape the curator expects.
+
+        Schema cues (sampled live against opencode 1.14):
+
+          message.data — JSON with ``role``, ``time.created``
+            (millisecond epoch), ``agent``, ``model.providerID``,
+            ``model.modelID``, ``summary`` (auto-generated title /
+            diffs).
+          part.data — JSON with ``type`` discriminator. Three types
+            we care about:
+              ``text`` — ``{type, text, time?}`` carries assistant
+                or user message body.
+              ``tool`` — ``{type, callID, tool, state: {input,
+                output}, time}`` carries one tool invocation.
+              ``step-start`` / ``step-finish`` — pacing markers,
+                ignored.
+
+        Returns an empty iterator on missing DB, persistent lock,
+        unknown session_id, or schema corruption. Caller assumes
+        empty == "no transcript content here, skip" rather than
+        "scan failed" — same semantics as
+        ``core.transcripts.iter_messages`` for an unreadable JSONL.
+        """
+        msg_rows = _run_db_query(
+            """
+            SELECT id, time_created, data FROM message
+            WHERE session_id = ?
+            ORDER BY time_created
+            """,
+            (session_id,),
+        )
+        if msg_rows is None:
+            return
+        part_rows = _run_db_query(
+            """
+            SELECT message_id, data FROM part
+            WHERE session_id = ?
+            ORDER BY message_id, time_created
+            """,
+            (session_id,),
+        )
+        if part_rows is None:
+            part_rows = []
+
+        parts_by_msg: dict[str, list[dict]] = {}
+        for mid, part_raw in part_rows:
+            try:
+                part = json.loads(part_raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(part, dict):
+                continue
+            parts_by_msg.setdefault(str(mid), []).append(part)
+
+        for mid, time_created_ms, msg_raw in msg_rows:
+            try:
+                msg = json.loads(msg_raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "")
+            if role not in ("user", "assistant"):
+                continue
+            # Prefer message.time.created (the model-side
+            # timestamp) over the row's bookkeeping time_created;
+            # they're typically identical but the row column is
+            # the safe fallback when the JSON is partial.
+            created_ms: int | None = None
+            time_obj = msg.get("time")
+            if isinstance(time_obj, dict):
+                c = time_obj.get("created")
+                if isinstance(c, int):
+                    created_ms = c
+            if created_ms is None and isinstance(time_created_ms, int):
+                created_ms = time_created_ms
+            if created_ms is None:
+                continue
+            try:
+                ts = datetime.fromtimestamp(
+                    created_ms / 1000, tz=timezone.utc
+                )
+            except (OverflowError, OSError, ValueError):
+                continue
+
+            text_parts: list[str] = []
+            tool_calls: list[dict] = []
+            for p in parts_by_msg.get(str(mid), []):
+                ptype = p.get("type")
+                if ptype == "text":
+                    t = p.get("text")
+                    if isinstance(t, str):
+                        text_parts.append(t)
+                elif ptype == "tool":
+                    state = p.get("state")
+                    input_obj = (
+                        state.get("input") if isinstance(state, dict) else None
+                    )
+                    tool_calls.append({
+                        "id": p.get("callID"),
+                        "name": p.get("tool"),
+                        "input": input_obj,
+                    })
+
+            yield TranscriptMessage(
+                role=role,
+                text="\n".join(text_parts),
+                timestamp=ts,
+                uuid=str(mid),
+                tool_calls=tuple(tool_calls),
+                raw=msg,
+            )
 
     def is_brain_owned_session(self, session_id: str) -> bool:
-        """Day 3: defensive ``False`` (treats unknown sessions as
-        not brain-owned). The recursion guard then doesn't
-        accidentally skip a real session. Day 4 swaps for the
-        content-prefix check against the first user message's
-        first text part in the ``message`` table."""
+        """Curator-recursion guard against opencode-stored sessions.
+
+        Reads the first user-role message via ``iter_messages`` and
+        checks its concatenated text against the same prompt
+        prefixes the claude-code path uses
+        (``CURATOR_REVIEW_PROMPT_PREFIX``, ``GOAL_JUDGE_PROMPT_PREFIX``).
+        The opencode storage layout is different (DB row vs JSONL
+        line) but the prefix-match is content-shaped — same answer
+        for the same conversation.
+
+        Lazy-imports the prefix constants to avoid the circular
+        import the claude-code path already documents at
+        ``core.transcripts._is_curator_owned``.
+        """
+        from core.goal_judge import GOAL_JUDGE_PROMPT_PREFIX
+        from core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX
+
+        for msg in self.iter_messages(session_id):
+            if msg.role != "user":
+                continue
+            text = msg.text
+            return (
+                text.startswith(CURATOR_REVIEW_PROMPT_PREFIX)
+                or text.startswith(GOAL_JUDGE_PROMPT_PREFIX)
+            )
         return False
 
     # ─── MCP config wiring (real on Day 3) ───────────────────────
@@ -928,4 +1252,6 @@ __all__ = [
     "VEXIS_AGENT_NAME",
     "VEXIS_AUX_AGENT_NAME",
     "VEXIS_MCP_PREFIX",
+    "opencode_db_path",
+    "set_opencode_db_path_override",
 ]
