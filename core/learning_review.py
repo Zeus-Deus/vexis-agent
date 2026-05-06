@@ -28,14 +28,23 @@ git history without ambiguity about which version was running.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import os
 import re
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
+
+from core.brain.base import (
+    BrainAuthRequired,
+    BrainError,
+    BrainNotInstalled,
+    BrainTimeoutError,
+)
+
+if TYPE_CHECKING:
+    from core.brain.base import Brain
 
 from core.memory import ENTRY_DELIMITER as _MEMORY_ENTRY_DELIMITER
 from core.paths import memories_dir, skills_dir, user_candidates_path
@@ -46,9 +55,7 @@ from core.yaml_config import (
     learning_max_entries_per_session,
     learning_max_entry_chars,
     learning_triage_enabled,
-    model_learning_review,
-    model_learning_triage,
-    resolve_model_flag,
+    subsystem_tier,
 )
 
 log = logging.getLogger(__name__)
@@ -1291,53 +1298,52 @@ def _run_triage(
     meta: SessionMeta,
     messages: list[TranscriptMessage],
     transcript: str,
-    *,
-    spawn: "SpawnFn | None" = None,
+    brain: "Brain",
 ) -> tuple[bool, str]:
-    """Cheap pre-review skim. Returns ``(should_review, raw_verdict)``.
+    """Cheap pre-review skim via ``Brain.spawn_aux``. Returns
+    ``(should_review, raw_verdict)``.
 
     Semantics:
       - YES → run the full sonnet review (return True, "YES").
       - NO  → skip; mark session nothing-to-save (return False, "NO").
       - Garbage / empty / parse failure → fail open, run sonnet
-        anyway (return True, "FAIL_OPEN"). Logged so we can monitor
-        parse-failure rates.
-      - Spawn errors (timeout, OSError, non-zero exit *not* identified
-        as rate-limit) → fail open (return True, "ERROR"). We do NOT
-        propagate as a review error, otherwise a flaky triage would
-        burn the per-session 3-strikes budget for what's a degraded-
-        mode pass.
+        anyway (return True, "FAIL_OPEN"). Logged.
+      - Spawn errors (timeout, BrainNotInstalled, non-zero exit
+        *not* identified as rate-limit) → fail open (return True,
+        "ERROR"). Phase B fold: same fail-open semantics across
+        Brain* exception types as the pre-Phase-B subprocess paths.
 
-    Rate-limit specifically: re-raised as ``_TriageRateLimitError`` so
-    the caller can surface it as ``output.error`` and let the existing
-    tick-abort path in core/learning_curator handle it. Silently
-    failing-open on rate-limits would defeat the whole point of the
-    rate-limit handling that the parent fixes added today.
+    Rate-limit specifically: re-raised as ``_TriageRateLimitError``
+    so the caller can surface it as ``output.error`` and let the
+    existing tick-abort path in core/learning_curator handle it.
     """
     prompt = _build_triage_prompt(transcript)
-    argv = ["claude", "-p", *resolve_model_flag(model_learning_triage()), prompt]
-    env = {**os.environ, RECURSION_ENV_VAR: "1"}
 
     try:
-        if spawn is not None:
-            cp = spawn(argv, env)
-        else:
-            cp = subprocess.run(
-                argv,
-                env=env,
-                cwd=str(workspace),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=LEARNING_TRIAGE_TIMEOUT_SECONDS,
+        result = asyncio.run(
+            brain.spawn_aux(
+                prompt,
+                model_tier=subsystem_tier("learning_triage"),
+                timeout_seconds=LEARNING_TRIAGE_TIMEOUT_SECONDS,
+                env_overrides={RECURSION_ENV_VAR: "1"},
+                cwd=workspace,
             )
-    except subprocess.TimeoutExpired:
+        )
+    except BrainTimeoutError:
         log.warning(
             "Learning triage for session %s timed out after %ds; "
             "failing open to full review",
             meta.session_uuid, LEARNING_TRIAGE_TIMEOUT_SECONDS,
         )
         return True, "ERROR"
-    except (OSError, FileNotFoundError) as exc:
+    except (BrainNotInstalled, BrainAuthRequired) as exc:
+        log.warning(
+            "Learning triage for session %s spawn failed (%s); "
+            "failing open to full review",
+            meta.session_uuid, exc,
+        )
+        return True, "ERROR"
+    except BrainError as exc:
         log.warning(
             "Learning triage for session %s spawn failed (%s); "
             "failing open to full review",
@@ -1345,17 +1351,9 @@ def _run_triage(
         )
         return True, "ERROR"
 
-    stdout = (
-        cp.stdout.decode("utf-8", errors="replace")
-        if isinstance(cp.stdout, bytes)
-        else cp.stdout or ""
-    )
-    stderr = (
-        cp.stderr.decode("utf-8", errors="replace")
-        if isinstance(cp.stderr, bytes)
-        else cp.stderr or ""
-    )
-    if cp.returncode != 0:
+    stdout = result.stdout
+    stderr = result.stderr
+    if result.returncode != 0:
         body = (stderr or stdout).strip()
         if _is_triage_rate_limit(body):
             # Surfacing this as an error (not a fail-open) is the
@@ -1363,12 +1361,12 @@ def _run_triage(
             # converts it into output.error so the curator's
             # _is_rate_limit_error gate aborts the tick.
             raise _TriageRateLimitError(
-                f"claude -p (triage) exited {cp.returncode}: {body[:500]}"
+                f"claude -p (triage) exited {result.returncode}: {body[:500]}"
             )
         log.warning(
             "Learning triage for session %s exited %d (%s); "
             "failing open to full review",
-            meta.session_uuid, cp.returncode, body[:200],
+            meta.session_uuid, result.returncode, body[:200],
         )
         return True, "ERROR"
 
@@ -1390,27 +1388,25 @@ def _run_triage(
 # --------------------------------------------------------------------
 
 
-SpawnFn = Callable[[list[str], dict[str, str]], subprocess.CompletedProcess]
-
-
 def run_review(
     workspace: Path,
     meta: SessionMeta,
     messages: list[TranscriptMessage],
-    *,
-    spawn: SpawnFn | None = None,
+    brain: "Brain",
 ) -> ReviewOutput:
-    """Spawn ``claude -p`` for one session, parse, verify, classify.
+    """Spawn the review through ``Brain.spawn_aux`` for one session,
+    parse, verify, classify.
 
-    Does not write anywhere — that's the controller's job. Pure
-    function modulo the subprocess; the ``spawn`` parameter exists
-    for tests and is ``None`` in production (we shell out via
-    ``subprocess.run``).
+    Does not write anywhere — that's the controller's job. Phase B:
+    routes through ``brain.spawn_aux`` instead of an inline
+    ``subprocess.run``. Sync wrapper around the async ``spawn_aux``
+    via ``asyncio.run`` because the curator daemon thread (only
+    caller) has no event loop.
 
-    Subprocess shape mirrors ``core/curator.py:_curator_subprocess_argv``:
-    no ``--resume`` (the review must stay isolated from the user's
-    session UUID), no ``--append-system-prompt``, env carries
-    ``VEXIS_LEARNING_REVIEW=1`` for recursion-guard inheritance.
+    The review fork stays isolated from the user's session UUID
+    (no resume / session-id) and carries
+    ``VEXIS_LEARNING_REVIEW=1`` env-override for recursion-guard
+    inheritance.
     """
     transcript = _format_transcript(messages)
     output = ReviewOutput(
@@ -1456,7 +1452,7 @@ def run_review(
     if learning_triage_enabled():
         try:
             should_review, verdict = _run_triage(
-                workspace, meta, messages, transcript, spawn=spawn
+                workspace, meta, messages, transcript, brain
             )
         except _TriageRateLimitError as exc:
             # Mirror the full-review rate-limit shape so the curator's
@@ -1491,43 +1487,32 @@ def run_review(
         existing_memory_text=existing_memory_text,
         user_queue_text=user_queue_text,
     )
-    argv = ["claude", "-p", *resolve_model_flag(model_learning_review()), prompt]
-    env = {**os.environ, RECURSION_ENV_VAR: "1"}
-
     try:
-        if spawn is not None:
-            cp = spawn(argv, env)
-        else:
-            cp = subprocess.run(
-                argv,
-                env=env,
-                cwd=str(workspace),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=LEARNING_REVIEW_TIMEOUT_SECONDS,
+        result = asyncio.run(
+            brain.spawn_aux(
+                prompt,
+                model_tier=subsystem_tier("learning_review"),
+                timeout_seconds=LEARNING_REVIEW_TIMEOUT_SECONDS,
+                env_overrides={RECURSION_ENV_VAR: "1"},
+                cwd=workspace,
             )
-    except subprocess.TimeoutExpired:
+        )
+    except BrainTimeoutError:
         output.error = f"timed out after {LEARNING_REVIEW_TIMEOUT_SECONDS}s"
         return output
-    except (OSError, FileNotFoundError) as exc:
+    except (BrainNotInstalled, BrainAuthRequired) as exc:
+        output.error = f"spawn failed: {exc}"
+        return output
+    except BrainError as exc:
         output.error = f"spawn failed: {exc}"
         return output
 
-    stdout = (
-        cp.stdout.decode("utf-8", errors="replace")
-        if isinstance(cp.stdout, bytes)
-        else cp.stdout or ""
-    )
-    if cp.returncode != 0:
-        stderr = (
-            cp.stderr.decode("utf-8", errors="replace")
-            if isinstance(cp.stderr, bytes)
-            else cp.stderr or ""
-        )
+    stdout = result.stdout
+    if result.returncode != 0:
         # Truncate to keep reviewed.json readable; the full body lives
         # in the daemon log anyway.
-        body = (stderr or stdout).strip()
-        output.error = f"claude -p exited {cp.returncode}: {body[:500]}"
+        body = (result.stderr or stdout).strip()
+        output.error = f"claude -p exited {result.returncode}: {body[:500]}"
         return output
 
     output.raw_response = stdout.strip()

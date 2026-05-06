@@ -572,13 +572,15 @@ def test_real_review_returns_skipped_outcome_for_oversized(env, monkeypatch):
         }))
     (pdir / "huge.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    # Block the actual subprocess (we should never reach it).
-    def spawn_should_not_run(argv, env_dict):
-        raise AssertionError("LLM was called for an oversized transcript")
-    monkeypatch.setattr(lr.subprocess, "run", spawn_should_not_run)
+    # Phase B: pre-Phase-B used ``monkeypatch.setattr(lr.subprocess.run,
+    # spawn_should_not_run)``; post-Phase-B the brain abstraction
+    # mediates spawns. An empty BrainNull would raise on exhaustion
+    # if anything spawned — same fail-loud guarantee as the old
+    # AssertionError, just routed through the brain.
+    from core.brain.null import BrainNull
 
     monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=12))
-    controller = LearningController(workspace=workspace)
+    controller = LearningController(workspace=workspace, brain=BrainNull())
     result = controller.run_now()
 
     assert "huge" in result.reviewed  # success path advances reviewed.json
@@ -601,28 +603,35 @@ def test_real_review_triage_no_skips_sonnet_end_to_end(env, monkeypatch):
     # Re-enable triage (the global suite default may not toggle this).
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
 
-    calls: list[list[str]] = []
+    # Phase B: pre-load BrainNull with one AuxResult — triage call
+    # consumes it, sonnet should NEVER fire (BrainNull exhaustion
+    # raises AssertionError, which is the same fail-loud guarantee
+    # the pre-Phase-B ``raise AssertionError("sonnet must not be
+    # called")`` provided).
+    from core.brain.base import AuxResult
+    from core.brain.null import BrainNull
 
-    def fake_run(argv, env, cwd, stdout, stderr, timeout):
-        calls.append(argv)
-        # The triage prompt is short; sonnet's prompt is long. Keying
-        # off model flag is the most direct discriminator.
-        if "haiku" in argv:
-            return _CP(stdout=b"NO\n", returncode=0)
-        raise AssertionError(
-            "sonnet must not be called when triage returned NO; "
-            f"argv={argv!r}"
-        )
-
-    monkeypatch.setattr(lr.subprocess, "run", fake_run)
+    # Triage NO → sonnet should NOT fire. The relationships extractor
+    # also runs per tick (commit 6) and consumes one AuxResult; pre-
+    # load it with empty extractions JSON so the extractor sees a
+    # no-op and the test stays focused on the triage gate.
+    brain = BrainNull(aux_results=[
+        AuxResult(stdout="NO\n", stderr="", returncode=0),
+        AuxResult(stdout='{"extractions": []}', stderr="", returncode=0),
+    ])
     monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
 
-    controller = LearningController(workspace=workspace)
+    controller = LearningController(workspace=workspace, brain=brain)
     result = controller.run_now()
 
     assert "skim-me" in result.reviewed
-    # Exactly one subprocess fired — the triage call.
-    assert len(calls) == 1
+    # Triage + extractor fired; sonnet did NOT.
+    records = brain.aux_call_records()
+    assert len(records) == 2
+    # First call is the triage (model_tier=tiny per default subsystem map).
+    assert records[0]["model_tier"] == "tiny"
+    # Second call is the extractor (model_tier=medium per default).
+    assert records[1]["model_tier"] == "medium"
     # Outcome string distinguishes triage-skipped so the audit trail
     # can show how often the cheap pass is filtering work.
     rec = controller._reviewed.load()["skim-me"]
@@ -640,21 +649,24 @@ def test_real_review_triage_yes_runs_sonnet_end_to_end(env, monkeypatch):
     _stage_session(workspace, "look-deeper", "2026-05-02T10:00:00Z")
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
 
-    calls: list[list[str]] = []
+    # Phase B: pre-load BrainNull with two AuxResults — triage YES
+    # then sonnet's "Nothing to save."
+    from core.brain.base import AuxResult
+    from core.brain.null import BrainNull
 
-    def fake_run(argv, env, cwd, stdout, stderr, timeout):
-        calls.append(argv)
-        if "haiku" in argv:
-            return _CP(stdout=b"YES\n", returncode=0)
-        return _CP(stdout=b"Nothing to save.\n", returncode=0)
-
-    monkeypatch.setattr(lr.subprocess, "run", fake_run)
+    # Triage YES (call 1) → sonnet "Nothing to save." (call 2) →
+    # extractor empty JSON (call 3, runs after review per tick order).
+    brain = BrainNull(aux_results=[
+        AuxResult(stdout="YES\n", stderr="", returncode=0),
+        AuxResult(stdout="Nothing to save.\n", stderr="", returncode=0),
+        AuxResult(stdout='{"extractions": []}', stderr="", returncode=0),
+    ])
     monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
 
-    controller = LearningController(workspace=workspace)
+    controller = LearningController(workspace=workspace, brain=brain)
     controller.run_now()
 
-    assert len(calls) == 2  # triage + sonnet
+    assert len(brain.aux_call_records()) == 3  # triage + sonnet + extractor
     rec = controller._reviewed.load()["look-deeper"]
     # Plain "nothing to save" — the (triage) suffix only attaches when
     # the cheap pass short-circuited.

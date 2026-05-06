@@ -74,21 +74,38 @@ def _meta(uuid: str = "session-1", path: Path | None = None) -> SessionMeta:
 
 
 def _spawn_returning(stdout: str, *, returncode: int = 0, stderr: str = ""):
-    """Build a fake spawn callable that returns a CompletedProcess
-    with the given stdout/return code. Captures argv/env so tests can
-    assert what was sent."""
-    captured: dict[str, Any] = {}
+    """Phase B: build a BrainNull pre-loaded with one AuxResult.
+    Returns (brain, brain) — the second value preserves the
+    ``spawn, captured = _spawn_returning(...)`` 2-tuple shape so
+    existing call sites unpacking ``spawn, captured`` keep working;
+    the second element is the same brain (use
+    ``captured.aux_call_records()`` to inspect what was sent).
+    """
+    from core.brain.base import AuxResult
+    from core.brain.null import BrainNull
 
-    def spawn(argv, env):
-        captured["argv"] = argv
-        captured["env"] = env
-        cp = subprocess.CompletedProcess(
-            args=argv, returncode=returncode,
-            stdout=stdout.encode(), stderr=stderr.encode(),
-        )
-        return cp
+    brain = BrainNull(
+        aux_results=[
+            AuxResult(stdout=stdout, stderr=stderr, returncode=returncode)
+        ]
+    )
+    return brain, brain
 
-    return spawn, captured
+
+@pytest.fixture(autouse=True)
+def _isolated_yaml_config(monkeypatch, tmp_path):
+    """Phase B: tier resolution reads ``~/.vexis/config.yaml``. Tests
+    must not see the user's real config — otherwise legacy
+    ``models.learning_triage: haiku`` raw-string keys override the
+    default tier and confuse assertions on ``model_tier``. Point the
+    config path at ``tmp_path / "config.yaml"`` so tests that
+    explicitly write a config to the same location (like
+    ``test_triage_yaml_config_overrides``) interoperate cleanly."""
+    from core import yaml_config
+
+    monkeypatch.setattr(
+        yaml_config, "_config_path", lambda: tmp_path / "config.yaml"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -957,7 +974,7 @@ def test_run_review_happy_path_one_lesson(tmp_path):
         '}]'
     )
     spawn, captured = _spawn_returning(response)
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
 
     assert output.error is None
     assert output.nothing_to_save is False
@@ -968,28 +985,28 @@ def test_run_review_happy_path_one_lesson(tmp_path):
     assert output.verified_lessons[0]["class"] == "PROCEDURAL"
     assert output.verified_lessons[0]["tier"] == "S3"
 
-    # Subprocess argv looks right:
-    assert captured["argv"][0] == "claude"
-    assert captured["argv"][1] == "-p"
-    # And the recursion env is set in the child env:
-    assert captured["env"][RECURSION_ENV_VAR] == "1"
-    # No --resume: review session must stay isolated:
-    assert "--resume" not in captured["argv"]
-    # Internal model tier wired in (yaml_config.model_learning_review
-    # default is "sonnet" — config can override).
-    assert "--model" in captured["argv"]
-    # The v2 prompt context blocks are present in the prompt (last
-    # arg; resolve_model_flag inserts --model <tier> before it):
-    prompt = captured["argv"][-1]
+    # Phase B: assertions move from argv-shape to brain-call-record
+    # shape. ``captured`` is the same BrainNull instance (the helper
+    # returns a 2-tuple of (brain, brain) for diff hygiene).
+    record = captured.aux_call_records()[0]
+    # Recursion env propagated via env_overrides:
+    assert record["env_overrides"] == {RECURSION_ENV_VAR: "1"}
+    # Tier (default ``small`` per DEFAULT_SUBSYSTEM_TIERS) — review
+    # is small-tier; the brain resolves it to a native model id:
+    assert record["model_tier"] == "small"
+    # The v2 prompt context blocks are present in the prompt:
+    prompt = record["prompt"]
     assert "<skill-index>" in prompt
     assert "<existing-memory>" in prompt
     assert "Classification — required before output" in prompt
+    # cwd routed to the workspace (recursion-guard JSONL placement):
+    assert record["cwd"] == tmp_path
 
 
 def test_run_review_nothing_to_save(tmp_path):
     msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
     spawn, _ = _spawn_returning("Nothing to save.")
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
     assert output.nothing_to_save is True
     assert output.verified_lessons == []
     assert output.error is None
@@ -1004,7 +1021,7 @@ def test_run_review_evidence_verification_rejects(tmp_path):
         '"scope": "S"}]'
     )
     spawn, _ = _spawn_returning(response)
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
     assert len(output.parsed_lessons) == 1
     assert len(output.verified_lessons) == 0
     assert len(output.rejected) == 1
@@ -1023,7 +1040,7 @@ def test_run_review_caps_at_max_entries(tmp_path, monkeypatch):
         ']'
     )
     spawn, _ = _spawn_returning(response)
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
     assert len(output.verified_lessons) == 2
     # The third one ends up rejected with the cap reason:
     assert len(output.rejected) == 1
@@ -1049,7 +1066,7 @@ def test_run_review_max_1_s3_per_session(tmp_path, monkeypatch):
         ']'
     )
     spawn, _ = _spawn_returning(response)
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
     assert len(output.verified_lessons) == 1
     assert output.verified_lessons[0]["target"]["skill_name"] == "skill-one"
     assert len(output.rejected) == 1
@@ -1058,30 +1075,36 @@ def test_run_review_max_1_s3_per_session(tmp_path, monkeypatch):
 
 def test_run_review_subprocess_nonzero_exit(tmp_path):
     spawn, _ = _spawn_returning("oops", returncode=1, stderr="claude failed")
-    output = run_review(tmp_path, _meta(), [_msg("user", "hi")], spawn=spawn)
+    output = run_review(tmp_path, _meta(), [_msg("user", "hi")], brain=spawn)
     assert output.error is not None
     assert "exited 1" in output.error
 
 
 def test_run_review_unparseable_response(tmp_path):
     spawn, _ = _spawn_returning("complete garbage with no JSON")
-    output = run_review(tmp_path, _meta(), [_msg("user", "hi")], spawn=spawn)
+    output = run_review(tmp_path, _meta(), [_msg("user", "hi")], brain=spawn)
     assert output.error is not None
     assert "could not parse" in output.error
 
 
 def test_run_review_timeout(tmp_path):
-    def spawn(argv, env):
-        raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
-    output = run_review(tmp_path, _meta(), [_msg("user", "hi")], spawn=spawn)
+    from core.brain.base import BrainTimeoutError
+    from core.brain.null import BrainNull
+
+    brain = BrainNull()
+    brain.next_aux_raises(BrainTimeoutError("review timed out"))
+    output = run_review(tmp_path, _meta(), [_msg("user", "hi")], brain=brain)
     assert output.error is not None
     assert "timed out" in output.error
 
 
 def test_run_review_spawn_oserror(tmp_path):
-    def spawn(argv, env):
-        raise FileNotFoundError("claude not on PATH")
-    output = run_review(tmp_path, _meta(), [_msg("user", "hi")], spawn=spawn)
+    from core.brain.base import BrainNotInstalled
+    from core.brain.null import BrainNull
+
+    brain = BrainNull()
+    brain.next_aux_raises(BrainNotInstalled("claude not on PATH"))
+    output = run_review(tmp_path, _meta(), [_msg("user", "hi")], brain=brain)
     assert output.error is not None
     assert "spawn failed" in output.error
 
@@ -1093,7 +1116,7 @@ def test_run_review_logs_large_transcript_warning(tmp_path, caplog):
     msgs = [_msg("user", big_text)]
     spawn, _ = _spawn_returning("Nothing to save.")
     with caplog.at_level(logging.WARNING):
-        run_review(tmp_path, _meta(), msgs, spawn=spawn)
+        run_review(tmp_path, _meta(), msgs, brain=spawn)
     matched = [r for r in caplog.records
                if "large transcript" in r.getMessage()]
     assert len(matched) == 1, f"expected one warning, got {len(matched)}"
@@ -1233,7 +1256,7 @@ def test_run_review_declines_oversized_transcript(tmp_path):
                                           stderr=b'')
         return cp
 
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
 
     assert output.declined_too_large is True
     assert output.error is None
@@ -1252,7 +1275,7 @@ def test_run_review_just_below_decline_threshold_runs(tmp_path):
     text = "y" * (LEARNING_TRANSCRIPT_DECLINE_CHARS - 5_000)
     msgs = [_msg("user", text)]
     spawn, _ = _spawn_returning("Nothing to save.")
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
     assert output.declined_too_large is False
     assert output.nothing_to_save is True
 
@@ -1417,7 +1440,7 @@ def test_run_review_situational_dedup_skip(tmp_path):
         '"scope": "environment"}]'
     )
     spawn, _ = _spawn_returning(response)
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
     assert len(output.parsed_lessons) == 1
     assert len(output.verified_lessons) == 0
     assert len(output.rejected) == 1
@@ -1460,35 +1483,51 @@ def test_build_review_prompt_v2_sections_present():
 
 
 def _spawn_sequence(*responses):
-    """Build a fake spawn callable that yields one response per call.
+    """Phase B: build a BrainNull pre-loaded with a sequence of
+    AuxResults, one per spawn_aux call. Each entry is either a
+    ``(stdout, returncode, stderr)`` tuple or a plain string treated
+    as stdout/exit-0. Returns ``(brain, calls)`` where ``calls`` is
+    a list-shim that exposes each spawn's ``{argv, env}`` view by
+    reading ``brain.aux_call_records()`` lazily — pre-Phase-B tests
+    asserted on ``calls[i]["env"][RECURSION_ENV_VAR]``; the shim
+    translates that to ``aux_call_records()[i]["env_overrides"]``."""
+    from core.brain.base import AuxResult
+    from core.brain.null import BrainNull
 
-    Each entry is either a (stdout, returncode, stderr) tuple or a
-    plain string treated as stdout/exit-0. Callable raises if the test
-    consumes more responses than supplied — easier to debug than an
-    IndexError. Returns the spawn callable plus a list capturing the
-    argv of each call so tests can assert which subprocess fired
-    first.
-    """
-    queue = list(responses)
-    calls: list[dict[str, Any]] = []
-
-    def spawn(argv, env):
-        if not queue:
-            raise AssertionError(
-                f"spawn called more times than expected; argv={argv}"
-            )
-        item = queue.pop(0)
+    aux_results = []
+    for item in responses:
         if isinstance(item, str):
-            stdout, returncode, stderr = item, 0, ""
+            aux_results.append(AuxResult(stdout=item, stderr="", returncode=0))
         else:
             stdout, returncode, stderr = item
-        calls.append({"argv": argv, "env": env})
-        return subprocess.CompletedProcess(
-            args=argv, returncode=returncode,
-            stdout=stdout.encode(), stderr=stderr.encode(),
-        )
+            aux_results.append(
+                AuxResult(stdout=stdout, stderr=stderr, returncode=returncode)
+            )
+    brain = BrainNull(aux_results=aux_results)
 
-    return spawn, calls
+    class _CallsShim:
+        """List-like view over ``brain.aux_call_records()`` that
+        exposes each call as ``{argv, env}`` for backward compat
+        with the pre-Phase-B test assertions. The "argv" key is a
+        synthetic claude-shaped argv built from the recorded prompt
+        + tier so tests can still grep for ``--model``."""
+
+        def __getitem__(self, i):
+            r = brain.aux_call_records()[i]
+            tier = r["model_tier"]
+            argv = ["claude", "-p"]
+            if tier:
+                argv += ["--model", tier]
+            argv.append(r["prompt"])
+            return {
+                "argv": argv,
+                "env": dict(r["env_overrides"] or {}),
+            }
+
+        def __len__(self):
+            return len(brain.aux_call_records())
+
+    return brain, _CallsShim()
 
 
 def test_parse_triage_response_yes_no_garbage():
@@ -1526,7 +1565,7 @@ def test_triage_no_skips_sonnet(tmp_path, monkeypatch):
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
     msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
     spawn, calls = _spawn_sequence("NO")
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
 
     assert len(calls) == 1
     assert output.nothing_to_save is True
@@ -1562,7 +1601,7 @@ def test_triage_yes_runs_sonnet(tmp_path, monkeypatch):
         '}]'
     )
     spawn, calls = _spawn_sequence("YES", sonnet_response)
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
 
     assert len(calls) == 2
     assert output.error is None
@@ -1578,7 +1617,7 @@ def test_triage_disabled_skips_triage(tmp_path, monkeypatch):
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: False)
     msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
     spawn, calls = _spawn_sequence("Nothing to save.")
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
 
     assert len(calls) == 1
     assert output.nothing_to_save is True
@@ -1593,7 +1632,7 @@ def test_triage_garbage_output_fails_open(tmp_path, monkeypatch):
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
     msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
     spawn, calls = _spawn_sequence("maybe", "Nothing to save.")
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
 
     assert len(calls) == 2
     assert output.triage_result == "FAIL_OPEN"
@@ -1607,7 +1646,7 @@ def test_triage_empty_output_fails_open(tmp_path, monkeypatch):
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
     msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
     spawn, calls = _spawn_sequence("", "Nothing to save.")
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
 
     assert len(calls) == 2
     assert output.triage_result == "FAIL_OPEN"
@@ -1624,7 +1663,7 @@ def test_triage_rate_limit_propagates(tmp_path, monkeypatch):
     spawn, calls = _spawn_sequence(
         ("", 1, "anthropic: hit your limit, try again later")
     )
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
 
     assert len(calls) == 1
     assert output.error is not None
@@ -1644,32 +1683,31 @@ def test_triage_rate_limit_other_marker(tmp_path, monkeypatch):
     msgs = [_msg("user", "hi")]
     for marker in ("usage limit reached", "rate limit hit", "HTTP 429 returned"):
         spawn, calls = _spawn_sequence(("", 1, marker))
-        output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+        output = run_review(tmp_path, _meta(), msgs, brain=spawn)
         assert len(calls) == 1
         assert output.error is not None
         assert output.triage_result == "RATE_LIMITED"
 
 
 def test_triage_spawn_oserror_fails_open(tmp_path, monkeypatch):
-    """Triage subprocess raises OSError (e.g. claude binary missing
-    transiently) → fall through to sonnet."""
+    """Triage subprocess raises BrainError (e.g. transient OSError
+    inside the brain spawn) → fall through to sonnet."""
+    from core.brain.base import AuxResult, BrainError
+    from core.brain.null import BrainNull
+
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
     msgs = [_msg("user", "hi")]
-    sonnet_calls = {"n": 0}
+    brain = BrainNull(
+        aux_results=[
+            # First call (triage) raises via next_aux_raises; second
+            # call (sonnet) consumes this AuxResult.
+            AuxResult(stdout="Nothing to save.", stderr="", returncode=0),
+        ]
+    )
+    brain.next_aux_raises(BrainError("transient"))
 
-    def spawn(argv, env):
-        # First call is triage; OSError. Second call is sonnet; succeeds.
-        if sonnet_calls["n"] == 0:
-            sonnet_calls["n"] += 1
-            raise OSError("transient")
-        sonnet_calls["n"] += 1
-        return subprocess.CompletedProcess(
-            args=argv, returncode=0,
-            stdout=b"Nothing to save.", stderr=b"",
-        )
-
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
-    assert sonnet_calls["n"] == 2
+    output = run_review(tmp_path, _meta(), msgs, brain=brain)
+    assert len(brain.aux_call_records()) == 2  # triage + sonnet
     assert output.triage_result == "ERROR"
     assert output.error is None
     assert output.nothing_to_save is True
@@ -1677,22 +1715,20 @@ def test_triage_spawn_oserror_fails_open(tmp_path, monkeypatch):
 
 
 def test_triage_spawn_timeout_fails_open(tmp_path, monkeypatch):
+    from core.brain.base import AuxResult, BrainTimeoutError
+    from core.brain.null import BrainNull
+
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
     msgs = [_msg("user", "hi")]
-    n = {"calls": 0}
+    brain = BrainNull(
+        aux_results=[
+            AuxResult(stdout="Nothing to save.", stderr="", returncode=0),
+        ]
+    )
+    brain.next_aux_raises(BrainTimeoutError("triage timed out"))
 
-    def spawn(argv, env):
-        if n["calls"] == 0:
-            n["calls"] += 1
-            raise subprocess.TimeoutExpired(cmd=argv, timeout=1)
-        n["calls"] += 1
-        return subprocess.CompletedProcess(
-            args=argv, returncode=0,
-            stdout=b"Nothing to save.", stderr=b"",
-        )
-
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
-    assert n["calls"] == 2
+    output = run_review(tmp_path, _meta(), msgs, brain=brain)
+    assert len(brain.aux_call_records()) == 2
     assert output.triage_result == "ERROR"
 
 
@@ -1706,7 +1742,7 @@ def test_triage_nonzero_exit_non_rate_limit_fails_open(tmp_path, monkeypatch):
         ("", 1, "some unrelated stderr noise"),
         "Nothing to save.",
     )
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
 
     assert len(calls) == 2
     assert output.triage_result == "ERROR"
@@ -1715,33 +1751,36 @@ def test_triage_nonzero_exit_non_rate_limit_fails_open(tmp_path, monkeypatch):
 
 
 def test_triage_uses_recursion_env_var(tmp_path, monkeypatch):
-    """Both triage and sonnet must inherit VEXIS_LEARNING_REVIEW=1 so
-    nested spawn-detection works for either call."""
+    """Both triage and sonnet must pass VEXIS_LEARNING_REVIEW=1 in
+    env_overrides so nested spawn-detection works for either call.
+    Phase B: assert via brain.aux_call_records() rather than the
+    pre-Phase-B argv ``env`` dict."""
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
     msgs = [_msg("user", "hi")]
-    spawn, calls = _spawn_sequence("YES", "Nothing to save.")
-    run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    brain, _ = _spawn_sequence("YES", "Nothing to save.")
+    run_review(tmp_path, _meta(), msgs, brain=brain)
 
-    assert calls[0]["env"][RECURSION_ENV_VAR] == "1"
-    assert calls[1]["env"][RECURSION_ENV_VAR] == "1"
+    records = brain.aux_call_records()
+    assert records[0]["env_overrides"] == {RECURSION_ENV_VAR: "1"}
+    assert records[1]["env_overrides"] == {RECURSION_ENV_VAR: "1"}
 
 
-def test_triage_uses_triage_model_flag(tmp_path, monkeypatch):
-    """Triage subprocess argv must carry the triage model flag (default
-    haiku), distinct from the review model (default sonnet)."""
+def test_triage_uses_triage_tier(tmp_path, monkeypatch):
+    """Phase B: triage and review pass DIFFERENT abstract tiers to
+    spawn_aux. Default subsystem map: ``learning_triage`` → ``tiny``
+    (cheap), ``learning_review`` → ``small``. The brain implementation
+    resolves tiers to native model ids at spawn time (claude-code:
+    tiny→haiku, small→haiku per DEFAULT_TIER_MAP_CLAUDE_CODE), but
+    the tier-distinction is what the test asserts."""
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
-    monkeypatch.setattr(lr, "model_learning_triage", lambda: "haiku")
-    monkeypatch.setattr(lr, "model_learning_review", lambda: "sonnet")
     msgs = [_msg("user", "hi")]
-    spawn, calls = _spawn_sequence("YES", "Nothing to save.")
-    run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    brain, _ = _spawn_sequence("YES", "Nothing to save.")
+    run_review(tmp_path, _meta(), msgs, brain=brain)
 
-    triage_argv = calls[0]["argv"]
-    sonnet_argv = calls[1]["argv"]
-    assert "--model" in triage_argv
-    assert triage_argv[triage_argv.index("--model") + 1] == "haiku"
-    assert "--model" in sonnet_argv
-    assert sonnet_argv[sonnet_argv.index("--model") + 1] == "sonnet"
+    records = brain.aux_call_records()
+    # Default subsystem tiers per core/yaml_config.py:DEFAULT_SUBSYSTEM_TIERS.
+    assert records[0]["model_tier"] == "tiny"   # learning_triage
+    assert records[1]["model_tier"] == "small"  # learning_review
 
 
 def test_triage_skipped_for_oversized_transcript(tmp_path, monkeypatch):
@@ -1755,7 +1794,7 @@ def test_triage_skipped_for_oversized_transcript(tmp_path, monkeypatch):
     def spawn(argv, env):
         raise AssertionError("no subprocess should fire when declined")
 
-    output = run_review(tmp_path, _meta(), msgs, spawn=spawn)
+    output = run_review(tmp_path, _meta(), msgs, brain=spawn)
     assert output.declined_too_large is True
     assert output.triage_result is None
     assert output.triage_skipped is False

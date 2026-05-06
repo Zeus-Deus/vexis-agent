@@ -1574,7 +1574,16 @@ def _real_review(
     if not messages:
         return ("skip: no conversational messages", WriteSummary())
 
-    output = run_review(workspace, meta, messages)
+    # Phase B: brain threaded by the LearningController via the
+    # _real_review wrapper closure (commit 4). When brain is None
+    # (legacy direct callers in tests), synthesise a BrainNull so
+    # ``run_review`` and ``_run_triage`` can still call spawn_aux
+    # uniformly — those tests must mock run_review entirely (they
+    # do; see tests/test_learning_curator.py mock.patch sites).
+    if brain is None:
+        from core.brain.null import BrainNull
+        brain = BrainNull()
+    output = run_review(workspace, meta, messages, brain)
 
     if output.error:
         raise RuntimeError(output.error)
