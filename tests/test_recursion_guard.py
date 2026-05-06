@@ -179,7 +179,17 @@ def test_review_one_persists_spawned_uuid_immediately(env, monkeypatch):
     """``_review_one`` runs the review_fn between scan-diff
     snapshots; a JSONL created by the review_fn lands in the persistent
     SpawnedStore on the same call (so a crash before tick completion
-    leaves the disk authoritative)."""
+    leaves the disk authoritative).
+
+    Phase C Day 6: scan-diff routes through
+    ``brain.iter_session_metas`` — must use a real
+    ``ClaudeCodeBrain`` rather than the default ``BrainNull`` so
+    the seeded JSONLs are actually visible to the snapshot.
+    """
+    from core.brain.claude_code import ClaudeCodeBrain
+    from core.running_tasks import RunningTasks
+    from core.sessions import SessionStore
+
     workspace = env
     pdir = claude_session_jsonl_dir(workspace)
     _stage_jsonl(
@@ -201,7 +211,16 @@ def test_review_one_persists_spawned_uuid_immediately(env, monkeypatch):
         return ("ok", lc.WriteSummary())
 
     monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
-    controller = LearningController(workspace=workspace, review_fn=fake_review)
+    cc_brain = ClaudeCodeBrain(
+        workspace=workspace,
+        session=SessionStore(workspace / "sessions.json"),
+        running_tasks=RunningTasks(),
+    )
+    controller = LearningController(
+        workspace=workspace,
+        review_fn=fake_review,
+        brain=cc_brain,
+    )
     controller.run_now()
 
     # In-memory set captured the child.

@@ -346,7 +346,19 @@ def test_handle_telegram_unknown_subcommand(env):
 def test_review_one_tracks_spawned_uuids(env, monkeypatch):
     """When the review fork creates a new JSONL in the projects dir,
     the controller's _review_one wrapper should pick it up and add
-    to _spawned_uuids."""
+    to _spawned_uuids.
+
+    Phase C Day 6: ``_dispatch_to_brain`` now snapshots
+    ``brain.iter_session_metas()`` rather than globbing the
+    claude-projects dir directly. The test must inject a real
+    ``ClaudeCodeBrain`` so the scan-diff actually walks the
+    seeded JSONLs — the default ``BrainNull`` knows about no
+    sessions.
+    """
+    from core.brain.claude_code import ClaudeCodeBrain
+    from core.running_tasks import RunningTasks
+    from core.sessions import SessionStore
+
     workspace = env
     _stage_session(workspace, "abandoned", "2026-05-02T10:00:00Z")
     monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
@@ -359,7 +371,16 @@ def test_review_one_tracks_spawned_uuids(env, monkeypatch):
         new_path.write_text('{"type":"user","timestamp":"2026-05-02T11:00:00Z","message":{"role":"user","content":"review prompt"}}\n', encoding="utf-8")
         return _stub_review_fn(workspace_arg, meta)
 
-    controller = LearningController(workspace=workspace, review_fn=fake_review_with_spawn)
+    cc_brain = ClaudeCodeBrain(
+        workspace=workspace,
+        session=SessionStore(workspace / "sessions.json"),
+        running_tasks=RunningTasks(),
+    )
+    controller = LearningController(
+        workspace=workspace,
+        review_fn=fake_review_with_spawn,
+        brain=cc_brain,
+    )
     controller.run_now()
 
     assert "claude-spawned-session" in controller._spawned_uuids

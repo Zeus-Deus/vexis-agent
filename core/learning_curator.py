@@ -80,7 +80,6 @@ from core.paths import (
 from core.skills import discover_skills, parse_skill_md
 from core.transcripts import (
     SessionMeta,
-    claude_session_jsonl_dir,
     iter_messages,
     list_eligible_sessions,
 )
@@ -2153,20 +2152,31 @@ class LearningController:
         lessons get written), so this dispatcher stays uniform.
 
         Also implements the **recursion guard scan-diff** (§4.6 of
-        the research doc): each ``claude -p`` invocation by the
-        review fork creates a new session JSONL in the same projects
-        directory the curator scans for eligibility. We snapshot the
-        directory's UUIDs before and after the review and add the
-        diff to ``self._spawned_uuids`` — ``list_eligible_sessions``
+        the research doc): each aux-spawn (curator review fork,
+        coherence judge, goal judge, etc.) creates a new session
+        in whatever storage the brain owns — claude-code: a JSONL
+        under ``~/.claude/projects/<encoded-cwd>/``; opencode: a
+        row in ``opencode.db``. We snapshot the brain's known
+        sessions before and after the review and add the diff to
+        ``self._spawned_uuids`` — ``list_eligible_sessions``
         filters those out so the next tick can't pick up the
         curator's own review session as a review candidate.
+
+        Phase C Day 6: routes the snapshot through
+        ``brain.iter_session_metas`` instead of the claude-code-
+        specific ``claude_session_jsonl_dir`` glob. Closes the
+        last claude-code-shape leak in the curator's hot path —
+        opencode workspaces now populate the spawned-UUIDs
+        registry correctly. The
+        ``brain.is_brain_owned_session`` content-prefix check
+        stays as the belt-and-braces fallback in
+        ``list_eligible_sessions``.
 
         Backward compat: if a legacy review_fn returns just a string
         (pre-Day-5 interface), wrap it in an empty WriteSummary so
         old test stubs still work without modification.
         """
-        projects_dir = claude_session_jsonl_dir(self._workspace)
-        before = self._scan_projects_uuids(projects_dir)
+        before = self._scan_brain_session_uuids()
         try:
             ret = self._review_fn(self._workspace, meta)
             if isinstance(ret, tuple):
@@ -2176,7 +2186,7 @@ class LearningController:
                 # an empty summary so the rest of the pipeline works.
                 outcome, summary = ret, WriteSummary()
         finally:
-            after = self._scan_projects_uuids(projects_dir)
+            after = self._scan_brain_session_uuids()
             new_uuids = after - before
             if new_uuids:
                 # Persist FIRST so a crash between the two updates
@@ -2280,10 +2290,42 @@ class LearningController:
                 result.facts_queued, meta.session_uuid,
             )
 
+    def _scan_brain_session_uuids(self) -> set[str]:
+        """Brain-agnostic session-UUID enumeration for the recursion-
+        guard scan-diff at ``_dispatch_to_brain``.
+
+        Phase C Day 6: replaces the claude-code-specific
+        ``_scan_projects_uuids(claude_session_jsonl_dir(workspace))``
+        glob with ``brain.iter_session_metas`` — claude-code
+        yields one meta per JSONL stem, opencode yields one per
+        ``opencode.db`` session row. The set semantics are
+        identical from the recursion guard's perspective.
+
+        Errors are swallowed (returns whatever was iterated up to
+        the failure) so a transient SQLITE_BUSY or filesystem
+        glitch doesn't abort the surrounding review path. The
+        content-prefix filter is the safety net.
+        """
+        try:
+            return {m.session_uuid for m in self._brain.iter_session_metas()}
+        except Exception:
+            log.exception(
+                "brain.iter_session_metas raised during recursion-guard scan"
+            )
+            return set()
+
     @staticmethod
     def _scan_projects_uuids(projects_dir: Path) -> set[str]:
-        """Cheap UUID enumeration of the projects directory. Returns
-        an empty set when the directory doesn't exist (fresh install)."""
+        """Cheap UUID enumeration of a claude-code projects directory.
+
+        Pre-Day-6 hot-path helper for the recursion guard;
+        replaced by ``_scan_brain_session_uuids`` in
+        ``_dispatch_to_brain`` (the only caller). Kept as a
+        public-shaped helper because tests in
+        ``tests/test_learning_curator.py`` reference it directly
+        for fixture setup. Returns an empty set when the directory
+        doesn't exist (fresh install).
+        """
         if not projects_dir.exists():
             return set()
         return {p.stem for p in projects_dir.glob("*.jsonl")}
