@@ -59,7 +59,21 @@ export function GoalsPage({ token, onAuthFail }: GoalsPageProps) {
           onAuthFail();
           return;
         }
+        // 4xx tells us the server's view of state has diverged from
+        // ours — the most common case being a 409 from Day 5.5's
+        // terminal-state guard ("Goal is already done"). Surface the
+        // detail message AND re-fetch so the UI catches up
+        // immediately instead of waiting for the next 5s poll. The
+        // refresh moves the goal into history; the error toast
+        // explains what happened until the next render clears it.
         setError(exc instanceof Error ? exc.message : String(exc));
+        try {
+          await refresh();
+        } catch {
+          // Ignore refresh failure here — the original error is
+          // what the user needs to see, and the polling loop will
+          // try again in 5s.
+        }
       } finally {
         setPendingAction(null);
       }
