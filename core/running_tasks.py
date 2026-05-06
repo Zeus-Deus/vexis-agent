@@ -433,6 +433,24 @@ class RunningTasks:
         state = self._chats.get(chat_id)
         return len(state.queue) if state is not None else 0
 
+    def is_drain_cancelled(self, chat_id: int) -> bool:
+        """True iff a /cancel has flagged this chat's drain to stop.
+
+        Read-only accessor — does not acquire the lock. The flag is
+        a single-bit boolean and the GIL guarantees the read is
+        atomic; callers tolerate a transient stale-False read at
+        worst, which collapses to "next post-turn check sees True".
+
+        Used by the /goal post-turn hook to short-circuit before
+        spawning the judge: a drain that's been cancelled mid-brain
+        means the brain returned early (no real reply to evaluate),
+        and feeding the empty reply to the judge would fold to
+        ``continue`` per the fold rule and enqueue a surprise
+        continuation.
+        """
+        state = self._chats.get(chat_id)
+        return state is not None and state.drain_cancelled
+
     def last_idle_at(self, chat_id: int) -> datetime | None:
         """Timestamp of the most recent drain release for chat_id, or
         None if the chat has never been busy in this daemon's lifetime.

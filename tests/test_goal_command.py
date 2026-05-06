@@ -21,6 +21,7 @@ from transports.telegram import (
     TelegramTransport,
     _CANCEL_OK,
     _CANCEL_OK_GOAL_PAUSED_TMPL,
+    _GOAL_BAREWORD_HINT,
     _GOAL_CLEAR_REPLY,
     _GOAL_DISABLED_NOTE,
     _GOAL_KICKOFF_REPLY_TMPL,
@@ -452,6 +453,202 @@ def test_cancel_without_active_goal_uses_existing_path(
 
     # Standard cancel reply, not the goal-paused variant.
     assert msg.reply_log == [_CANCEL_OK]
+
+
+# ──────────────────────────────────────────────────────────────────
+# Race guards on _run_goal_hook (Day 2 bugfix)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_cancel_mid_kickoff_does_not_run_goal_hook(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    """**The bug**: /cancel during a brain turn used to let
+    ``_run_goal_hook`` fire after the cancelled brain returned None,
+    judging the empty reply as "continue" per the §3 fold rule, and
+    enqueueing a surprise continuation that ``take_over_if_pending``
+    would then run after the post-cancel drain release.
+
+    Fix: ``_run_goal_hook`` checks ``running_tasks.is_drain_cancelled``
+    at top and bails — no judge call, no enqueue, no status message.
+    The ``/cancel`` reply is still produced by ``_on_cancel`` and the
+    auto-pause integration writes ``status=paused``.
+    """
+    store = GoalStateStore(goals_file)
+    GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    ).set("g")
+
+    bot = _FakeBot()
+
+    async def scenario() -> None:
+        # Mimic a drain in flight (claim taken, then /cancel hits).
+        await transport._running_tasks.claim(_CHAT)
+        # Issue /cancel — runs the auto-pause path.
+        upd, _b, _msg = _update("/cancel")
+        # /cancel uses its own bot via msg.reply_text; we capture
+        # those messages on the fake message's reply_log already.
+        await transport._on_cancel(upd, _ctx())
+        # Drain now reaches the goal hook with reply="" because the
+        # brain raised BrainCancelled and handler returned None.
+        with mock.patch("core.goal_manager.judge_goal") as fake_judge:
+            await transport._run_goal_hook(bot, _CHAT, "")
+            # Judge MUST NOT be called — bail before that.
+            fake_judge.assert_not_called()
+
+        # No continuation enqueued, no "Continuing" status message.
+        assert transport._running_tasks.queue_depth(_CHAT) == 0
+        assert not any("Continuing" in t for _cid, t in bot.sent_messages)
+        # Goal state: paused with the user-cancelled reason.
+        state = store.load(_SESSION)
+        assert state is not None
+        assert state.status == "paused"
+        assert state.paused_reason == "user-cancelled"
+
+    asyncio.run(scenario())
+
+
+def test_pause_during_judge_call_drops_continuation(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    """Inverse race: ``/goal pause`` lands AFTER
+    ``evaluate_after_turn`` returned but BEFORE the hook enqueues
+    the continuation. The reload guard at the enqueue site catches
+    it — no continuation lands, no "↻ Continuing" status message
+    sent (state changed under us, the user already saw their pause
+    reply).
+
+    Simulated by patching ``GoalManager.evaluate_after_turn`` to
+    side-effect a paused-status write into the store before
+    returning a continue decision. Equivalent to a real concurrent
+    pause that landed during the judge's await window.
+    """
+    store = GoalStateStore(goals_file)
+    GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    ).set("g")
+
+    from core.goal_manager import CONTINUATION_PROMPT_TEMPLATE, GoalManager as _GM
+
+    def evaluate_with_concurrent_pause(self, last_response: str) -> dict:
+        # Stand in for evaluate_after_turn: do the manager's work
+        # (turns_used++, save), then perform a paused-status write
+        # via a separate manager instance to mimic /goal pause
+        # arriving from another handler.
+        state = self._state
+        assert state is not None
+        state.turns_used += 1
+        state.last_verdict = "continue"
+        state.last_reason = "more work"
+        self._store.save(self._session_uuid, state)
+        # Concurrent pause writer — second manager, same store.
+        external = _GM(
+            session_uuid=self._session_uuid,
+            workspace=self._workspace,
+            store=self._store,
+        )
+        external.pause(reason="user-paused")
+        return {
+            "status": "active",
+            "should_continue": True,
+            "continuation_prompt": CONTINUATION_PROMPT_TEMPLATE.format(
+                goal=state.goal
+            ),
+            "verdict": "continue",
+            "reason": "more work",
+            "message": "↻ Continuing toward goal (1/20): more work",
+        }
+
+    bot = _FakeBot()
+
+    async def scenario() -> None:
+        with mock.patch.object(
+            _GM, "evaluate_after_turn", evaluate_with_concurrent_pause
+        ):
+            await transport._run_goal_hook(bot, _CHAT, "brain reply")
+
+    asyncio.run(scenario())
+
+    # No continuation enqueued.
+    assert transport._running_tasks.queue_depth(_CHAT) == 0
+    # No status messages sent (state flipped under us).
+    assert not any("Continuing" in t for _cid, t in bot.sent_messages)
+    # Final disk state: paused (the concurrent writer's write).
+    state = store.load(_SESSION)
+    assert state is not None
+    assert state.status == "paused"
+    assert state.paused_reason == "user-paused"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Bareword-typo guard
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_goal_bareword_redirects_to_hint(
+    transport: TelegramTransport,
+    goals_on: None,
+    goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/goal cancel / /goal stop / /goal abort / /goal kill / /goal halt
+    are almost certainly typos for /cancel. The handler returns the
+    hint instead of either treating the bareword as goal text or
+    letting the mid-run reject hide the intent.
+
+    Asserted three ways:
+      1. /goal cancel mid-drain → hint (NOT "Brain is busy").
+      2. /goal stop with no drain → hint (NOT goal-set with text "stop").
+      3. /goal foobar → proceeds normally to set the goal.
+    """
+    store = GoalStateStore(goals_file)
+
+    # Case 1: /goal cancel mid-drain → hint, regardless of busy state.
+    async def seed_drain() -> None:
+        await transport._running_tasks.claim(_CHAT)
+
+    asyncio.run(seed_drain())
+    upd, _bot, msg = _update("/goal cancel")
+    asyncio.run(transport._on_goal(upd, _ctx("cancel")))
+    assert msg.reply_log == [_GOAL_BAREWORD_HINT]
+    assert store.load(_SESSION) is None  # NOT set as a goal
+
+    # Reset the running_tasks so case 2 isn't mid-drain.
+    transport._running_tasks = type(transport._running_tasks)()  # type: ignore[assignment]
+
+    # Case 2: /goal stop outside a drain → still the hint, not goal-set.
+    upd, _bot, msg = _update("/goal stop")
+    asyncio.run(transport._on_goal(upd, _ctx("stop")))
+    assert msg.reply_log == [_GOAL_BAREWORD_HINT]
+    assert store.load(_SESSION) is None  # NOT set as a goal
+
+    # Case 3: a real goal text proceeds normally. Stub the kickoff
+    # dispatch path so we don't go all the way through the brain.
+    async def _no_dispatch(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(transport, "_dispatch_to_brain", _no_dispatch)
+    upd, _bot, msg = _update("/goal foobar")
+    asyncio.run(transport._on_goal(upd, _ctx("foobar")))
+    state = store.load(_SESSION)
+    assert state is not None
+    assert state.goal == "foobar"
+    assert state.status == "active"
+
+
+def test_goal_uppercase_bareword_hits_hint(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    """Bareword check is case-insensitive — /goal STOP / /goal Cancel
+    both hit the hint. Multi-word phrases starting with the same
+    word (e.g. /goal stop the timer) are real goal text and bypass
+    the check."""
+    store = GoalStateStore(goals_file)
+
+    upd, _bot, msg = _update("/goal STOP")
+    asyncio.run(transport._on_goal(upd, _ctx("STOP")))
+    assert msg.reply_log == [_GOAL_BAREWORD_HINT]
+    assert store.load(_SESSION) is None
 
 
 def test_cancel_with_goals_disabled_skips_auto_pause(

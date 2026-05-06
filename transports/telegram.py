@@ -111,6 +111,17 @@ _GOAL_REJECT_MIDRUN = (
     "Brain is busy. /cancel first, then /goal <text>."
 )
 _GOAL_INVALID_TMPL = "Invalid goal: {reason}"
+# Single-word inputs to /goal that almost certainly meant /cancel.
+# We redirect with a hint rather than treating them as goal text or
+# letting the mid-run reject hide the typo. Multi-word phrases that
+# happen to start with "stop" / "cancel" / etc. ARE goal text — only
+# the bareword case (after strip) hits this branch.
+_GOAL_BAREWORD_CANCEL_LIKE = frozenset(
+    {"cancel", "stop", "abort", "kill", "halt"}
+)
+_GOAL_BAREWORD_HINT = (
+    "Did you mean /cancel? (Or /goal clear to drop the goal entirely.)"
+)
 _CANCEL_OK_GOAL_PAUSED_TMPL = (
     "Cancelled, sir. (Goal paused at {turns}/{budget} turns — "
     "/goal resume to keep going.)"
@@ -1091,6 +1102,14 @@ class TelegramTransport:
             await msg.reply_text(_GOAL_INVALID_TMPL.format(reason="goal text is empty"))
             return
 
+        # Bareword-typo guard. /goal cancel / /goal stop / etc. is
+        # almost always a typo for /cancel — never a real goal.
+        # Caught BEFORE the mid-run reject so the user gets the
+        # right hint regardless of drain state.
+        if goal_text.lower() in _GOAL_BAREWORD_CANCEL_LIKE:
+            await msg.reply_text(_GOAL_BAREWORD_HINT)
+            return
+
         # Mid-run reject: a drain is already processing this chat.
         # Setting a new goal would race a continuation against the
         # in-flight turn. /cancel is the way out (which auto-pauses
@@ -1134,12 +1153,39 @@ class TelegramTransport:
         continuation prompt (tagged ``origin="goal_continuation"``)
         when the judge says continue.
 
+        Two race guards protect the user from surprise continuations:
+
+        * **Cancel guard at entry.** If ``running_tasks.is_drain_cancelled``
+          returns True, the brain turn that just finished was aborted
+          mid-flight by /cancel — its reply is empty/cancelled, and
+          feeding that to the judge would fold to ``continue`` per
+          the empty-response rule, enqueuing a continuation that the
+          drain's post-cancel ``take_over_if_pending`` would then
+          run. Bail before we touch the judge.
+        * **Active recheck before enqueue.** Between
+          :meth:`evaluate_after_turn` returning and the enqueue, a
+          concurrent ``/goal pause`` / ``/goal clear`` / cancel
+          auto-pause may have flipped status. Reload from disk and
+          bail if the goal is no longer active. We also suppress the
+          status message in this case — state changed under us and
+          the user already triggered the change, so they don't need
+          a "↻ Continuing toward goal" line that contradicts their
+          own pause/clear reply.
+
         Failures are isolated — a broken judge or store I/O error
         logs and returns, never breaks the drain loop.
         """
         try:
             from core.yaml_config import goals_enabled
             if not goals_enabled():
+                return
+
+            # Race guard 1: drain-cancelled. The brain turn was
+            # aborted mid-flight; its reply isn't a real signal.
+            if self._running_tasks.is_drain_cancelled(chat_id):
+                log.debug(
+                    "goal hook: skipping (drain cancelled) for chat %s", chat_id
+                )
                 return
 
             session_uuid = self._handler.current_session_uuid()
@@ -1153,6 +1199,45 @@ class TelegramTransport:
             return
 
         msg_text = decision.get("message") or ""
+        should_continue = decision.get("should_continue", False)
+
+        # Terminal branch (done / budget-exhausted): send the status
+        # message and stop. No reload needed — the reload guard only
+        # exists to suppress continuations that would race a
+        # concurrent pause/clear, not terminal status updates.
+        if not should_continue:
+            if msg_text:
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id, text=msg_text, parse_mode=None
+                    )
+                except Exception:
+                    log.exception(
+                        "goal hook: terminal status send failed for chat %s", chat_id
+                    )
+            return
+
+        # Continue branch: race guard 2. Re-read state from disk
+        # before sending the "↻ Continuing" line OR enqueuing the
+        # continuation. A concurrent pause/clear between
+        # evaluate_after_turn and here means the user already saw
+        # their own /goal reply; tacking a "Continuing" message on
+        # top would contradict it.
+        try:
+            mgr.reload()
+        except Exception:
+            log.exception(
+                "goal hook: reload failed for chat %s; bailing safe", chat_id
+            )
+            return
+        if not mgr.is_active():
+            log.debug(
+                "goal hook: state flipped during evaluate; dropping "
+                "continuation for chat %s",
+                chat_id,
+            )
+            return
+
         if msg_text:
             try:
                 await bot.send_message(
@@ -1160,9 +1245,6 @@ class TelegramTransport:
                 )
             except Exception:
                 log.exception("goal hook: status send failed for chat %s", chat_id)
-
-        if not decision.get("should_continue"):
-            return
 
         prompt = decision.get("continuation_prompt")
         if not prompt:

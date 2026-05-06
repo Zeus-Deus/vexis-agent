@@ -129,6 +129,20 @@ class GoalManager:
     def state(self) -> GoalState | None:
         return self._state
 
+    def reload(self) -> GoalState | None:
+        """Re-read state from the store and replace the in-memory copy.
+
+        The post-turn hook calls this between
+        :meth:`evaluate_after_turn` returning and the continuation
+        enqueue: a concurrent /goal pause / /goal clear / cancel
+        auto-pause may have flipped status to paused or cleared
+        during the judge call's async window. A fresh read catches
+        that and lets the caller bail out before adding a stale
+        continuation to the queue.
+        """
+        self._state = self._store.load(self._session_uuid)
+        return self._state
+
     def is_active(self) -> bool:
         """True iff a goal is set AND the loop should fire on the
         next turn. ``cleared`` and ``done`` count as no goal here;
