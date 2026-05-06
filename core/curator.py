@@ -34,13 +34,22 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
 import tarfile
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
+
+from core.brain.base import (
+    BrainAuthRequired,
+    BrainError,
+    BrainNotInstalled,
+    BrainTimeoutError,
+)
+
+if TYPE_CHECKING:
+    from core.brain.base import Brain
 
 from core.notify import Notifier
 from core.paths import (
@@ -65,6 +74,7 @@ from core.yaml_config import (
     curator_enabled,
     curator_interval_hours,
     curator_stale_after_days,
+    subsystem_tier,
 )
 
 log = logging.getLogger(__name__)
@@ -337,23 +347,6 @@ class Phase2Result:
     error: str | None = None
 
 
-def _curator_subprocess_argv(prompt: str, candidate_text: str) -> list[str]:
-    """Compose the argv for the curator's claude -p invocation.
-
-    Note: the curator gets a fresh session (no --resume), no SOUL
-    or CAPABILITIES injection, and a hardened prompt that names the
-    only commands available. Tool restrictions are enforced at the
-    CLI layer via the VEXIS_CURATOR=1 env var.
-    """
-    return [
-        "claude",
-        "-p",
-        f"{prompt}\n\n## Candidate skills\n\n{candidate_text}",
-        "--permission-mode",
-        "bypassPermissions",
-    ]
-
-
 def _candidate_text(workspace: Path) -> tuple[str, list[str]]:
     """Render the candidate-skill list the curator's LLM sees, and return
     the list of candidate names so we can compare pre/post."""
@@ -377,16 +370,20 @@ def _candidate_text(workspace: Path) -> tuple[str, list[str]]:
 
 def run_phase2(
     workspace: Path,
+    brain: "Brain",
     *,
     now: datetime | None = None,
-    spawn: Callable[[list[str], dict[str, str]], subprocess.CompletedProcess]
-    | None = None,
 ) -> Phase2Result:
-    """Run the LLM consolidation pass.
+    """Run the LLM consolidation pass via ``Brain.spawn_aux``.
 
-    The ``spawn`` parameter exists for tests — production passes None
-    and we shell out via ``subprocess.run``. The injected callable
-    must return a CompletedProcess-like with stdout / stderr / returncode.
+    Phase B: ``brain`` is the aux-spawn surface. Unlike judges and
+    extractors, the curator's consolidation pass MUST be able to
+    write files (it moves / merges / archives skill SKILL.md trees),
+    so it passes ``allow_tools=True`` so the spawned brain sees
+    ``--permission-mode bypassPermissions``.
+
+    Sync wrapper around the async ``spawn_aux`` via ``asyncio.run``;
+    the curator daemon thread (only caller) has no event loop.
     """
     if now is None:
         now = _utc_now()
@@ -402,47 +399,42 @@ def run_phase2(
             error=f"backup tarball at {backup_path} is suspiciously small; aborting",
         )
 
-    argv = _curator_subprocess_argv(_CURATOR_REVIEW_PROMPT, candidate_text)
-    env = {**os.environ, "VEXIS_CURATOR": "1"}
+    prompt = (
+        f"{_CURATOR_REVIEW_PROMPT}\n\n## Candidate skills\n\n{candidate_text}"
+    )
 
     try:
-        if spawn is not None:
-            cp = spawn(argv, env)
-        else:
-            cp = subprocess.run(
-                argv,
-                env=env,
-                cwd=str(workspace),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=PHASE2_TIMEOUT_SECONDS,
+        result = asyncio.run(
+            brain.spawn_aux(
+                prompt,
+                model_tier=subsystem_tier("curator"),
+                timeout_seconds=PHASE2_TIMEOUT_SECONDS,
+                env_overrides={"VEXIS_CURATOR": "1"},
+                allow_tools=True,  # consolidation writes files
+                cwd=workspace,
             )
-    except subprocess.TimeoutExpired:
+        )
+    except BrainTimeoutError:
         return Phase2Result(
             ran=True,
             backup_path=str(backup_path),
             error=f"phase2 timed out after {PHASE2_TIMEOUT_SECONDS}s",
         )
-    except (OSError, FileNotFoundError) as exc:
+    except (BrainNotInstalled, BrainAuthRequired) as exc:
+        return Phase2Result(
+            ran=False, backup_path=str(backup_path), error=f"spawn failed: {exc}"
+        )
+    except BrainError as exc:
         return Phase2Result(
             ran=False, backup_path=str(backup_path), error=f"spawn failed: {exc}"
         )
 
-    stdout = (
-        cp.stdout.decode("utf-8", errors="replace")
-        if isinstance(cp.stdout, bytes)
-        else cp.stdout or ""
-    )
-    if cp.returncode != 0:
-        stderr = (
-            cp.stderr.decode("utf-8", errors="replace")
-            if isinstance(cp.stderr, bytes)
-            else cp.stderr or ""
-        )
+    stdout = result.stdout
+    if result.returncode != 0:
         return Phase2Result(
             ran=True,
             backup_path=str(backup_path),
-            error=f"claude -p exited {cp.returncode}: {stderr.strip() or stdout.strip()}",
+            error=f"claude -p exited {result.returncode}: {(result.stderr or stdout).strip()}",
         )
 
     after_text, after_names = _candidate_text(workspace)
@@ -560,11 +552,10 @@ class RunSummary:
 
 def run_curator(
     workspace: Path,
+    brain: "Brain",
     *,
     skip_phase2: bool = False,
     now: datetime | None = None,
-    spawn: Callable[[list[str], dict[str, str]], subprocess.CompletedProcess]
-    | None = None,
 ) -> RunSummary:
     """Execute one full curator pass: phase 1 → phase 2 → write report."""
     started_at = now or _utc_now()
@@ -574,7 +565,7 @@ def run_curator(
             ran=False, final_message="phase 2 skipped (skip_phase2=True)"
         )
     else:
-        p2 = run_phase2(workspace, now=started_at, spawn=spawn)
+        p2 = run_phase2(workspace, brain, now=started_at)
     finished_at = _utc_now()
     folder = write_report(started_at, finished_at, p1, p2)
 
@@ -608,9 +599,21 @@ class CuratorController:
         self,
         workspace: Path,
         notifier: Notifier | None = None,
+        *,
+        brain: "Brain | None" = None,
     ) -> None:
+        # Phase B: brain is the aux-spawn surface for the
+        # consolidation pass. Production main.py threads the real
+        # brain in; tests can leave it None and a BrainNull is
+        # synthesised at the call site below — those tests must
+        # mock out run_phase2 entirely (they do — see
+        # tests/test_curator.py:_FakeProc usage), so the BrainNull
+        # is never actually exercised in test paths.
+        from core.brain.null import BrainNull
+
         self._workspace = workspace
         self._notifier = notifier
+        self._brain: "Brain" = brain or BrainNull()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._busy = threading.Lock()
@@ -668,7 +671,7 @@ class CuratorController:
                 # Pruning is housekeeping — never block the actual run.
                 log.exception("Backup pruning failed; continuing with curator pass")
             log.info("Curator pass beginning")
-            summary = run_curator(self._workspace)
+            summary = run_curator(self._workspace, self._brain)
             log.info(
                 "Curator pass complete: phase1=%s phase2=%s folder=%s",
                 summary.phase1.archived,

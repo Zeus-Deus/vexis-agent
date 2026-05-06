@@ -1,5 +1,11 @@
 """Tests for the curator: phase 1 transitions, deferred-first-run,
-pause/resume, phase 2 with mocked claude -p, report writing."""
+pause/resume, phase 2 with mocked claude -p, report writing.
+
+Phase B: phase2 now spawns via ``Brain.spawn_aux`` instead of an
+inline subprocess.run. Tests inject a ``BrainNull`` pre-loaded
+with one ``AuxResult`` (the simple cases) or a ``_SideEffectBrain``
+subclass when the spawn must perform a real side-effect like
+archiving a skill (the consolidation-pass test)."""
 
 from __future__ import annotations
 
@@ -7,10 +13,13 @@ import os
 import tarfile
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from core import curator as cur
+from core.brain.base import AuxResult
+from core.brain.null import BrainNull
 from core.skills import (
     ARCHIVE_DIR_NAME,
     PinStore,
@@ -18,6 +27,31 @@ from core.skills import (
     STATE_STALE,
     UsageStore,
 )
+
+
+def _brain_returning(stdout: str = "", stderr: str = "", returncode: int = 0) -> BrainNull:
+    """BrainNull pre-loaded with one AuxResult — Phase B replacement
+    for the old ``_FakeProc(...) + fake_spawn`` pair."""
+    return BrainNull(
+        aux_results=[
+            AuxResult(stdout=stdout, stderr=stderr, returncode=returncode)
+        ]
+    )
+
+
+class _SideEffectBrain(BrainNull):
+    """BrainNull subclass that runs a callback before returning the
+    canned AuxResult — for tests where the spawn must perform a
+    real workspace mutation (e.g. archiving a skill so phase1's
+    re-scan picks it up)."""
+
+    def __init__(self, on_call, aux_result: AuxResult):
+        super().__init__(aux_results=[aux_result])
+        self._on_call = on_call
+
+    async def spawn_aux(self, prompt, **kwargs):
+        self._on_call()
+        return await super().spawn_aux(prompt, **kwargs)
 
 
 @pytest.fixture
@@ -169,25 +203,12 @@ def test_phase1_anchors_on_created_at_when_no_last_used(workspace: Path):
 # --------------------------------------------------------------------
 
 
-class _FakeProc:
-    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
-        self.stdout = stdout.encode("utf-8")
-        self.stderr = stderr.encode("utf-8")
-        self.returncode = returncode
-
-
 def test_phase2_writes_backup_tarball(workspace: Path):
     _seed_skill(workspace, "alpha")
     _seed_skill(workspace, "beta")
 
-    captured: dict[str, list] = {"argv": [], "env": []}
-
-    def fake_spawn(argv, env):
-        captured["argv"].append(argv)
-        captured["env"].append(env)
-        return _FakeProc(stdout="CURATOR-SUMMARY:\nNo changes needed.\n")
-
-    out = cur.run_phase2(workspace, spawn=fake_spawn)
+    brain = _brain_returning(stdout="CURATOR-SUMMARY:\nNo changes needed.\n")
+    out = cur.run_phase2(workspace, brain)
     assert out.ran
     assert out.backup_path is not None
 
@@ -202,19 +223,22 @@ def test_phase2_writes_backup_tarball(workspace: Path):
 def test_phase2_sets_curator_env(workspace: Path):
     _seed_skill(workspace, "alpha")
 
-    captured_env: list[dict] = []
-
-    def fake_spawn(argv, env):
-        captured_env.append(env)
-        return _FakeProc(stdout="CURATOR-SUMMARY:\ndone\n")
-
-    cur.run_phase2(workspace, spawn=fake_spawn)
-    assert captured_env
-    assert captured_env[0].get("VEXIS_CURATOR") == "1"
+    brain = _brain_returning(stdout="CURATOR-SUMMARY:\ndone\n")
+    cur.run_phase2(workspace, brain)
+    # The curator passes VEXIS_CURATOR=1 via env_overrides; the brain
+    # records the kwarg shape — assert the env-override surfaced
+    # correctly to the spawn layer.
+    record = brain.aux_call_records()[0]
+    assert record["env_overrides"] == {"VEXIS_CURATOR": "1"}
+    # Curator is the only consumer that needs allow_tools=True so it
+    # can write SKILL.md trees during consolidation.
+    assert record["allow_tools"] is True
 
 
 def test_phase2_no_candidates_returns_no_op(workspace: Path):
-    out = cur.run_phase2(workspace, spawn=lambda a, e: _FakeProc())
+    # No candidates → brain.spawn_aux is never called, so an empty
+    # BrainNull is fine.
+    out = cur.run_phase2(workspace, BrainNull())
     assert not out.ran
     assert "No candidates" in out.final_message
 
@@ -222,10 +246,8 @@ def test_phase2_no_candidates_returns_no_op(workspace: Path):
 def test_phase2_failure_recorded(workspace: Path):
     _seed_skill(workspace, "alpha")
 
-    def boom(argv, env):
-        return _FakeProc(stderr="something exploded", returncode=2)
-
-    out = cur.run_phase2(workspace, spawn=boom)
+    brain = _brain_returning(stderr="something exploded", returncode=2)
+    out = cur.run_phase2(workspace, brain)
     assert out.ran
     assert out.error is not None
     assert "exited 2" in out.error
@@ -238,7 +260,9 @@ def test_phase2_failure_recorded(workspace: Path):
 
 def test_run_curator_writes_report_md_and_run_json(workspace: Path):
     _seed_skill(workspace, "alpha")
-    summary = cur.run_curator(workspace, skip_phase2=True)
+    # skip_phase2=True means brain.spawn_aux is never called; pass
+    # an empty BrainNull rather than mocking.
+    summary = cur.run_curator(workspace, BrainNull(), skip_phase2=True)
     assert (summary.folder / "REPORT.md").is_file()
     assert (summary.folder / "run.json").is_file()
     state = cur.load_state()
@@ -269,8 +293,10 @@ def test_run_once_prunes_backups_before_running(
     # Stub out run_curator so we don't actually spawn claude -p
     captured: dict[str, int] = {}
 
-    def fake_run_curator(_ws, **_kw):
-        # At this point, prune should already have run, leaving 11 backups
+    def fake_run_curator(_ws, _brain, **_kw):
+        # Phase B: signature gained ``brain`` as the second positional;
+        # the stub ignores it. At this point, prune should already
+        # have run, leaving 11 backups.
         captured["before_run"] = sum(1 for _ in backups.iterdir())
         return cur.RunSummary(
             folder=workspace, phase1=cur.Phase1Result(), phase2=cur.Phase2Result()
@@ -285,16 +311,21 @@ def test_run_curator_phase2_records_archived_names(workspace: Path):
     _seed_skill(workspace, "alpha")
     _seed_skill(workspace, "beta")
 
-    def consolidating_spawn(argv, env):
+    def archive_beta() -> None:
         # Simulate the LLM archiving 'beta' by actually invoking the
         # archive directly. This is what the real LLM would do via
         # vexis-skill archive beta.
         from core.skills import archive_skill
         archive_skill(workspace / "skills", "beta")
-        return _FakeProc(
-            stdout="CURATOR-SUMMARY:\nArchived beta as redundant with alpha.\n"
-        )
 
-    summary = cur.run_curator(workspace, spawn=consolidating_spawn)
+    brain = _SideEffectBrain(
+        on_call=archive_beta,
+        aux_result=AuxResult(
+            stdout="CURATOR-SUMMARY:\nArchived beta as redundant with alpha.\n",
+            stderr="",
+            returncode=0,
+        ),
+    )
+    summary = cur.run_curator(workspace, brain)
     assert "beta" in summary.phase2.archived_names
     assert (workspace / "skills" / ARCHIVE_DIR_NAME / "beta").exists()

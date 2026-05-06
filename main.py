@@ -272,7 +272,9 @@ async def _run() -> None:
         notifier=notifier,
         workspace=workspace,
     )
-    curator = CuratorController(workspace=workspace, notifier=notifier)
+    curator = CuratorController(
+        workspace=workspace, notifier=notifier, brain=brain,
+    )
     learning_curator = LearningController(
         workspace=workspace, notifier=notifier, brain=brain,
     )
