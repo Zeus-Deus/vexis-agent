@@ -2,12 +2,26 @@
 
 The env-var / .env config in ``core/config.py`` is the source of
 truth for daemon credentials and workspace location. This file
-supplements it with values that are nicer to keep in YAML:
+supplements it with values that are nicer to keep in YAML.
 
+Canonical schema reference (every block is optional; missing file
+→ all defaults; malformed file → warning + defaults):
+
+    # ── brain abstraction (Phase C, see docs/brains.md) ─────────
+    brain:
+      kind: claude-code           # or "opencode" or "null"; default
+                                  # claude-code. Selects which agent
+                                  # CLI vexis spawns under. Opencode
+                                  # is opt-in — flipping requires the
+                                  # legacy-keys → tier-schema migration
+                                  # documented in docs/migration.md.
+
+    # ── memory limits ───────────────────────────────────────────
     memory:
       memory_char_limit: 2200
       user_char_limit: 1375
 
+    # ── learning curator ────────────────────────────────────────
     curator:
       enabled: true
       interval_hours: 168
@@ -15,9 +29,43 @@ supplements it with values that are nicer to keep in YAML:
       stale_after_days: 30
       archive_after_days: 90
 
-All keys are optional. Missing file → all defaults. Malformed file
-logs a warning and falls through to defaults; we don't want a
-corrupt config to brick the daemon when sane defaults will do.
+    # ── per-subsystem model selection ───────────────────────────
+    # Phase B (post-rollout) schema: subsystems pick an abstract
+    # tier; per-brain tier maps translate to native model ids.
+    # See docs/brains.md "Models" + docs/migration.md "Switching
+    # to opencode: minimal config" for the legacy raw-string
+    # back-compat shim and migration recipe.
+    models:
+      brain: default              # foreground display only;
+                                  # foreground spawn never passes
+                                  # --model
+      subsystems:                 # NEW (Phase B+): abstract tiers
+        learning_review: small
+        learning_triage: tiny
+        coherence_judge: small
+        relationships_extractor: medium
+        relationships_classifier: tiny
+        goal_judge: large
+        curator: small
+      tiers:                      # NEW (Phase C): per-brain
+        claude-code:              # tier→native overrides; only
+          large: sonnet           # set if the built-in defaults
+        opencode:                 # at DEFAULT_TIER_MAP_<brain>
+          large: anthropic/claude-sonnet-4
+          medium: anthropic/claude-sonnet-3-7
+      # Legacy raw-string keys (pre-Phase-B) still work on
+      # claude-code via passthrough but break opencode (which
+      # requires provider/model shape) — see docs/migration.md.
+
+    # ── goals (v3d, see docs/goals.md) ──────────────────────────
+    goals:
+      enabled: true
+      max_turns: 20
+
+    # ── relationships (v3c, see docs/relationships.md) ──────────
+    relationships:
+      explicit_consent_enabled: false
+      approval_hint_enabled: true
 """
 
 from __future__ import annotations

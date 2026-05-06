@@ -291,3 +291,87 @@ post-turn hook without a code change.
 
 Full design: `.plans/goal-command-research.md`.
 End-user one-pager: `docs/goals.md`.
+
+## Brain abstraction (Phase C)
+
+Vexis runs on top of an agent CLI selected at startup by
+`brain.kind` in `~/.vexis/config.yaml`. Two implementations
+ship today; both satisfy the `core.brain.Brain` ABC so the rest
+of vexis (transports, learning curator, goals, schedules,
+dashboard, install script) doesn't care which one is running.
+
+- **`claude-code` (default)** — `ClaudeCodeBrain` against the
+  `claude` CLI binary. Pre-Phase-C behaviour, byte-equivalent.
+  Sessions live in `~/.claude/projects/<encoded-cwd>/`.
+- **`opencode` (opt-in)** — `OpenCodeBrain` against the
+  `opencode` CLI binary. Sessions live in
+  `~/.local/share/opencode/opencode.db`. Opt-in; flipping
+  requires the legacy-keys → tier-schema config migration
+  documented in `docs/migration.md`.
+- **`null`** — `BrainNull`, the test fake. Useful for a vexis
+  daemon running without a real model (dashboard-only smoke).
+
+**Default flow.**
+
+1. `main.py` reads `brain.kind` once at startup; logs which
+   brain was instantiated.
+2. The transport hands user messages to `brain.respond` for
+   foreground turns.
+3. Aux subsystems (curator, judges, extractors) spawn through
+   `brain.spawn_aux(prompt, model_tier=...)` — never directly
+   shell out. Tier resolution: subsystem picks an abstract size
+   (`tiny` / `small` / `medium` / `large`); brain translates
+   per `models.tiers.<brain-kind>.<tier>` config or the built-in
+   `DEFAULT_TIER_MAP_<BRAIN>` constants.
+4. Curator reads transcripts via `brain.iter_session_metas` +
+   `brain.iter_messages` + `brain.is_brain_owned_session`. The
+   recursion guard works on either brain's session storage.
+
+**Key files.**
+
+- `core/brain/base.py` — `Brain` ABC + `BrainEvent` variants +
+  exception hierarchy (`BrainError`, `BrainTimeoutError`,
+  `BrainCancelled`, `SessionLost`, `BrainNotInstalled`,
+  `BrainAuthRequired`).
+- `core/brain/claude_code.py` — claude-code implementation.
+- `core/brain/opencode.py` — opencode implementation, including
+  the SQLite reader, `OPENCODE_CONFIG_CONTENT` builder, and
+  namespace-prefix MCP merge.
+- `core/brain/null.py` — test fake; canned responses + recorded
+  call shapes. Default brain in the unit-test suite.
+- `core/yaml_config.py` — `brain_kind()`, `model_for_tier()`,
+  `subsystem_tier()`, plus the `DEFAULT_TIER_MAP_*` constants.
+- `scripts/install.py` — installer; symlinks AGENTS.md ↔
+  CLAUDE.md, writes per-brain MCP config (`.mcp.json` for
+  claude-code, `opencode.json` with `vexis-` namespace prefix
+  for opencode), verifies the binary is on PATH.
+
+**Per-brain test runs.**
+
+```
+pytest                              # default suite (BrainNull)
+pytest -m brain_smoke               # real claude-code binary
+pytest -m brain_smoke_opencode      # real opencode binary
+```
+
+**Cross-brain contract.** `tests/test_brain_contract.py`
+parametrises 23 inspection-only assertions over all three
+implementations (`null` / `claude_code` / `opencode`); 67
+total cases. `tests/test_aux_spawn_routing.py` pins each aux
+subsystem's tier choice. `tests/test_system_prompt_snapshots.py`
+pins structural invariants (no tool-name leaks, opencode
+omits the `<available_skills>` block claude-code emits, SOUL
+renders before CAPABILITIES).
+
+**Decision posture.** `brain.kind: claude-code` is the default
+and stays the default. Opencode is opt-in. Switching brains is
+high-friction today (YAML edit + restart + minimal config
+migration); the next research after this rollout closes is
+**`/model` UX** — slash-commands, dashboard picker, runtime
+config edits — which makes the switch productive enough to
+dogfood opencode end-to-end.
+
+End-user docs: `docs/brains.md` (per-brain reference),
+`docs/migration.md` (opt-in / opt-out flow + the legacy-keys
+migration recipe), `docs/dogfood-checklist.md` (12 manual
+flows that gate "ready for daily use" on a fresh install).
