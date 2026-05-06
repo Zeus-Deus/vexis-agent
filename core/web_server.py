@@ -1513,9 +1513,19 @@ class WebDashboard:
 
     async def _drop_dashboard_goal_continuations(self) -> None:
         """Drop any pending ``goal_continuation`` messages from every
-        chat's queue. Called by the dashboard's pause / clear / resume
-        endpoints so a continuation queued before the user clicked the
-        button doesn't sneak through after the state change.
+        chat's queue. Called by the dashboard's pause and clear
+        endpoints so a continuation queued before the user clicked
+        the button doesn't sneak through after the state change.
+
+        **Not called from resume** — Telegram's ``/goal resume``
+        handler doesn't drop continuations either, so the dashboard
+        and Telegram surfaces share identical resume semantics
+        (write status=active, reset turns_used, no queue mutation).
+        Adding a defensive drop here was a Day 5 oversight that
+        introduced silent behavioral divergence between the two
+        surfaces. See `tests/test_dashboard_goals_endpoints.py::
+        test_post_resume_does_not_drop_continuations` for the
+        regression pin.
 
         ``running_tasks`` may be None on bare test fixtures; guard.
         """
@@ -1552,12 +1562,11 @@ class WebDashboard:
         if s is None or s.status != "paused":
             raise HTTPException(404, "no paused goal to resume")
         mgr.resume()
-        # Resume doesn't enqueue a continuation itself — the next
-        # user message in Telegram will kick the loop again. We
-        # don't need to drop anything from the queue, but doing so
-        # is safe (and forensically tidy) in case a stale
-        # continuation slipped in during the paused window.
-        await self._drop_dashboard_goal_continuations()
+        # NO continuation drop here — parity with Telegram's
+        # ``/goal resume`` handler (``transports/telegram.py:_on_goal``
+        # under ``sub == "resume"``), which writes state and replies
+        # but does not touch the queue. Both surfaces share identical
+        # resume semantics by design.
         state = mgr.state
         assert state is not None
         return self._goal_record_dict(sid, state)

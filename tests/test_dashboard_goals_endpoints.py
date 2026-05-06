@@ -370,3 +370,60 @@ def test_post_pause_drops_pending_goal_continuations(
 
     # Continuation dropped, user message survives.
     assert dashboard._running_tasks.queue_depth(123) == 1
+
+
+def test_post_resume_does_not_drop_continuations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**Telegram parity**: dashboard resume MUST NOT drop queued
+    ``goal_continuation`` messages. The Telegram ``/goal resume``
+    handler in ``transports/telegram.py:_on_goal`` doesn't touch
+    the queue either — both surfaces share identical resume
+    semantics: write status=active, reset turns_used to 0, no
+    queue mutation.
+
+    Day 5 originally added a defensive drop here for "forensic
+    tidiness", which silently diverged the two surfaces. The fix
+    removes that drop; this test pins the no-drop invariant as a
+    regression guard so a future "while-you're-in-there" addition
+    can't reintroduce the divergence without failing CI.
+    """
+    dashboard = _build_dashboard(tmp_path, monkeypatch)
+    store = GoalStateStore(tmp_path / "goals.json")
+    mgr = GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    )
+    mgr.set("g")
+    state = mgr.state
+    assert state is not None
+    state.turns_used = 4
+    state.status = "paused"
+    state.paused_reason = "user-paused"
+    store.save(_SESSION, state)
+
+    async def seed() -> None:
+        await dashboard._running_tasks.claim(123)
+        await dashboard._running_tasks.enqueue(
+            123, 99, "stale continuation",
+            origin="goal_continuation",
+        )
+        await dashboard._running_tasks.enqueue(
+            123, 99, "real user message",
+            origin="user",
+        )
+
+    asyncio.run(seed())
+    assert dashboard._running_tasks.queue_depth(123) == 2
+
+    client = TestClient(dashboard._app)
+    resp = client.post("/api/v1/goals/resume", headers=_hdr())
+    assert resp.status_code == 200
+
+    # Both queued items survive — resume is a state-only mutation.
+    assert dashboard._running_tasks.queue_depth(123) == 2
+    # And state DID transition: turns_used reset, status=active.
+    after = store.load(_SESSION)
+    assert after is not None
+    assert after.status == "active"
+    assert after.turns_used == 0
