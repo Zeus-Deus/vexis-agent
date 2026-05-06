@@ -44,12 +44,14 @@ DEFAULT_LEARNING_TICK_INTERVAL_MINUTES = 5
 DEFAULT_LEARNING_IDLE_THRESHOLD_MINUTES = 25
 DEFAULT_LEARNING_FAILURE_COOLDOWN_HOURS = 1
 DEFAULT_LEARNING_MAX_ENTRIES_PER_SESSION = 2
-# /goal feature defaults. Disabled by default until Day 4 release-gate
-# eval runs green; flip via ``goals.enabled: true`` in
-# ``~/.vexis/config.yaml`` (or update DEFAULT_GOALS_ENABLED on the
-# release commit). 20-turn budget mirrors Hermes
-# (`hermes_cli/config.py`) and matches `core.goal_state.DEFAULT_MAX_TURNS`.
-DEFAULT_GOALS_ENABLED = False
+# /goal feature defaults. Enabled by default at v3d Day 4 release
+# after the eval gate passed (see ``tests/test_goal_eval.py`` and
+# ``docs/goals.md`` for thresholds + how to re-run). Disable via
+# ``goals.enabled: false`` in ``~/.vexis/config.yaml`` to silence
+# the slash command and the post-turn hook without code changes.
+# 20-turn budget mirrors Hermes (`hermes_cli/config.py`) and matches
+# ``core.goal_state.DEFAULT_MAX_TURNS``.
+DEFAULT_GOALS_ENABLED = True
 DEFAULT_GOALS_MAX_TURNS = 20
 # Day 4 v2 calibration: raised from 280 → 400. Day 4 eval surfaced
 # the LLM consistently producing 290-340 char lessons for technical

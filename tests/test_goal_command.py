@@ -29,6 +29,7 @@ from transports.telegram import (
     _GOAL_NO_GOAL_TO_PAUSE,
     _GOAL_REJECT_MIDRUN,
     _NOTHING_TO_CANCEL,
+    _PICKING_UP_PREFIX as _GOAL_PICKING_UP_PREFIX,
 )
 
 
@@ -1111,3 +1112,177 @@ def test_pause_does_not_cancel_running_brain_proc(
         assert chat_entry["drain_active"] is True
 
     asyncio.run(scenario())
+
+
+# ──────────────────────────────────────────────────────────────────
+# Day 4a — /status goal-summary surfacing
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_goal_status_line_active(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    """An active goal renders as ``⊙ Goal (N/M turns): <text>``."""
+    store = GoalStateStore(goals_file)
+    mgr = GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    )
+    mgr.set("port the goal command")
+    state = mgr.state
+    assert state is not None
+    state.turns_used = 3
+    store.save(_SESSION, state)
+
+    line = transport._goal_status_line()
+    assert line is not None
+    assert line.startswith("⊙ Goal (3/20 turns):")
+    assert "port the goal command" in line
+
+
+def test_goal_status_line_paused_with_reason(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    """A paused goal renders the paused_reason inline."""
+    store = GoalStateStore(goals_file)
+    mgr = GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    )
+    mgr.set("ship feature X")
+    state = mgr.state
+    assert state is not None
+    state.turns_used = 7
+    state.status = "paused"
+    state.paused_reason = "user-cancelled"
+    store.save(_SESSION, state)
+
+    line = transport._goal_status_line()
+    assert line is not None
+    assert "⏸ Goal (paused, 7/20 turns — user-cancelled):" in line
+    assert "ship feature X" in line
+
+
+def test_goal_status_line_done(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    store = GoalStateStore(goals_file)
+    mgr = GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    )
+    mgr.set("g")
+    mgr.mark_done("delivered")
+    line = transport._goal_status_line()
+    assert line is not None
+    assert line.startswith("✓ Goal (done):")
+    assert "g" in line
+
+
+def test_goal_status_line_omitted_when_cleared(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    """A cleared record stays on disk for audit but doesn't show up
+    in /status — same posture as ``status_line`` on the manager."""
+    store = GoalStateStore(goals_file)
+    mgr = GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    )
+    mgr.set("g")
+    mgr.clear()
+    assert transport._goal_status_line() is None
+
+
+def test_goal_status_line_omitted_when_no_goal(
+    transport: TelegramTransport, goals_on: None
+) -> None:
+    assert transport._goal_status_line() is None
+
+
+def test_goal_status_line_omitted_when_disabled(
+    transport: TelegramTransport, goals_off: None, goals_file: Path
+) -> None:
+    """Even with an active goal on disk, the /status surface is
+    suppressed when goals are globally disabled — keeps the feature
+    invisible when the flag is off."""
+    store = GoalStateStore(goals_file)
+    GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    ).set("would-show-when-on")
+    assert transport._goal_status_line() is None
+
+
+def test_goal_status_line_truncates_long_goal(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    """Long goal text is truncated at 80 chars with an ellipsis so a
+    novella in /goal <text> doesn't blow up the /status reply."""
+    store = GoalStateStore(goals_file)
+    long_text = "ship the thing " * 20  # 300 chars
+    mgr = GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    )
+    mgr.set(long_text)
+    line = transport._goal_status_line()
+    assert line is not None
+    # Truncated body at most 80 chars; "…" present.
+    assert "…" in line
+
+
+# ──────────────────────────────────────────────────────────────────
+# Day 4b — Picking-up preview suppression for goal continuations
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_drain_suppresses_pickup_preview_for_goal_continuation(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    """A queued goal continuation should NOT trigger the
+    ``Picking up:`` preview — the goal hook's own
+    ``↻ Continuing toward goal (N/M): <reason>`` line conveys the
+    same info more usefully. Real user messages still get the
+    preview unchanged.
+
+    Verified end-to-end through ``_drain_chat`` with two queued
+    items: a goal continuation followed by a user message. Drain
+    processes both; only the user-origin item's pickup line lands
+    in the bot output.
+    """
+    bot = _FakeBot()
+
+    async def scenario() -> None:
+        # Pre-load the queue: goal continuation, then user message.
+        await transport._running_tasks.claim(_CHAT)
+        await transport._running_tasks.enqueue(
+            _CHAT, _USER, "[Continuing toward your standing goal] ...",
+            origin="goal_continuation",
+        )
+        await transport._running_tasks.enqueue(
+            _CHAT, _USER, "real follow-up", origin="user",
+        )
+
+        # Stub the goal hook so it's a no-op (we don't want it
+        # running in this test — it would call judge_goal).
+        async def _no_hook(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        transport._run_goal_hook = _no_hook  # type: ignore[method-assign]
+
+        # Drive the drain manually with first_text="<initial>" so we
+        # exercise the loop's ordering. is_first=True for the
+        # initial, so the preview never fires for it; the suppression
+        # is tested on iteration 2 (continuation) and iteration 3
+        # (user message).
+        await transport._drain_chat(bot, _CHAT, _USER, "<initial>")
+
+    asyncio.run(scenario())
+
+    pickup_lines = [
+        text for _cid, text in bot.sent_messages
+        if text.startswith(_GOAL_PICKING_UP_PREFIX)
+    ]
+    assert len(pickup_lines) == 1, (
+        f"expected exactly one Picking-up preview (for the user msg), "
+        f"got {pickup_lines}"
+    )
+    assert "real follow-up" in pickup_lines[0]
+    # And the goal-continuation message went through the brain handler
+    # WITHOUT a preceding Picking-up preview.
+    assert "Continuing toward your standing goal" not in " ".join(pickup_lines)

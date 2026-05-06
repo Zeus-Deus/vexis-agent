@@ -189,3 +189,105 @@ eval drops, flip back to sonnet via
 
 Full design: `.plans/relationships-v3c-research.md`.
 End-user one-pager: `docs/relationships.md`.
+
+## Goals (v3d)
+
+`/goal <text>` kicks off a multi-step task that Vexis works on
+across turns until the goal is reached, paused, or the turn budget
+runs out. After every brain turn an auxiliary `claude -p` judge
+(sonnet-default; override via `models.goal_judge` in
+`~/.vexis/config.yaml`) decides whether the goal is satisfied; if
+not and the budget remains, Vexis enqueues a continuation prompt
+through the same per-chat FIFO that real user messages use.
+
+**Default flow.**
+
+1. `/goal <text>` — sets the standing goal, kicks off turn 1.
+2. Brain replies. The post-turn hook in `transports/telegram.py`
+   reads the assistant's final text, calls `judge_goal`, and
+   either marks the goal done or enqueues a continuation tagged
+   `origin="goal_continuation"`.
+3. Loop terminates when the judge says done, the user pauses /
+   clears, the turn budget exhausts, or `/cancel` fires.
+
+**Subcommands.**
+
+- `/goal` (alias `/goal status`) — show current state.
+- `/goal pause` — soft pause: the in-flight brain turn finishes,
+  the loop stops auto-continuing afterwards. Drops queued
+  continuations from the FIFO; never kills the brain proc.
+- `/goal resume` — resets `turns_used` to 0 and re-enables the
+  loop. Next brain turn restarts the judge cycle.
+- `/goal clear` — drops the goal. Record retained on disk for
+  audit; the chat treats it as no-active-goal.
+
+**Auto-pause on `/cancel`.** A `/cancel` while a goal is active
+flips status to paused with `paused_reason="user-cancelled"` and
+drops queued continuations. This is the §4 trade-off in
+`.plans/goal-command-research.md`: a surprise continuation hours
+after a /cancel (when the user thought they were done) is a worse
+failure mode than typing `/goal resume` to keep going.
+
+**Soft pause.** `/goal pause` writes paused state and drops
+pending continuations from the queue. It does NOT call
+`running_tasks.cancel` and does NOT touch any brain subprocess —
+the in-flight turn keeps running and lands its reply normally. The
+loop just won't auto-continue afterwards. Test pin:
+`tests/test_goal_command.py::test_pause_does_not_cancel_running_brain_proc`.
+
+**Default budget.** 20 turns. Override via `goals.max_turns: N` in
+`~/.vexis/config.yaml`. On exhaustion the manager auto-pauses with
+`paused_reason="turn budget exhausted (N/M)"` — the user can `/goal
+resume` to extend with another full budget (resume zeros the count).
+
+**Persistence.** Per-session goal state lives at `~/.vexis/goals.json`,
+keyed by Claude session UUID. Sidecar `.lock` + `fcntl.flock` +
+atomic temp-rename writes (same idiom as `core/learning_curator.py:SpawnedStore`).
+Survives daemon restart; the next user message wakes the loop.
+**No auto-fire on boot** — restart safety is "next user message
+resumes", not "boot resumes".
+
+**Curator-recursion guard.** Every judge call spawns a `claude -p`
+that writes its own session JSONL into the workspace projects
+directory. Without a filter the curator would later review each
+judge JSONL for lessons. Filter is the content-prefix check at
+`core/transcripts.py:_is_curator_owned`, recognising
+`GOAL_JUDGE_PROMPT_PREFIX = "You are a strict judge evaluating whether
+an autonomous agent"`. The `VEXIS_GOAL_JUDGE=1` env var is set on
+the spawn for audit / forensics — same pattern as
+`COHERENCE_JUDGE_ENV_VAR`, but note (per the Day 1 audit) that the
+env-var-as-filter mechanism is a phantom: no curator code path
+reads either env var for filtering. The content-prefix is the
+only real filter.
+
+**Prompt-cache invariant.** Continuation prompts are plain
+user-role messages of shape
+``[Continuing toward your standing goal]\nGoal: <text>\n\n...``.
+No system-prompt mutation, no toolset swap. Anthropic prompt
+caching stays intact across continuations. Pinned by:
+
+- `tests/test_goal_manager.py::test_continuation_prompt_starts_with_verbatim_prefix`
+- `tests/test_goal_manager.py::test_continuation_prompt_no_system_prompt_leak`
+
+**Eval gate.** Six-fixture release-gate eval at
+`tests/test_goal_eval.py`. Run when the prompt or judge model
+changes:
+
+```
+pytest -m eval tests/test_goal_eval.py -v -s
+```
+
+Threshold: 100% accuracy on cases (a) clear-done, (b)
+clear-continue, (c) unachievable→done, (e) empty→continue, (f)
+error→continue. Case (d) ambiguous→continue is advisory — the
+verdict is logged for human review without a hard assertion.
+Approximate cost: 4 real sonnet judge calls + 2 deterministic
+fixtures ≈ $0.05 ceiling.
+
+**Disabled flag.** `goals.enabled` defaults to `True` (v3d Day 4
+release flip). Set `goals: {enabled: false}` in
+`~/.vexis/config.yaml` to silence the slash command and the
+post-turn hook without a code change.
+
+Full design: `.plans/goal-command-research.md`.
+End-user one-pager: `docs/goals.md`.

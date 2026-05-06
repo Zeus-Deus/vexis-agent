@@ -511,9 +511,20 @@ class TelegramTransport:
         queued follow-ups still run.
         """
         text = first_text
+        # The first turn's origin is "user" by construction:
+        # _dispatch_to_brain only ever passes user-typed (or /goal
+        # kickoff text, which is also a user-driven message) text in
+        # as ``first_text``. Continuations only appear via
+        # ``pop_or_release`` on subsequent iterations, where we read
+        # the QueuedMessage's ``origin`` field directly.
+        origin = "user"
         is_first = True
         while True:
-            if not is_first:
+            if not is_first and origin != "goal_continuation":
+                # Goal continuations get their own user-visible
+                # status line via ``_run_goal_hook`` ("↻ Continuing
+                # toward goal (N/M): <reason>"). The "Picking up:"
+                # preview would be redundant chat clutter on top.
                 preview = _make_pickup_preview(text)
                 try:
                     await bot.send_message(
@@ -559,6 +570,7 @@ class TelegramTransport:
                     return
             text = next_msg.text
             user_id = next_msg.user_id
+            origin = next_msg.origin
             is_first = False
 
     async def _on_clear(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -884,6 +896,11 @@ class TelegramTransport:
         queue depth and last-idle timestamp, and replies with a short
         summary. Touches no shared mutable state — safe to call while
         a drain is mid-flight.
+
+        When a goal exists for the current session UUID and goals are
+        enabled, appends a one-line goal summary so the user can see
+        whether the loop is active without typing /goal status
+        separately.
         """
         msg = update.message
         user = update.effective_user
@@ -899,7 +916,56 @@ class TelegramTransport:
         reply = _format_status_reply(
             snapshot, queue_depth, last_idle, datetime.now(timezone.utc)
         )
+        goal_line = self._goal_status_line()
+        if goal_line:
+            reply = f"{reply}\n{goal_line}"
         await msg.reply_text(reply)
+
+    def _goal_status_line(self) -> str | None:
+        """Return a one-line goal summary for /status, or None.
+
+        Returns None when goals are disabled, when no goal exists for
+        the current session, or when status is ``cleared``. Format
+        per `.plans/goal-command-research.md` §6 Day 4:
+
+          * active : "⊙ Goal (N/M turns): <text>"
+          * paused : "⏸ Goal (paused, N/M turns — <reason>): <text>"
+          * done   : "✓ Goal (done): <text>"
+          * cleared: omitted
+
+        Goal text is truncated at 80 chars with "…" so a long goal
+        doesn't blow up the /status reply length.
+        """
+        try:
+            from core.yaml_config import goals_enabled
+            if not goals_enabled():
+                return None
+            session_uuid = self._handler.current_session_uuid()
+            if not session_uuid:
+                return None
+            from core.goal_state import GoalStateStore
+            from core.paths import goals_path
+            store = GoalStateStore(goals_path())
+            state = store.load(session_uuid)
+        except Exception:
+            log.debug("status goal-summary read failed", exc_info=True)
+            return None
+        if state is None or state.status == "cleared":
+            return None
+        text = state.goal
+        if len(text) > 80:
+            text = text[:79] + "…"
+        if state.status == "active":
+            return f"⊙ Goal ({state.turns_used}/{state.max_turns} turns): {text}"
+        if state.status == "paused":
+            reason = f" — {state.paused_reason}" if state.paused_reason else ""
+            return (
+                f"⏸ Goal (paused, {state.turns_used}/{state.max_turns} "
+                f"turns{reason}): {text}"
+            )
+        if state.status == "done":
+            return f"✓ Goal (done): {text}"
+        return None
 
     async def _on_pin(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
