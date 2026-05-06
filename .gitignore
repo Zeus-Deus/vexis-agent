@@ -24,3 +24,9 @@ SOUL.md
 
 # Personal planning notes
 .plans/
+
+# Per-brain instruction-file symlink. CLAUDE.md is canonical (gitted);
+# AGENTS.md is the symlink the install script creates so opencode and
+# any future AGENTS.md-reading brain can find the same content. The
+# install script refuses to overwrite a real (non-symlink) AGENTS.md.
+AGENTS.md
