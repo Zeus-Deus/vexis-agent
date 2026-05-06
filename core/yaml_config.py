@@ -458,6 +458,14 @@ def resolve_model_flag(tier: str) -> list[str]:
     Empty list rather than a None return so callers can splat with
     ``*resolve_model_flag(...)`` directly into argv composition without
     a conditional.
+
+    .. deprecated::
+        Phase B of the brain abstraction prefers
+        :func:`subsystem_tier` + :func:`model_for_tier` so model names
+        are brain-agnostic at the subsystem level. ``resolve_model_flag``
+        stays for now so legacy direct-spawn paths keep working
+        unchanged; once Phase C lands, callers should funnel through
+        ``Brain.spawn_aux`` instead and never construct argv themselves.
     """
     if not isinstance(tier, str):
         return []
@@ -465,3 +473,154 @@ def resolve_model_flag(tier: str) -> list[str]:
     if not cleaned or cleaned.lower() == "default":
         return []
     return ["--model", cleaned]
+
+
+# --------------------------------------------------------------------
+# [models.subsystems] + [models.tiers] — brain-agnostic tier mapping
+# --------------------------------------------------------------------
+#
+# Phase B of the brain abstraction (.plans/brain-abstraction-research.md
+# §4 "Tier-name resolution") splits the model-config story in two:
+#
+#   1. ``models.subsystems.<name>`` maps each subsystem (curator,
+#      goal_judge, etc.) to an abstract size tier (``tiny`` /
+#      ``small`` / ``medium`` / ``large``). Subsystem code passes
+#      this string to ``Brain.spawn_aux(..., model_tier=...)``.
+#
+#   2. ``models.tiers.<brain-kind>.<tier>`` maps each abstract tier
+#      to a brain-native model identifier (``haiku`` for claude-code,
+#      ``anthropic/claude-haiku-3-5`` for opencode, etc.).
+#      The brain implementation reads its own row at spawn time.
+#
+# Together: a subsystem says "I want small," each brain knows what
+# small means for it, and config edits to switch model versions touch
+# one place per brain — not every subsystem.
+#
+# Back-compat: legacy ``models.<subsystem-name>: <raw-string>`` keys
+# (e.g. ``models.curator: claude-haiku-3-5``) still work. The
+# subsystem reads ``subsystem_tier(name)`` which returns whatever's
+# configured (tier OR raw string); ``model_for_tier`` recognises
+# raw strings (anything not in ``ABSTRACT_TIERS``) and passes them
+# through untranslated. The legacy keys live alongside the new schema
+# for users who haven't migrated.
+
+ABSTRACT_TIERS: frozenset[str] = frozenset({"tiny", "small", "medium", "large"})
+
+# Default tier per subsystem. Picked per ``.plans/brain-abstraction-research.md``
+# §4 — quality-sensitive subsystems (goal_judge) get ``large``; cost-sensitive
+# high-volume ones (relationships_classifier, learning_triage) get ``tiny``.
+# Override via ``models.subsystems.<name>`` in ``~/.vexis/config.yaml``.
+DEFAULT_SUBSYSTEM_TIERS: dict[str, str] = {
+    "curator": "small",
+    "coherence_judge": "small",
+    "goal_judge": "large",
+    "relationships_extractor": "medium",
+    "relationships_classifier": "tiny",
+    "learning_review": "small",
+    "learning_triage": "tiny",
+    "migration_classifier": "small",
+}
+
+# Default tier→model map for the claude-code brain. The keys are the
+# four abstract tiers; the values are claude-code-native aliases the
+# CLI already understands (``--model haiku`` / ``--model sonnet``).
+# Override via ``models.tiers.claude-code.<tier>`` in
+# ``~/.vexis/config.yaml`` — useful when a new model release lands
+# (one-line edit promotes every "large"-tier subsystem in one go).
+DEFAULT_TIER_MAP_CLAUDE_CODE: dict[str, str] = {
+    "tiny": "haiku",
+    "small": "haiku",
+    "medium": "sonnet",
+    "large": "sonnet",
+}
+
+
+def subsystem_tier(name: str) -> str | None:
+    """Return the configured tier (or legacy raw model) for a subsystem.
+
+    Resolution order:
+      1. ``models.subsystems.<name>`` — new schema, returned as-is.
+         Expected to be one of the abstract tiers but raw model names
+         are also accepted.
+      2. ``models.<name>`` — legacy back-compat. Returned as-is;
+         ``model_for_tier`` will pass it through to the brain
+         untranslated.
+      3. ``DEFAULT_SUBSYSTEM_TIERS[name]`` — the per-subsystem default
+         from the constant above.
+      4. ``None`` — only when ``name`` is unknown AND no legacy key
+         is set. The brain's ``spawn_aux`` treats ``None`` as "use the
+         brain's native default model" (no ``--model`` flag).
+
+    Subsystem callers pass the result directly to
+    ``Brain.spawn_aux(prompt, model_tier=subsystem_tier("curator"))``;
+    the brain implementation handles tier→native translation.
+    """
+    raw = _read_raw().get("models")
+    section = raw if isinstance(raw, dict) else {}
+
+    # Path 1: new schema, models.subsystems.<name>
+    subs = section.get("subsystems")
+    if isinstance(subs, dict):
+        v = subs.get(name)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # Path 2: legacy raw-string key, models.<name>
+    v = section.get(name)
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+
+    # Path 3: per-subsystem default
+    return DEFAULT_SUBSYSTEM_TIERS.get(name)
+
+
+def model_for_tier(brain_kind: str, tier: str | None) -> str | None:
+    """Translate an abstract tier or legacy raw-model into the brain's
+    native model identifier.
+
+    Returns:
+      * ``None`` when ``tier`` is ``None``, ``""``, or the literal
+        sentinel ``"default"`` — the brain's ``spawn_aux`` should not
+        pass a ``--model`` flag (use whatever the brain CLI picks on
+        its own).
+      * The mapped native model id (e.g. ``"haiku"``, ``"sonnet"``)
+        for an abstract tier (``tiny`` / ``small`` / ``medium`` /
+        ``large``). Resolution order: ``models.tiers.<brain-kind>.<tier>``
+        then the per-brain default constant
+        (``DEFAULT_TIER_MAP_CLAUDE_CODE`` for claude-code).
+      * The ``tier`` string itself unchanged when it is *not* an
+        abstract tier — covers the legacy-raw-model case
+        (``models.curator: claude-haiku-3-5`` passes
+        ``"claude-haiku-3-5"`` through as-is so the brain just shells
+        ``--model claude-haiku-3-5``).
+
+    For the unknown brain-kind case (anything other than
+    ``"claude-code"`` in Phase B), abstract tiers fall through to
+    ``None`` — Phase C will add ``models.tiers.opencode.<tier>``
+    defaults.
+    """
+    if tier is None:
+        return None
+    cleaned = tier.strip()
+    if not cleaned or cleaned.lower() == "default":
+        return None
+
+    # Legacy raw-model string — pass through untranslated.
+    if cleaned not in ABSTRACT_TIERS:
+        return cleaned
+
+    # Abstract tier — look up in config first, then per-brain defaults.
+    raw = _read_raw().get("models")
+    if isinstance(raw, dict):
+        tiers_section = raw.get("tiers")
+        if isinstance(tiers_section, dict):
+            brain_section = tiers_section.get(brain_kind)
+            if isinstance(brain_section, dict):
+                v = brain_section.get(cleaned)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+
+    if brain_kind == "claude-code":
+        return DEFAULT_TIER_MAP_CLAUDE_CODE.get(cleaned)
+
+    return None
