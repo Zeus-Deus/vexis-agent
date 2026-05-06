@@ -29,14 +29,21 @@ approval time by the slash-command / dashboard surface (see
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import os
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
+
+from core.brain.base import (
+    BrainAuthRequired,
+    BrainError,
+    BrainNotInstalled,
+    BrainTimeoutError,
+)
+
+if TYPE_CHECKING:
+    from core.brain.base import Brain
 
 from core.relationships.candidate_store import (
     RelationshipsCandidateStore,
@@ -45,10 +52,7 @@ from core.relationships.consent import _fact_id
 from core.relationships.store import RelationshipsStore
 from core.relationships.triggers import derive_slug
 from core.transcripts import TranscriptMessage
-from core.yaml_config import (
-    model_relationships_extractor,
-    resolve_model_flag,
-)
+from core.yaml_config import subsystem_tier
 
 log = logging.getLogger(__name__)
 
@@ -183,31 +187,6 @@ def _format_transcript_for_extractor(messages: list[TranscriptMessage]) -> tuple
 # --------------------------------------------------------------------
 
 
-SpawnFn = Callable[[list[str], dict[str, str]], "subprocess.CompletedProcess[bytes]"]
-
-
-def _build_argv() -> list[str]:
-    return ["claude", "-p", *resolve_model_flag(model_relationships_extractor())]
-
-
-def _build_env() -> dict[str, str]:
-    env = {**os.environ}
-    env[EXTRACTOR_ENV_VAR] = "1"
-    return env
-
-
-def _spawn_default(
-    argv: list[str], env: dict[str, str]
-) -> "subprocess.CompletedProcess[bytes]":
-    return subprocess.run(
-        argv,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=EXTRACTOR_TIMEOUT_SECONDS,
-    )
-
-
 def _parse_extractor_output(stdout: str) -> list[ExtractedFact]:
     """Parse the extractor's JSON. Tolerant: locates the first
     `{` and last `}` and tries that substring. Returns an empty
@@ -273,16 +252,17 @@ async def extract_relationships(
     *,
     workspace: Path,
     candidate_store: RelationshipsCandidateStore,
+    brain: "Brain",
     relationships_store: RelationshipsStore | None = None,
-    spawn: SpawnFn | None = None,
     sensitive_scan: Callable[..., str | None] | None = None,
 ) -> ExtractionResult:
     """Run one extractor pass over ``messages`` and queue any
     surviving facts to ``candidate_store``.
 
-    Test seams: ``spawn`` overrides the subprocess call;
-    ``sensitive_scan`` overrides the threat-scanner call.
-    Production passes None for both.
+    Phase B: spawns via ``Brain.spawn_aux`` instead of an inline
+    ``subprocess.run`` + ``asyncio.to_thread`` shim. ``brain`` is
+    the aux-spawn surface. The ``sensitive_scan`` test seam stays
+    for the threat-scanner call (orthogonal to the spawn).
     """
     result = ExtractionResult(session_uuid=session_uuid)
     transcript_text, user_turn_count = _format_transcript_for_extractor(messages)
@@ -293,35 +273,30 @@ async def extract_relationships(
         turn_count=user_turn_count,
         transcript=transcript_text,
     )
-    argv = _build_argv() + [prompt]
-    env = _build_env()
-    spawn_fn: SpawnFn = spawn or _spawn_default
 
-    def _run() -> tuple[str, str | None]:
-        try:
-            cp = spawn_fn(argv, env)
-        except subprocess.TimeoutExpired:
-            return "", f"timed out after {EXTRACTOR_TIMEOUT_SECONDS}s"
-        except (OSError, FileNotFoundError) as exc:
-            return "", f"spawn failed: {exc}"
-        stdout = (
-            cp.stdout.decode("utf-8", errors="replace")
-            if isinstance(cp.stdout, bytes)
-            else (cp.stdout or "")
+    stdout = ""
+    err: str | None = None
+    try:
+        aux = await brain.spawn_aux(
+            prompt,
+            model_tier=subsystem_tier("relationships_extractor"),
+            timeout_seconds=EXTRACTOR_TIMEOUT_SECONDS,
+            env_overrides={EXTRACTOR_ENV_VAR: "1"},
+            cwd=workspace,
         )
-        if cp.returncode != 0:
-            stderr = (
-                cp.stderr.decode("utf-8", errors="replace")
-                if isinstance(cp.stderr, bytes)
-                else (cp.stderr or "")
+        stdout = aux.stdout
+        if aux.returncode != 0:
+            err = (
+                f"claude -p exited {aux.returncode}: "
+                f"{(aux.stderr or aux.stdout).strip()[:300]}"
             )
-            return stdout, (
-                f"claude -p exited {cp.returncode}: "
-                f"{(stderr or stdout).strip()[:300]}"
-            )
-        return stdout, None
+    except BrainTimeoutError:
+        err = f"timed out after {EXTRACTOR_TIMEOUT_SECONDS}s"
+    except (BrainNotInstalled, BrainAuthRequired) as exc:
+        err = f"spawn failed: {exc}"
+    except BrainError as exc:
+        err = f"spawn failed: {exc}"
 
-    stdout, err = await asyncio.to_thread(_run)
     result.raw_response = stdout
     if err:
         result.error = err

@@ -2217,6 +2217,7 @@ class LearningController:
                     meta.session_uuid,
                     workspace=self._workspace,
                     candidate_store=rel.candidate_store,
+                    brain=self._brain,
                     relationships_store=rel.store,
                 )
             )

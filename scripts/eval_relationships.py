@@ -218,11 +218,22 @@ async def _run_one(fixture: dict, workspace: Path) -> FixtureResult:
     rstore = RelationshipsStore(workspace)
     messages = _to_messages(fixture["transcript"])
     session_uuid = f"eval-{fixture['name']}"
+    # Eval script: real ClaudeCodeBrain spawn so the extractor calls
+    # the actual model.
+    from core.brain.claude_code import ClaudeCodeBrain
+    from core.running_tasks import RunningTasks
+    from core.sessions import SessionStore
+    eval_brain = ClaudeCodeBrain(
+        workspace=workspace,
+        session=SessionStore(workspace / ".vexis" / "sessions.json"),
+        running_tasks=RunningTasks(),
+    )
     result = await extract_relationships(
         messages,
         session_uuid,
         workspace=workspace,
         candidate_store=cstore,
+        brain=eval_brain,
         relationships_store=rstore,
     )
     if result.error:

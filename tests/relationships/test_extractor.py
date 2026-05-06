@@ -55,24 +55,28 @@ def _msg(text: str, role: str = "user") -> TranscriptMessage:
 
 
 def _make_spawn(stdout: str, returncode: int = 0):
-    """Build a fake spawn function that returns ``stdout`` verbatim."""
+    """Phase B: returns a BrainNull pre-loaded with one AuxResult.
+    Name preserved for diff hygiene; variable assignment downstream
+    binds the result to ``brain`` (not ``spawn``)."""
+    from core.brain.base import AuxResult
+    from core.brain.null import BrainNull
 
-    def _spawn(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess:
-        return subprocess.CompletedProcess(
-            args=argv,
-            returncode=returncode,
-            stdout=stdout.encode("utf-8"),
-            stderr=b"",
-        )
-
-    return _spawn
+    return BrainNull(
+        aux_results=[
+            AuxResult(stdout=stdout, stderr="", returncode=returncode)
+        ]
+    )
 
 
 def _make_timeout_spawn():
-    def _spawn(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess:
-        raise subprocess.TimeoutExpired(cmd=argv, timeout=EXTRACTOR_TIMEOUT_SECONDS)
+    """Phase B: BrainNull configured to raise BrainTimeoutError on
+    next ``spawn_aux`` call."""
+    from core.brain.base import BrainTimeoutError
+    from core.brain.null import BrainNull
 
-    return _spawn
+    brain = BrainNull()
+    brain.next_aux_raises(BrainTimeoutError(f"timed out after {EXTRACTOR_TIMEOUT_SECONDS}s"))
+    return brain
 
 
 def _make_clean_scan():
@@ -115,7 +119,7 @@ def test_extractor_happy_path_one_fact_one_slug(tmp_path: Path):
             workspace=tmp_path,
             candidate_store=cstore,
             relationships_store=rstore,
-            spawn=spawn,
+            brain=spawn,
             sensitive_scan=_make_clean_scan(),
         )
     )
@@ -151,7 +155,7 @@ def test_extractor_multiple_persons_single_transcript(tmp_path: Path):
             workspace=tmp_path,
             candidate_store=cstore,
             relationships_store=rstore,
-            spawn=spawn,
+            brain=spawn,
             sensitive_scan=_make_clean_scan(),
         )
     )
@@ -183,7 +187,7 @@ def test_extractor_low_confidence_dropped(tmp_path: Path):
             workspace=tmp_path,
             candidate_store=cstore,
             relationships_store=rstore,
-            spawn=spawn,
+            brain=spawn,
             sensitive_scan=_make_clean_scan(),
         )
     )
@@ -215,7 +219,7 @@ def test_extractor_drops_sensitive_at_extract_time(tmp_path: Path):
             workspace=tmp_path,
             candidate_store=cstore,
             relationships_store=rstore,
-            spawn=spawn,
+            brain=spawn,
             sensitive_scan=_make_blocking_scan(),
         )
     )
@@ -248,7 +252,7 @@ def test_extractor_real_scanner_drops_third_party_medical(tmp_path: Path):
             workspace=tmp_path,
             candidate_store=cstore,
             relationships_store=rstore,
-            spawn=spawn,
+            brain=spawn,
             sensitive_scan=None,  # real scanner
         )
     )
@@ -303,7 +307,7 @@ def test_extractor_dedups_against_live(tmp_path: Path):
             workspace=tmp_path,
             candidate_store=cstore,
             relationships_store=rstore,
-            spawn=spawn,
+            brain=spawn,
             sensitive_scan=_make_clean_scan(),
         )
     )
@@ -358,7 +362,7 @@ def test_extractor_timeout_no_queue_write(tmp_path: Path):
             workspace=tmp_path,
             candidate_store=cstore,
             relationships_store=rstore,
-            spawn=spawn,
+            brain=spawn,
             sensitive_scan=_make_clean_scan(),
         )
     )
@@ -380,7 +384,7 @@ def test_extractor_nonzero_exit_no_queue_write(tmp_path: Path):
             workspace=tmp_path,
             candidate_store=cstore,
             relationships_store=rstore,
-            spawn=spawn,
+            brain=spawn,
             sensitive_scan=_make_clean_scan(),
         )
     )
@@ -401,7 +405,7 @@ def test_extractor_unparseable_response_returns_empty(tmp_path: Path):
             workspace=tmp_path,
             candidate_store=cstore,
             relationships_store=rstore,
-            spawn=spawn,
+            brain=spawn,
             sensitive_scan=_make_clean_scan(),
         )
     )
@@ -421,7 +425,7 @@ def test_extractor_empty_transcript_returns_no_op(tmp_path: Path):
             workspace=tmp_path,
             candidate_store=cstore,
             relationships_store=rstore,
-            spawn=_make_spawn("never called"),
+            brain=_make_spawn("never called"),
             sensitive_scan=_make_clean_scan(),
         )
     )
