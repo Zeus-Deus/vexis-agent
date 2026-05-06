@@ -1541,19 +1541,30 @@ class WebDashboard:
             )
 
     async def _goals_pause(self) -> dict:
+        from core.goal_state import TerminalGoalError
         sid = self._active_session_uuid()
         if not sid:
             raise HTTPException(404, "no active session")
         mgr = self._build_goal_manager(sid)
         if not mgr.is_active():
             raise HTTPException(404, "no active goal to pause")
-        mgr.pause(reason="dashboard-paused")
+        try:
+            mgr.pause(reason="dashboard-paused")
+        except TerminalGoalError as exc:
+            # Race: disk flipped to done/cleared between our __init__
+            # load and the locked save. Tell the user explicitly so
+            # the dashboard can refresh instead of showing stale state.
+            raise HTTPException(
+                409,
+                f"Goal is already {exc.status} — refresh the dashboard.",
+            ) from exc
         await self._drop_dashboard_goal_continuations()
         state = mgr.state
         assert state is not None  # we just paused it
         return self._goal_record_dict(sid, state)
 
     async def _goals_resume(self) -> dict:
+        from core.goal_state import TerminalGoalError
         sid = self._active_session_uuid()
         if not sid:
             raise HTTPException(404, "no active session")
@@ -1561,7 +1572,15 @@ class WebDashboard:
         s = mgr.state
         if s is None or s.status != "paused":
             raise HTTPException(404, "no paused goal to resume")
-        mgr.resume()
+        try:
+            mgr.resume()
+        except TerminalGoalError as exc:
+            # Race: disk flipped to done/cleared between our __init__
+            # load and the locked save.
+            raise HTTPException(
+                409,
+                f"Goal is already {exc.status} — refresh the dashboard.",
+            ) from exc
         # NO continuation drop here — parity with Telegram's
         # ``/goal resume`` handler (``transports/telegram.py:_on_goal``
         # under ``sub == "resume"``), which writes state and replies

@@ -362,8 +362,13 @@ def test_daemon_restart_rehydrates_active_goal(tmp_path: Path) -> None:
     # Methods the store IS allowed to expose. Day 3 pinned this set
     # to catch a future addition that could auto-fire goal loops on
     # daemon boot. Day 5 added ``list_recent_inactive`` for the
-    # dashboard's history table — read-only, no auto-fire path.
-    expected = {"load", "save", "clear", "list_active", "list_recent_inactive"}
+    # dashboard's history table (read-only). Day 5.5 added
+    # ``update_atomic`` for compare-and-swap pause / resume writes
+    # (CAS write helper — caller-driven, no auto-fire path).
+    expected = {
+        "load", "save", "clear", "list_active",
+        "list_recent_inactive", "update_atomic",
+    }
     assert callable_public == expected, (
         f"Unexpected public method on GoalStateStore: {callable_public}. "
         "If you've added one, double-check it cannot auto-fire goal "

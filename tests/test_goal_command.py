@@ -21,6 +21,7 @@ from transports.telegram import (
     TelegramTransport,
     _CANCEL_OK,
     _CANCEL_OK_GOAL_PAUSED_TMPL,
+    _GOAL_ALREADY_TERMINAL_TMPL,
     _GOAL_BAREWORD_HINT,
     _GOAL_CLEAR_REPLY,
     _GOAL_DISABLED_NOTE,
@@ -1286,3 +1287,101 @@ def test_drain_suppresses_pickup_preview_for_goal_continuation(
     # And the goal-continuation message went through the brain handler
     # WITHOUT a preceding Picking-up preview.
     assert "Continuing toward your standing goal" not in " ".join(pickup_lines)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Day 5.5 — Telegram pause/resume on terminal goal
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_telegram_pause_after_done_replies_already_done(
+    transport: TelegramTransport,
+    goals_on: None,
+    goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the user types ``/goal pause`` on a goal whose disk
+    state has flipped to ``done`` (from evaluate_after_turn) since
+    this command's manager init, the handler must NOT confirm a
+    pause that didn't happen. It surfaces the
+    :class:`TerminalGoalError` as an explicit "Goal is already done"
+    reply.
+
+    Simulated by patching ``_build_goal_manager`` to flip disk to
+    done out-of-band before mgr.pause runs — same race-injection
+    pattern as the dashboard 409 race tests."""
+    store = GoalStateStore(goals_file)
+    GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    ).set("g")
+
+    real_build = transport._build_goal_manager
+
+    def racing_build(session_uuid: str):
+        mgr = real_build(session_uuid)
+        # Concurrent writer flips disk to done — the manager's
+        # in-memory still says active.
+        disk = store.load(session_uuid)
+        assert disk is not None
+        disk.status = "done"
+        disk.last_verdict = "done"
+        disk.last_reason = "concurrent finish"
+        store.save(session_uuid, disk)
+        return mgr
+
+    transport._build_goal_manager = racing_build  # type: ignore[method-assign]
+
+    upd, _bot, msg = _update("/goal pause")
+    asyncio.run(transport._on_goal(upd, _ctx("pause")))
+
+    expected = _GOAL_ALREADY_TERMINAL_TMPL.format(status="done")
+    assert msg.reply_log == [expected]
+
+    # No queue mutation — pause didn't happen.
+    assert transport._running_tasks.queue_depth(_CHAT) == 0
+    # Disk still done.
+    final = store.load(_SESSION)
+    assert final is not None
+    assert final.status == "done"
+    assert final.paused_reason is None
+
+
+def test_telegram_resume_after_done_replies_already_done(
+    transport: TelegramTransport,
+    goals_on: None,
+    goals_file: Path,
+) -> None:
+    """Resume on a done goal also surfaces the terminal reply."""
+    store = GoalStateStore(goals_file)
+    mgr = GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    )
+    mgr.set("g")
+    state = mgr.state
+    assert state is not None
+    state.status = "paused"
+    store.save(_SESSION, state)
+
+    real_build = transport._build_goal_manager
+
+    def racing_build(session_uuid: str):
+        mgr = real_build(session_uuid)
+        disk = store.load(session_uuid)
+        assert disk is not None
+        disk.status = "done"
+        disk.last_verdict = "done"
+        disk.last_reason = "concurrent finish"
+        store.save(session_uuid, disk)
+        return mgr
+
+    transport._build_goal_manager = racing_build  # type: ignore[method-assign]
+
+    upd, _bot, msg = _update("/goal resume")
+    asyncio.run(transport._on_goal(upd, _ctx("resume")))
+
+    expected = _GOAL_ALREADY_TERMINAL_TMPL.format(status="done")
+    assert msg.reply_log == [expected]
+
+    final = store.load(_SESSION)
+    assert final is not None
+    assert final.status == "done"

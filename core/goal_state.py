@@ -34,9 +34,30 @@ import os
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
+
+
+class TerminalGoalError(Exception):
+    """Raised when a pause / resume tried to mutate a goal whose
+    on-disk status is already terminal (``done`` or ``cleared``).
+
+    The dashboard surfaces this as ``409 Conflict``; Telegram replies
+    with a short "Goal already done" line. Both refuse to revive a
+    finished goal — once ``done`` lands, it stays done; once
+    ``cleared`` lands, it stays cleared until the user types
+    ``/goal <text>`` to set a new one.
+
+    Lives in ``core.goal_state`` (not ``core.goal_manager``) so the
+    store can raise it from inside its locked update path without
+    importing the manager — keeps the dependency direction clean.
+    """
+
+    def __init__(self, status: str, *, session_uuid: str = "") -> None:
+        self.status = status
+        self.session_uuid = session_uuid
+        super().__init__(f"goal already {status}")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -339,6 +360,68 @@ class GoalStateStore:
         existing.status = "cleared"
         self.save(session_uuid, existing)
 
+    def update_atomic(
+        self,
+        session_uuid: str,
+        mutator: Callable[["GoalState"], "GoalState"],
+        *,
+        refuse_terminal: bool = True,
+    ) -> "GoalState":
+        """Read-modify-write under fcntl.flock + atomic temp-rename.
+
+        ``mutator`` is called with the **disk** state at lock-acquire
+        time (NOT the manager's in-memory state) and must return the
+        new ``GoalState`` to persist. The whole sequence runs under
+        ``LOCK_EX`` so concurrent writers serialize.
+
+        ``refuse_terminal=True`` (the default) raises
+        :class:`TerminalGoalError` when the disk state's status is
+        ``"done"`` or ``"cleared"`` at lock-acquire time — used by
+        ``GoalManager.pause`` / ``GoalManager.resume`` which must
+        refuse to revive a finished goal. ``refuse_terminal=False``
+        skips the guard for callers (like ``evaluate_after_turn``)
+        whose terminal verdicts must overwrite any concurrent
+        non-terminal write.
+
+        Raises :class:`KeyError` if no row exists for the session
+        (caller decides whether to recreate or bail).
+
+        Returns the post-mutation :class:`GoalState`.
+        """
+        captured: list[GoalState | None] = [None]
+        terminal: list[str | None] = [None]
+        missing: list[bool] = [False]
+
+        def _do(goals: dict) -> None:
+            row = goals.get(session_uuid)
+            if row is None:
+                missing[0] = True
+                return
+            try:
+                current = GoalState.from_dict(row)
+            except Exception:
+                # Corrupt row — treat as missing so the caller bails
+                # rather than overwriting unintelligible data.
+                missing[0] = True
+                return
+            if refuse_terminal and current.status in ("done", "cleared"):
+                terminal[0] = current.status
+                return
+            new_state = mutator(current)
+            goals[session_uuid] = new_state.to_dict()
+            captured[0] = new_state
+
+        self._mutate(_do)
+        if missing[0]:
+            raise KeyError(session_uuid)
+        if terminal[0] is not None:
+            raise TerminalGoalError(
+                terminal[0], session_uuid=session_uuid
+            )
+        result = captured[0]
+        assert result is not None  # one of {missing, terminal, captured} set
+        return result
+
     # ----- internal ---------------------------------------------------
 
     def _mutate(self, mutator) -> None:
@@ -375,4 +458,5 @@ __all__ = [
     "DEFAULT_MAX_TURNS",
     "GoalState",
     "GoalStateStore",
+    "TerminalGoalError",
 ]

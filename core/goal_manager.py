@@ -52,6 +52,7 @@ from core.goal_state import (
     DEFAULT_MAX_TURNS,
     GoalState,
     GoalStateStore,
+    TerminalGoalError,
 )
 
 log = logging.getLogger(__name__)
@@ -212,14 +213,34 @@ class GoalManager:
         (if any) is NOT interrupted — pause is "soft", taking effect
         on the next drain iteration when the goal hook reads
         ``status=paused`` and exits early.
+
+        Reload-under-lock via :meth:`GoalStateStore.update_atomic`:
+        if the disk state has flipped to terminal (``done`` /
+        ``cleared``) since this manager was constructed, raises
+        :class:`TerminalGoalError`. Caller surfaces as 409 (dashboard)
+        or "Goal already done" (Telegram) — pause cannot revive a
+        finished goal.
         """
         if self._state is None:
             return None
-        if self._state.status == "cleared":
+
+        def _apply(current: GoalState) -> GoalState:
+            current.status = "paused"
+            current.paused_reason = reason
+            return current
+
+        try:
+            new_state = self._store.update_atomic(
+                self._session_uuid, _apply, refuse_terminal=True,
+            )
+        except KeyError:
+            # Row was deleted between our __init__ load and now.
+            # Treat as no-goal — same posture as the original
+            # ``self._state is None`` short-circuit.
             return None
-        self._state.status = "paused"
-        self._state.paused_reason = reason
-        self._store.save(self._session_uuid, self._state)
+        # TerminalGoalError propagates up to the caller (transport
+        # surface translates to 409 / Telegram reply).
+        self._state = new_state
         return self._state
 
     def resume(self) -> GoalState | None:
@@ -228,17 +249,29 @@ class GoalManager:
         The reset is deliberate — without it, a goal paused at the
         budget ceiling would re-pause after a single turn on resume
         (Hermes does the same; `.plans/goal-command-research.md` §4
-        adopts the behaviour). No-op when no goal is set or it's
-        already cleared.
+        adopts the behaviour). No-op when no goal is set.
+
+        Same reload-under-lock contract as :meth:`pause`: raises
+        :class:`TerminalGoalError` if disk state is ``done`` or
+        ``cleared`` at lock-acquire time. A done goal cannot be
+        resumed — it's finished.
         """
         if self._state is None:
             return None
-        if self._state.status == "cleared":
+
+        def _apply(current: GoalState) -> GoalState:
+            current.status = "active"
+            current.paused_reason = None
+            current.turns_used = 0
+            return current
+
+        try:
+            new_state = self._store.update_atomic(
+                self._session_uuid, _apply, refuse_terminal=True,
+            )
+        except KeyError:
             return None
-        self._state.status = "active"
-        self._state.paused_reason = None
-        self._state.turns_used = 0
-        self._store.save(self._session_uuid, self._state)
+        self._state = new_state
         return self._state
 
     def clear(self) -> None:
@@ -384,4 +417,7 @@ __all__ = [
     "CONTINUATION_PROMPT_TEMPLATE",
     "GoalAlreadyActiveError",
     "GoalManager",
+    # Re-exported from core.goal_state so callers that already import
+    # from goal_manager can catch this without learning a second module.
+    "TerminalGoalError",
 ]

@@ -122,6 +122,10 @@ _GOAL_BAREWORD_CANCEL_LIKE = frozenset(
 _GOAL_BAREWORD_HINT = (
     "Did you mean /cancel? (Or /goal clear to drop the goal entirely.)"
 )
+_GOAL_ALREADY_TERMINAL_TMPL = (
+    "Goal is already {status} — no action taken. /goal status to confirm, "
+    "or /goal <text> to start a new one."
+)
 _CANCEL_OK_GOAL_PAUSED_TMPL = (
     "Cancelled, sir. (Goal paused at {turns}/{budget} turns — "
     "/goal resume to keep going.)"
@@ -1118,7 +1122,18 @@ class TelegramTransport:
             return
 
         if sub == "pause":
-            state = mgr.pause(reason="user-paused")
+            from core.goal_state import TerminalGoalError
+            try:
+                state = mgr.pause(reason="user-paused")
+            except TerminalGoalError as exc:
+                # Race lost: disk turned terminal between this
+                # handler's manager init and the locked save. Don't
+                # confirm a pause that didn't happen — tell the user
+                # the goal is already done.
+                await msg.reply_text(
+                    _GOAL_ALREADY_TERMINAL_TMPL.format(status=exc.status)
+                )
+                return
             if state is None:
                 await msg.reply_text(_GOAL_NO_GOAL_TO_PAUSE)
                 return
@@ -1135,7 +1150,14 @@ class TelegramTransport:
             return
 
         if sub == "resume":
-            state = mgr.resume()
+            from core.goal_state import TerminalGoalError
+            try:
+                state = mgr.resume()
+            except TerminalGoalError as exc:
+                await msg.reply_text(
+                    _GOAL_ALREADY_TERMINAL_TMPL.format(status=exc.status)
+                )
+                return
             if state is None:
                 await msg.reply_text(_GOAL_NO_GOAL_TO_RESUME)
                 return

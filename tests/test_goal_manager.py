@@ -13,7 +13,7 @@ from core.goal_manager import (
     GoalAlreadyActiveError,
     GoalManager,
 )
-from core.goal_state import GoalState, GoalStateStore
+from core.goal_state import GoalState, GoalStateStore, TerminalGoalError
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -322,6 +322,218 @@ def test_continuation_prompt_none_when_inactive(store: GoalStateStore) -> None:
     mgr.set("g")
     mgr.pause()
     assert mgr.next_continuation_prompt() is None
+
+
+# ──────────────────────────────────────────────────────────────────
+# Day 5.5 — terminal verdicts win against concurrent pause / resume
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_pause_after_done_raises_terminal(store: GoalStateStore) -> None:
+    """A pause on a goal whose disk state is already ``done`` raises
+    :class:`TerminalGoalError` instead of silently overwriting the
+    terminal status with ``paused``."""
+    mgr = _mgr(store)
+    mgr.set("g")
+    mgr.mark_done("delivered")  # disk: done
+
+    # Build a fresh manager whose in-memory state was loaded BEFORE
+    # the done write — simulates the race where the dashboard pause
+    # request started while the goal was still active.
+    racing = GoalManager(
+        session_uuid="sid", workspace=Path("/tmp"), store=store
+    )
+    # Force-set a stale in-memory active state so pause() doesn't
+    # short-circuit on `_state is None`. Disk is still done.
+    racing._state = GoalState(goal="g", status="active", turns_used=2)
+
+    with pytest.raises(TerminalGoalError) as exc_info:
+        racing.pause(reason="user-paused")
+    assert exc_info.value.status == "done"
+    assert exc_info.value.session_uuid == "sid"
+
+    # Disk untouched — still done with last_verdict=done.
+    final = store.load("sid")
+    assert final is not None
+    assert final.status == "done"
+    assert final.last_verdict == "done"
+    assert final.paused_reason is None
+
+
+def test_resume_after_done_raises_terminal(store: GoalStateStore) -> None:
+    """Resume on a done goal raises :class:`TerminalGoalError` —
+    a finished goal cannot be revived."""
+    mgr = _mgr(store)
+    mgr.set("g")
+    mgr.mark_done("delivered")
+
+    racing = GoalManager(
+        session_uuid="sid", workspace=Path("/tmp"), store=store
+    )
+    racing._state = GoalState(goal="g", status="paused", turns_used=2)
+
+    with pytest.raises(TerminalGoalError) as exc_info:
+        racing.resume()
+    assert exc_info.value.status == "done"
+
+    final = store.load("sid")
+    assert final is not None
+    assert final.status == "done"
+
+
+def test_pause_after_cleared_raises_terminal(store: GoalStateStore) -> None:
+    """Cleared is the other terminal state. Pause raises rather
+    than overwriting."""
+    mgr = _mgr(store)
+    mgr.set("g")
+    mgr.clear()
+
+    racing = GoalManager(
+        session_uuid="sid", workspace=Path("/tmp"), store=store
+    )
+    racing._state = GoalState(goal="g", status="active")
+
+    with pytest.raises(TerminalGoalError) as exc_info:
+        racing.pause()
+    assert exc_info.value.status == "cleared"
+
+    final = store.load("sid")
+    assert final is not None
+    assert final.status == "cleared"
+
+
+def test_resume_after_cleared_raises_terminal(store: GoalStateStore) -> None:
+    mgr = _mgr(store)
+    mgr.set("g")
+    mgr.clear()
+
+    racing = GoalManager(
+        session_uuid="sid", workspace=Path("/tmp"), store=store
+    )
+    racing._state = GoalState(goal="g", status="paused")
+
+    with pytest.raises(TerminalGoalError) as exc_info:
+        racing.resume()
+    assert exc_info.value.status == "cleared"
+
+
+def test_pause_loses_to_concurrent_done_verdict(
+    store: GoalStateStore,
+) -> None:
+    """End-to-end shape of the bug Day 5.5 fixes.
+
+    Setup: GoalManager loaded ACTIVE state at __init__. Then a
+    concurrent writer (simulating the goal hook's evaluate_after_turn
+    save) flips disk to done. The manager's in-memory state is now
+    stale — it still says active.
+
+    With the Day 5.5 fix, ``mgr.pause()`` reloads disk under fcntl
+    lock, sees done, raises :class:`TerminalGoalError`. Disk stays
+    done. Without the fix (pre-Day-5.5), the pause would have
+    blindly written its in-memory paused status over the done write
+    — silent state corruption.
+    """
+    # Goal active on disk.
+    mgr = GoalManager(
+        session_uuid="sid", workspace=Path("/tmp"), store=store
+    )
+    mgr.set("ship the thing")
+    # mgr's in-memory state: status=active, turns_used=0.
+
+    # Concurrent writer flips disk to done. Manager has no idea.
+    disk_state = store.load("sid")
+    assert disk_state is not None
+    disk_state.status = "done"
+    disk_state.turns_used = 1
+    disk_state.last_verdict = "done"
+    disk_state.last_reason = "shipped"
+    store.save("sid", disk_state)
+
+    # Manager's in-memory state still claims active — the stale view.
+    assert mgr._state is not None
+    assert mgr._state.status == "active"
+
+    # Pause MUST raise rather than corrupt disk.
+    with pytest.raises(TerminalGoalError) as exc_info:
+        mgr.pause(reason="user-paused")
+    assert exc_info.value.status == "done"
+
+    # Disk authoritative state preserved.
+    final = store.load("sid")
+    assert final is not None
+    assert final.status == "done"
+    assert final.last_verdict == "done"
+    assert final.last_reason == "shipped"
+    # Critically, paused_reason is NOT set — the pause's mutation
+    # was rejected before any write happened.
+    assert final.paused_reason is None
+
+
+def test_resume_loses_to_concurrent_done_verdict(
+    store: GoalStateStore,
+) -> None:
+    """Mirror of the pause race for resume."""
+    mgr = GoalManager(
+        session_uuid="sid", workspace=Path("/tmp"), store=store
+    )
+    mgr.set("g")
+    state = mgr.state
+    assert state is not None
+    state.status = "paused"
+    state.turns_used = 5
+    store.save("sid", state)
+    # Refresh manager so its in-memory matches disk (paused).
+    mgr = GoalManager(
+        session_uuid="sid", workspace=Path("/tmp"), store=store
+    )
+    assert mgr._state is not None and mgr._state.status == "paused"
+
+    # Concurrent writer flips disk to done.
+    state.status = "done"
+    state.last_verdict = "done"
+    state.last_reason = "concurrent finish"
+    store.save("sid", state)
+
+    with pytest.raises(TerminalGoalError) as exc_info:
+        mgr.resume()
+    assert exc_info.value.status == "done"
+
+    final = store.load("sid")
+    assert final is not None
+    assert final.status == "done"
+    # Resume's reset of turns_used to 0 was rejected — disk count
+    # preserved at the value the concurrent writer left it.
+    assert final.turns_used == 5
+
+
+def test_pause_reload_picks_up_disk_changes(
+    store: GoalStateStore,
+) -> None:
+    """The reload-under-lock isn't only for terminal protection —
+    it also means non-terminal disk changes are preserved across
+    a pause. E.g., another writer bumped ``turns_used`` between
+    this manager's __init__ and our pause; the bumped count
+    survives the pause write."""
+    mgr = GoalManager(
+        session_uuid="sid", workspace=Path("/tmp"), store=store
+    )
+    mgr.set("g")
+    # Concurrent writer bumps turns_used (non-terminal change).
+    disk = store.load("sid")
+    assert disk is not None
+    disk.turns_used = 7
+    disk.last_verdict = "continue"
+    disk.last_reason = "more work"
+    store.save("sid", disk)
+    # mgr's in-memory still has turns_used=0 from set().
+
+    new_state = mgr.pause(reason="user-paused")
+    assert new_state is not None
+    assert new_state.status == "paused"
+    # turns_used preserved from disk (NOT clobbered to mgr's stale 0).
+    assert new_state.turns_used == 7
+    assert new_state.last_verdict == "continue"
+    assert new_state.paused_reason == "user-paused"
 
 
 def test_continuation_prompt_starts_with_verbatim_prefix(
