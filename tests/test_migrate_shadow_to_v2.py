@@ -514,11 +514,15 @@ def test_apply_identity_already_promoted_is_no_op(env):
 # --------------------------------------------------------------------
 
 
-def test_re_apply_s3_collides_on_second_run(env):
-    """First apply stages the skill; second apply hits the staging-
-    tree collision check in stage_new_skill (per the v2 design,
-    staging collisions are explicit failures). The user re-runs
-    --plan to get a fresh decision for failures."""
+def test_re_apply_s3_is_idempotent(env):
+    """First apply stages the skill; second apply over the same
+    plan must succeed as a no-op with a "skipped" message — the
+    module docstring promises ``--apply`` is idempotent and a
+    re-run on prior-success entries must not flip them to failures.
+
+    This replaces the prior test_re_apply_s3_collides_on_second_run,
+    which pinned the bug fixed in this commit (collision-strict
+    behavior on byte-identical re-stage)."""
     row = mig.PlanRow(
         index=1,
         entry=mig.ShadowEntry(
@@ -529,12 +533,168 @@ def test_re_apply_s3_collides_on_second_run(env):
         arg="fresh-skill",
     )
     first = mig.apply_plan(env, [row])
-    assert first.ok
+    assert first.ok, first.results[0].message
+    second = mig.apply_plan(env, [row])
+    assert second.ok, second.results[0].message
+    msg = second.results[0].message.lower()
+    assert "already applied" in msg or "skipped" in msg, (
+        f"second-run message should signal idempotent skip; got: "
+        f"{second.results[0].message!r}"
+    )
+
+
+def test_re_apply_s3_detects_content_drift(env):
+    """If the staged SKILL.md has been hand-edited between runs (or
+    a different plan would have written different content), the
+    second --apply must surface drift rather than overwriting the
+    edit. The error message names the staged path so the user can
+    reconcile."""
+    row = mig.PlanRow(
+        index=1,
+        entry=mig.ShadowEntry(
+            raw="", lesson="L", scope="x", evidence="E",
+            learned_date="2026-05-02",
+        ),
+        decision="PROCEDURAL_S3",
+        arg="fresh-skill",
+    )
+    first = mig.apply_plan(env, [row])
+    assert first.ok, first.results[0].message
+
+    from core.learning_writes import shadow_skills_root
+    staged = shadow_skills_root(env) / "fresh-skill" / "SKILL.md"
+    drifted = staged.read_text(encoding="utf-8") + "\n# hand-edited\n"
+    staged.write_text(drifted, encoding="utf-8")
+
     second = mig.apply_plan(env, [row])
     assert not second.ok
-    # The error message names the staging collision so the user
-    # knows what to do next:
-    assert "staged skill" in second.results[0].message.lower()
+    msg = second.results[0].message
+    assert "differs" in msg.lower(), (
+        f"drift error must say content differs; got: {msg!r}"
+    )
+    assert str(staged) in msg, (
+        f"drift error must name the staged path; got: {msg!r}"
+    )
+    # Hand-edit is preserved — the apply must NOT have overwritten it.
+    assert staged.read_text(encoding="utf-8") == drifted
+
+
+def test_re_apply_s2_is_idempotent(env):
+    """Same idempotence contract for S2 support files. Pre-fix, S2
+    silently overwrote the existing file (no collision check at all
+    in stage_support_file) — worse than S3's loud error because a
+    user hand-edit between runs would be silently destroyed. Now S2
+    short-circuits with a "skipped" message when content matches."""
+    create_skill(
+        env / "skills",
+        "umbrella",
+        "---\nname: umbrella\ndescription: D.\n---\n\nB\n",
+    )
+    row = mig.PlanRow(
+        index=1,
+        entry=mig.ShadowEntry(
+            raw="",
+            lesson="When using bge-m3 on Dutch corpora, query in Dutch.",
+            scope="multilingual RAG",
+            evidence="dutch corpus retrieval is broken with English queries",
+        ),
+        decision="PROCEDURAL_S2",
+        arg="umbrella/references/dutch-bge-m3.md",
+    )
+    first = mig.apply_plan(env, [row])
+    assert first.ok, first.results[0].message
+    second = mig.apply_plan(env, [row])
+    assert second.ok, second.results[0].message
+    msg = second.results[0].message.lower()
+    assert "already applied" in msg or "skipped" in msg, (
+        f"second-run message should signal idempotent skip; got: "
+        f"{second.results[0].message!r}"
+    )
+
+
+def test_re_apply_s2_detects_content_drift(env):
+    """The dangerous case: a user hand-edits the staged S2 file
+    between runs. Pre-fix, the second --apply would silently
+    overwrite the edit (because stage_support_file has no collision
+    check). Now we detect drift and refuse, preserving the edit."""
+    create_skill(
+        env / "skills",
+        "umbrella",
+        "---\nname: umbrella\ndescription: D.\n---\n\nB\n",
+    )
+    row = mig.PlanRow(
+        index=1,
+        entry=mig.ShadowEntry(
+            raw="",
+            lesson="When using bge-m3 on Dutch corpora, query in Dutch.",
+            scope="multilingual RAG",
+            evidence="dutch corpus retrieval is broken with English queries",
+        ),
+        decision="PROCEDURAL_S2",
+        arg="umbrella/references/dutch-bge-m3.md",
+    )
+    first = mig.apply_plan(env, [row])
+    assert first.ok, first.results[0].message
+
+    from core.learning_writes import shadow_skills_root
+    staged = (
+        shadow_skills_root(env) / "umbrella" / "references"
+        / "dutch-bge-m3.md"
+    )
+    drifted = staged.read_text(encoding="utf-8") + "\n<!-- hand-edited -->\n"
+    staged.write_text(drifted, encoding="utf-8")
+
+    second = mig.apply_plan(env, [row])
+    assert not second.ok
+    msg = second.results[0].message
+    assert "differs" in msg.lower(), (
+        f"drift error must say content differs; got: {msg!r}"
+    )
+    assert str(staged) in msg, (
+        f"drift error must name the staged path; got: {msg!r}"
+    )
+    # Hand-edit is preserved.
+    assert staged.read_text(encoding="utf-8") == drifted
+
+
+def test_apply_idempotent_full_plan(env):
+    """A multi-row plan mixing S2 and S3 must apply idempotently end
+    to end: a second run of ``apply_plan`` over the same rows
+    succeeds with all rows reporting "skipped". No torn state, no
+    flipped results between runs."""
+    create_skill(
+        env / "skills",
+        "umbrella",
+        "---\nname: umbrella\ndescription: D.\n---\n\nB\n",
+    )
+    rows = [
+        mig.PlanRow(
+            index=1,
+            entry=mig.ShadowEntry(
+                raw="", lesson="Lesson one.", scope="s1", evidence="e1",
+                learned_date="2026-05-02",
+            ),
+            decision="PROCEDURAL_S3",
+            arg="brand-new-skill",
+        ),
+        mig.PlanRow(
+            index=2,
+            entry=mig.ShadowEntry(
+                raw="", lesson="Lesson two.", scope="s2", evidence="e2",
+            ),
+            decision="PROCEDURAL_S2",
+            arg="umbrella/references/two.md",
+        ),
+    ]
+    first = mig.apply_plan(env, rows)
+    assert first.ok, [r.message for r in first.results]
+    second = mig.apply_plan(env, rows)
+    assert second.ok, [r.message for r in second.results]
+    for r in second.results:
+        msg = r.message.lower()
+        assert "already applied" in msg or "skipped" in msg, (
+            f"row {r.index}: expected skip message, got {r.message!r}"
+        )
 
 
 # --------------------------------------------------------------------

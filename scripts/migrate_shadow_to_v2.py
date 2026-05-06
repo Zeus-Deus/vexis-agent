@@ -32,8 +32,12 @@ the user is reviewing markdown they're already familiar with.
 
 Recovery / partial-state:
   - --apply is idempotent. Re-running against an already-applied plan
-    is a no-op per entry (each apply step checks for the staged
-    file's existence first).
+    is a no-op per entry: each S2/S3 step compares the would-be
+    content to the existing staged file. Byte-identical → "skipped
+    (already applied)"; different → drift error naming the staged
+    path so the user can reconcile (re-run --plan, or remove the
+    staged file). User hand-edits to staged files are NEVER silently
+    overwritten.
   - Failed --apply leaves the partial work in the staging tree;
     re-run continues from where it left off.
   - The applied plan is moved to ``migration-plans-applied/`` so
@@ -62,6 +66,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.learning_review import _scan_lesson_for_sensitive_content  # noqa: E402
 from core.learning_writes import (  # noqa: E402
+    _resolve_staged_skill_dir,
+    shadow_skills_root,
     stage_new_skill,
     stage_skill_patch,
     stage_support_file,
@@ -567,6 +573,55 @@ def _apply_one(workspace: Path, row: PlanRow) -> ApplyResult:
     return ApplyResult(row.index, decision, False, f"unknown decision {decision!r}")
 
 
+def _idempotent_skip_or_drift(
+    target: Path, body: str,
+) -> tuple[bool, str] | None:
+    """Pre-flight idempotence check for the apply wrappers.
+
+    Closes the TODO from commit 41fb2b4. The underlying ``stage_*``
+    helpers in core/learning_writes.py keep their collision-strict
+    (S3) / silent-overwrite (S2) defaults — those are correct for
+    the curator's own writes — and the idempotent-overlay lives
+    here, in the migration-script wrapper, so that re-running
+    ``--apply`` over an already-applied plan honors the module-
+    docstring contract.
+
+    Returns:
+        ``None`` — target doesn't exist; the wrapper proceeds with
+        the underlying ``stage_*`` call.
+        ``(True, "skipped (already applied, identical content): ...")``
+        — target exists with byte-identical content; short-circuit.
+        ``(False, "<drift message>")`` — target exists with
+        different content; short-circuit with a drift error that
+        names the staged path so the user can reconcile (re-run
+        ``--plan`` against the current shadow file, or manually
+        remove the staged file). Strict-(a) posture from the audit
+        — we never silently overwrite a user's hand-edit.
+    """
+    if not target.exists():
+        return None
+    try:
+        existing = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        return (
+            False,
+            f"could not read staged file at {target} for "
+            f"idempotence check: {exc}",
+        )
+    if existing == body:
+        return (
+            True,
+            f"skipped (already applied, identical content): {target}",
+        )
+    return (
+        False,
+        f"staged content at {target} differs from what this plan "
+        f"would write — re-run --plan against the current shadow "
+        f"file to reconcile, or remove the staged file to allow "
+        f"this plan to overwrite",
+    )
+
+
 def _apply_s2(workspace: Path, row: PlanRow) -> ApplyResult:
     if "/" not in row.arg:
         return ApplyResult(
@@ -575,6 +630,15 @@ def _apply_s2(workspace: Path, row: PlanRow) -> ApplyResult:
         )
     skill_name, rel_path = row.arg.split("/", 1)
     body = _migration_support_file_body(row.entry)
+    # Idempotence overlay: stage_support_file silently overwrites an
+    # existing target. Without this pre-check a re-apply would
+    # destroy a user hand-edit on the staged file. See
+    # ``_idempotent_skip_or_drift`` for the strict-(a) posture.
+    target = _resolve_staged_skill_dir(workspace, skill_name) / Path(rel_path)
+    verdict = _idempotent_skip_or_drift(target, body)
+    if verdict is not None:
+        ok, message = verdict
+        return ApplyResult(row.index, row.decision, ok, message)
     result = stage_support_file(workspace, skill_name, rel_path, body)
     return ApplyResult(
         row.index, row.decision, result.ok, result.message,
@@ -582,30 +646,20 @@ def _apply_s2(workspace: Path, row: PlanRow) -> ApplyResult:
 
 
 def _apply_s3(workspace: Path, row: PlanRow) -> ApplyResult:
-    # TODO(idempotence-bug): the module docstring promises
-    # ``--apply`` is idempotent ("re-running ... is a no-op per
-    # entry, each apply step checks for the staged file's existence
-    # first"), but ``stage_new_skill`` from core/learning_writes.py
-    # is collision-strict — it returns an error when the staged dir
-    # already exists, with NO regard for whether the existing
-    # content matches what we'd write. So re-running --apply on an
-    # already-applied plan fails on every prior-success S3 entry,
-    # even though the on-disk content is identical to what we'd
-    # write again. Surfaced 2026-05-03 during the first real
-    # migration: 11 prior successes all flipped to failures on
-    # second-run.
-    #
-    # Fix shape (NOT implemented; left for the next migration
-    # cycle): before calling ``stage_new_skill``, check whether the
-    # staged dir already exists AND its SKILL.md content matches
-    # the body we're about to write. If both true → return ok=True
-    # with message "skipped (already applied, identical content)".
-    # If staged exists but content differs → still error (the user
-    # has hand-edited and we shouldn't overwrite). Same treatment
-    # belongs in ``_apply_s2`` for support files. The collision-
-    # strict behavior in stage_new_skill itself stays as-is — that's
-    # the right default for the curator's own writes; only the
-    # migration-script wrapper needs the idempotent-overlay.
+    """Stage a new umbrella skill from a v1 lesson.
+
+    Idempotence overlay (closes the TODO from commit 41fb2b4):
+    ``stage_new_skill`` is collision-strict (errors when the staged
+    dir already exists, with no content-match consideration). The
+    migration script's ``--apply`` contract requires idempotence —
+    re-applying the same plan must succeed on prior-success entries
+    rather than flipping them to failures. The pre-check at
+    ``_idempotent_skip_or_drift`` short-circuits on byte-identical
+    content and surfaces drift loudly when the staged file has been
+    hand-edited. ``stage_new_skill``'s default stays collision-
+    strict — that's correct for the curator's own writes; only this
+    wrapper needs the overlay.
+    """
     skill_name = row.arg
     if not skill_name:
         return ApplyResult(
@@ -613,6 +667,13 @@ def _apply_s3(workspace: Path, row: PlanRow) -> ApplyResult:
             "PROCEDURAL_S3 needs a new skill name",
         )
     body = _migration_skill_body(skill_name, row.entry)
+    # S3 has no category in the migration path, so the staged dir
+    # is the uncategorised location under shadow_skills_root.
+    target = shadow_skills_root(workspace) / skill_name / "SKILL.md"
+    verdict = _idempotent_skip_or_drift(target, body)
+    if verdict is not None:
+        ok, message = verdict
+        return ApplyResult(row.index, row.decision, ok, message)
     result = stage_new_skill(workspace, skill_name, body)
     return ApplyResult(
         row.index, row.decision, result.ok, result.message,
