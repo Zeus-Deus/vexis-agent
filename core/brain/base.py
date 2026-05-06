@@ -1,0 +1,407 @@
+"""Brain abstraction — contract every brain implementation honours.
+
+Vexis runs on top of an agent CLI. ``Brain`` is the contract: foreground
+turn (``respond``), aux spawn (``spawn_aux``), session model
+(``session_token`` / ``rotate_session``), transcript readback
+(``iter_session_metas`` / ``iter_messages`` / ``is_brain_owned_session``),
+MCP config wiring (``write_mcp_config``), file conventions
+(``instruction_file_name`` / ``instruction_search_paths``), and lifecycle
+(``healthcheck`` / ``kill_in_flight``).
+
+Phase A (Day 1) introduces this module as a refactor: ``BrainClaudeCode``
+formally implements ``Brain`` with byte-identical external behaviour.
+Phase B will route every aux-spawn site through ``Brain.spawn_aux`` and
+every transcripts read through ``Brain.iter_session_metas`` /
+``iter_messages`` (today the curator & friends call out directly to
+``claude -p`` and to ``~/.claude/projects/`` — the abstraction is in
+place but not yet load-bearing). Phase C will add ``BrainOpenCode``.
+
+Design citations: ``.plans/brain-abstraction-research.md`` §4 (the ABC
+contract) and §5 (the phased rollout). The exception hierarchy and
+``BrainEvent`` union are documented at the bottom of §4.
+
+Methods that don't have natural Phase-A implementations
+(``spawn_aux``, ``write_mcp_config``) raise ``NotImplementedError`` on
+``BrainClaudeCode`` until Phase B / C lands; ``BrainNull`` implements
+every method as a no-op or canned response so the unit-test suite has
+zero subprocess dependencies. The cross-brain contract test
+(``tests/test_brain_contract.py``) pins both shapes.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal, Union
+
+
+# ──────────────────────────────────────────────────────────────────
+# Exception hierarchy
+# ──────────────────────────────────────────────────────────────────
+
+
+class BrainError(RuntimeError):
+    """Generic brain failure. Base of the hierarchy.
+
+    Transport-layer code catches this for "something broke; tell the
+    user, log details." Subclasses carry more specific recovery
+    semantics (timeout retry vs session-lost rotate vs cancel-acked).
+    """
+
+
+class BrainTimeoutError(BrainError):
+    """The brain subprocess didn't exit within the configured timeout
+    (``BRAIN_TIMEOUT_SECONDS``, default 1800 s). The process was killed
+    via ``kill_in_flight``-shaped logic before the exception was raised.
+    """
+
+
+class BrainCancelled(BrainError):
+    """The brain subprocess was cancelled via ``/cancel`` (or the
+    ``/goal pause`` path for goal-continuation messages). Surfaced to
+    the caller so the transport layer can render the appropriate
+    cancel acknowledgement instead of a generic error.
+    """
+
+
+class SessionLost(BrainError):
+    """The brain's session is no longer accessible. Vexis must rotate
+    the session token via ``rotate_session()`` and tell the user the
+    previous conversation was lost; do NOT retry the failing message
+    on the new session — restart fresh.
+
+    For ``BrainClaudeCode``: triggered by claude-code's
+    "No conversation found" stderr. For ``BrainOpenCode``: triggered
+    by a typed ``session.error`` event with a session-not-found tag.
+    """
+
+
+class BrainNotInstalled(BrainError):
+    """The brain binary is not on PATH. Raised by ``healthcheck`` and
+    by ``respond`` / ``spawn_aux`` on the first failed spawn if
+    ``healthcheck`` wasn't called at startup. Carries actionable
+    install hints in its message string.
+    """
+
+
+class BrainAuthRequired(BrainError):
+    """The brain binary is installed but not authenticated. Raised by
+    ``healthcheck`` and by ``respond`` / ``spawn_aux`` on the first
+    failed spawn that returns a recognisable auth-error stderr. Carries
+    actionable login hints in its message string.
+    """
+
+
+# ──────────────────────────────────────────────────────────────────
+# BrainEvent — normalised event stream
+#
+# Both brains' native outputs convert into this shape. ``respond()`` is
+# *not* abstract over the event stream (it returns final text) — events
+# are an internal implementation detail consumed by the brain itself
+# (StatusFile updates, tool tracking). Phase A defines the dataclasses
+# so a future ``Brain.respond_streaming`` can be added additively.
+# ──────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SessionEstablished:
+    """Emitted exactly once per ``respond()`` call after the brain
+    confirms the session id. claude-code: the ``--session-id`` we
+    pinned. opencode: the id opencode generated, extracted from the
+    first event's ``sessionID`` field."""
+
+    session_id: str
+
+
+@dataclass(frozen=True)
+class TextDelta:
+    """Streaming text chunk. Brains MAY emit zero or one ``TextEnd``
+    per logical text block, but they MUST emit at least one
+    ``TextDelta`` or ``TextEnd`` before the ``Finished`` event so the
+    caller can accumulate the assistant reply."""
+
+    delta: str
+
+
+@dataclass(frozen=True)
+class TextEnd:
+    """Marks a text block as complete. ``text`` is the cumulative text
+    of THIS block only (not the whole response). Brains emitting
+    ``TextEnd`` are expected to emit it instead of (or after) the
+    final ``TextDelta``."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class ToolStart:
+    """Tool call announced. ``name`` is canonical lowercase
+    (``read``/``edit``/``shell``/...) — brains normalise case
+    (claude-code's ``Read`` → ``read``)."""
+
+    tool_id: str  # opaque per-call id from the brain
+    name: str
+    input: dict
+
+
+@dataclass(frozen=True)
+class ToolEnd:
+    """Tool call finished or failed."""
+
+    tool_id: str
+    status: Literal["completed", "error"]
+    output: str | None
+    error: str | None
+
+
+@dataclass(frozen=True)
+class Finished:
+    """Terminal event. ``text`` is the full assistant reply
+    (concatenation of all ``TextDelta`` / ``TextEnd`` content).
+    ``reason`` explains why the stream ended."""
+
+    text: str
+    reason: Literal["idle", "error", "cancelled", "timeout"]
+
+
+@dataclass(frozen=True)
+class StreamError:
+    """Non-terminal error — the stream may continue or may end with
+    ``Finished`` after this. For terminal errors brains should emit
+    ``Finished(reason="error")`` instead so callers don't have to
+    handle two terminal shapes."""
+
+    message: str
+
+
+BrainEvent = Union[
+    SessionEstablished,
+    TextDelta,
+    TextEnd,
+    ToolStart,
+    ToolEnd,
+    Finished,
+    StreamError,
+]
+
+
+# ──────────────────────────────────────────────────────────────────
+# Aux + healthcheck + MCP dataclasses
+# ──────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class AuxResult:
+    """Result of one ``spawn_aux`` call. Used by curator, judges,
+    extractors, and classifiers — each consumes ``stdout`` and treats
+    a non-zero ``returncode`` as failure."""
+
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+@dataclass(frozen=True)
+class BrainHealth:
+    """Result of ``healthcheck``. ``ok=True`` means the brain binary
+    is installed AND authenticated. ``hints`` carries actionable
+    suggestions for the user (e.g. "Install with: …", "Run: claude
+    /login")."""
+
+    ok: bool
+    error: str | None
+    hints: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class McpServerSpec:
+    """Canonical MCP server description. Per-brain writers translate
+    this into the brain's native config shape (claude-code's
+    ``mcpServers: {name: {command, args, env}}`` vs opencode's
+    ``mcp: {name: {type, command: [argv...], environment, ...}}``).
+
+    ``command`` is the executable; ``args`` are positional args that
+    follow it. ``env`` is per-server environment overrides applied at
+    spawn time by the brain."""
+
+    name: str
+    command: str
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Brain ABC
+# ──────────────────────────────────────────────────────────────────
+
+
+class Brain(ABC):
+    """Vexis's brain contract. See module docstring for the design.
+
+    Every implementation must provide all abstract methods. Methods
+    that have no Phase-A implementation on ``BrainClaudeCode`` (e.g.
+    ``spawn_aux``, ``write_mcp_config``) raise ``NotImplementedError``
+    until Phase B/C wires them; the abstraction is still load-bearing
+    for typing and for ``BrainNull`` to fully exercise the transport
+    layer in unit tests.
+    """
+
+    # ─── foreground turn ─────────────────────────────────────────
+
+    @abstractmethod
+    async def respond(self, message: str, chat_id: int) -> str:
+        """Run one foreground turn. Returns the assistant's final text.
+
+        Side effects: writes to the per-chat ``StatusFile`` for
+        ``/status``, registers the running subprocess with
+        ``RunningTasks`` for ``/cancel``.
+
+        Raises:
+            BrainTimeoutError: subprocess didn't exit in time.
+            BrainCancelled: ``/cancel`` fired during the turn.
+            SessionLost: brain session is no longer accessible.
+            BrainNotInstalled: brain binary missing from PATH.
+            BrainAuthRequired: brain binary present but not authed.
+            BrainError: catch-all for other subprocess failures.
+        """
+
+    # ─── system prompt assembly ──────────────────────────────────
+
+    @abstractmethod
+    def build_system_prompt(self) -> str:
+        """Compose the full system prompt for this brain. Default
+        composition: SOUL.md + CAPABILITIES.md + memory blocks +
+        relationships block + skills index. Subclasses MAY drop
+        sections that the brain duplicates natively (e.g.
+        ``BrainOpenCode`` skips the skills index because OpenCode
+        auto-discovers ``<workspace>/skills/**/SKILL.md`` itself)."""
+
+    # ─── aux spawn (Phase B routes curator/judges through this) ──
+
+    @abstractmethod
+    async def spawn_aux(
+        self,
+        prompt: str,
+        *,
+        model_tier: Literal["tiny", "small", "medium", "large"] | None = None,
+        timeout_seconds: float = 60.0,
+        env_overrides: dict[str, str] | None = None,
+    ) -> AuxResult:
+        """Run a one-shot fresh-session aux call.
+
+        ``model_tier`` is an abstract size tier, not a raw model name;
+        the brain translates it via the per-brain mapping in
+        ``~/.vexis/config.yaml`` under ``models.tiers.<brain-kind>``.
+        ``model_tier=None`` means "let the brain pick its native
+        default model" (no ``--model`` flag).
+
+        Used by the learning curator, coherence judge, goal judge,
+        relationships extractor, and relationships classifier — each
+        consumes ``AuxResult.stdout`` and treats a non-zero
+        ``returncode`` as failure.
+        """
+
+    # ─── session model ───────────────────────────────────────────
+
+    @abstractmethod
+    def session_token(self) -> str | None:
+        """Opaque token vexis stores to identify the current session.
+        Format is brain-specific. ``None`` means no session has been
+        started for this brain yet (rare — most brains generate or
+        accept a token at first ``respond``)."""
+
+    @abstractmethod
+    def rotate_session(self) -> str:
+        """Discard the current session token and return a new one. The
+        new token may be a placeholder until the first ``respond()``
+        call confirms it (claude-code accepts a caller-pinned UUID;
+        opencode generates the id and reports it in the first event).
+        Used after ``SessionLost`` to recover."""
+
+    # ─── transcript readback ─────────────────────────────────────
+
+    @abstractmethod
+    def iter_session_metas(self) -> Iterator[Any]:
+        """Cheap enumeration of sessions known to this brain in the
+        current workspace. One entry per session. Used by the learning
+        curator for eligibility scans; the curator filters by mtime
+        and content prefix.
+
+        Returns ``Iterator[SessionMeta]`` (the dataclass currently
+        lives in ``core.transcripts`` and may be relaxed in Phase C
+        when its claude-code-specific fields like ``jsonl_path`` need
+        to coexist with opencode's SQL-row identity)."""
+
+    @abstractmethod
+    def iter_messages(self, session_id: str) -> Iterator[Any]:
+        """Full read of one session's user+assistant turns. claude-code:
+        line-by-line JSONL parse. opencode (Phase C): SELECT against
+        ``message`` table. Returns ``Iterator[TranscriptMessage]``."""
+
+    @abstractmethod
+    def is_brain_owned_session(self, session_id: str) -> bool:
+        """Return True if the session was spawned by an aux call
+        (curator review, goal judge, etc.) — used by the recursion
+        guard to skip brain-owned sessions during eligibility scans.
+        Both brains check the first user-turn text against vexis's
+        canonical prompt prefixes (``CURATOR_REVIEW_PROMPT_PREFIX``,
+        ``GOAL_JUDGE_PROMPT_PREFIX``); the storage layer differs but
+        the prefix-match is content-shaped."""
+
+    # ─── MCP config wiring ───────────────────────────────────────
+
+    @abstractmethod
+    def write_mcp_config(self, servers: list[McpServerSpec]) -> Path:
+        """Write the MCP server config in this brain's expected
+        location and format. Returns the path written. Idempotent.
+
+        claude-code: ``<workspace>/.mcp.json`` with
+        ``{"mcpServers": {name: {command, args, env}}}``.
+        opencode: merges ``vexis-``-prefixed entries into
+        ``<workspace>/opencode.json`` ``mcp:`` block, preserving
+        user-owned non-prefixed entries byte-for-byte (Phase C)."""
+
+    # ─── file conventions ────────────────────────────────────────
+
+    @abstractmethod
+    def instruction_file_name(self) -> str:
+        """Project-instruction filename this brain reads.
+        claude-code: ``"CLAUDE.md"``. opencode: ``"AGENTS.md"``
+        (though it also reads ``CLAUDE.md`` as a fallback,
+        ``AGENTS.md`` is canonical)."""
+
+    @abstractmethod
+    def instruction_search_paths(self, workspace: Path) -> list[Path]:
+        """Paths this brain looks at for instructions, in lookup
+        order. Used by the install script to set up the
+        ``AGENTS.md`` ↔ ``CLAUDE.md`` symlink and by ``/status`` to
+        surface where instructions are read from."""
+
+    # ─── lifecycle ───────────────────────────────────────────────
+
+    async def healthcheck(self) -> BrainHealth:
+        """Optional: confirm the brain binary is installed and
+        authenticated. Default implementation returns ``ok=True``;
+        subclasses MAY override to actually run ``<binary> --version``
+        and parse auth state.
+
+        Not abstract — every brain is allowed to skip the check; the
+        first ``respond`` will surface the error if the binary is
+        missing or unauth'd. Implementations that do override should
+        return ``BrainHealth(ok=False, error=…, hints=[…])`` for
+        actionable failures."""
+        return BrainHealth(ok=True, error=None, hints=[])
+
+    async def kill_in_flight(self) -> None:
+        """Kill the currently-running ``respond()`` subprocess if any.
+
+        Default implementation is a no-op — today vexis kills via
+        ``RunningTasks.cancel()`` (which calls ``proc.kill()`` against
+        the proc registered with ``RunningTasks.attach()``). This hook
+        is exposed on the ABC for a future world where ``/cancel``
+        wants to talk to the brain directly; subclasses MAY override
+        to track ``self._current_proc`` and call ``os.killpg`` when
+        invoked."""
+        return None

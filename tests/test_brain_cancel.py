@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from brains import claude_code as brain_module
-from brains.claude_code import (
+from core.brain import claude_code as brain_module
+from core.brain.claude_code import (
     BrainCancelled,
     BrainError,
     BrainTimeoutError,
@@ -145,8 +145,8 @@ def patch_killpg(monkeypatch):
 
     monkeypatch.setattr("core.running_tasks.os.getpgid", _getpgid)
     monkeypatch.setattr("core.running_tasks.os.killpg", _killpg)
-    monkeypatch.setattr("brains.claude_code.os.getpgid", _getpgid)
-    monkeypatch.setattr("brains.claude_code.os.killpg", _killpg)
+    monkeypatch.setattr("core.brain.claude_code.os.getpgid", _getpgid)
+    monkeypatch.setattr("core.brain.claude_code.os.killpg", _killpg)
     return procs
 
 

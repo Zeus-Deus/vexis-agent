@@ -5,6 +5,23 @@ per-chat status file as tool events arrive (powers /status). Input is
 still passed text-format on argv — we don't need streaming-input
 queueing here since the application-level queue (core/running_tasks)
 already handles follow-up messages.
+
+Phase A (Day 1) of the brain abstraction moved this module from
+``brains/claude_code.py`` to ``core/brain/claude_code.py`` and added
+formal ``Brain`` ABC inheritance. The ``respond()`` body is
+byte-identical to the pre-move implementation. Methods that have
+natural Phase-A wiring (``build_system_prompt``, ``session_token``,
+``rotate_session``, ``iter_session_metas``, ``iter_messages``,
+``is_brain_owned_session``, ``instruction_file_name``,
+``instruction_search_paths``, ``healthcheck``, ``kill_in_flight``)
+delegate to the existing module-level functions so behaviour is
+unchanged. Methods deferred to Phase B / C (``spawn_aux``,
+``write_mcp_config``) raise ``NotImplementedError`` until those phases
+land. See ``.plans/brain-abstraction-research.md`` §5 for the rollout.
+
+Exception classes are re-exported from ``core.brain.base`` so existing
+``from core.brain.claude_code import BrainCancelled`` imports keep
+working — the canonical home is now ``core.brain.base``.
 """
 
 from __future__ import annotations
@@ -14,10 +31,24 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Literal
 
+from core.brain.base import (
+    AuxResult,
+    Brain,
+    BrainAuthRequired,
+    BrainCancelled,
+    BrainError,
+    BrainHealth,
+    BrainNotInstalled,
+    BrainTimeoutError,
+    McpServerSpec,
+    SessionLost,
+)
 from core.memory import MemoryStore
 from core.paths import memories_dir, skills_dir
 from core.running_tasks import RunningTasks
@@ -26,9 +57,27 @@ from core.sessions import SessionStore
 from core.skills import build_skills_index_block
 from core.status import StatusFile, extract_tool_target
 
+# Re-export the exception types so existing import sites
+# (``from core.brain.claude_code import BrainCancelled, ...``) keep
+# working. The canonical definition home is ``core.brain.base``.
+__all__ = [
+    "AuxResult",
+    "BrainAuthRequired",
+    "BrainCancelled",
+    "BrainError",
+    "BrainHealth",
+    "BrainNotInstalled",
+    "BrainTimeoutError",
+    "ClaudeCodeBrain",
+    "McpServerSpec",
+    "SessionLost",
+    "audit_destructive_mentions",
+    "build_system_prompt",
+]
+
 log = logging.getLogger(__name__)
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 # 30 min — generous for long multi-step work, hard ceiling for runaway calls.
 BRAIN_TIMEOUT_SECONDS = 1800
@@ -222,24 +271,7 @@ def audit_destructive_mentions(response: str) -> Iterator[tuple[str, bool]]:
             yield reason, asked
 
 
-class BrainError(RuntimeError):
-    pass
-
-
-class BrainTimeoutError(BrainError):
-    pass
-
-
-class BrainCancelled(BrainError):
-    """Raised when the brain subprocess was cancelled via /cancel."""
-
-
-class SessionLost(BrainError):
-    """Raised when --resume fails because Claude Code can't find the session.
-    The session has been rotated; the user's message was not processed."""
-
-
-class ClaudeCodeBrain:
+class ClaudeCodeBrain(Brain):
     def __init__(
         self,
         workspace: Path,
@@ -448,3 +480,124 @@ class ClaudeCodeBrain:
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except asyncio.TimeoutError:
                 log.error("claude -p (pid=%s) ignored SIGKILL", proc.pid)
+
+    # ─── Brain ABC implementations beyond ``respond`` ────────────
+    #
+    # Phase A wires every method that has a natural existing
+    # implementation to its existing call site so behaviour is
+    # unchanged. Methods deferred to Phase B / C raise
+    # ``NotImplementedError`` with the phase tag so a stray call
+    # surfaces immediately rather than silently misbehaving.
+
+    def build_system_prompt(self) -> str:
+        """ABC method; delegates to the module-level
+        ``build_system_prompt(workspace)`` so the cached ``respond()``
+        path and direct callers (background tasks) see byte-identical
+        prompts."""
+        return build_system_prompt(self._workspace)
+
+    async def spawn_aux(
+        self,
+        prompt: str,
+        *,
+        model_tier: Literal["tiny", "small", "medium", "large"] | None = None,
+        timeout_seconds: float = 60.0,
+        env_overrides: dict[str, str] | None = None,
+    ) -> AuxResult:
+        """Phase B will route the curator, judges, and extractors
+        through this method. Today (Phase A) those subsystems still
+        spawn ``claude -p`` directly via their own subprocess
+        helpers — no behaviour change. Calling this method now is a
+        programming error, not a runtime failure mode."""
+        raise NotImplementedError(
+            "ClaudeCodeBrain.spawn_aux is wired in Phase B; "
+            "today the curator, judges, and extractors spawn "
+            "`claude -p` directly via their own subprocess helpers. "
+            "See .plans/brain-abstraction-research.md §5 Day 2."
+        )
+
+    def session_token(self) -> str | None:
+        """Return the active SessionStore UUID. Always a string for
+        ``ClaudeCodeBrain`` — the SessionStore generates a UUID at
+        construction time, so there is never a "no token yet" state.
+        ``None`` is part of the ABC's contract for brains that
+        generate the id only on first use (e.g. opencode)."""
+        return self._session.get()
+
+    def rotate_session(self) -> str:
+        """Mint a fresh UUID and return it. Used by
+        ``MessageHandler.handle_clear`` and the ``SessionLost``
+        recovery path inside ``respond``."""
+        return self._session.rotate()
+
+    def iter_session_metas(self) -> Iterator:
+        """Walk the workspace's claude-code projects directory.
+        Delegates to ``core.transcripts.iter_session_metas`` so the
+        existing curator/relationships eligibility scan is unchanged."""
+        from core.transcripts import iter_session_metas
+
+        return iter_session_metas(self._workspace)
+
+    def iter_messages(self, session_id: str) -> Iterator:
+        """Stream user+assistant turns from one session JSONL.
+        Delegates to ``core.transcripts.iter_messages`` after
+        translating ``session_id`` (a UUID) into the JSONL path."""
+        from core.transcripts import claude_session_jsonl_dir, iter_messages
+
+        jsonl_path = claude_session_jsonl_dir(self._workspace) / f"{session_id}.jsonl"
+        return iter_messages(jsonl_path)
+
+    def is_brain_owned_session(self, session_id: str) -> bool:
+        """Content-prefix check against the first user-turn of the
+        session JSONL. Delegates to ``core.transcripts._is_curator_owned``
+        — the recursion guard the learning curator already uses."""
+        from core.transcripts import _is_curator_owned, claude_session_jsonl_dir
+
+        jsonl_path = claude_session_jsonl_dir(self._workspace) / f"{session_id}.jsonl"
+        if not jsonl_path.exists():
+            return False
+        return _is_curator_owned(jsonl_path)
+
+    def write_mcp_config(self, servers: list[McpServerSpec]) -> Path:
+        """Phase C will land this. Today vexis ships a static
+        ``.mcp.json`` checked into the repo; nothing programmatically
+        writes it. Calling this method now is a programming error,
+        not a runtime failure mode."""
+        raise NotImplementedError(
+            "ClaudeCodeBrain.write_mcp_config is wired in Phase C; "
+            "today vexis ships a static `.mcp.json` at the project "
+            "root and nothing rewrites it. See "
+            ".plans/brain-abstraction-research.md §5 Day 4."
+        )
+
+    def instruction_file_name(self) -> str:
+        return "CLAUDE.md"
+
+    def instruction_search_paths(self, workspace: Path) -> list[Path]:
+        """claude-code reads project ``CLAUDE.md`` first, then the
+        per-user global at ``~/.claude/CLAUDE.md``. Returned in
+        lookup order so ``/status`` can render "instructions read
+        from: …" in the same order claude-code consults them."""
+        return [workspace / "CLAUDE.md", Path.home() / ".claude" / "CLAUDE.md"]
+
+    async def healthcheck(self) -> BrainHealth:
+        """Confirm the ``claude`` binary is on PATH. Phase A keeps
+        this minimal — no auth check yet. Phase C may extend."""
+        if shutil.which("claude") is None:
+            return BrainHealth(
+                ok=False,
+                error="`claude` not on PATH",
+                hints=[
+                    "Install Claude Code: https://docs.anthropic.com/claude/claude-code",
+                    "Then verify with: claude --version",
+                ],
+            )
+        return BrainHealth(ok=True, error=None, hints=[])
+
+    async def kill_in_flight(self) -> None:
+        """No-op for Phase A — today ``/cancel`` kills the in-flight
+        proc via ``RunningTasks.cancel()`` (which calls ``proc.kill``
+        on the proc registered by ``RunningTasks.attach``). This hook
+        is exposed on the ABC for a future world where ``/cancel``
+        wants to talk to the brain directly."""
+        return None

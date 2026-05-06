@@ -13,7 +13,7 @@ import signal
 import sys
 from pathlib import Path
 
-from brains.claude_code import ClaudeCodeBrain, build_system_prompt
+from core.brain.claude_code import ClaudeCodeBrain, build_system_prompt
 from core.background_tasks import (
     BackgroundTaskError,
     BackgroundTaskLimitReached,

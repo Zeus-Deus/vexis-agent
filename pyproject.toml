@@ -25,7 +25,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["brains*", "transports*", "tools*", "core*"]
+include = ["transports*", "tools*", "core*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

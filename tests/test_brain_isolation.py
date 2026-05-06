@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from brains.claude_code import build_system_prompt
+from core.brain.claude_code import build_system_prompt
 from core.relationships.candidate_store import (
     RelationshipsCandidateStore,
     candidates_path,

@@ -7,8 +7,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from brains.base import Brain
-from brains.claude_code import BrainCancelled, BrainTimeoutError, SessionLost
+from core.brain.base import Brain, BrainCancelled, BrainTimeoutError, SessionLost
 from core.auth import is_allowed
 from core.notify import ContextNote, Notifier
 from core.paths import skills_dir
