@@ -5,10 +5,10 @@ Standalone Python daemon. Telegram bot + `claude -p` bridge for controlling an O
 This is a transport layer in front of an agent CLI (claude-code by default; opencode optional), not a new agent. Telegram in, MCP tools out, agent CLI in the middle.
 
 ## Repo layout
-- `brains/` — AI provider adapters. Default: `claude_code.py`.
+- `core/brain/` — agent CLI adapters (claude-code, opencode, null). See `## Brain abstraction (Phase C)` below.
 - `transports/` — messaging adapters. Default: `telegram.py`.
 - `tools/` — MCP servers (desktop-control, tailnet-serve, voxtype, omarchy-kb).
-- `core/` — main loop, auth, config.
+- `core/` — main loop, auth, config, learning curator, goals, schedules, sessions.
 
 ## Local dev environment
 - Miniconda env: `vexis-agent_env`. Activate before any `pip install` or running code.
@@ -25,13 +25,37 @@ This is a transport layer in front of an agent CLI (claude-code by default; open
 - Eval runs (`scripts/eval_learning.py`) are expensive (~50 LLM calls per run). Only invoke when prompts or fixtures change. Treat as a release gate, not a CI step.
 
 ## Model selection
-Internal subsystems (learning curator review, coherence judge,
-migration classifier) call `claude -p` with `--model sonnet` by
-default so they don't compete for plan tokens with the user-facing
-brain. The brain uses the account default. Configure under
-`models:` in `~/.vexis/config.yaml`; the literal value `default`
-means "no `--model` flag — let `claude -p` pick". See
-`core/yaml_config.py:model_*()` and `resolve_model_flag()`.
+Phase B of the brain abstraction split model selection in two:
+
+1. **Subsystems pick an abstract size tier.** Aux-spawn callers
+   (curator, judges, extractors, classifier) pass one of
+   `tiny` / `small` / `medium` / `large` to
+   `brain.spawn_aux(prompt, model_tier=...)`. Tier choice is
+   subsystem-owned (e.g. `goal_judge` → `large` for quality;
+   `relationships_classifier` → `tiny` for cost). Defaults at
+   `core/yaml_config.py:DEFAULT_SUBSYSTEM_TIERS`; override per
+   subsystem under `models.subsystems.<name>` in
+   `~/.vexis/config.yaml`.
+
+2. **Brains translate tiers to native model ids.** Each brain
+   reads `models.tiers.<brain-kind>.<tier>` from config, falling
+   back to `DEFAULT_TIER_MAP_<BRAIN>` (claude-code: `haiku` /
+   `sonnet` aliases; opencode: `provider/model` shape like
+   `anthropic/claude-haiku-3-5`). The user-facing foreground turn
+   uses the brain's account default — vexis doesn't pass
+   `--model` for `respond()`.
+
+Legacy raw-string keys (e.g. `models.coherence_judge: sonnet`)
+still work via the back-compat shim — they pass through
+unchanged on claude-code. They break on opencode (which requires
+`provider/model` shape); the migration recipe is in
+`docs/migration.md` "Switching to opencode: minimal config".
+
+The literal value `default` means "no `--model` flag — let the
+brain CLI pick". See `core/yaml_config.py:subsystem_tier()`,
+`model_for_tier()`, the `DEFAULT_TIER_MAP_*` constants, and the
+`## Brain abstraction (Phase C)` section below for the full
+picture.
 
 ## Reference repos (clone to /tmp when needed)
 - `NousResearch/hermes-agent` — peek at gateway, skills, memory patterns. Never bulk-copy.
@@ -173,7 +197,7 @@ with `relationships.explicit_consent_enabled: true` if you want
 phrasings like "remember that Sarah likes mystery novels" to save
 immediately without going through the candidate queue.
 
-**Eval gate.** The haiku-default extractor has an integration
+**Eval gate.** The sonnet-default extractor has an integration
 eval at `tests/relationships/test_extractor_eval.py`. Run
 deliberately (real `claude -p` calls):
 
