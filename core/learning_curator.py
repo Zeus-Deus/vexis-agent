@@ -2499,32 +2499,45 @@ class LearningController:
     async def _relationships_dryrun_text(self, last_n: int) -> str:
         """v3b Day 1 — observation-only.
 
-        Walks the most recent ``last_n`` session JSONLs (by file
-        mtime, descending), runs ``relationships_detect`` against
-        every ``role=="user"`` turn, and returns a printable report
-        of what *would* trigger. NO file writes anywhere — no
-        consent token, no shadow file, no live file. Day 2 wires
-        the detector into ``_dispatch_to_brain`` for real.
+        Walks the most recent ``last_n`` sessions known to the
+        configured brain (by ``last_message_timestamp``,
+        descending), runs ``relationships_detect`` against every
+        ``role=="user"`` turn, and returns a printable report of
+        what *would* trigger. NO file writes anywhere — no
+        consent token, no shadow file, no live file.
 
-        Curator-owned JSONLs (review forks) are filtered out via
-        the same content-prefix guard the daemon tick uses, so a
-        prior review of "remember that …" inside a quoted lesson
-        body doesn't show up as a fake trigger.
+        Curator-owned sessions (review forks) are filtered out via
+        ``brain.is_brain_owned_session`` so the recursion guard
+        works uniformly across brains.
+
+        Phase C Day 5: routes session enumeration + transcript
+        reads through the brain abstraction (``iter_session_metas``,
+        ``iter_messages``) instead of the claude-code-specific
+        ``claude_session_jsonl_dir`` glob. Closes the last direct
+        ``claude_session_jsonl_dir`` caller in this module and
+        makes the dryrun work uniformly on opencode workspaces
+        (where sessions live as DB rows, no JSONL).
         """
-        projects_dir = claude_session_jsonl_dir(self._workspace)
-        if not projects_dir.exists():
+        # Brain-agnostic: opencode yields SessionMeta with
+        # jsonl_path=None, claude-code yields with the JSONL path.
+        # Either way we sort by last_message_timestamp DESC and
+        # take the top N.
+        all_metas = list(self._brain.iter_session_metas())
+        if not all_metas:
+            kind = type(self._brain).__name__
             return (
-                f"relationships-dryrun: no session JSONLs at "
-                f"{projects_dir} (workspace has no Claude Code "
-                f"history yet)."
+                f"relationships-dryrun: no sessions known to "
+                f"{kind} for workspace {self._workspace} "
+                f"(no history yet)."
             )
 
-        all_jsonls = sorted(
-            (p for p in projects_dir.glob("*.jsonl") if p.is_file()),
-            key=lambda p: p.stat().st_mtime,
+        from datetime import datetime, timezone
+        epoch = datetime.min.replace(tzinfo=timezone.utc)
+        all_metas.sort(
+            key=lambda m: m.last_message_timestamp or epoch,
             reverse=True,
         )
-        recent = all_jsonls[: max(1, last_n)]
+        recent = all_metas[: max(1, last_n)]
 
         lines: list[str] = []
         verdict_counts: Counter[str] = Counter()
@@ -2533,19 +2546,15 @@ class LearningController:
         sessions_scanned = 0
         sessions_skipped_curator = 0
 
-        for jsonl in recent:
-            # Phase B: route through brain.is_brain_owned_session so
-            # the recursion guard works uniformly across brains.
-            # ClaudeCodeBrain takes a session UUID; we pass jsonl.stem
-            # since our claude-code JSONL files are named ``<uuid>.jsonl``.
-            if self._brain.is_brain_owned_session(jsonl.stem):
+        for meta in recent:
+            session_uuid = meta.session_uuid
+            if self._brain.is_brain_owned_session(session_uuid):
                 sessions_skipped_curator += 1
                 continue
             sessions_scanned += 1
-            session_uuid = jsonl.stem
             short = session_uuid[:8]
             user_turn_index = 0
-            for msg in iter_messages(jsonl):
+            for msg in self._brain.iter_messages(session_uuid):
                 if msg.role != "user":
                     continue
                 user_turn_index += 1

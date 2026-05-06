@@ -193,7 +193,20 @@ def test_role_gate_dispatch_path_does_not_invoke_detect_over_replies():
     jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     try:
-        controller = lc.LearningController(workspace=workspace)
+        # Phase C Day 5: dryrun routes session enumeration +
+        # transcript reads through the brain abstraction. Default
+        # is BrainNull (returns empty); we need a real
+        # ClaudeCodeBrain so it picks up the seeded JSONL via
+        # ``core.transcripts.iter_session_metas``.
+        from core.brain.claude_code import ClaudeCodeBrain
+        from core.running_tasks import RunningTasks
+        from core.sessions import SessionStore
+        workspace.mkdir(parents=True, exist_ok=True)
+        sess = SessionStore(workspace / "sessions.json")
+        cc_brain = ClaudeCodeBrain(
+            workspace=workspace, session=sess, running_tasks=RunningTasks(),
+        )
+        controller = lc.LearningController(workspace=workspace, brain=cc_brain)
         seen_texts: list[str] = []
 
         async def _spy(text, **kwargs):
