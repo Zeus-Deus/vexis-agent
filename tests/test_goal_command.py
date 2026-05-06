@@ -677,3 +677,310 @@ def test_cancel_with_goals_disabled_skips_auto_pause(
     after = store.load(_SESSION)
     assert after is not None
     assert after.status == "active"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Day 3 — preemption / restart / lifecycle edge cases
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_user_message_arrives_first_during_goal_hook(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    """§3 line 332 — user-arrives-first race.
+
+    The user types a message during a brain turn. By the time the
+    goal hook fires post-turn, the user message is already enqueued
+    (origin=user). Hook judges, gets continue, enqueues continuation
+    (origin=goal_continuation). Resulting deque: [user, continuation].
+    pop_or_release returns the user message first, then the
+    continuation — preserving the user-wins-on-arrival-order
+    invariant. Both flow through the drain in order.
+    """
+    store = GoalStateStore(goals_file)
+    GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    ).set("port the goal command")
+    bot = _FakeBot()
+
+    async def scenario() -> None:
+        # Drain claimed (mimics current brain turn in flight).
+        await transport._running_tasks.claim(_CHAT)
+        # Real user message arrived while brain was busy → enqueued.
+        await transport._running_tasks.enqueue(
+            _CHAT, _USER, "user follow-up", origin="user"
+        )
+        # Brain returns reply; hook fires with judge=continue.
+        with mock.patch(
+            "core.goal_manager.judge_goal", return_value=("continue", "more")
+        ):
+            await transport._run_goal_hook(bot, _CHAT, "brain reply")
+
+        # Queue now holds [user, continuation] in arrival order.
+        assert transport._running_tasks.queue_depth(_CHAT) == 2
+        first = await transport._running_tasks.pop_or_release(_CHAT)
+        second = await transport._running_tasks.pop_or_release(_CHAT)
+
+        assert first is not None and first.origin == "user"
+        assert first.text == "user follow-up"
+        assert second is not None and second.origin == "goal_continuation"
+        assert "Continuing toward your standing goal" in second.text
+
+    asyncio.run(scenario())
+
+
+def test_continuation_arrives_first_then_user_message(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    """§3 line 334 — the race we explicitly accepted.
+
+    Hook finishes judge before the user's message lands. Queue
+    becomes [continuation, user]; the continuation runs first,
+    the user message after. We document this as accepted behaviour
+    rather than fighting it — peek-then-enqueue would introduce a
+    TOCTOU window of its own (`.plans/goal-command-research.md`
+    §5 "Race: continuation enqueue vs. real user message").
+
+    Test verifies the deque order, the continuation's prompt shape,
+    and that a subsequent judge call would re-evaluate the goal
+    after the user's turn (judge fires again on the user-turn reply).
+    """
+    store = GoalStateStore(goals_file)
+    GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    ).set("ship feature X")
+    bot = _FakeBot()
+    judge_calls: list[str] = []
+
+    def judge_capture(workspace, goal, last_response, **_kw):
+        judge_calls.append(last_response)
+        # First call: continue. Second (after user turn): done.
+        if len(judge_calls) == 1:
+            return ("continue", "needs more work")
+        return ("done", "user closed it out")
+
+    async def scenario() -> None:
+        # Drain claimed; queue empty.
+        await transport._running_tasks.claim(_CHAT)
+        with mock.patch(
+            "core.goal_manager.judge_goal", side_effect=judge_capture
+        ):
+            # First hook call → enqueues continuation.
+            await transport._run_goal_hook(bot, _CHAT, "first reply")
+            # User message lands AFTER the continuation.
+            await transport._running_tasks.enqueue(
+                _CHAT, _USER, "user follow-up", origin="user"
+            )
+            assert transport._running_tasks.queue_depth(_CHAT) == 2
+
+            # Pop in order — continuation first, user second.
+            first = await transport._running_tasks.pop_or_release(_CHAT)
+            second = await transport._running_tasks.pop_or_release(_CHAT)
+            assert first is not None and first.origin == "goal_continuation"
+            assert second is not None and second.origin == "user"
+            assert second.text == "user follow-up"
+
+            # Simulate the drain processing the user turn and the
+            # hook firing again on its reply — judge should fire a
+            # SECOND time, this time mapping the user's response to
+            # done.
+            await transport._run_goal_hook(bot, _CHAT, "user-driven final reply")
+
+        # Two judge calls: first on the brain's first reply (continue),
+        # second on the user-driven turn's reply (done).
+        assert len(judge_calls) == 2
+        assert judge_calls[0] == "first reply"
+        assert judge_calls[1] == "user-driven final reply"
+        # Goal ends in done state — user's turn closed the goal.
+        final = store.load(_SESSION)
+        assert final is not None
+        assert final.status == "done"
+
+    asyncio.run(scenario())
+
+
+def test_post_cancel_resume_kicks_loop_again(
+    transport: TelegramTransport, goals_on: None, goals_file: Path
+) -> None:
+    """After /cancel auto-pauses, normal user messages run as plain
+    turns — no continuation enqueues because status=paused. Then
+    /goal resume zeros turns_used and the next post-turn hook
+    enqueues a continuation again.
+    """
+    store = GoalStateStore(goals_file)
+    mgr = GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    )
+    mgr.set("port the goal command")
+    # Burn 3 turns to make the post-resume reset visible.
+    state = mgr.state
+    assert state is not None
+    state.turns_used = 3
+    store.save(_SESSION, state)
+    # Simulate /cancel auto-pause having already happened.
+    state.status = "paused"
+    state.paused_reason = "user-cancelled"
+    store.save(_SESSION, state)
+
+    bot = _FakeBot()
+
+    async def scenario() -> None:
+        # 1) Plain user message after the paused state. Hook should
+        #    NOT fire (state is paused → is_active False at top).
+        with mock.patch("core.goal_manager.judge_goal") as fake_judge:
+            await transport._run_goal_hook(bot, _CHAT, "casual reply")
+            fake_judge.assert_not_called()
+        assert transport._running_tasks.queue_depth(_CHAT) == 0
+
+        # 2) /goal resume — flips active, resets turns_used to 0.
+        upd, _b, _m = _update("/goal resume")
+        await transport._on_goal(upd, _ctx("resume"))
+        resumed = store.load(_SESSION)
+        assert resumed is not None
+        assert resumed.status == "active"
+        assert resumed.turns_used == 0
+
+        # 3) Next post-turn hook now DOES enqueue a continuation.
+        await transport._running_tasks.claim(_CHAT)
+        with mock.patch(
+            "core.goal_manager.judge_goal", return_value=("continue", "more")
+        ):
+            await transport._run_goal_hook(bot, _CHAT, "brain reply after resume")
+        # Continuation is in the queue.
+        assert transport._running_tasks.queue_depth(_CHAT) == 1
+        msg = await transport._running_tasks.pop_or_release(_CHAT)
+        assert msg is not None
+        assert msg.origin == "goal_continuation"
+        # turns_used is now 1 (the brain turn after resume burned one).
+        after = store.load(_SESSION)
+        assert after is not None
+        assert after.turns_used == 1
+
+    asyncio.run(scenario())
+
+
+def test_session_clear_orphans_old_goal(
+    transport: TelegramTransport,
+    goals_on: None,
+    goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§4 — /clear (the session-clear command) rotates the active
+    session UUID via core/sessions.py:172-177. The old session's
+    goal record stays on disk keyed by the OLD UUID. The new session
+    has no goal until the user types /goal <text> again.
+
+    Test simulates the rotation by changing what
+    ``handler.current_session_uuid()`` returns. Asserts:
+      - /goal status on the new UUID returns "no active goal"
+      - ``store.load(old_uuid)`` still returns the orphaned record
+      - ``store.list_active()`` returns the orphan only if its
+        status is still active (it is — /clear doesn't touch goals).
+    """
+    old_uuid = "old-session-uuid"
+    new_uuid = "new-session-uuid"
+
+    # Seed a goal under the OLD UUID.
+    store = GoalStateStore(goals_file)
+    GoalManager(
+        session_uuid=old_uuid, workspace=Path("/tmp"), store=store
+    ).set("orphan-able goal")
+
+    # Rotate the handler's reported session UUID — same effect as
+    # SessionStore.rotate() on a real /clear.
+    transport._handler.current_session_uuid = lambda: new_uuid  # type: ignore[method-assign]
+
+    upd, _bot, msg = _update("/goal status")
+    asyncio.run(transport._on_goal(upd, _ctx("status")))
+    # New session sees no goal.
+    assert msg.reply_log
+    assert "No active goal" in msg.reply_log[0]
+
+    # Old record still on disk under its original UUID.
+    old = store.load(old_uuid)
+    assert old is not None
+    assert old.goal == "orphan-able goal"
+    assert old.status == "active"
+
+    # New session has nothing.
+    assert store.load(new_uuid) is None
+
+    # list_active includes the orphan (its status is still active).
+    actives = dict(store.list_active())
+    assert old_uuid in actives
+    assert new_uuid not in actives
+
+
+def test_budget_exhaustion_renders_pause_message_at_transport_layer(
+    transport: TelegramTransport,
+    goals_on: None,
+    goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§5 — turn-budget backstop. With max_turns=2, two consecutive
+    continue-verdict hooks burn the budget; the third evaluation
+    flips status to paused with a budget-exhausted reason and the
+    transport sends the §3 budget-exhaustion status line verbatim
+    (NOT "✓ Goal achieved" — budget exhaustion is a pause, not a
+    completion).
+
+    Pins the exact wording at the user-visible level (the manager
+    test only asserts ``"paused" in message.lower()`` — drift in
+    the exact phrasing wouldn't fail there). Mirrors the §3
+    template: ``"⏸ Goal paused — N/N turns used. /goal resume to
+    keep going, /goal clear to stop."``
+    """
+    # Override goals_max_turns to 2 so we can exhaust the budget
+    # in a few hook calls.
+    monkeypatch.setattr("core.yaml_config.goals_max_turns", lambda: 2)
+
+    store = GoalStateStore(goals_file)
+    GoalManager(
+        session_uuid=_SESSION,
+        workspace=Path("/tmp"),
+        store=store,
+        default_max_turns=2,
+    ).set("budget-test goal")
+
+    bot = _FakeBot()
+
+    async def scenario() -> None:
+        await transport._running_tasks.claim(_CHAT)
+        with mock.patch(
+            "core.goal_manager.judge_goal", return_value=("continue", "not yet")
+        ):
+            # Turn 1 → continue, enqueues continuation.
+            await transport._run_goal_hook(bot, _CHAT, "reply 1")
+            # Drain consumed the continuation in real life; here we
+            # just clear it manually so the next hook starts clean.
+            await transport._running_tasks.pop_or_release(_CHAT)
+
+            # Turn 2 → still continue per the mocked judge, BUT the
+            # manager checks budget AFTER incrementing turns_used to 2,
+            # so it auto-pauses. No continuation enqueued.
+            await transport._run_goal_hook(bot, _CHAT, "reply 2")
+
+        # State: paused, turns_used=2, budget-exhausted reason.
+        state = store.load(_SESSION)
+        assert state is not None
+        assert state.status == "paused"
+        assert state.turns_used == 2
+        assert state.paused_reason is not None
+        assert "budget exhausted" in state.paused_reason.lower()
+        assert "2/2" in state.paused_reason
+
+        # Transport sent the §3 budget-exhaustion reply verbatim.
+        sent = [t for _cid, t in bot.sent_messages]
+        budget_lines = [t for t in sent if t.startswith("⏸")]
+        assert len(budget_lines) == 1
+        line = budget_lines[0]
+        assert "2/2 turns used" in line
+        assert "/goal resume" in line
+        assert "/goal clear" in line
+        # And NOT a "Goal achieved" line — budget exhaustion isn't a win.
+        assert not any("Goal achieved" in t for t in sent)
+
+        # No leftover continuation in the queue.
+        assert transport._running_tasks.queue_depth(_CHAT) == 0
+
+    asyncio.run(scenario())

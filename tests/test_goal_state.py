@@ -283,3 +283,136 @@ def test_from_dict_handles_missing_optional_fields() -> None:
     assert state.max_turns == DEFAULT_MAX_TURNS
     assert state.created_at is None
     assert state.last_verdict is None
+
+
+# ──────────────────────────────────────────────────────────────────
+# Day 3 — restart and lifecycle
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_daemon_restart_rehydrates_active_goal(tmp_path: Path) -> None:
+    """§5 — daemon restart mid-loop must preserve an active goal.
+
+    Simulates the restart by creating a fresh ``GoalStateStore``
+    pointing at the same on-disk file and verifying the active
+    record is readable. The hook in ``transports/telegram.py`` then
+    rebuilds a manager per-call against the live store, so
+    rehydration is automatic on the next user message — no
+    "scan for active goals on boot and re-fire" path needed (per
+    the §5 boot policy: do nothing automatic).
+
+    Asserts:
+      - Pre-restart store writes an active goal.
+      - Post-restart fresh store reads it back identically.
+      - ``list_active`` returns the rehydrated record.
+      - **Crucially**: no auto-fire on store reinstantiation. The
+        store has no method that would enqueue or trigger work; it
+        only persists / reads. Restart safety is "the next user
+        message wakes the loop", not "boot wakes the loop".
+    """
+    path = tmp_path / "goals.json"
+
+    # Pre-restart: write an active goal with mid-flight turn count.
+    store_pre = GoalStateStore(path)
+    state = GoalState(
+        goal="port goal command",
+        status="active",
+        turns_used=4,
+        max_turns=20,
+        last_verdict="continue",
+        last_reason="halfway through Day 2 work",
+    )
+    store_pre.save("session-pre", state)
+
+    # "Restart": drop the in-memory store, build a new one against
+    # the same file. This is exactly what happens when the daemon
+    # process restarts — fresh GoalStateStore() in transport's
+    # _build_goal_manager helper.
+    del store_pre
+    store_post = GoalStateStore(path)
+
+    # Active goal is readable.
+    rehydrated = store_post.load("session-pre")
+    assert rehydrated is not None
+    assert rehydrated.goal == "port goal command"
+    assert rehydrated.status == "active"
+    assert rehydrated.turns_used == 4
+    assert rehydrated.last_verdict == "continue"
+    assert rehydrated.last_reason == "halfway through Day 2 work"
+
+    # list_active picks it up (single-row file, status=active).
+    actives = dict(store_post.list_active())
+    assert "session-pre" in actives
+    assert actives["session-pre"].turns_used == 4
+
+    # **Boot policy invariant**: the store has no auto-fire method.
+    # Confirm there is no public scan/run/wake method that would
+    # surprise the user post-restart. The only public surface is
+    # load / save / clear / list_active.
+    public = [
+        name for name in dir(store_post)
+        if not name.startswith("_")
+        and callable(getattr(store_post, name))
+    ]
+    expected = {"load", "save", "clear", "list_active", "SCHEMA_VERSION"}
+    # SCHEMA_VERSION is a class attribute, not a method — drop from
+    # the callable check.
+    callable_public = {n for n in public if not isinstance(getattr(store_post, n), int)}
+    assert callable_public == expected - {"SCHEMA_VERSION"}, (
+        f"Unexpected public method on GoalStateStore: {callable_public}. "
+        "If you've added one, double-check it cannot auto-fire goal "
+        "loops on daemon boot — the §5 boot policy is 'do nothing "
+        "automatic'."
+    )
+
+
+def test_multiple_cleared_records_cumulate(tmp_path: Path) -> None:
+    """§3 — cleared records are retained on disk for audit and
+    restart forensics. Three set→clear cycles across distinct
+    session UUIDs should leave three rows in goals.json, all keyed
+    by their session UUID, with the third (still active) being the
+    only one ``list_active`` returns.
+
+    Mirrors the real session-clear lifecycle: every /clear rotates
+    the active session UUID, leaving the old goal orphaned but
+    readable. Multiple /clear cycles accumulate, which is fine —
+    one cleared row per session, ~200 bytes; never grows fast.
+    """
+    path = tmp_path / "goals.json"
+    store = GoalStateStore(path)
+
+    # Cycle 1: set then clear under sid-1.
+    store.save("sid-1", GoalState(goal="first", status="active"))
+    store.clear("sid-1")
+
+    # Cycle 2: set then clear under sid-2.
+    store.save("sid-2", GoalState(goal="second", status="active"))
+    store.clear("sid-2")
+
+    # Cycle 3: set under sid-3, leave active.
+    store.save("sid-3", GoalState(goal="third", status="active"))
+
+    # All three records survive on disk.
+    assert store.load("sid-1") is not None
+    assert store.load("sid-1").status == "cleared"  # type: ignore[union-attr]
+    assert store.load("sid-2") is not None
+    assert store.load("sid-2").status == "cleared"  # type: ignore[union-attr]
+    assert store.load("sid-3") is not None
+    assert store.load("sid-3").status == "active"  # type: ignore[union-attr]
+
+    # Each cleared row retains its goal text for audit.
+    assert store.load("sid-1").goal == "first"  # type: ignore[union-attr]
+    assert store.load("sid-2").goal == "second"  # type: ignore[union-attr]
+
+    # list_active returns ONLY sid-3 — the cleared rows are filtered
+    # out by the status check.
+    actives = dict(store.list_active())
+    assert set(actives.keys()) == {"sid-3"}
+    assert actives["sid-3"].goal == "third"
+
+    # File on disk physically holds all three keys (verified via raw
+    # JSON, not through the store). Defends against a future "drop
+    # cleared records on save" optimisation that would silently
+    # break the audit trail.
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert set(raw["goals"].keys()) == {"sid-1", "sid-2", "sid-3"}
