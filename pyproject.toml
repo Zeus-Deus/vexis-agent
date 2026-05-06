@@ -29,7 +29,9 @@ include = ["transports*", "tools*", "core*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q -m 'not eval'"
+addopts = "-q -m 'not eval and not brain_smoke and not brain_smoke_opencode'"
 markers = [
     "eval: integration eval that calls real claude -p (cost/network); opt-in via -m eval",
+    "brain_smoke: real-binary claude-code smoke (cost/network); opt-in via -m brain_smoke",
+    "brain_smoke_opencode: real-binary opencode smoke (cost/network); opt-in via -m brain_smoke_opencode",
 ]

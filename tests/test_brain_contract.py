@@ -1,6 +1,15 @@
-"""Cross-brain contract tests for the Phase A `Brain` ABC.
+"""Cross-brain contract tests for the `Brain` ABC.
 
-Verifies, parameterised over ``[BrainNull, ClaudeCodeBrain]``:
+Phase C Day 5: parametrise over ``[BrainNull, ClaudeCodeBrain,
+OpenCodeBrain]``. Earlier phases ran only the first two; OpenCode
+joins now that Day 4's session resume + SQL transcript reader
+have landed and the inspection-only methods all return the right
+shapes against an isolated tmp DB (the autouse
+``_isolate_opencode_db`` fixture in ``tests/conftest.py``
+redirects opencode's reader to a non-existent path so tests
+don't see the user's real history).
+
+Verifies, parameterised over all three implementations:
 - every abstract method is implemented (Python ABC enforcement —
   instantiating an ABC with unimplemented abstract methods raises
   ``TypeError`` at construction time);
@@ -59,6 +68,7 @@ from core.brain.base import (
 )
 from core.brain.claude_code import ClaudeCodeBrain
 from core.brain.null import BrainNull
+from core.brain.opencode import OpenCodeBrain
 from core.running_tasks import RunningTasks
 from core.sessions import SessionStore
 
@@ -102,21 +112,38 @@ def null_brain() -> BrainNull:
     return BrainNull(responses=["canned-1", "canned-2"])
 
 
-@pytest.fixture(params=["null", "claude_code"])
+@pytest.fixture
+def opencode_brain(workspace: Path, tmp_path: Path) -> OpenCodeBrain:
+    """OpenCodeBrain constructed against tmp paths. The autouse
+    ``_isolate_opencode_db`` fixture in ``tests/conftest.py`` already
+    redirects the SQL reader to a non-existent path so the
+    inspection-only methods return empty without touching the
+    user's real ``~/.local/share/opencode/opencode.db``."""
+    return OpenCodeBrain(
+        workspace=workspace,
+        session=SessionStore(tmp_path / "opencode-sessions.json"),
+        running_tasks=RunningTasks(),
+    )
+
+
+@pytest.fixture(params=["null", "claude_code", "opencode"])
 def brain_under_test(
     request: pytest.FixtureRequest,
     null_brain: BrainNull,
     claude_brain: ClaudeCodeBrain,
+    opencode_brain: OpenCodeBrain,
 ) -> Brain:
-    """Parameterised over both brain implementations. Tests using this
-    fixture should only exercise inspection-only methods or methods
-    that work uniformly across implementations (e.g. exception
-    hierarchy checks). Methods that diverge between brains
-    (spawn_aux raises on claude_code, returns on null) get their own
-    explicit per-brain tests."""
+    """Parameterised over all three brain implementations. Tests
+    using this fixture should only exercise inspection-only methods
+    or methods that work uniformly across implementations (e.g.
+    exception hierarchy checks). Methods that diverge between
+    brains (spawn_aux raises on claude_code, returns on null) get
+    their own explicit per-brain tests."""
     if request.param == "null":
         return null_brain
-    return claude_brain
+    if request.param == "claude_code":
+        return claude_brain
+    return opencode_brain
 
 
 # ──────────────────────────────────────────────────────────────────
