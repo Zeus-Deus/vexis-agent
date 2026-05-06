@@ -40,9 +40,10 @@ The user can send you images via Telegram. They arrive as text messages
 prefixed with `[user sent image: /tmp/vexis-incoming-<uuid>.png]`
 followed by their caption (if any).
 
-When you see this prefix, use the `Read` tool on the path to actually
-look at the image. The image is saved as PNG and Read can display
-images directly. Then respond to whatever the user is asking about it.
+When you see this prefix, use your file-reading tool on the path to
+actually look at the image. The image is saved as PNG and most agent
+file-reading tools can display images directly. Then respond to
+whatever the user is asking about it.
 
 Examples:
 - `[user sent image: /tmp/vexis-incoming-abc.png] what's wrong here?`
@@ -342,8 +343,8 @@ might want to keep chatting regardless of duration.
 `fix-login-bug`, `add-dark-mode`, `refactor-auth-module`. Must start
 with a lowercase letter; only lowercase letters, digits, and hyphens.
 
-`<prompt>` is what you'd send to a Claude Code session. The background
-task runs as a fresh Claude Code session with the same project access
+`<prompt>` is what you'd send to an agent session. The background
+task runs as a fresh agent session with the same project access
 you have.
 
 Returns JSON with the task name and spawn time. Tell the user clearly:
@@ -358,7 +359,7 @@ the last 50 lines of the task log:
 
     ~/projects/vexis-agent/scripts/vexis-bg tail fix-login-bug
 
-The log is `claude -p --output-format stream-json` output, so you'll
+The log is the agent CLI's structured event stream output, so you'll
 see structured tool-use and partial-message events. Use what you read
 to give a meaningful status update:
 
@@ -671,8 +672,8 @@ path verbatim in your reply** — the Telegram transport detects
 `<workspace>/browser/screenshots/<ts>.png` and sends the file as a
 photo before the text body, then strips the path from the prose.
 The file stays on disk after sending so you (or the user) can
-re-reference it later. Use the `Read` tool on the path if you need
-to look at the image yourself. `--full-page` captures the entire
+re-reference it later. Use your file-reading tool on the path if you
+need to look at the image yourself. `--full-page` captures the entire
 scrollable page rather than just the viewport. `image_base64` is
 opt-in via `--include-base64`; off by default because the brain's
 stream-json buffer can't carry multi-megabyte lines and the path

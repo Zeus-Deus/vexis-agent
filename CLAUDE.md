@@ -2,7 +2,7 @@
 
 Standalone Python daemon. Telegram bot + `claude -p` bridge for controlling an Omarchy (Hyprland/Wayland) desktop from a phone.
 
-This is a transport layer in front of Claude Code, not a new agent. Telegram in, MCP tools out, Claude Code in the middle.
+This is a transport layer in front of an agent CLI (claude-code by default; opencode optional), not a new agent. Telegram in, MCP tools out, agent CLI in the middle.
 
 ## Repo layout
 - `brains/` — AI provider adapters. Default: `claude_code.py`.
