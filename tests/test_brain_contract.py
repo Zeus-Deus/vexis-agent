@@ -501,9 +501,12 @@ def test_null_brain_respond_returns_canned_response(null_brain: BrainNull):
     assert reply == "canned-1"
     reply2 = asyncio.run(null_brain.respond("again", chat_id=1))
     assert reply2 == "canned-2"
-    # Exhausted queue returns "" rather than raising.
-    reply3 = asyncio.run(null_brain.respond("more?", chat_id=1))
-    assert reply3 == ""
+    # Exhausted queue raises AssertionError — fail loud rather than
+    # silently returning "" (which would let downstream assertions
+    # pass for the wrong reason). Tests should pre-load enough
+    # responses for the call volume they expect.
+    with pytest.raises(AssertionError, match="exhausted"):
+        asyncio.run(null_brain.respond("more?", chat_id=1))
 
 
 def test_null_brain_records_calls(null_brain: BrainNull):
@@ -523,21 +526,29 @@ def test_null_brain_next_raises_injects_exception(null_brain: BrainNull):
 
 def test_null_brain_spawn_aux_returns_canned():
     """spawn_aux works on null brain — returns AuxResult from the
-    queue, defaulting to empty stdout/stderr if exhausted."""
+    queue. Exhaustion raises rather than silently returning empty."""
     brain = BrainNull(
         aux_results=[AuxResult(stdout="hello", stderr="", returncode=0)]
     )
     result = asyncio.run(brain.spawn_aux("any prompt", model_tier="small"))
     assert result.stdout == "hello"
     assert result.returncode == 0
-    # Exhausted: default empty result, not raise.
-    result2 = asyncio.run(brain.spawn_aux("more", model_tier="tiny"))
-    assert result2.stdout == ""
-    assert result2.returncode == 0
+    # Exhausted: raises AssertionError (fail-loud, see ``respond``
+    # docstring for rationale).
+    with pytest.raises(AssertionError, match="exhausted"):
+        asyncio.run(brain.spawn_aux("more", model_tier="tiny"))
 
 
 def test_null_brain_aux_calls_recorded():
-    brain = BrainNull()
+    """``aux_calls()`` records ``(prompt, model_tier)`` for every call.
+    Each call needs a pre-loaded ``AuxResult`` since exhaustion now
+    raises — pre-load two so both calls succeed."""
+    brain = BrainNull(
+        aux_results=[
+            AuxResult(stdout="r1", stderr="", returncode=0),
+            AuxResult(stdout="r2", stderr="", returncode=0),
+        ]
+    )
     asyncio.run(brain.spawn_aux("p1", model_tier="small"))
     asyncio.run(brain.spawn_aux("p2", model_tier="large"))
     assert brain.aux_calls() == [("p1", "small"), ("p2", "large")]

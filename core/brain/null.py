@@ -119,7 +119,15 @@ class BrainNull(Brain):
             self._pending_exc = None
             raise exc
         if not self._responses:
-            return ""
+            # Fail loud: silent ``return ""`` would let tests pass for
+            # the wrong reason when downstream assertions happen to
+            # tolerate empty replies. Tests should pre-load enough
+            # responses for the call volume they expect.
+            raise AssertionError(
+                f"BrainNull.respond exhausted at call #{len(self._respond_calls)} "
+                f"(message={message!r}, chat_id={chat_id}); "
+                f"pre-load more responses or use next_raises() to inject"
+            )
         return self._responses.pop(0)
 
     def build_system_prompt(self) -> str:
@@ -148,7 +156,13 @@ class BrainNull(Brain):
             self._pending_aux_exc = None
             raise exc
         if not self._aux_results:
-            return AuxResult(stdout="", stderr="", returncode=0)
+            # Fail loud — see the matching docstring on respond()
+            # exhaustion for rationale.
+            raise AssertionError(
+                f"BrainNull.spawn_aux exhausted at call #{len(self._aux_records)} "
+                f"(prompt={prompt[:80]!r}, model_tier={model_tier!r}); "
+                f"pre-load more aux_results or use next_aux_raises() to inject"
+            )
         return self._aux_results.pop(0)
 
     def session_token(self) -> str | None:
