@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -224,6 +224,7 @@ def list_eligible_sessions(
     idle_threshold: timedelta,
     now: datetime,
     spawned_by_curator: set[str] | None = None,
+    is_brain_owned: "Callable[[str], bool] | None" = None,
 ) -> list[SessionMeta]:
     """Filter ``iter_session_metas`` down to sessions that need review.
 
@@ -234,7 +235,7 @@ def list_eligible_sessions(
         get filtered out even if their JSONLs land in the same
         projects directory; the caller passes the union of the
         in-memory set and the persistent ``spawned.json`` registry),
-      - the JSONL's first user turn doesn't start with the curator
+      - the session's first user turn doesn't start with the curator
         review prompt (content-based recursion guard, catches legacy
         backlog and any case the persistent registry missed),
       - ``last_message_timestamp > reviewed.get(uuid, datetime.min)``,
@@ -246,6 +247,16 @@ def list_eligible_sessions(
     ``last_message_at_review_time`` snapshot from reviewed.json,
     not the wall-clock review time — that's what makes "user
     resumed and added new content" naturally re-eligible.
+
+    Phase B: ``is_brain_owned`` is an optional callable injected by
+    the caller (production: ``brain.is_brain_owned_session``). When
+    provided, the recursion guard goes through the brain abstraction
+    so a future ``BrainOpenCode`` can filter SQL-row-stored sessions
+    via the same content-prefix check. When ``None`` (legacy / test
+    callers without a brain reference), falls back to the
+    file-system-based ``_is_curator_owned`` against
+    ``meta.jsonl_path`` — preserves byte-identical behaviour for the
+    hundreds of test sites that don't thread a brain through.
     """
     spawned = spawned_by_curator or set()
     epoch = datetime.min.replace(tzinfo=timezone.utc)
@@ -260,7 +271,10 @@ def list_eligible_sessions(
         # eligibility-passing curator JSONLs through to the review
         # path. Order matters: spawned-set check (free) → content
         # check (one open) → reviewed/idle (cheap dict + arith).
-        if _is_curator_owned(meta.jsonl_path):
+        if is_brain_owned is not None:
+            if is_brain_owned(meta.session_uuid):
+                continue
+        elif _is_curator_owned(meta.jsonl_path):
             continue
         last_reviewed = reviewed.get(meta.session_uuid, epoch)
         # Compare at whole-second precision: ReviewedStore historically

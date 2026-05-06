@@ -80,7 +80,6 @@ from core.paths import (
 from core.skills import discover_skills, parse_skill_md
 from core.transcripts import (
     SessionMeta,
-    _is_curator_owned,
     claude_session_jsonl_dir,
     iter_messages,
     list_eligible_sessions,
@@ -1835,6 +1834,13 @@ class LearningController:
             idle_threshold=idle_threshold,
             now=started_at,
             spawned_by_curator=spawned_union,
+            # Phase B: route the recursion guard through the brain
+            # abstraction so a future opencode brain can filter
+            # SQL-row-stored sessions with the same content-prefix
+            # check. ClaudeCodeBrain.is_brain_owned_session delegates
+            # to the existing core.transcripts._is_curator_owned, so
+            # behaviour is unchanged today.
+            is_brain_owned=self._brain.is_brain_owned_session,
         )
         result.eligible = [m.session_uuid for m in candidates]
 
@@ -2510,7 +2516,11 @@ class LearningController:
         sessions_skipped_curator = 0
 
         for jsonl in recent:
-            if _is_curator_owned(jsonl):
+            # Phase B: route through brain.is_brain_owned_session so
+            # the recursion guard works uniformly across brains.
+            # ClaudeCodeBrain takes a session UUID; we pass jsonl.stem
+            # since our claude-code JSONL files are named ``<uuid>.jsonl``.
+            if self._brain.is_brain_owned_session(jsonl.stem):
                 sessions_skipped_curator += 1
                 continue
             sessions_scanned += 1
