@@ -425,3 +425,30 @@ export interface TailscaleStatus {
   peers: TailscalePeer[];
   error: string | null;
 }
+
+// ---- /goal dashboard tab ----------------------------------------
+
+export type GoalStatus = "active" | "paused" | "done" | "cleared";
+
+export interface GoalRecord {
+  session_uuid: string;
+  goal: string;
+  status: GoalStatus;
+  turns_used: number;
+  max_turns: number;
+  created_at: string | null;
+  last_turn_at: string | null;
+  last_verdict: "done" | "continue" | "skipped" | null;
+  last_reason: string | null;
+  paused_reason: string | null;
+}
+
+export interface GoalsState {
+  // The current session's goal record when status ∈ {active, paused}.
+  // Done and cleared records appear in `history` instead so the
+  // active panel only renders things the user can act on.
+  active: GoalRecord | null;
+  // Most recent 20 non-active records (paused / done / cleared)
+  // sorted by last_turn_at desc.
+  history: GoalRecord[];
+}

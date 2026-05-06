@@ -8,6 +8,8 @@ import type {
   BrowserState,
   CuratorRunDetail,
   CuratorState,
+  GoalRecord,
+  GoalsState,
   LearningJudgeRequest,
   LearningJudgeResult,
   LearningState,
@@ -167,6 +169,13 @@ export const api = {
       { method: "POST", body },
     ),
   tailscale: (token: string) => call<TailscaleStatus>(token, "/tailscale/status"),
+  goals: (token: string) => call<GoalsState>(token, "/goals"),
+  pauseGoal: (token: string) =>
+    call<GoalRecord>(token, "/goals/pause", { method: "POST" }),
+  resumeGoal: (token: string) =>
+    call<GoalRecord>(token, "/goals/resume", { method: "POST" }),
+  clearGoal: (token: string) =>
+    call<GoalRecord>(token, "/goals/clear", { method: "POST" }),
   relationshipsResolveQualifier: (
     token: string,
     slug: string,

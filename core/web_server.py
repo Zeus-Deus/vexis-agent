@@ -1000,6 +1000,44 @@ class WebDashboard:
         async def get_tailscale_status() -> dict:
             return await asyncio.to_thread(self._tailscale_payload)
 
+        # ----- /goal observability + control -----
+        #
+        # Dashboard surface for the v3d /goal feature. The feature's
+        # only entry point remains the Telegram /goal <text> command
+        # — the dashboard is observability + control (pause / resume /
+        # clear), never creation. Mutations route through the same
+        # ``GoalManager`` that Telegram handlers use, with a sentinel
+        # ``paused_reason="dashboard-paused"`` etc. so the audit trail
+        # records where the action came from.
+
+        @app.get(
+            "/api/v1/goals",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_goals() -> dict:
+            return await asyncio.to_thread(self._goals_payload)
+
+        @app.post(
+            "/api/v1/goals/pause",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_goals_pause() -> dict:
+            return await self._goals_pause()
+
+        @app.post(
+            "/api/v1/goals/resume",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_goals_resume() -> dict:
+            return await self._goals_resume()
+
+        @app.post(
+            "/api/v1/goals/clear",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_goals_clear() -> dict:
+            return await self._goals_clear()
+
         # ----- frontend bootstrap -----
 
         index_html = self._config.web_dist / "index.html"
@@ -1376,6 +1414,173 @@ class WebDashboard:
             ],
             "error": first_error,
         }
+
+    # ----- /goal payload + mutation helpers ---------------------------
+
+    def _goal_record_dict(
+        self, session_uuid: str, state: "GoalState"
+    ) -> dict:
+        """Serialize a (session_uuid, GoalState) pair to the JSON
+        shape the dashboard frontend expects. Timestamps render as
+        ISO-8601 strings (or ``null``)."""
+
+        def _iso(dt):
+            return dt.astimezone(timezone.utc).isoformat() if dt else None
+
+        return {
+            "session_uuid": session_uuid,
+            "goal": state.goal,
+            "status": state.status,
+            "turns_used": state.turns_used,
+            "max_turns": state.max_turns,
+            "created_at": _iso(state.created_at),
+            "last_turn_at": _iso(state.last_turn_at),
+            "last_verdict": state.last_verdict,
+            "last_reason": state.last_reason,
+            "paused_reason": state.paused_reason,
+        }
+
+    def _goals_store(self) -> "GoalStateStore":
+        from core.goal_state import GoalStateStore
+        from core.paths import goals_path
+        return GoalStateStore(goals_path())
+
+    def _active_session_uuid(self) -> str | None:
+        """Read the active session UUID via the shared SessionStore.
+
+        ``self._sessions`` may be None on bare test fixtures that
+        construct the dashboard without the session wiring; guard so
+        the dashboard endpoint stays robust in that case (returns
+        ``no active goal`` rather than crashing).
+        """
+        if self._sessions is None:
+            return None
+        try:
+            return self._sessions.get()
+        except Exception:
+            log.debug("goals: SessionStore.get() raised", exc_info=True)
+            return None
+
+    def _goals_payload(self) -> dict:
+        """``{active, history}`` for the dashboard.
+
+        ``active`` is the goal record for the current session UUID
+        (only when its status is ``"active"`` or ``"paused"`` — done
+        and cleared records appear in history instead). ``history``
+        is the most recent 20 non-active records sorted by
+        ``last_turn_at`` desc.
+        """
+        store = self._goals_store()
+        active_record: dict | None = None
+        sid = self._active_session_uuid()
+        if sid:
+            try:
+                state = store.load(sid)
+            except Exception:
+                log.debug("goals: load failed for %s", sid, exc_info=True)
+                state = None
+            if state is not None and state.status in ("active", "paused"):
+                active_record = self._goal_record_dict(sid, state)
+        try:
+            history_pairs = store.list_recent_inactive(limit=20)
+        except Exception:
+            log.debug("goals: list_recent_inactive failed", exc_info=True)
+            history_pairs = []
+        return {
+            "active": active_record,
+            "history": [
+                self._goal_record_dict(sid, state)
+                for sid, state in history_pairs
+            ],
+        }
+
+    def _build_goal_manager(self, session_uuid: str):
+        """Construct a GoalManager bound to the live store.
+
+        Mirrors the helper the Telegram transport uses
+        (``transports/telegram.py:_build_goal_manager``) but here on
+        the dashboard's side. Lazy-imports so bare test fixtures
+        without the goal modules loaded still work.
+        """
+        from core.goal_manager import GoalManager
+        from core.yaml_config import goals_max_turns
+        return GoalManager(
+            session_uuid=session_uuid,
+            workspace=self._workspace,
+            store=self._goals_store(),
+            default_max_turns=goals_max_turns(),
+        )
+
+    async def _drop_dashboard_goal_continuations(self) -> None:
+        """Drop any pending ``goal_continuation`` messages from every
+        chat's queue. Called by the dashboard's pause / clear / resume
+        endpoints so a continuation queued before the user clicked the
+        button doesn't sneak through after the state change.
+
+        ``running_tasks`` may be None on bare test fixtures; guard.
+        """
+        if self._running_tasks is None:
+            return
+        try:
+            await self._running_tasks.drop_messages_matching_all_chats(
+                lambda m: m.origin == "goal_continuation"
+            )
+        except Exception:
+            log.debug(
+                "goals: drop_messages_matching_all_chats failed", exc_info=True
+            )
+
+    async def _goals_pause(self) -> dict:
+        sid = self._active_session_uuid()
+        if not sid:
+            raise HTTPException(404, "no active session")
+        mgr = self._build_goal_manager(sid)
+        if not mgr.is_active():
+            raise HTTPException(404, "no active goal to pause")
+        mgr.pause(reason="dashboard-paused")
+        await self._drop_dashboard_goal_continuations()
+        state = mgr.state
+        assert state is not None  # we just paused it
+        return self._goal_record_dict(sid, state)
+
+    async def _goals_resume(self) -> dict:
+        sid = self._active_session_uuid()
+        if not sid:
+            raise HTTPException(404, "no active session")
+        mgr = self._build_goal_manager(sid)
+        s = mgr.state
+        if s is None or s.status != "paused":
+            raise HTTPException(404, "no paused goal to resume")
+        mgr.resume()
+        # Resume doesn't enqueue a continuation itself — the next
+        # user message in Telegram will kick the loop again. We
+        # don't need to drop anything from the queue, but doing so
+        # is safe (and forensically tidy) in case a stale
+        # continuation slipped in during the paused window.
+        await self._drop_dashboard_goal_continuations()
+        state = mgr.state
+        assert state is not None
+        return self._goal_record_dict(sid, state)
+
+    async def _goals_clear(self) -> dict:
+        sid = self._active_session_uuid()
+        if not sid:
+            raise HTTPException(404, "no active session")
+        mgr = self._build_goal_manager(sid)
+        if not mgr.has_goal():
+            raise HTTPException(404, "no active goal to clear")
+        # Snapshot the goal record BEFORE clearing so the response
+        # carries the final state (status=cleared) the frontend can
+        # use to update its UI without an extra fetch.
+        mgr.clear()
+        await self._drop_dashboard_goal_continuations()
+        # Re-load from disk to read the cleared row (clear() drops
+        # the in-memory state ref but persists status=cleared).
+        state = self._goals_store().load(sid)
+        if state is None:
+            # Defensive — clear() should always leave a row.
+            raise HTTPException(500, "goal record vanished after clear")
+        return self._goal_record_dict(sid, state)
 
     def _browser_payload(self) -> dict:
         manager = self._browser.manager

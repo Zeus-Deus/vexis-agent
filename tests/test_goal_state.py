@@ -354,11 +354,17 @@ def test_daemon_restart_rehydrates_active_goal(tmp_path: Path) -> None:
         if not name.startswith("_")
         and callable(getattr(store_post, name))
     ]
-    expected = {"load", "save", "clear", "list_active", "SCHEMA_VERSION"}
-    # SCHEMA_VERSION is a class attribute, not a method — drop from
-    # the callable check.
-    callable_public = {n for n in public if not isinstance(getattr(store_post, n), int)}
-    assert callable_public == expected - {"SCHEMA_VERSION"}, (
+    # SCHEMA_VERSION is a class attribute (int), not a method — drop
+    # from the callable check.
+    callable_public = {
+        n for n in public if not isinstance(getattr(store_post, n), int)
+    }
+    # Methods the store IS allowed to expose. Day 3 pinned this set
+    # to catch a future addition that could auto-fire goal loops on
+    # daemon boot. Day 5 added ``list_recent_inactive`` for the
+    # dashboard's history table — read-only, no auto-fire path.
+    expected = {"load", "save", "clear", "list_active", "list_recent_inactive"}
+    assert callable_public == expected, (
         f"Unexpected public method on GoalStateStore: {callable_public}. "
         "If you've added one, double-check it cannot auto-fire goal "
         "loops on daemon boot — the §5 boot policy is 'do nothing "

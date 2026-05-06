@@ -277,6 +277,36 @@ class GoalStateStore:
                 out.append((sid, state))
         return out
 
+    def list_recent_inactive(
+        self, limit: int = 20
+    ) -> list[tuple[str, GoalState]]:
+        """All non-active rows (paused / done / cleared) sorted by
+        ``last_turn_at`` desc, capped at ``limit``.
+
+        Used by the dashboard's history table. ``last_turn_at`` is the
+        right sort key because it captures the most recent activity
+        regardless of status — a goal cleared 5 minutes ago should
+        outrank one done yesterday. Rows with no ``last_turn_at``
+        (set but never evaluated) sort last via a min-datetime
+        fallback so they stay readable but don't push real entries
+        out of the cap.
+        """
+        rows: list[tuple[str, GoalState]] = []
+        for sid, row in self._load_raw().items():
+            try:
+                state = GoalState.from_dict(row)
+            except Exception:
+                continue
+            if state.status == "active":
+                continue
+            rows.append((sid, state))
+        epoch = datetime.min.replace(tzinfo=timezone.utc)
+        rows.sort(
+            key=lambda pair: pair[1].last_turn_at or epoch,
+            reverse=True,
+        )
+        return rows[:limit]
+
     # ----- write paths ------------------------------------------------
 
     def save(self, session_uuid: str, state: GoalState) -> None:

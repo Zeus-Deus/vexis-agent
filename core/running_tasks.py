@@ -146,6 +146,27 @@ class RunningTasks:
         )
         return depth
 
+    async def drop_messages_matching_all_chats(
+        self,
+        predicate: Callable[[QueuedMessage], bool],
+    ) -> int:
+        """Apply ``drop_messages_matching`` across every known chat.
+
+        Used by the dashboard's /goal pause/clear endpoints, which
+        operate per-session-UUID and don't carry a chat_id. In the
+        single-user deployment there's at most one or two chats, so
+        the loop is trivially small. Snapshots the chat-ID set under
+        the lock then calls ``drop_messages_matching`` (which
+        re-acquires the lock per chat) so we never hold ``_lock``
+        across multiple drop operations.
+        """
+        async with self._lock:
+            chat_ids = list(self._chats.keys())
+        total = 0
+        for cid in chat_ids:
+            total += await self.drop_messages_matching(cid, predicate)
+        return total
+
     async def drop_messages_matching(
         self,
         chat_id: int,
