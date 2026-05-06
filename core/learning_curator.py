@@ -1569,10 +1569,6 @@ def _real_review(
     All other outcomes — including the decline-too-large skip —
     advance ``last_reviewed_at`` so the session doesn't loop.
     """
-    messages = list(iter_messages(meta.jsonl_path))
-    if not messages:
-        return ("skip: no conversational messages", WriteSummary())
-
     # Phase B: brain threaded by the LearningController via the
     # _real_review wrapper closure (commit 4). When brain is None
     # (legacy direct callers in tests), synthesise a BrainNull so
@@ -1582,6 +1578,19 @@ def _real_review(
     if brain is None:
         from core.brain.null import BrainNull
         brain = BrainNull()
+    # Phase C Day 4: opencode workspaces don't carry a JSONL —
+    # sessions live as rows in ``opencode.db``. When ``jsonl_path``
+    # is None we route the transcript read through the brain so the
+    # SQL reader handles it. When it's set (claude-code, plus the
+    # many existing tests that synthesise SessionMeta with a stubbed
+    # path against ``BrainNull``), keep the file read so behaviour
+    # is byte-identical to pre-Day-4.
+    if meta.jsonl_path is not None:
+        messages = list(iter_messages(meta.jsonl_path))
+    else:
+        messages = list(brain.iter_messages(meta.session_uuid))
+    if not messages:
+        return ("skip: no conversational messages", WriteSummary())
     output = run_review(workspace, meta, messages, brain)
 
     if output.error:
@@ -2214,13 +2223,22 @@ class LearningController:
 
     def _run_silent_extractor(self, meta: SessionMeta) -> None:
         """v3c Day 4a: fire the relationships extractor against
-        ``meta``'s session JSONL. No-op when the transcript is
+        ``meta``'s session transcript. No-op when the transcript is
         empty. Counter updates land on the curator so REPORT.md
-        surfaces them under the existing relationships block."""
+        surfaces them under the existing relationships block.
+
+        Phase C Day 4: when ``meta.jsonl_path`` is None (opencode
+        workspaces — sessions live as DB rows, no file), route the
+        transcript read through the brain. Claude-code workspaces
+        keep reading the JSONL directly so behaviour is byte-
+        identical to pre-Day-4."""
         from core.relationships.extractor import (
             extract_relationships,
         )
-        messages = list(iter_messages(meta.jsonl_path))
+        if meta.jsonl_path is not None:
+            messages = list(iter_messages(meta.jsonl_path))
+        else:
+            messages = list(self._brain.iter_messages(meta.session_uuid))
         if not messages:
             return
         rel = self._relationships_curator

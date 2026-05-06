@@ -176,6 +176,26 @@ class SessionStore:
         self._save()
         return new
 
+    def set(self, token: str) -> None:
+        """Overwrite the active session's token without rotating to a
+        fresh UUID and without flipping ``initialized``.
+
+        Phase C Day 4: ``BrainOpenCode`` doesn't accept caller-pinned
+        session ids — opencode generates the id itself and reports
+        it on the first ``SessionEstablished`` event. The brain
+        harvests that id and writes it back via this setter so
+        subsequent ``respond()`` calls can pass ``--session <id>`` to
+        resume the same conversation.
+
+        The token is opaque to ``SessionStore`` — claude-code stores
+        a UUID, opencode stores its own id (typically prefixed
+        ``ses_``). Validation is the brain's job, not the store's.
+        """
+        if not isinstance(token, str) or not token:
+            raise ValueError("session token must be a non-empty string")
+        self._sessions[self._active]["uuid"] = token
+        self._save()
+
     # ----- multi-session API -----
 
     def list(self) -> list[SessionInfo]:

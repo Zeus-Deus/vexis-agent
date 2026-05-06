@@ -75,7 +75,18 @@ class TranscriptMessage:
 
 @dataclass(frozen=True)
 class SessionMeta:
-    """Cheap (stat + tail-read) summary of a session JSONL.
+    """Cheap summary of one session.
+
+    Two storage layouts exist. claude-code stores a JSONL file per
+    session under ``~/.claude/projects/<encoded-cwd>/`` — the
+    cheap-probe path is stat + tail-read of that file, and
+    ``jsonl_path`` carries the file path so the legacy curator
+    fallback (``transcripts._is_curator_owned``) can still read
+    transcript content directly. opencode (Phase C Day 4) stores
+    sessions as rows in ``~/.local/share/opencode/opencode.db``;
+    no JSONL exists, so ``jsonl_path`` is ``None`` and downstream
+    callers must route through ``brain.iter_messages`` to read
+    content.
 
     ``last_message_timestamp`` is None for files that are empty,
     unreadable, or contain no parseable timestamps in the tail
@@ -84,7 +95,7 @@ class SessionMeta:
     """
 
     session_uuid: str
-    jsonl_path: Path
+    jsonl_path: Path | None
     last_message_timestamp: datetime | None
     message_count_estimate: int   # cheap: line count, not parsed
 
@@ -274,7 +285,9 @@ def list_eligible_sessions(
         if is_brain_owned is not None:
             if is_brain_owned(meta.session_uuid):
                 continue
-        elif _is_curator_owned(meta.jsonl_path):
+        elif meta.jsonl_path is not None and _is_curator_owned(
+            meta.jsonl_path
+        ):
             continue
         last_reviewed = reviewed.get(meta.session_uuid, epoch)
         # Compare at whole-second precision: ReviewedStore historically
