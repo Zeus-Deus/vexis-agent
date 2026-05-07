@@ -98,6 +98,8 @@ _MODEL_USAGE = (
     "/model list <brain> — list models for that brain\n"
     "/model set brain <name> — change brain.kind (restart required)\n"
     "/model set <subsystem> <tier-or-name> — set subsystem assignment\n"
+    "/model set <subsystem> — picker: tap a provider then a model\n"
+    "/model refresh — refresh opencode discovery cache\n"
     "/model reset [<subsystem>] — back to defaults"
 )
 _MODEL_INVALID_BRAIN_KIND_TMPL = (
@@ -125,6 +127,50 @@ _MODEL_BACKUP_REPLY_TMPL = (
     "📋 Backed up commented config to ~/.vexis/config.yaml.bak. "
     "Future edits won't re-back-up until you re-add comments to "
     "your config."
+)
+
+# Day 3 of model picker UX — picker flow templates. Source-of-truth
+# for wording: ``.plans/model-picker-ux-research.md`` §5. Drift
+# surfaces as test failures.
+_PICKER_PROMPT_TMPL = (
+    "Pick a model for {subsystem} (currently: {current}). "
+    "Tap a provider, then a model. Aliases (haiku/sonnet/opus) "
+    "are omitted from the picker — use /model set {subsystem} "
+    "<alias> directly to keep using one."
+)
+_PICKER_MODEL_PROMPT_TMPL = (
+    "{subsystem} → {provider}. Tap a model{page_suffix}.{hidden_suffix}"
+)
+# Surfaces in the model picker reply only when the collapsed
+# default view is hiding dated variants. Wording mirrors
+# ``.plans/model-picker-ux-research.md`` family-grouping spec
+# (auto-tracking-latest by default; pin a specific date via
+# the toggle).
+_PICKER_HIDDEN_VERSIONS_TMPL = (
+    " ({n} older versions hidden — tap [Show all versions] to "
+    "pin a specific date.)"
+)
+_PICKER_NO_DISCOVERY_TMPL = (
+    "No discovered models for brain '{brain}'. Use the typed-arg "
+    "path:\n  /model set {subsystem} <model-name>\n"
+    "or run /model refresh to retry discovery."
+)
+_PICKER_STALE_SUBSYSTEM_TMPL = (
+    "This picker references an unknown subsystem id. Re-issue "
+    "/model set {subsystem} to start a fresh picker."
+)
+_MODEL_REFRESH_NOOP_TMPL = (
+    "Current brain: {brain} has no live discovery to refresh. "
+    "/model refresh is meaningful on claude-code (Anthropic /v1/models) "
+    "and opencode (`opencode models --refresh`)."
+)
+_MODEL_REFRESH_OK_TMPL = (
+    "✓ Refreshed opencode discovery cache.\n{counts}"
+)
+_MODEL_REFRESH_EMPTY_TMPL = (
+    "Discovery refresh ran but returned no models. Is opencode "
+    "installed and authenticated? (Check `opencode models` in a "
+    "shell.)"
 )
 
 
@@ -747,12 +793,117 @@ class TelegramTransport:
             log.warning("Rejected callback from user_id=%s", user_id)
             return
         await query.answer()
-        action, _, name = query.data.partition(":")
+        action, _, payload = query.data.partition(":")
         if action == "switch":
             self._pending_deletes.clear()
-            reply = await self._handler.handle_switch(user_id, name)
+            reply = await self._handler.handle_switch(user_id, payload)
         elif action == "delete":
-            reply = self._arm_delete_confirmation(name)
+            reply = self._arm_delete_confirmation(payload)
+        elif action == "model_pick_provider":
+            # Day 3 of model picker UX. payload = "<subsystem>:<provider>"
+            # OR (post-family-grouping)
+            # "<subsystem>:<provider>:<expand_flag>". Missing flag
+            # defaults to 0 (collapsed default view) so older
+            # callbacks-in-flight stay backwards-compatible.
+            subsystem, _, rest = payload.partition(":")
+            if ":" in rest:
+                provider, _, flag_str = rest.partition(":")
+                expanded = flag_str == "1"
+            else:
+                provider = rest
+                expanded = False
+            await self._render_model_picker(
+                query, subsystem, provider, page=0, expanded=expanded,
+            )
+            return
+        elif action == "model_pick_page":
+            # payload = "<subsystem>:<provider>:<page>" OR (post-
+            # family-grouping) "<subsystem>:<provider>:<page>:<flag>".
+            # Missing flag → collapsed view; same backwards-compat
+            # posture as model_pick_provider.
+            subsystem, _, rest = payload.partition(":")
+            provider, _, rest2 = rest.partition(":")
+            if ":" in rest2:
+                page_str, _, flag_str = rest2.partition(":")
+                expanded = flag_str == "1"
+            else:
+                page_str = rest2
+                expanded = False
+            try:
+                page = int(page_str)
+            except ValueError:
+                return
+            await self._render_model_picker(
+                query, subsystem, provider, page=page, expanded=expanded,
+            )
+            return
+        elif action == "model_pick_model":
+            # payload = "<sidx>:<provider/model_id>" (sidx is the
+            # sorted-DEFAULT_SUBSYSTEM_TIERS index — see
+            # _subsystem_to_index docstring for the budget rationale).
+            sidx_str, _, model_id = payload.partition(":")
+            subsystem = self._index_to_subsystem(sidx_str)
+            if subsystem is None or not model_id:
+                # Stale picker (subsystems re-ordered since render?
+                # shouldn't happen across daemon lifetime but
+                # defensive). Edit message rather than crash.
+                await query.edit_message_text(
+                    _PICKER_STALE_SUBSYSTEM_TMPL.format(subsystem=sidx_str)
+                )
+                return
+            _ok, reply = self._apply_subsystem_set(subsystem, model_id)
+            await query.edit_message_text(reply)
+            return
+        elif action == "model_pick_back":
+            # payload = "<subsystem>" — re-render the provider
+            # picker over the existing message so the user lands
+            # back at the provider step without scrollback drift.
+            await self._render_provider_picker(
+                msg=None, subsystem=payload, edit_query=query,
+            )
+            return
+        elif action == "model_pick_cancel":
+            # payload = "<subsystem>". Per
+            # ``.plans/model-picker-ux-research.md`` §5 cancel
+            # deletes the picker reply entirely (the user's slash
+            # message persists — only the bot's interactive UI is
+            # cleaned up so the chat doesn't accumulate dead UI).
+            #
+            # Telegram constraint: bots can only delete their own
+            # messages within 48 hours of sending. Picker replies
+            # are seconds-old when cancelled in normal flow, so
+            # this is moot in practice — but if a user starts a
+            # pick, walks away, comes back hours later, and taps
+            # Cancel, the delete will fail. We catch + log + fall
+            # back to editing the message to "(cancelled)" so the
+            # chat doesn't silently leave the picker buttons live.
+            chat_id = query.message.chat.id if query.message else None
+            message_id = query.message.message_id if query.message else None
+            bot = query.message.get_bot() if query.message else None
+            if bot is not None and chat_id is not None and message_id is not None:
+                try:
+                    await bot.delete_message(
+                        chat_id=chat_id, message_id=message_id,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "model_pick_cancel: delete_message failed (likely "
+                        "stale, > 48h old); falling back to edit. err=%s",
+                        exc,
+                    )
+                    try:
+                        await query.edit_message_text("(cancelled)")
+                    except Exception:
+                        log.warning(
+                            "model_pick_cancel: edit fallback also failed; "
+                            "picker UI may persist",
+                        )
+            return
+        elif action == "model_pick_noop":
+            # The page-indicator label sends this; deliberately
+            # ignored. query.answer() above acks the tap so the
+            # client doesn't show a loading spinner.
+            return
         else:
             return
         if reply is not None:
@@ -1303,17 +1454,12 @@ class TelegramTransport:
         ``~/.vexis/config.yaml.bak`` (self-managing across daemon
         restarts; see core/yaml_config_writer.py).
         """
-        from core.model_validator import (
-            validate_models_config,
-        )
         from core.yaml_config import (
             DEFAULT_SUBSYSTEM_TIERS,
             VALID_BRAIN_KINDS,
             _read_raw,
             brain_kind,
-            model_for_tier_from_config,
             model_ux_enabled,
-            subsystem_tier_from_config,
         )
         from core.yaml_config_writer import (
             atomic_write_yaml,
@@ -1390,12 +1536,81 @@ class TelegramTransport:
             )
             return
 
+        # ── refresh ────────────────────────────────────────────
+        # Calls the same in-process helper the dashboard's
+        # POST /api/v1/models/discovery/refresh route wraps —
+        # single backend primitive, two surfaces (per
+        # ``.plans/model-picker-ux-research.md`` §6 Day 3 + §7
+        # staleness mitigation revision).
+        #
+        # Both brains have a live cache to refresh now: opencode
+        # via ``opencode models --refresh`` subprocess, claude-code
+        # via the Anthropic /v1/models endpoint with the user's
+        # OAuth bearer / ANTHROPIC_API_KEY. Pre-2026-05-07 the
+        # claude-code branch was an informational no-op (curated
+        # hardcoded list); the live-discovery work made the
+        # refresh meaningful for both.
+        if sub == "refresh":
+            from core.model_discovery import (
+                discovery_grouped_for_brain,
+                refresh_claude_code_models,
+                refresh_opencode_models,
+            )
+            kind = brain_kind()
+            if kind == "opencode":
+                refresh_opencode_models()  # invalidates + re-runs subprocess
+            elif kind == "claude-code":
+                refresh_claude_code_models()  # invalidates + re-fetches /v1/models
+            else:
+                # null brain or future brain without discovery —
+                # report cleanly rather than crashing.
+                await msg.reply_text(
+                    _MODEL_REFRESH_NOOP_TMPL.format(brain=kind)
+                )
+                return
+            grouped = discovery_grouped_for_brain(kind)
+            if not grouped:
+                await msg.reply_text(_MODEL_REFRESH_EMPTY_TMPL)
+                return
+            counts = "\n".join(
+                f"  {provider}: {len(models)} models"
+                for provider, models in grouped.items()
+            )
+            await msg.reply_text(
+                _MODEL_REFRESH_OK_TMPL.format(counts=counts)
+            )
+            return
+
         # ── set ────────────────────────────────────────────────
         if sub == "set":
-            if len(args) < 3:
+            # Day 3 of model picker UX adds two trigger shapes:
+            #   /model set <subsystem>          → picker flow
+            #   /model set <subsystem> ?        → picker flow (alias)
+            #   /model set <subsystem> <model>  → typed-arg (unchanged)
+            #
+            # Picker-trigger detection happens FIRST so the typed-arg
+            # validation path stays byte-equivalent for users who
+            # supply a value. ``brain`` is never picker-triggerable —
+            # there are only 3 brain kinds and no discovery flow,
+            # so /model set brain falls through to the typed-arg
+            # path and errors out without a value.
+            if len(args) < 2:
                 await msg.reply_text(_MODEL_USAGE)
                 return
             key = args[1].lower()
+
+            picker_trigger = (
+                key != "brain"
+                and key in DEFAULT_SUBSYSTEM_TIERS
+                and (len(args) == 2 or (len(args) >= 3 and args[2] == "?"))
+            )
+            if picker_trigger:
+                await self._render_provider_picker(msg, key)
+                return
+
+            if len(args) < 3:
+                await msg.reply_text(_MODEL_USAGE)
+                return
             value = args[2]
 
             cfg_path = vexis_dir() / "config.yaml"
@@ -1428,55 +1643,107 @@ class TelegramTransport:
                 )
                 return
 
-            # Per-subsystem set — write to models.subsystems.<key> = value.
+            # Per-subsystem set — share the reply-builder with the
+            # picker callback so both surfaces get identical reply
+            # text (including the conditional backup line per
+            # ``.plans/model-picker-ux-research.md`` §5 cleanup 4).
             if key not in DEFAULT_SUBSYSTEM_TIERS:
                 await msg.reply_text(
                     f"Unknown subsystem '{key}'. Known: "
                     f"{', '.join(sorted(DEFAULT_SUBSYSTEM_TIERS))}"
                 )
                 return
-
-            # Build the proposed config and run validator pre-write.
-            proposed = self._proposed_set_subsystem(current, key, value)
-            findings = validate_models_config(proposed, brain_kind())
-            errors = [f for f in findings if f.severity == "error"]
-            if errors:
-                problems = "\n".join(
-                    f"  • [{f.subsystem or '<global>'}] "
-                    f"{f.problem}\n    → {f.suggested_fix}"
-                    for f in errors
-                )
-                await msg.reply_text(
-                    _MODEL_VALIDATOR_ERROR_TMPL.format(problems=problems)
-                )
-                return
-
-            # Validator clean → backup → write → reply.
-            backup_msg = ""
-            if cfg_path.exists():
-                bak = backup_if_commented(cfg_path)
-                if bak is not None:
-                    backup_msg = "\n" + _MODEL_BACKUP_REPLY_TMPL
-            atomic_write_yaml(cfg_path, proposed)
-
-            # Resolve what the new value actually maps to so the
-            # reply tells the user what their next call will use.
-            resolved = model_for_tier_from_config(
-                proposed.get("models"),
-                brain_kind(),
-                subsystem_tier_from_config(proposed.get("models"), key),
-            )
-            await msg.reply_text(
-                _MODEL_SET_OK_TMPL.format(
-                    key=key, value=value,
-                    resolved=resolved or "<brain default>",
-                    brain=brain_kind(),
-                ) + backup_msg
-            )
+            _ok, reply = self._apply_subsystem_set(key, value)
+            await msg.reply_text(reply)
             return
 
         # Unknown subcommand → usage.
         await msg.reply_text(_MODEL_USAGE)
+
+    # ── Day 3 of model picker UX — shared reply-builder ────────────
+
+    def _apply_subsystem_set(
+        self, subsystem: str, value: str,
+    ) -> tuple[bool, str]:
+        """Validate + write + render the reply for a per-subsystem
+        ``models.subsystems.<sub> = <value>`` mutation.
+
+        Shared by the typed-arg path on /model set AND the Day 3
+        picker callback. Returns ``(success, reply_text)`` so the
+        callback can decide between editing the picker reply
+        (success) or showing a refusal toast that preserves the
+        picker state (validator error).
+
+        Reply text matches the typed-arg path byte-for-byte
+        (including the conditional comment-preservation backup
+        line per ``.plans/model-picker-ux-research.md`` §5
+        cleanup 4 — the line surfaces only when
+        ``backup_if_commented`` actually wrote a .bak).
+        """
+        from core.model_discovery import discovery_for_validator
+        from core.model_validator import validate_models_config
+        from core.yaml_config import (
+            VALID_BRAIN_KINDS,
+            _read_raw,
+            brain_kind,
+            model_for_tier_from_config,
+            subsystem_tier_from_config,
+        )
+        from core.yaml_config_writer import (
+            atomic_write_yaml,
+            backup_if_commented,
+        )
+        from core.paths import vexis_dir
+
+        cfg_path = vexis_dir() / "config.yaml"
+        current = _read_raw()
+        proposed = self._proposed_set_subsystem(current, subsystem, value)
+        # Day 4 of model picker UX wires discovery into the slash
+        # write path so rule 6 (available-models membership) actually
+        # fires here — without it, the picker would write opencode
+        # ids the spawn would reject. Same data source as the
+        # dashboard's _models_payload (5-min in-process cache; sub-ms
+        # for warm calls). Rule 6 promoted to error-severity for
+        # opencode in this same Day 4 batch, so this wiring is what
+        # turns the promotion into an actual pre-write refusal on
+        # the slash + picker path.
+        available = discovery_for_validator(VALID_BRAIN_KINDS)
+        findings = validate_models_config(
+            proposed, brain_kind(),
+            available_models_per_brain=available,
+        )
+        errors = [f for f in findings if f.severity == "error"]
+        if errors:
+            problems = "\n".join(
+                f"  • [{f.subsystem or '<global>'}] "
+                f"{f.problem}\n    → {f.suggested_fix}"
+                for f in errors
+            )
+            return (
+                False,
+                _MODEL_VALIDATOR_ERROR_TMPL.format(problems=problems),
+            )
+
+        backup_msg = ""
+        if cfg_path.exists():
+            bak = backup_if_commented(cfg_path)
+            if bak is not None:
+                backup_msg = "\n" + _MODEL_BACKUP_REPLY_TMPL
+        atomic_write_yaml(cfg_path, proposed)
+
+        resolved = model_for_tier_from_config(
+            proposed.get("models"),
+            brain_kind(),
+            subsystem_tier_from_config(proposed.get("models"), subsystem),
+        )
+        return (
+            True,
+            _MODEL_SET_OK_TMPL.format(
+                key=subsystem, value=value,
+                resolved=resolved or "<brain default>",
+                brain=brain_kind(),
+            ) + backup_msg,
+        )
 
     @staticmethod
     def _proposed_set_subsystem(
@@ -1490,6 +1757,329 @@ class TelegramTransport:
         subs[subsystem] = value
         models["subsystems"] = subs
         return {**current, "models": models}
+
+    # ── Day 3 of model picker UX — keyboard helpers + render ───────
+
+    # Picker pagination size. Telegram's `<InlineKeyboardMarkup>` has
+    # no hard row limit but UX degrades past ~25 buttons in a single
+    # message; opencode's largest provider buckets push 50+ ids so
+    # paginated lists keep the picker readable. 20 leaves room for
+    # nav row + back/cancel without crowding.
+    _PICKER_PAGE_SIZE = 20
+
+    @staticmethod
+    def _subsystem_to_index(subsystem: str) -> int:
+        """Map a subsystem name to its sorted index in
+        ``DEFAULT_SUBSYSTEM_TIERS``. Used in
+        ``model_pick_model:<idx>:<full_id>`` callback_data so the
+        encoding fits Telegram's 64-byte cap on opencode's
+        worst-case full ids (e.g.
+        ``openrouter/anthropic/claude-sonnet-4.5`` is 38 bytes;
+        plus a 24-char subsystem name and the ``model_pick_model:``
+        prefix would push past 64). The 4 short callback shapes
+        (provider/page/back/cancel) keep the verbose subsystem
+        name — they fit comfortably and stay greppable."""
+        from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+        return sorted(DEFAULT_SUBSYSTEM_TIERS).index(subsystem)
+
+    @staticmethod
+    def _index_to_subsystem(idx_str: str) -> str | None:
+        """Inverse of :meth:`_subsystem_to_index`. Returns ``None``
+        when ``idx_str`` doesn't parse or is out of range — the
+        callback handler renders a stale-picker message in that
+        case rather than crashing."""
+        from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            return None
+        sortlist = sorted(DEFAULT_SUBSYSTEM_TIERS)
+        if 0 <= idx < len(sortlist):
+            return sortlist[idx]
+        return None
+
+    @classmethod
+    def _make_provider_keyboard(
+        cls, subsystem: str, providers: list[str],
+    ) -> InlineKeyboardMarkup:
+        """One button per provider, plus a Cancel row. Provider
+        order matches the API's (anthropic first, then alphabetical
+        — see ``core.model_discovery._sort_providers``).
+
+        Aliases are NOT exposed as separate buttons here per the
+        Day 2 alias-omission decision in
+        ``.plans/model-picker-ux-research.md`` §5: bare aliases
+        (haiku/sonnet/opus) drift over time as Anthropic releases
+        new models behind the same name, so the picker enforces
+        version pinning by surfacing only full ids. Users who want
+        an alias keep using the typed-arg path."""
+        rows: list[list[InlineKeyboardButton]] = []
+        for provider in providers:
+            data = f"model_pick_provider:{subsystem}:{provider}"
+            # Subsystem name + provider name + 19-byte prefix; both
+            # fit comfortably under 64 bytes for realistic values
+            # (longest subsystem 'relationships_classifier' = 24,
+            # longest provider 'github-copilot' = 14 → 58 bytes).
+            rows.append([InlineKeyboardButton(text=provider, callback_data=data)])
+        rows.append([InlineKeyboardButton(
+            text="✗ Cancel",
+            callback_data=f"model_pick_cancel:{subsystem}",
+        )])
+        return InlineKeyboardMarkup(rows)
+
+    @classmethod
+    def _make_model_keyboard(
+        cls, subsystem: str, provider: str, models: list[str],
+        page: int = 0, expanded: bool = False,
+    ) -> InlineKeyboardMarkup:
+        """Model picker for a given provider. Aliases already
+        filtered out by the caller (the picker uses full ids only).
+
+        Family grouping (added 2026-05-07): when ``expanded`` is
+        False (default), dated variants are collapsed into one
+        button per family via :func:`default_view_models`. Tapping
+        the new ``Show all versions`` toggle re-renders with
+        ``expanded=True``, exposing every variant. The toggle only
+        renders when collapsing actually hides something — opencode
+        and other providers without dated variants never see it.
+
+        Pagination: page-size buttons per screen, with a nav row
+        (``← Prev`` / ``page n/m`` / ``Next →``) at the top when
+        there's more than one page. The page indicator is a
+        no-op-callback button (``model_pick_noop``) — Telegram
+        requires every InlineKeyboardButton to have either a URL
+        or callback_data; sending a deliberately-ignored callback
+        is the cleanest way to render an inert label.
+
+        Subsystem-as-name (not index) in the callback_data for the
+        navigation/back/cancel/toggle buttons (they don't carry a
+        long full id so the byte budget is comfortable). Model
+        selection switches to subsystem-as-INDEX because the full
+        id pushes the prefix-name combination past 64 bytes on
+        opencode."""
+        from core.model_discovery import (
+            default_view_models,
+            expanded_view_models,
+        )
+        # Compute collapsed + expanded counts so we can decide
+        # whether the toggle is meaningful (don't render it when
+        # the two views are identical — opencode case).
+        collapsed = default_view_models(models)
+        expanded_models = expanded_view_models(models)
+        has_hidden = len(expanded_models) > len(collapsed)
+        visible_set = expanded_models if expanded else collapsed
+
+        sidx = cls._subsystem_to_index(subsystem)
+        total_pages = max(1, (len(visible_set) + cls._PICKER_PAGE_SIZE - 1) // cls._PICKER_PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        start = page * cls._PICKER_PAGE_SIZE
+        visible = visible_set[start:start + cls._PICKER_PAGE_SIZE]
+        rows: list[list[InlineKeyboardButton]] = []
+
+        if total_pages > 1:
+            # Pagination preserves the expand flag — within an
+            # expanded view, paging through the longer list keeps
+            # the same view mode.
+            nav: list[InlineKeyboardButton] = []
+            flag = 1 if expanded else 0
+            if page > 0:
+                nav.append(InlineKeyboardButton(
+                    text="← Prev",
+                    callback_data=(
+                        f"model_pick_page:{subsystem}:{provider}:"
+                        f"{page - 1}:{flag}"
+                    ),
+                ))
+            nav.append(InlineKeyboardButton(
+                text=f"{page + 1}/{total_pages}",
+                callback_data="model_pick_noop",
+            ))
+            if page < total_pages - 1:
+                nav.append(InlineKeyboardButton(
+                    text="Next →",
+                    callback_data=(
+                        f"model_pick_page:{subsystem}:{provider}:"
+                        f"{page + 1}:{flag}"
+                    ),
+                ))
+            rows.append(nav)
+
+        for m in visible:
+            data = f"model_pick_model:{sidx}:{m}"
+            if len(data.encode("utf-8")) > _CB_DATA_MAX_BYTES:
+                # Defensive: a realistic full id should always fit
+                # under 64 bytes with the sidx prefix, but if a
+                # discovery source ever ships a freakishly long id
+                # we silently skip it rather than crash. The user
+                # can still typed-arg-set it via the slash if they
+                # know the name.
+                log.warning(
+                    "model_pick_model callback_data exceeds %d bytes "
+                    "for %s; skipping button",
+                    _CB_DATA_MAX_BYTES, m,
+                )
+                continue
+            rows.append([InlineKeyboardButton(text=m, callback_data=data)])
+
+        if has_hidden:
+            # Toggle re-renders the same provider with the flipped
+            # flag from page 0. callback_data shape:
+            # ``model_pick_provider:<sub>:<provider>:<flag>`` —
+            # reuses the existing provider-tap action with an
+            # explicit flag rather than adding a separate
+            # ``model_pick_toggle`` action.
+            toggle_label = "Hide versions" if expanded else "Show all versions"
+            new_flag = 0 if expanded else 1
+            rows.append([InlineKeyboardButton(
+                text=toggle_label,
+                callback_data=(
+                    f"model_pick_provider:{subsystem}:{provider}:{new_flag}"
+                ),
+            )])
+
+        rows.append([
+            InlineKeyboardButton(
+                text="← Back",
+                callback_data=f"model_pick_back:{subsystem}",
+            ),
+            InlineKeyboardButton(
+                text="✗ Cancel",
+                callback_data=f"model_pick_cancel:{subsystem}",
+            ),
+        ])
+        return InlineKeyboardMarkup(rows)
+
+    async def _render_provider_picker(
+        self, msg, subsystem: str, *, edit_query=None,
+    ) -> None:
+        """Render the provider keyboard as a fresh reply (when
+        ``edit_query`` is None) or by editing an existing picker
+        message (when called from the Back button's callback).
+
+        Discovery may be empty for null brain or for opencode
+        without binary; in that case the picker degrades to a
+        text-only fallback steering the user to the typed-arg
+        path or to /model refresh."""
+        from core.model_discovery import discovery_grouped_for_brain
+        from core.yaml_config import (
+            _read_raw,
+            brain_kind,
+            subsystem_tier_from_config,
+        )
+
+        kind = brain_kind()
+        grouped = discovery_grouped_for_brain(kind)
+        # Filter aliases out of the picker per the Day 2 decision —
+        # buckets that are empty after filtering collapse out of
+        # the keyboard (matches the dashboard's behavior).
+        aliases = {"haiku", "sonnet", "opus"}
+        filtered = {
+            p: [m for m in models if m not in aliases]
+            for p, models in grouped.items()
+        }
+        filtered = {p: models for p, models in filtered.items() if models}
+
+        if not filtered:
+            # No discovery data → text-only fallback. Same wording
+            # whether opencode binary is missing or null brain is
+            # active; the actionable next step is the same.
+            text = _PICKER_NO_DISCOVERY_TMPL.format(
+                brain=kind, subsystem=subsystem,
+            )
+            if edit_query is not None:
+                await edit_query.edit_message_text(text)
+            else:
+                await msg.reply_text(text)
+            return
+
+        # Render the prompt with the user's current pick (if any)
+        # so they have context for what they're replacing.
+        current_value = subsystem_tier_from_config(
+            _read_raw().get("models"), subsystem,
+        )
+        text = _PICKER_PROMPT_TMPL.format(
+            subsystem=subsystem,
+            current=current_value or "default",
+        )
+        keyboard = self._make_provider_keyboard(
+            subsystem, list(filtered.keys()),
+        )
+        if edit_query is not None:
+            await edit_query.edit_message_text(text, reply_markup=keyboard)
+        else:
+            await msg.reply_text(text, reply_markup=keyboard)
+
+    async def _render_model_picker(
+        self, query, subsystem: str, provider: str,
+        page: int = 0, expanded: bool = False,
+    ) -> None:
+        """Edit the existing picker message to show the model
+        keyboard for ``provider``. Called from the
+        ``model_pick_provider`` (initial tap + toggle) and
+        ``model_pick_page`` callback branches.
+
+        Re-fetches discovery rather than carrying the model list
+        through callback_data (which would blow the 64-byte cap).
+        The 5-min discovery cache means this is a sub-ms read; if
+        the cache invalidated between provider-tap and re-render
+        the user just sees the freshly-grouped list, which is
+        fine.
+
+        ``expanded`` toggles family-grouping: False (default) shows
+        one button per family via ``default_view_models``; True
+        shows every dated variant. Reply text gains a
+        ``hidden_suffix`` mentioning the count when collapsed
+        view actually hides anything."""
+        from core.model_discovery import (
+            default_view_models,
+            discovery_grouped_for_brain,
+            expanded_view_models,
+        )
+        from core.yaml_config import brain_kind
+
+        grouped = discovery_grouped_for_brain(brain_kind())
+        aliases = {"haiku", "sonnet", "opus"}
+        models = [m for m in grouped.get(provider, []) if m not in aliases]
+        if not models:
+            # Provider disappeared from discovery between picker
+            # render and tap (rare — discovery cache is 5 min). Fall
+            # back to the provider keyboard so the user can pick a
+            # still-valid provider.
+            await self._render_provider_picker(
+                msg=None, subsystem=subsystem, edit_query=query,
+            )
+            return
+        # Pick collapsed vs expanded count for pagination math +
+        # hidden-count surfacing.
+        collapsed = default_view_models(models)
+        expanded_models = expanded_view_models(models)
+        active = expanded_models if expanded else collapsed
+        total_pages = max(
+            1, (len(active) + self._PICKER_PAGE_SIZE - 1)
+            // self._PICKER_PAGE_SIZE,
+        )
+        page_suffix = (
+            f" (page {page + 1}/{total_pages})" if total_pages > 1 else ""
+        )
+        # Hidden-count surfaces only in the collapsed view AND only
+        # when collapse actually hides something. Reads the same
+        # collapse-vs-expand counts the keyboard builder uses so the
+        # text stays in sync with what the buttons render.
+        hidden_count = (
+            len(expanded_models) - len(collapsed) if not expanded else 0
+        )
+        hidden_suffix = (
+            _PICKER_HIDDEN_VERSIONS_TMPL.format(n=hidden_count)
+            if hidden_count > 0 else ""
+        )
+        text = _PICKER_MODEL_PROMPT_TMPL.format(
+            subsystem=subsystem, provider=provider,
+            page_suffix=page_suffix, hidden_suffix=hidden_suffix,
+        )
+        keyboard = self._make_model_keyboard(
+            subsystem, provider, models, page=page, expanded=expanded,
+        )
+        await query.edit_message_text(text, reply_markup=keyboard)
 
     def _model_status_text(self) -> str:
         """Render the current resolution table for ``/model``

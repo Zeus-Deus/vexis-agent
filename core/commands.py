@@ -45,6 +45,16 @@ COMMANDS: tuple[BotCommand, ...] = (
     BotCommand("curator", "Curator status / pause / resume / run / restore"),
     BotCommand("learning", "Learning curator status / pause / resume / run / audit"),
     BotCommand("goal", "Set a goal Vexis works on across turns"),
+    # Subcommand grammar (status / list / set / reset / refresh / picker)
+    # documented in the description rather than registered as separate
+    # entries — same posture as /curator and /learning. Telegram's
+    # command names can't contain spaces, so /model refresh would have
+    # to be /model_refresh (a different top-level command); keeping it
+    # as a subcommand surfaces via /model's USAGE reply on first use.
+    BotCommand(
+        "model",
+        "Show / set per-subsystem model assignment; refresh discovery",
+    ),
     BotCommand("dashboard", "Open the web dashboard (Tailscale URL + token)"),
     BotCommand("tailscale", "Show Tailscale status (serves, funnels, peers)"),
 )

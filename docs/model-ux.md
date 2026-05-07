@@ -49,6 +49,36 @@ next aux call after your edit sees the new value. Foreground turns
 don't pass `--model` (use the brain's account default), so they're
 unaffected by tier changes.
 
+## Why model name is the primary input now
+
+Pre-picker-UX, both the slash command and the dashboard
+dropdown made tier (`small`/`medium`/`large`) the primary
+knob: users were nudged toward "pick a tier; the brain picks
+the model". The picker UX research (`.plans/model-picker-ux-research.md`
+§1) surfaced this as an inversion bug — users routinely think
+in model names ("I want claude-opus-4-1 on the curator") and
+were forced to translate that intent into a tier or remember
+the legacy `models.<sub>: sonnet` raw-string shape. Worse:
+tiers are unstable across brains (claude-code's `large` →
+`sonnet`; opencode's `large` → `anthropic/claude-sonnet-4`),
+so the same tier picked yesterday on claude-code resolves to
+a different family on opencode.
+
+Day 1–4 of the picker UX inverted this:
+- **Picker buttons surface model names directly** (provider-grouped).
+  Tiers move into a "Tier fallbacks (advanced)" section at the
+  bottom of the dashboard dropdown.
+- **Aliases (`haiku`/`sonnet`/`opus`) are omitted from picker
+  buttons** to enforce explicit version pinning — yesterday's
+  `sonnet` is a different model than tomorrow's `sonnet` once
+  Anthropic ships a new generation. The typed-arg path keeps
+  aliases for power-user convenience.
+- **Tiers stay as the per-subsystem default floor** under the
+  hood — `subsystem_tier()` and `model_for_tier()` resolution
+  is unchanged. The picker writes to `models.subsystems.<name>`;
+  the validator and resolution layer disambiguate by inspecting
+  the value's shape, not by the key location.
+
 ## /model slash command
 
 ```
@@ -57,15 +87,34 @@ unaffected by tier changes.
 /model list                            enumerate subsystems + brains
 /model list <brain>                    per-brain model hints
 /model set brain <name>                change brain.kind (restart req)
-/model set <subsystem> <tier-or-name>  set per-subsystem assignment
+/model set <subsystem>                 picker: tap provider, then model
+/model set <subsystem> ?               picker (explicit alias of above)
+/model set <subsystem> <tier-or-name>  typed-arg: set per-subsystem
+/model refresh                         refresh opencode discovery cache
 /model reset                           reset all subsystems to defaults
 /model reset <subsystem>               reset one subsystem
 ```
 
 ### Examples
 
-Switch the goal judge to `large` (resolves to `sonnet` on
-claude-code, `anthropic/claude-sonnet-4` on opencode):
+Open the picker for the curator, tap a provider, then a model:
+
+```
+/model set curator
+# Reply: Pick a model for curator (currently: small).
+#        Tap a provider, then a model.
+#        [anthropic] [openai] [✗ Cancel]
+# (Tap anthropic →)
+#        curator → anthropic. Tap a model.
+#        [claude-haiku-4-5] [claude-opus-4-1] [claude-sonnet-4-6]
+#        [← Back] [✗ Cancel]
+# (Tap claude-opus-4-1 →)
+#        ✓ curator → claude-opus-4-1 (resolves to claude-opus-4-1
+#        on claude-code). Takes effect on the next curator call.
+```
+
+Switch the goal judge to `large` (typed-arg, resolves to `sonnet`
+on claude-code, `anthropic/claude-sonnet-4` on opencode):
 
 ```
 /model set goal_judge large
@@ -87,11 +136,63 @@ for that subsystem):
 /model reset curator
 ```
 
+### Picker walkthrough
+
+The picker uses Telegram inline keyboards. The flow:
+
+1. **Provider step.** Bot replies with one button per discovered
+   provider (anthropic first, then alphabetical) plus a Cancel
+   row. The picker prompt copy mentions that aliases are omitted
+   from the buttons — power users who want one keep using the
+   typed-arg path.
+2. **Model step.** Tapping a provider edits the existing message
+   to show that provider's models (full names only — aliases
+   filtered) plus `← Back` and `✗ Cancel`. Edit-in-place
+   preserves the user's scrollback position; no new reply.
+3. **Confirmation.** Tapping a model edits the message to the
+   same `✓ <subsystem> → <model>` confirmation the typed-arg
+   path emits. Validator runs pre-write; on error severity the
+   message edits to the refusal copy and no write happens.
+
+Cancel deletes the picker reply entirely via `bot.delete_message`
+so the chat doesn't accumulate dead UI elements (the user's
+slash message persists). If the picker reply is older than 48
+hours (Telegram bot delete-message limit), the handler logs +
+falls back to editing the message to `(cancelled)` rather than
+crashing or leaving live picker buttons in chat.
+
+### Pagination
+
+Providers with more than 20 models (opencode's `openrouter` is
+the typical case) paginate. Top row carries `← Prev` /
+`page n/m` / `Next →` based on the current page; the page
+indicator is a no-op button (Telegram requires every button
+to have callback_data, so a deliberately-ignored callback is
+the cleanest way to render an inert label).
+
+### `/model refresh`
+
+```
+/model refresh
+# On opencode: invalidates the in-process discovery cache,
+#              re-runs `opencode models --refresh` so models.dev
+#              picks up newly-added providers, replies with
+#              per-provider counts.
+# On claude-code: informational no-op — the curated list is
+#                 in-process and has no live cache to refresh.
+```
+
+`/model refresh` and the dashboard's refresh button share the
+same in-process helper (`core.model_discovery.refresh_opencode_models`).
+Single backend primitive, two surfaces — there's no HTTP
+round-trip between the daemon and itself.
+
 ### Validator refusal
 
-The validator runs **pre-write** on every `set`. Error-severity
-findings refuse the write with the suggested-fix copy inline.
-Example: opencode + bare alias:
+The validator runs **pre-write** on every `set` (typed-arg
+path AND picker callback). Error-severity findings refuse
+the write with the suggested-fix copy inline. Example:
+opencode + bare alias:
 
 ```
 /model set learning_review sonnet     # on brain.kind: opencode
@@ -104,6 +205,14 @@ Example: opencode + bare alias:
 #       provider/model from /model list opencode.
 #       Run: /model set learning_review small
 ```
+
+Day 4 of the picker UX promoted **rule 6** (available-models
+membership) from warning → error on opencode: a configured id
+that isn't in `opencode models` output now refuses the write
+rather than warning-and-letting-the-spawn-fail. claude-code
+stays at warning because (a) its discovery is a curated
+in-process list that goes stale between Anthropic releases and
+(b) the spawn itself errors gracefully on truly unknown names.
 
 Same vocabulary the dashboard surfaces and the spawn-site
 `BrainModelNotFoundError` carries — single source of truth across
@@ -133,18 +242,38 @@ as `/model status` (`build_resolution_table` is the shared helper).
   scoped to the whole config (e.g. typo'd `brain.kind`, unknown
   legacy keys). Hidden when no findings present.
 - **Subsystem resolution table** — one row per known subsystem.
-  Editable dropdown per row sourced from abstract tiers + the
-  brain's discovered model list + the current configured value.
+  Editable `<select>` per row sourced from
+  `available_models_by_provider` (Day 1 of picker UX added the
+  provider-grouped API field; Day 2 migrated the dropdown). Each
+  provider becomes its own `<optgroup>` (anthropic first, then
+  alphabetical); a `Tier fallbacks (advanced)` `<optgroup>`
+  always sits at the bottom. Aliases (`haiku`/`sonnet`/`opus`)
+  are filtered out of the picker per the version-pinning
+  decision in `.plans/model-picker-ux-research.md` §5 — the
+  typed-arg path on the slash still accepts them. When a row's
+  configured value isn't otherwise visible (e.g. legacy alias),
+  it surfaces under a dedicated `Current` `<optgroup>` at the
+  top so the dropdown's value stays valid.
   Status column shows ✓/⚠/✗/ⓘ glyph based on the highest-severity
   finding for that row, with a hover tooltip carrying the
   suggested-fix.
+- **Per-row search filter** — when a row's option count exceeds
+  ~30 (opencode trips this; claude-code stays simple), an
+  `<input type="text">` renders above the `<select>` and
+  filters visible options as the user types (debounced ~150ms).
+  Filter matches against full provider/model id; provider
+  buckets with no matches collapse out entirely. Search input
+  is NOT auto-focused — default focus stays wherever the
+  browser put it so navigation keystrokes work as before.
 - **Tier overrides** — collapsible per-tier table showing the
   configured override (if any) and the default for the active
   brain. Day 4 added the read display; the editor lands in a
   later workstream.
 - **Available models** — per-brain hint + a "refresh" button that
-  re-runs `opencode models --refresh` for opencode (claude-code
-  is hardcoded; refresh is a no-op there).
+  shares `core.model_discovery.refresh_opencode_models()` with
+  the slash command's `/model refresh` (single backend primitive,
+  two surfaces). claude-code's curated list is in-process and
+  has no live cache, so the button is a no-op there.
 
 ### Brain switcher modal
 
@@ -238,15 +367,20 @@ for the modal.
 
 Two layers catch model-config mistakes:
 
-1. **Validator** — runs pre-write on every `/model set`, every
-   dashboard save, AND on daemon startup (logs findings without
-   crashing). 7 rules, scoped to:
+1. **Validator** — runs pre-write on every `/model set` (typed
+   AND picker callback), every dashboard save, AND on daemon
+   startup (logs findings without crashing). 7 rules, scoped to:
    - brain.kind validity (warning, fall-back posture)
    - subsystem name validity (warning per unknown key)
    - tier resolution to non-empty (defense in depth)
    - opencode + bare alias = error (would crash spawn)
    - claude-code + slashy id = warning (advisory)
-   - available-models membership (warning, when discovery data set)
+   - **available-models membership: error on opencode (Day 4 of
+     picker UX promotion), warning on claude-code** (curated list
+     goes stale; spawn errors gracefully on truly unknown names).
+     Skips abstract tiers (`tiny`/`small`/`medium`/`large`)
+     because tiers are validated by the resolution layer, not by
+     membership in the discovered set.
    - dead-knob hygiene (info, currently surfaces
      `migration_classifier`)
 
@@ -303,6 +437,52 @@ The `~/.vexis/config.yaml` edit-and-restart workflow still works
 — it's just no longer required. See [`docs/migration.md`](migration.md)
 for the both-brains-in-one-config recipe if you want to flip
 back and forth without re-migrating each time.
+
+## Advanced configuration — tiers as fallback
+
+Tiers (`tiny`/`small`/`medium`/`large`) are no longer the
+primary input — they're the per-subsystem default floor under
+the hood. The picker writes raw model ids to
+`models.subsystems.<name>` directly; the resolution layer
+treats any value not in `ABSTRACT_TIERS` as a raw passthrough.
+
+You can still set tiers explicitly when you want
+brain-portable defaults:
+
+```yaml
+models:
+  subsystems:
+    curator: small        # resolves per brain via DEFAULT_TIER_MAP_<brain>
+  tiers:
+    claude-code:
+      large: opus         # override what `large` maps to on claude-code
+```
+
+The picker surfaces tiers under a `Tier fallbacks (advanced)`
+`<optgroup>` at the bottom of the dropdown — selectable, just
+visually demoted. The slash typed-arg path still accepts them:
+`/model set curator small`.
+
+### Aliases — picker omits, typed-arg keeps
+
+The bare aliases `haiku`/`sonnet`/`opus` are accepted by the
+typed-arg slash path:
+
+```
+/model set goal_judge sonnet     # power-user shorthand
+```
+
+They are **omitted from the picker buttons** by deliberate
+design. Reasons: (a) aliases drift over time as Anthropic
+ships new models behind the same name — yesterday's `sonnet`
+is a different model than tomorrow's `sonnet`, so picking via
+button (which implies "I clicked exactly this thing") would
+silently update on you; (b) version pinning matters for
+reproducibility — when you pick `claude-sonnet-4-6` from the
+button, that selection is stable until you change it. The
+picker enforces version pinning by surfacing only full names;
+the typed-arg path keeps aliases for users who want
+auto-tracking-latest.
 
 ## Default-flip posture
 

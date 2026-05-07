@@ -501,9 +501,20 @@ export interface ModelsState {
   global_findings: ModelValidationFinding[];
   // ── Day 4 additions ────────────────────────────────────────
   // Per-brain available model lists, sourced from
-  // core.model_discovery (5-min in-process cache). Used to
-  // populate the dashboard's per-row dropdowns.
+  // core.model_discovery (5-min in-process cache). Retained for
+  // backwards compatibility — Day 2 of model picker UX migrated
+  // the dropdown to ``available_models_by_provider`` below, but
+  // any consumer that doesn't care about provider grouping (e.g.
+  // membership checks) can keep reading the flat list.
   available_models: Record<string, string[]>;
+  // Day 1 of model picker UX — provider-grouped sibling of
+  // available_models. Shape: {brain_kind: {provider: [model_ids]}}.
+  // Within-provider order is lexicographic; provider order is
+  // anthropic-first (vexis is anthropic-centric) then alphabetical.
+  // Empty for brains without discovery (BrainNull) and for opencode
+  // when the binary isn't installed. Drives the dashboard's
+  // <optgroup>-grouped dropdown (Day 2).
+  available_models_by_provider: Record<string, Record<string, string[]>>;
   // True iff ~/.vexis/config.yaml currently has YAML comments.
   // Self-managing across daemon restarts (after the first
   // mutation comments are gone, so this stays false until the

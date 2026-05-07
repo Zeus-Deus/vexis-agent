@@ -382,7 +382,13 @@ def test_rule6_resolved_id_in_discovered_set_passes():
     )
 
 
-def test_rule6_resolved_id_not_in_discovered_set_warns():
+def test_rule6_opencode_unknown_id_is_error_post_day_4():
+    """Day 4 of model picker UX promoted opencode rule 6 from
+    warning → error: opencode rejects unknown model ids at spawn
+    with 'Model not found', so the validator should refuse the
+    write rather than warn-and-let-it-spawn. claude-code stays
+    at warning (covered by the next test) because its discovery
+    is curated and goes stale between Anthropic releases."""
     config = {
         "brain": {"kind": "opencode"},
         "models": {"subsystems": {"curator": "anthropic/totally-fake"}},
@@ -394,7 +400,86 @@ def test_rule6_resolved_id_not_in_discovered_set_warns():
         },
     )
     assert _has_finding(
+        findings, severity="error", subsystem="curator",
+        problem_substring="isn't in the discovered set",
+    )
+    # Pin the inverse: NO warning-level rule-6 finding (so the
+    # promotion is exhaustive — we didn't accidentally double-emit).
+    assert not _has_finding(
         findings, severity="warning", subsystem="curator",
+        problem_substring="isn't in the discovered set",
+    )
+
+
+def test_rule6_claude_code_unknown_id_stays_warning():
+    """Pin the per-brain split: claude-code's curated in-process
+    list goes stale between Anthropic releases, so refusing a
+    newly-released model id would block the user from picking it.
+    Rule 6 stays advisory (warning) on claude-code; the spawn
+    itself errors gracefully on truly unknown names."""
+    config = {
+        "brain": {"kind": "claude-code"},
+        "models": {"subsystems": {"curator": "claude-mythical-7000"}},
+    }
+    findings = validate_models_config(
+        config, "claude-code",
+        available_models_per_brain={
+            "claude-code": {"haiku", "sonnet", "opus", "claude-haiku-4-5"},
+        },
+    )
+    assert _has_finding(
+        findings, severity="warning", subsystem="curator",
+        problem_substring="isn't in the discovered set",
+    )
+    # And NOT promoted to error.
+    assert not _has_finding(
+        findings, severity="error", subsystem="curator",
+        problem_substring="isn't in the discovered set",
+    )
+
+
+def test_rule6_opencode_abstract_tier_not_flagged():
+    """Day 4: rule 6 skips abstract tiers (tiny/small/medium/large).
+    Tiers are validated by the tier-resolution layer, not by
+    membership in the discovered set — the discovered set holds
+    raw model ids only. Without this skip a user picking 'small'
+    on opencode would trip the membership check because 'small'
+    isn't in ``opencode models`` output."""
+    config = {
+        "brain": {"kind": "opencode"},
+        "models": {"subsystems": {"curator": "small"}},
+    }
+    findings = validate_models_config(
+        config, "opencode",
+        available_models_per_brain={
+            "opencode": {"anthropic/claude-haiku-3-5", "openai/gpt-4o"},
+        },
+    )
+    # 'small' resolves via DEFAULT_TIER_MAP_OPENCODE to
+    # anthropic/claude-haiku-3-5 (which IS in the discovered set
+    # above), so no rule 6 finding fires regardless of severity.
+    assert not _has_finding(
+        findings, subsystem="curator",
+        problem_substring="isn't in the discovered set",
+    )
+
+
+def test_rule6_opencode_discovered_id_not_flagged():
+    """Pin: a configured id that IS in the discovered set passes
+    silently. Sanity check that promotion didn't break the
+    happy path."""
+    config = {
+        "brain": {"kind": "opencode"},
+        "models": {"subsystems": {"curator": "anthropic/claude-haiku-3-5"}},
+    }
+    findings = validate_models_config(
+        config, "opencode",
+        available_models_per_brain={
+            "opencode": {"anthropic/claude-haiku-3-5", "openai/gpt-4o"},
+        },
+    )
+    assert not _has_finding(
+        findings, subsystem="curator",
         problem_substring="isn't in the discovered set",
     )
 

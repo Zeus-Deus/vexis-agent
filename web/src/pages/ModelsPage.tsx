@@ -238,7 +238,9 @@ export function ModelsPage({ token, onAuthFail }: ModelsPageProps) {
       <ResolutionTable
         rows={state.subsystems}
         brain={state.brain_kind}
-        availableModels={state.available_models[state.brain_kind] ?? []}
+        availableModelsByProvider={
+          state.available_models_by_provider[state.brain_kind] ?? {}
+        }
         editable={state.model_ux_enabled}
         onSet={onSetSubsystem}
         onReset={onResetSubsystem}
@@ -424,17 +426,57 @@ function GlobalFindings({ findings }: { findings: ModelValidationFinding[] }) {
 
 // ---- Resolution table -------------------------------------------
 
+// Day 2 of model picker UX — model-name-primary dropdown.
+// Aliases ("haiku" / "sonnet" / "opus" on claude-code) are omitted
+// from the picker per `.plans/model-picker-ux-research.md` §5
+// cleanup 5: aliases drift over time as Anthropic releases new
+// models behind the same name, so picker buttons enforce version
+// pinning by surfacing only full names. The typed-arg path on the
+// /model slash command still accepts aliases — cleanup applies to
+// the picker UI only.
+const PICKER_OMITTED_ALIASES = new Set(["haiku", "sonnet", "opus"]);
+
+// Tier-fallbacks-advanced bucket lives at the bottom of the
+// dropdown. Same set as `model_validator.ABSTRACT_TIERS`; pinned
+// here so the picker doesn't need to round-trip through the API
+// for what's structurally a constant.
+const TIER_FALLBACKS = ["tiny", "small", "medium", "large"];
+
+// Threshold above which the per-row search/filter input renders.
+// claude-code (~9 models) doesn't need it; opencode (~250 across
+// providers) does. Threshold rather than brain check because the
+// trigger is option-count ergonomics, not brain identity — if a
+// future brain ships 50 models the search input shows up
+// automatically without a code change here.
+const PICKER_SEARCH_THRESHOLD = 30;
+
+// Debounce delay for the per-row search input. 150 ms is below
+// human-perceptible lag (~200 ms) but still coalesces rapid
+// keystrokes. Pure client-side filter is sub-ms even on the
+// largest realistic option set so the debounce is purely about
+// avoiding re-render thrash mid-typing.
+const PICKER_SEARCH_DEBOUNCE_MS = 150;
+
+function useDebounced<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const id = window.setTimeout(() => setDebounced(value), delayMs);
+    return () => window.clearTimeout(id);
+  }, [value, delayMs]);
+  return debounced;
+}
+
 function ResolutionTable({
   rows,
   brain,
-  availableModels,
+  availableModelsByProvider,
   editable,
   onSet,
   onReset,
 }: {
   rows: ModelSubsystemRow[];
   brain: string;
-  availableModels: string[];
+  availableModelsByProvider: Record<string, string[]>;
   editable: boolean;
   onSet: (subsystem: string, value: string) => void;
   onReset: (subsystem: string) => void;
@@ -462,7 +504,7 @@ function ResolutionTable({
               <ResolutionRow
                 key={row.name}
                 row={row}
-                availableModels={availableModels}
+                availableModelsByProvider={availableModelsByProvider}
                 editable={editable}
                 onSet={onSet}
                 onReset={onReset}
@@ -475,63 +517,175 @@ function ResolutionTable({
   );
 }
 
+// Strip aliases from each provider bucket. Aliases are exactly the
+// strings in PICKER_OMITTED_ALIASES (no provider prefix); opencode's
+// `anthropic/claude-haiku-3-5` is a full id and stays.
+function filterAliases(
+  byProvider: Record<string, string[]>,
+): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const [provider, models] of Object.entries(byProvider)) {
+    const filtered = models.filter((m) => !PICKER_OMITTED_ALIASES.has(m));
+    if (filtered.length > 0) out[provider] = filtered;
+  }
+  return out;
+}
+
+// Apply the search query to the provider-grouped data. Match
+// case-insensitively against the full model id (which contains the
+// provider prefix on opencode, so typing "openai" filters to
+// openai's bucket; typing "sonnet" filters to anything with
+// "sonnet" in the id across providers). Empty groups collapse —
+// we drop the bucket entirely rather than render an empty
+// optgroup so the picker doesn't show a label with no options.
+function applySearchFilter(
+  byProvider: Record<string, string[]>,
+  query: string,
+): Record<string, string[]> {
+  const q = query.trim().toLowerCase();
+  if (q === "") return byProvider;
+  const out: Record<string, string[]> = {};
+  for (const [provider, models] of Object.entries(byProvider)) {
+    const matched = models.filter(
+      (m) =>
+        m.toLowerCase().includes(q) ||
+        provider.toLowerCase().includes(q),
+    );
+    if (matched.length > 0) out[provider] = matched;
+  }
+  return out;
+}
+
+function totalOptionCount(byProvider: Record<string, string[]>): number {
+  let n = 0;
+  for (const models of Object.values(byProvider)) n += models.length;
+  return n;
+}
+
+// Check whether row.configured is already represented by any
+// option the dropdown would otherwise render. If not, the picker
+// surfaces it under a dedicated "Current" optgroup so the user's
+// existing pick stays visible even if it's a legacy alias or a
+// model that's since been removed from discovery.
+function configuredAlreadyVisible(
+  configured: string,
+  byProvider: Record<string, string[]>,
+): boolean {
+  if (TIER_FALLBACKS.includes(configured)) return true;
+  for (const models of Object.values(byProvider)) {
+    if (models.includes(configured)) return true;
+  }
+  return false;
+}
+
 function ResolutionRow({
   row,
-  availableModels,
+  availableModelsByProvider,
   editable,
   onSet,
   onReset,
 }: {
   row: ModelSubsystemRow;
-  availableModels: string[];
+  availableModelsByProvider: Record<string, string[]>;
   editable: boolean;
   onSet: (subsystem: string, value: string) => void;
   onReset: (subsystem: string) => void;
 }) {
   const worst = pickWorst(row.findings);
-  const tiers = ["tiny", "small", "medium", "large"];
-  // Build a deduplicated, alphabetised dropdown source: abstract
-  // tiers + discovery list + (current configured value if it
-  // doesn't match either, so the dropdown can render the
-  // user's existing pick).
-  const optionSet = new Set<string>([...tiers, ...availableModels]);
-  if (row.configured) optionSet.add(row.configured);
-  const options = Array.from(optionSet).sort();
+  // Per-row search query state. Independent across rows so users
+  // can edit one subsystem without their typing in another row's
+  // filter affecting this one. NOT auto-focused — default focus
+  // stays wherever it was on the page (the user explicitly raised
+  // the keystroke-capture concern for Day 2).
+  const [searchQuery, setSearchQuery] = useState("");
+  const debouncedQuery = useDebounced(searchQuery, PICKER_SEARCH_DEBOUNCE_MS);
+
+  // Build the dropdown's groups: alias-filtered providers, with
+  // the search query applied. Total count drives the search-input
+  // visibility — no input on small option sets.
+  const filteredByProvider = filterAliases(availableModelsByProvider);
+  const showSearch = totalOptionCount(filteredByProvider) > PICKER_SEARCH_THRESHOLD;
+  const visibleByProvider = applySearchFilter(filteredByProvider, debouncedQuery);
+
+  // Provider order: same as backend (anthropic first, then
+  // alphabetical). Object.entries respects insertion order, and
+  // discovery_grouped_for_validator emits in priority order, so
+  // we iterate in the order the API delivered.
+  const providerEntries = Object.entries(visibleByProvider);
+
+  // Surface the user's currently configured value under a
+  // dedicated "Current" optgroup if it's not already visible
+  // (e.g. legacy "sonnet" alias on a row, or a discovered model
+  // that fell out of the cache). Keeps the dropdown's own value
+  // valid (HTML <select> warns when value points at a
+  // non-existent option).
+  const currentNeedsBucket =
+    row.configured !== null &&
+    !configuredAlreadyVisible(row.configured, filteredByProvider);
+
   return (
     <div
       className="grid items-baseline gap-x-4 py-1.5 border-b border-[var(--color-border)] last:border-b-0"
       style={{ gridTemplateColumns: "1.5fr 1.5fr 1fr 0.4fr" }}
     >
       <span className="text-[var(--color-fg)]">{row.name}</span>
-      <span className="text-[var(--color-fg-2)] flex items-center gap-2">
+      <span className="text-[var(--color-fg-2)] flex flex-col items-stretch gap-1">
         {editable ? (
           <>
-            <select
-              aria-label={`Set ${row.name}`}
-              value={row.configured ?? ""}
-              onChange={(e) => onSet(row.name, e.target.value)}
-              className="font-data text-[12px] bg-[var(--color-base)] border border-[var(--color-border)] px-1.5 py-0.5 text-[var(--color-fg)]"
-            >
-              <option value="" disabled>
-                (default)
-              </option>
-              {options.map((opt) => (
-                <option key={opt} value={opt}>
-                  {opt}
-                </option>
-              ))}
-            </select>
-            {row.configured !== null && (
-              <button
-                type="button"
-                onClick={() => onReset(row.name)}
-                title="reset to default"
-                aria-label={`Reset ${row.name}`}
-                className="text-[10px] uppercase-tight text-[var(--color-fg-dim)] hover:text-[var(--color-error)]"
-              >
-                reset
-              </button>
+            {showSearch && (
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="filter models…"
+                aria-label={`Filter models for ${row.name}`}
+                className="font-data text-[11px] bg-[var(--color-base)] border border-[var(--color-border)] px-1.5 py-0.5 text-[var(--color-fg)]"
+              />
             )}
+            <div className="flex items-center gap-2">
+              <select
+                aria-label={`Set ${row.name}`}
+                value={row.configured ?? ""}
+                onChange={(e) => onSet(row.name, e.target.value)}
+                className="font-data text-[12px] bg-[var(--color-base)] border border-[var(--color-border)] px-1.5 py-0.5 text-[var(--color-fg)]"
+              >
+                <option value="" disabled>
+                  (default — falls back to tier)
+                </option>
+                {currentNeedsBucket && row.configured !== null && (
+                  <optgroup label="Current">
+                    <option value={row.configured}>{row.configured}</option>
+                  </optgroup>
+                )}
+                {providerEntries.map(([provider, models]) => (
+                  <optgroup key={provider} label={provider}>
+                    {models.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+                <optgroup label="Tier fallbacks (advanced)">
+                  {TIER_FALLBACKS.map((t) => (
+                    <option key={t} value={t}>
+                      {t}
+                    </option>
+                  ))}
+                </optgroup>
+              </select>
+              {row.configured !== null && (
+                <button
+                  type="button"
+                  onClick={() => onReset(row.name)}
+                  title="reset to default"
+                  aria-label={`Reset ${row.name}`}
+                  className="text-[10px] uppercase-tight text-[var(--color-fg-dim)] hover:text-[var(--color-error)]"
+                >
+                  reset
+                </button>
+              )}
+            </div>
           </>
         ) : (
           row.configured ?? <Dim>(default)</Dim>

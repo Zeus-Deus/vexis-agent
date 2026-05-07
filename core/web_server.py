@@ -1581,7 +1581,10 @@ class WebDashboard:
         rather than 500-ing. Validator findings (which include the
         config-parse failure context if any) carry the diagnostic.
         """
-        from core.model_discovery import discovery_for_validator
+        from core.model_discovery import (
+            discovery_for_validator,
+            discovery_grouped_for_validator,
+        )
         from core.model_validator import build_resolution_table
         from core.yaml_config import (
             VALID_BRAIN_KINDS,
@@ -1609,6 +1612,17 @@ class WebDashboard:
             table["available_models"] = {
                 k: sorted(v) for k, v in available.items()
             }
+            # Day 1 of model picker UX — provider-grouped sibling of
+            # ``available_models``. Pre-grouped per brain so the
+            # Day 2 dashboard ``<optgroup>`` dropdown can render
+            # without parsing on the client. Sourced from the same
+            # 5-min cache as ``available_models`` (no additional
+            # subprocess calls). Existing flat ``available_models``
+            # field is retained for backwards compatibility — the
+            # current dashboard dropdown still consumes it.
+            table["available_models_by_provider"] = (
+                discovery_grouped_for_validator(VALID_BRAIN_KINDS)
+            )
             table["has_comments"] = self._config_has_comments(has_comments)
             table["model_ux_enabled"] = model_ux_enabled()
             return table
@@ -1628,6 +1642,7 @@ class WebDashboard:
                     "suggested_fix": "check daemon log for stack trace",
                 }],
                 "available_models": {},
+                "available_models_by_provider": {},
                 "has_comments": False,
                 "model_ux_enabled": False,
             }
@@ -1906,28 +1921,33 @@ class WebDashboard:
 
     def _models_discovery_refresh(self) -> dict:
         """POST /api/v1/models/discovery/refresh — bust the
-        in-process discovery cache and re-run
-        ``opencode models --refresh`` so models.dev's own cache
-        also refreshes. Returns the fresh per-brain model lists
-        so the dashboard can repopulate the dropdowns inline.
+        in-process discovery cache for both brains and re-fetch
+        live. opencode runs ``opencode models --refresh`` so
+        models.dev's own cache also refreshes; claude-code hits
+        the Anthropic /v1/models endpoint with the user's OAuth
+        bearer / ANTHROPIC_API_KEY (falls back to the hardcoded
+        list on any failure). Returns the fresh per-brain model
+        lists so the dashboard can repopulate the dropdowns inline.
 
         Not flag-gated — discovery is read-only and useful even
         for the ``model_ux.enabled: false`` case (e.g. if a user
         wants to inspect what's available before flipping the
         flag)."""
         from core.model_discovery import (
-            discover_claude_code_models,
-            invalidate_discovery_cache,
+            refresh_claude_code_models,
             refresh_opencode_models,
         )
-        # Fresh claude-code is a constant return; fresh opencode
-        # re-runs the subprocess.
-        invalidate_discovery_cache()
+        # Both brains have meaningful refresh paths post-2026-05-07.
+        # claude-code's was a no-op when its discovery was a
+        # hardcoded constant; live /v1/models discovery made the
+        # refresh meaningful (picks up newly-released Anthropic
+        # models without a vexis PR).
+        claude_code_models = refresh_claude_code_models()
         opencode_models = refresh_opencode_models()
         return {
             "ok": True,
             "available_models": {
-                "claude-code": sorted(discover_claude_code_models()),
+                "claude-code": sorted(claude_code_models),
                 "opencode": sorted(opencode_models),
                 "null": [],
             },

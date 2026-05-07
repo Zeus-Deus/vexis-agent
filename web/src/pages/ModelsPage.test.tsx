@@ -117,6 +117,15 @@ function buildFixture(
       opencode: [],
       null: [],
     },
+    // Day 1 of model picker UX — provider-grouped sibling.
+    // Dashboard (Day 2) reads this for the <optgroup>-grouped
+    // dropdown; flat available_models above stays for backwards
+    // compat consumers.
+    available_models_by_provider: {
+      "claude-code": { anthropic: ["haiku", "sonnet", "opus"] },
+      opencode: {},
+      null: {},
+    },
     has_comments: false,
     model_ux_enabled: false,
     ...overrides,

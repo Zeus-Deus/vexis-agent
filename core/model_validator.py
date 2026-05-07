@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from core.yaml_config import (
+    ABSTRACT_TIERS,
     DEFAULT_SUBSYSTEM_TIERS,
     VALID_BRAIN_KINDS,
     model_for_tier_from_config,
@@ -435,12 +436,28 @@ def _check_per_subsystem(
             # subsystem if discovery is enabled. Both findings together
             # give the user the full picture.
 
-        # Rule 6: available-models membership (advisory; only fires
-        # when discovery data is supplied).
-        if discovered and resolved not in discovered:
+        # Rule 6: available-models membership.
+        # Only fires when discovery data is supplied AND the resolved
+        # id isn't an abstract tier (tiers are validated by the
+        # tier-resolution layer, not by membership in the discovered
+        # set). Day 4 of model picker UX promoted opencode unknown
+        # ids from warning → error: opencode rejects unknown model
+        # ids at spawn with "Model not found", so the validator
+        # should refuse the write rather than warn-and-let-it-spawn.
+        # claude-code stays at warning because (a) its discovery is
+        # a curated in-process list that goes stale between Anthropic
+        # releases — refusing newly-released models would block
+        # users from picking them — and (b) claude-code's spawn
+        # itself errors gracefully on unknown names.
+        if (
+            discovered
+            and resolved not in discovered
+            and resolved not in ABSTRACT_TIERS
+        ):
+            severity = "error" if brain_kind == "opencode" else "warning"
             findings.append(
                 ValidationFinding(
-                    severity="warning",
+                    severity=severity,
                     subsystem=subsystem,
                     problem=(
                         f"{subsystem} resolves to {resolved!r} but "

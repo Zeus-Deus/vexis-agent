@@ -274,12 +274,27 @@ async def _run() -> None:
     # and dashboard (Day 4) will reject ``error``-severity findings
     # at write time; startup is observe-only.
     try:
+        from core.model_discovery import (
+            discovery_for_validator as _validator_discovery,
+        )
         from core.model_validator import (
             log_findings as _log_validator_findings,
             validate_models_config as _validate_models_config,
         )
-        from core.yaml_config import _read_raw as _read_raw_config
-        _findings = _validate_models_config(_read_raw_config(), _kind)
+        from core.yaml_config import (
+            VALID_BRAIN_KINDS as _validator_brain_kinds,
+            _read_raw as _read_raw_config,
+        )
+        # Day 4 of model picker UX wires discovery into the startup
+        # pass so rule 6 (available-models membership) surfaces at
+        # boot — opencode users with stale model ids in their
+        # config see the error before their first /model spawn.
+        _findings = _validate_models_config(
+            _read_raw_config(), _kind,
+            available_models_per_brain=_validator_discovery(
+                _validator_brain_kinds,
+            ),
+        )
         if _findings:
             log.info(
                 "model_validator: %d finding(s) at startup; see below",

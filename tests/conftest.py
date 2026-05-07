@@ -51,6 +51,46 @@ def _isolate_opencode_db(tmp_path: Path):
     set_opencode_db_path_override(None)
 
 
+@pytest.fixture(autouse=True)
+def _block_claude_code_live_discovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    """Same posture as the opencode-db isolation: tests must NOT
+    hit the real Anthropic /v1/models endpoint by default.
+
+    - Real network in CI is flaky and slow (10s timeout per call).
+    - Tests would silently start passing/failing based on the
+      developer's local OAuth status (e.g. expired token = test
+      flake).
+    - The user's real OAuth credentials must never leak into
+      arbitrary test fixtures.
+
+    Tests that explicitly want to exercise the live path
+    monkeypatch ``ANTHROPIC_API_KEY`` and/or
+    ``model_discovery._read_claude_oauth_token`` themselves.
+    See ``tests/test_model_discovery.py``'s ``force_oauth_token``
+    fixture for the canonical opt-in shape.
+
+    Implementation: drop ANTHROPIC_API_KEY from env, point the
+    OAuth credentials path at a guaranteed-nonexistent file
+    inside ``tmp_path``. The real reader function still runs
+    (which means tests that monkeypatch ``_CLAUDE_OAUTH_PATH``
+    to a real fixture file work as expected), it just returns
+    None because the path doesn't exist. Discovery falls through
+    to the hardcoded fallback list deterministically."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    from core import model_discovery as _md
+    monkeypatch.setattr(
+        _md, "_CLAUDE_OAUTH_PATH",
+        tmp_path / "no-claude-credentials.json",
+    )
+    # Bust any cache state populated by a previous test run that
+    # may have hit the real API before this fixture was added.
+    _md.invalidate_discovery_cache("claude-code")
+    yield
+    _md.invalidate_discovery_cache("claude-code")
+
+
 def _make_brain(kind: str, tmp_path: Path) -> Brain:
     """Construct one brain implementation against tmp paths so the
     fixture cannot leak state into the user's real ~/.vexis/.

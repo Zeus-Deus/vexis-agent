@@ -45,7 +45,9 @@ def test_command_strings_unique():
 
 def test_expected_commands_present():
     names = {cmd.command for cmd in COMMANDS}
-    for expected in ("new", "switch", "sessions", "screenshot", "cancel"):
+    for expected in (
+        "new", "switch", "sessions", "screenshot", "cancel", "model",
+    ):
         assert expected in names, f"/{expected} missing from COMMANDS"
 
 

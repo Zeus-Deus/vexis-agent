@@ -328,6 +328,83 @@ def test_get_models_global_findings_carry_brain_kind_warnings(
 # ──────────────────────────────────────────────────────────────────
 
 
+# ──────────────────────────────────────────────────────────────────
+# Day 1 of model picker UX — available_models_by_provider field
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_get_models_exposes_available_models_by_provider(
+    client: TestClient,
+):
+    """Day 1 of model picker UX adds a provider-grouped sibling of
+    ``available_models``. Field present on the default response,
+    keyed by brain kind. claude-code grouping always has an
+    ``anthropic`` bucket (curated in-process list); opencode
+    grouping is empty when the binary isn't installed (test
+    environment)."""
+    r = client.get("/api/v1/models", headers=_hdr())
+    data = r.json()
+    assert "available_models_by_provider" in data
+    grouped = data["available_models_by_provider"]
+    assert set(grouped.keys()) == {"claude-code", "opencode", "null"}
+    # claude-code: hardcoded → always populated.
+    assert "anthropic" in grouped["claude-code"]
+    assert "haiku" in grouped["claude-code"]["anthropic"]
+    # null: never has discovery → empty dict.
+    assert grouped["null"] == {}
+
+
+def test_get_models_grouped_field_within_provider_sorted(
+    client: TestClient,
+):
+    """Pin within-provider sort so the dashboard / picker can
+    render without re-sorting on the client."""
+    r = client.get("/api/v1/models", headers=_hdr())
+    bucket = r.json()["available_models_by_provider"]["claude-code"]["anthropic"]
+    assert bucket == sorted(bucket)
+
+
+def test_get_models_keeps_flat_available_models_for_backwards_compat(
+    client: TestClient,
+):
+    """Pin: ``available_models`` (flat per brain) stays in the
+    payload for backwards compatibility. The current dashboard
+    dropdown reads from this; Day 2 migrates it to the grouped
+    field. Both fields populated from the same discovery call so
+    membership is consistent."""
+    r = client.get("/api/v1/models", headers=_hdr())
+    data = r.json()
+    flat = data["available_models"]["claude-code"]
+    grouped = data["available_models_by_provider"]["claude-code"]
+    # Flat field shape unchanged — sorted list per brain.
+    assert isinstance(flat, list)
+    assert "haiku" in flat
+    # Membership consistency: every grouped model also appears in
+    # the flat list. (Strict equality is the right contract since
+    # both come from the same source set.)
+    grouped_flat = {
+        m for bucket in grouped.values() for m in bucket
+    }
+    assert grouped_flat == set(flat)
+
+
+def test_get_models_grouped_field_present_in_fallback_payload(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """Defensive: the empty-fallback branch (build_resolution_table
+    raises) MUST still ship the new field — keyed empty — so the
+    dashboard / picker can rely on the field always being present."""
+    def _explode(*_a, **_k):
+        raise RuntimeError("synthetic blow-up")
+    monkeypatch.setattr(
+        "core.model_validator.build_resolution_table", _explode,
+    )
+    r = client.get("/api/v1/models", headers=_hdr())
+    data = r.json()
+    assert "available_models_by_provider" in data
+    assert data["available_models_by_provider"] == {}
+
+
 def test_get_models_tier_overrides_default_when_unset(
     client: TestClient,
 ):
