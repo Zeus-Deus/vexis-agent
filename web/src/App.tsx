@@ -9,6 +9,7 @@ import { BrowserPage } from "./pages/BrowserPage";
 import { LearningPage } from "./pages/LearningPage";
 import { TailscalePage } from "./pages/TailscalePage";
 import { GoalsPage } from "./pages/GoalsPage";
+import { ModelsPage } from "./pages/ModelsPage";
 
 type TabId =
   | "memory"
@@ -18,6 +19,7 @@ type TabId =
   | "browser"
   | "learning"
   | "goals"
+  | "models"
   | "tailscale";
 
 const TABS: TabDef[] = [
@@ -28,6 +30,7 @@ const TABS: TabDef[] = [
   { id: "browser", label: "Browser", glyph: "◐" },
   { id: "learning", label: "Learning", glyph: "▲" },
   { id: "goals", label: "Goals", glyph: "⊙" },
+  { id: "models", label: "Models", glyph: "⊕" },
   { id: "tailscale", label: "Tailscale", glyph: "◈" },
 ];
 
@@ -39,6 +42,7 @@ const HASH_TO_TAB: Record<string, TabId> = {
   "#browser": "browser",
   "#learning": "learning",
   "#goals": "goals",
+  "#models": "models",
   "#tailscale": "tailscale",
 };
 
@@ -102,6 +106,9 @@ export function App() {
         {tab === "goals" && (
           <GoalsPage token={token} onAuthFail={handleAuthFail} />
         )}
+        {tab === "models" && (
+          <ModelsPage token={token} onAuthFail={handleAuthFail} />
+        )}
         {tab === "tailscale" && (
           <TailscalePage token={token} onAuthFail={handleAuthFail} />
         )}
@@ -157,7 +164,7 @@ function Footer() {
       <div className="max-w-[1400px] w-full mx-auto px-5 py-3 flex items-baseline gap-4 font-data text-[10px] text-[var(--color-fg-dim)] uppercase tracking-widest">
         <span>read-only · with six actions</span>
         <span className="ml-auto">
-          mem · skills · curator · status · browser · learning · goals · tailscale
+          mem · skills · curator · status · browser · learning · goals · models · tailscale
         </span>
       </div>
     </footer>

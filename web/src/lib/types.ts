@@ -452,3 +452,51 @@ export interface GoalsState {
   // sorted by last_turn_at desc.
   history: GoalRecord[];
 }
+
+// ── Model UX (Day 3 read-only; Day 4 adds edit affordances) ──
+
+export type ValidationSeverity = "error" | "warning" | "info";
+
+export interface ModelValidationFinding {
+  severity: ValidationSeverity;
+  // null for whole-config findings (brain.kind validity etc.).
+  subsystem: string | null;
+  problem: string;
+  suggested_fix: string;
+}
+
+export interface ModelSubsystemRow {
+  // One of the keys in DEFAULT_SUBSYSTEM_TIERS — curator, goal_judge, etc.
+  name: string;
+  // Raw value from config (legacy or new schema), or null if defaulted.
+  configured: string | null;
+  // What the resolution layer sees (abstract tier or raw alias).
+  // null when no model is configured (caller falls back to brain default).
+  resolved_tier: string | null;
+  // Native model id the brain CLI receives. null = no --model flag passed.
+  resolved_model_id: string | null;
+  // Per-row validator findings (rule 4/5/6/7 hits for this subsystem).
+  findings: ModelValidationFinding[];
+}
+
+export interface ModelTierOverride {
+  // User-set value via models.tiers.<brain>.<tier>, or null.
+  configured: string | null;
+  // DEFAULT_TIER_MAP_<brain>[<tier>], or null when the brain has
+  // no built-in default for this tier.
+  default: string | null;
+}
+
+export interface ModelsState {
+  // The brain currently active (read-once at daemon startup).
+  brain_kind: string;
+  // 8 rows — one per known subsystem in DEFAULT_SUBSYSTEM_TIERS.
+  subsystems: ModelSubsystemRow[];
+  // Per-tier overrides for the active brain. Day 4 adds an editor.
+  tier_overrides: Record<string, ModelTierOverride>;
+  // VALID_BRAIN_KINDS — populated for Day 4's brain switcher.
+  brain_inventory: string[];
+  // Whole-config findings (subsystem=null) — brain.kind validity,
+  // unknown legacy keys, etc.
+  global_findings: ModelValidationFinding[];
+}

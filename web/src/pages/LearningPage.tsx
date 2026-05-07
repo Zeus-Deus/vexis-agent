@@ -701,23 +701,24 @@ function RatesPanel({ rates }: { rates: LearningRates }) {
 
 // ---- Models panel -----------------------------------------------
 
-function ModelsPanel({ models }: { models: LearningState["models"] }) {
-  const rows: Array<[string, string]> = [
-    ["brain", models.brain ?? "—"],
-    ["learning_review", models.learning_review ?? "—"],
-    ["coherence_judge", models.coherence_judge ?? "—"],
-    ["migration_classifier", models.migration_classifier ?? "—"],
-  ];
+function ModelsPanel({ models: _models }: { models: LearningState["models"] }) {
+  // Day 3 of model UX moved the resolution table to its own
+  // top-level Models tab. The four-row inline panel that used to
+  // live here was incomplete (showed 4 of 8 subsystems) and
+  // mis-stated the "restart to change" story (per-spawn config
+  // re-reads pick up tier edits without a restart; only
+  // brain.kind needs one).
   return (
     <Section title="Models">
       <Card>
-        <dl className="grid gap-y-1 gap-x-6 px-4 py-3 md:grid-cols-2 font-data text-[12px]">
-          {rows.map(([k, v]) => (
-            <KV key={k} label={k} value={v} />
-          ))}
-        </dl>
-        <p className="px-4 pb-3 font-data text-[10.5px] text-[var(--color-fg-dim)]">
-          Edit ~/.vexis/config.yaml [models] and restart the daemon to change.
+        <p className="px-4 py-3 font-data text-[12px] text-[var(--color-fg-2)]">
+          Per-subsystem resolution table moved to its own tab:{" "}
+          <a
+            href="#models"
+            className="text-[var(--color-accent)] hover:underline"
+          >
+            Models →
+          </a>
         </p>
       </Card>
     </Section>

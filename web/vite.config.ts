@@ -27,4 +27,18 @@ export default defineConfig({
       },
     },
   },
-});
+  // Day 3 of model UX wires vitest. Run with `npm test` (one-shot) or
+  // `npm run test:watch`. jsdom gives DOM APIs (window, document) so
+  // React Testing Library can mount components. The cast avoids a
+  // type collision between vite's pinned PluginOption type and
+  // vitest's (vitest 2.1 ships a different vite version internally
+  // and the public defineConfig overload doesn't accept a `test`
+  // key); vitest reads the `test` block at runtime regardless.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  test: {
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/setupTests.ts"],
+    include: ["src/**/*.test.{ts,tsx}"],
+  },
+} as Parameters<typeof defineConfig>[0] & { test: object });

@@ -14,6 +14,7 @@ import type {
   LearningJudgeResult,
   LearningState,
   MemoryState,
+  ModelsState,
   RelationshipsCandidatesState,
   RelationshipsLiveState,
   SkillBody,
@@ -170,6 +171,7 @@ export const api = {
     ),
   tailscale: (token: string) => call<TailscaleStatus>(token, "/tailscale/status"),
   goals: (token: string) => call<GoalsState>(token, "/goals"),
+  models: (token: string) => call<ModelsState>(token, "/models"),
   pauseGoal: (token: string) =>
     call<GoalRecord>(token, "/goals/pause", { method: "POST" }),
   resumeGoal: (token: string) =>
