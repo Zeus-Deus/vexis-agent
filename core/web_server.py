@@ -1040,16 +1040,55 @@ class WebDashboard:
 
         # ----- /api/v1/models — Day 3 of model UX -----
         # Read-only resolution table backing the dashboard's
-        # Models tab. Day 4 will add POST endpoints for edits.
-        # Until then this endpoint is the dashboard's only data
-        # source; the slash command (Day 2) is the only mutation
-        # surface and is flag-gated behind ``model_ux.enabled``.
+        # Models tab. Day 4 adds POST endpoints for edits +
+        # discovery-refresh, all gated behind model_ux_enabled()
+        # to match the slash command's flag posture.
         @app.get(
             "/api/v1/models",
             dependencies=[Depends(_require_auth)],
         )
         async def get_models() -> dict:
             return await asyncio.to_thread(self._models_payload)
+
+        # ----- Day 4 mutation + discovery endpoints -----
+        # All flag-gated behind model_ux_enabled() so the production
+        # claude-code path is byte-equivalent for any user who
+        # hasn't flipped the flag.
+        @app.post(
+            "/api/v1/models/set",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_models_set(payload: dict) -> dict:
+            return await asyncio.to_thread(
+                self._models_set, payload,
+            )
+
+        @app.post(
+            "/api/v1/models/reset",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_models_reset(payload: dict | None = None) -> dict:
+            return await asyncio.to_thread(
+                self._models_reset, payload or {},
+            )
+
+        @app.post(
+            "/api/v1/models/brain",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_models_brain(payload: dict) -> dict:
+            return await asyncio.to_thread(
+                self._models_set_brain, payload,
+            )
+
+        @app.post(
+            "/api/v1/models/discovery/refresh",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_models_discovery_refresh() -> dict:
+            return await asyncio.to_thread(
+                self._models_discovery_refresh,
+            )
 
         # ----- frontend bootstrap -----
 
@@ -1517,6 +1556,17 @@ class WebDashboard:
         test in ``tests/test_models_api.py`` pins that both surfaces
         return byte-identical per-subsystem resolution data.
 
+        Day 4 additions:
+          - ``available_models`` per brain (cached 5 minutes via
+            ``core.model_discovery``) so the dashboard's dropdown
+            doesn't need a separate request per row. Validator's
+            rule 6 also runs against the same set.
+          - ``has_comments`` flag so the dashboard can pre-fetch
+            the comment-preservation modal trigger without a
+            separate round-trip.
+          - ``model_ux_enabled`` flag so the dashboard can render
+            the disabled-flag banner if appropriate.
+
         Graceful degradation: if config parsing fails (corrupt
         ``~/.vexis/config.yaml``), the validator still runs against
         the empty fallback dict ``yaml_config._read_raw`` returns
@@ -1524,12 +1574,29 @@ class WebDashboard:
         rather than 500-ing. Validator findings (which include the
         config-parse failure context if any) carry the diagnostic.
         """
+        from core.model_discovery import discovery_for_validator
         from core.model_validator import build_resolution_table
-        from core.yaml_config import _read_raw, brain_kind
+        from core.yaml_config import (
+            VALID_BRAIN_KINDS,
+            _read_raw,
+            brain_kind,
+            model_ux_enabled,
+        )
+        from core.yaml_config_writer import has_comments
         try:
             cfg = _read_raw()
             kind = brain_kind()
-            return build_resolution_table(cfg, kind)
+            available = discovery_for_validator(VALID_BRAIN_KINDS)
+            table = build_resolution_table(
+                cfg, kind, available_models_per_brain=available,
+            )
+            # Day 4 additions on top of the Day 3 shape.
+            table["available_models"] = {
+                k: sorted(v) for k, v in available.items()
+            }
+            table["has_comments"] = self._config_has_comments(has_comments)
+            table["model_ux_enabled"] = model_ux_enabled()
+            return table
         except Exception:
             log.exception("models payload build failed; returning empty fallback")
             # Defensive: return an empty-but-shaped table so the
@@ -1545,7 +1612,326 @@ class WebDashboard:
                     "problem": "models payload build failed; see daemon log",
                     "suggested_fix": "check daemon log for stack trace",
                 }],
+                "available_models": {},
+                "has_comments": False,
+                "model_ux_enabled": False,
             }
+
+    @staticmethod
+    def _config_has_comments(has_comments_fn) -> bool:
+        """Read ~/.vexis/config.yaml and report whether it has
+        any YAML comments. Used by the dashboard's comment-
+        preservation modal pre-trigger. Self-managing: after the
+        first slash/dashboard mutation comments are gone, so
+        subsequent calls return False and the modal stays out of
+        the way."""
+        from core.yaml_config import _config_path
+        path = _config_path()
+        try:
+            return has_comments_fn(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            return False
+
+    # ─── Day 4 mutation + discovery helpers ─────────────────────────
+
+    def _models_set(self, payload: dict) -> dict:
+        """POST /api/v1/models/set — set a per-subsystem
+        assignment. Body: ``{"subsystem": str, "value": str}``.
+
+        Same gates as the slash command:
+          - flag-gated behind ``model_ux_enabled()``
+          - validator runs pre-write; refuses on error-severity
+          - comment-presence-gated backup before the atomic
+            rewrite
+          - returns the new resolution row + (optional) backup
+            confirmation in the response body so the dashboard
+            can render the toast inline
+
+        Failure modes:
+          - 403 if model_ux disabled
+          - 400 unknown subsystem
+          - 400 validator-error (response.detail carries the
+            suggested_fix copy verbatim)
+          - 500 only on unexpected internals (atomic-write IO
+            failure, etc.)
+        """
+        from core.model_discovery import discovery_for_validator
+        from core.model_validator import validate_models_config
+        from core.yaml_config import (
+            DEFAULT_SUBSYSTEM_TIERS,
+            VALID_BRAIN_KINDS,
+            _read_raw,
+            brain_kind,
+            model_for_tier_from_config,
+            model_ux_enabled,
+            subsystem_tier_from_config,
+        )
+        from core.yaml_config_writer import (
+            atomic_write_yaml,
+            backup_if_commented,
+        )
+        from core.paths import vexis_dir
+        from fastapi import HTTPException
+
+        if not model_ux_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail="model UX is disabled (set model_ux.enabled: true)",
+            )
+        subsystem = payload.get("subsystem")
+        value = payload.get("value")
+        if not isinstance(subsystem, str) or not isinstance(value, str):
+            raise HTTPException(
+                status_code=400,
+                detail="payload requires {subsystem: str, value: str}",
+            )
+        if subsystem not in DEFAULT_SUBSYSTEM_TIERS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unknown subsystem '{subsystem}'. Known: "
+                    f"{', '.join(sorted(DEFAULT_SUBSYSTEM_TIERS))}"
+                ),
+            )
+
+        cfg_path = vexis_dir() / "config.yaml"
+        current = _read_raw()
+        proposed = self._proposed_set_subsystem(current, subsystem, value)
+
+        available = discovery_for_validator(VALID_BRAIN_KINDS)
+        findings = validate_models_config(
+            proposed, brain_kind(),
+            available_models_per_brain=available,
+        )
+        errors = [f for f in findings if f.severity == "error"]
+        if errors:
+            problems = "\n".join(
+                f"[{f.subsystem or '<global>'}] {f.problem} "
+                f"-- fix: {f.suggested_fix}"
+                for f in errors
+            )
+            raise HTTPException(status_code=400, detail=problems)
+
+        backup_path = (
+            backup_if_commented(cfg_path) if cfg_path.exists() else None
+        )
+        atomic_write_yaml(cfg_path, proposed)
+
+        resolved_tier = subsystem_tier_from_config(
+            proposed.get("models"), subsystem,
+        )
+        resolved_id = model_for_tier_from_config(
+            proposed.get("models"), brain_kind(), resolved_tier,
+        )
+        return {
+            "ok": True,
+            "subsystem": subsystem,
+            "value": value,
+            "resolved_tier": resolved_tier,
+            "resolved_model_id": resolved_id,
+            "backup_path": str(backup_path) if backup_path else None,
+        }
+
+    def _models_reset(self, payload: dict) -> dict:
+        """POST /api/v1/models/reset — reset all subsystem
+        assignments (legacy + new schema), or one subsystem if
+        ``payload["subsystem"]`` is provided. Preserves
+        models.tiers and models.brain.
+
+        Same gates as the slash command's reset path."""
+        from core.yaml_config import (
+            DEFAULT_SUBSYSTEM_TIERS,
+            _read_raw,
+            model_ux_enabled,
+        )
+        from core.yaml_config_writer import (
+            atomic_write_yaml,
+            backup_if_commented,
+        )
+        from core.paths import vexis_dir
+        from fastapi import HTTPException
+
+        if not model_ux_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail="model UX is disabled (set model_ux.enabled: true)",
+            )
+
+        target = payload.get("subsystem")
+        if target is not None and not isinstance(target, str):
+            raise HTTPException(
+                status_code=400,
+                detail="subsystem must be a string or omitted",
+            )
+        if target is not None and target not in DEFAULT_SUBSYSTEM_TIERS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unknown subsystem '{target}'. Known: "
+                    f"{', '.join(sorted(DEFAULT_SUBSYSTEM_TIERS))}"
+                ),
+            )
+
+        cfg_path = vexis_dir() / "config.yaml"
+        current = _read_raw()
+        models = dict(current.get("models") or {})
+
+        if target is None:
+            # Drop every subsystem assignment (legacy + new schema)
+            # but leave models.tiers and models.brain alone.
+            models.pop("subsystems", None)
+            for sub_name in list(models):
+                if sub_name in DEFAULT_SUBSYSTEM_TIERS:
+                    models.pop(sub_name)
+            scope = "all subsystems"
+        else:
+            models.pop(target, None)
+            subs_block = models.get("subsystems")
+            if isinstance(subs_block, dict):
+                subs_block.pop(target, None)
+                if not subs_block:
+                    models.pop("subsystems", None)
+            scope = target
+
+        new_cfg = {**current, "models": models}
+        if not models:
+            new_cfg.pop("models", None)
+
+        backup_path = (
+            backup_if_commented(cfg_path) if cfg_path.exists() else None
+        )
+        atomic_write_yaml(cfg_path, new_cfg)
+        return {
+            "ok": True,
+            "scope": scope,
+            "backup_path": str(backup_path) if backup_path else None,
+        }
+
+    def _models_set_brain(self, payload: dict) -> dict:
+        """POST /api/v1/models/brain — set ``brain.kind``. Body:
+        ``{"kind": str}``.
+
+        Refuses unknown kind as policy (typo guard) — matches
+        slash behaviour. Validator's rule 1 only warns; refusal
+        here is policy-driven, not severity-driven.
+
+        Returns ``{ok: true, kind, restart_required: true,
+        warnings: [...preview-mode validator findings...]}``
+        so the dashboard's modal can show what'll happen at
+        next-start AND surface the "switch brain → restart
+        required" reminder."""
+        from core.model_discovery import discovery_for_validator
+        from core.model_validator import validate_models_config
+        from core.yaml_config import (
+            VALID_BRAIN_KINDS,
+            _read_raw,
+            model_ux_enabled,
+        )
+        from core.yaml_config_writer import (
+            atomic_write_yaml,
+            backup_if_commented,
+        )
+        from core.paths import vexis_dir
+        from fastapi import HTTPException
+
+        if not model_ux_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail="model UX is disabled (set model_ux.enabled: true)",
+            )
+        kind = payload.get("kind")
+        if not isinstance(kind, str) or kind not in VALID_BRAIN_KINDS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"invalid brain.kind '{kind}'. Valid: "
+                    f"{', '.join(sorted(VALID_BRAIN_KINDS))}"
+                ),
+            )
+
+        cfg_path = vexis_dir() / "config.yaml"
+        current = _read_raw()
+        brain_block = dict(current.get("brain") or {})
+        brain_block["kind"] = kind
+        new_cfg = {**current, "brain": brain_block}
+
+        # Preview-mode validation against the proposed brain. If
+        # rule 4 errors fire, surface them as warnings in the
+        # response body — the dashboard's modal renders these
+        # before the switch lands so the user knows the next
+        # restart will need tier-key migration. Don't refuse;
+        # the user opted into the brain change knowing they'll
+        # fix the rest.
+        available = discovery_for_validator(VALID_BRAIN_KINDS)
+        preview = validate_models_config(
+            new_cfg, kind, available_models_per_brain=available,
+        )
+        warnings = [
+            {
+                "severity": f.severity,
+                "subsystem": f.subsystem,
+                "problem": f.problem,
+                "suggested_fix": f.suggested_fix,
+            }
+            for f in preview
+            if f.severity in ("error", "warning")
+        ]
+
+        backup_path = (
+            backup_if_commented(cfg_path) if cfg_path.exists() else None
+        )
+        atomic_write_yaml(cfg_path, new_cfg)
+        return {
+            "ok": True,
+            "kind": kind,
+            "restart_required": True,
+            "warnings": warnings,
+            "backup_path": str(backup_path) if backup_path else None,
+        }
+
+    def _models_discovery_refresh(self) -> dict:
+        """POST /api/v1/models/discovery/refresh — bust the
+        in-process discovery cache and re-run
+        ``opencode models --refresh`` so models.dev's own cache
+        also refreshes. Returns the fresh per-brain model lists
+        so the dashboard can repopulate the dropdowns inline.
+
+        Not flag-gated — discovery is read-only and useful even
+        for the ``model_ux.enabled: false`` case (e.g. if a user
+        wants to inspect what's available before flipping the
+        flag)."""
+        from core.model_discovery import (
+            discover_claude_code_models,
+            invalidate_discovery_cache,
+            refresh_opencode_models,
+        )
+        # Fresh claude-code is a constant return; fresh opencode
+        # re-runs the subprocess.
+        invalidate_discovery_cache()
+        opencode_models = refresh_opencode_models()
+        return {
+            "ok": True,
+            "available_models": {
+                "claude-code": sorted(discover_claude_code_models()),
+                "opencode": sorted(opencode_models),
+                "null": [],
+            },
+        }
+
+    @staticmethod
+    def _proposed_set_subsystem(
+        current: dict, subsystem: str, value: str,
+    ) -> dict:
+        """Build the proposed config for a per-subsystem set. Pure
+        function; the writer never sees a partial edit. Mirrors
+        ``transports.telegram.TelegramTransport._proposed_set_subsystem``
+        — both surfaces produce the same shape so the validator
+        sees identical inputs."""
+        models = dict(current.get("models") or {})
+        subs = dict(models.get("subsystems") or {})
+        subs[subsystem] = value
+        models["subsystems"] = subs
+        return {**current, "models": models}
 
     def _build_goal_manager(self, session_uuid: str):
         """Construct a GoalManager bound to the live store.
