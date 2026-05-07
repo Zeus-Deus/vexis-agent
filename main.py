@@ -267,6 +267,29 @@ async def _run() -> None:
     # ``null`` is the test fake — useful for dashboard-only smoke.
     from core.yaml_config import brain_kind as _brain_kind
     _kind = _brain_kind()
+
+    # Model UX Day 1: validate the on-disk config and log findings
+    # at severity-appropriate levels. Doesn't crash; same fall-back
+    # posture as ``brain_kind()`` itself. The slash command (Day 2)
+    # and dashboard (Day 4) will reject ``error``-severity findings
+    # at write time; startup is observe-only.
+    try:
+        from core.model_validator import (
+            log_findings as _log_validator_findings,
+            validate_models_config as _validate_models_config,
+        )
+        from core.yaml_config import _read_raw as _read_raw_config
+        _findings = _validate_models_config(_read_raw_config(), _kind)
+        if _findings:
+            log.info(
+                "model_validator: %d finding(s) at startup; see below",
+                len(_findings),
+            )
+            _log_validator_findings(_findings)
+    except Exception:
+        # Never let validator failures block daemon startup.
+        log.exception("model_validator startup pass raised; continuing")
+
     if _kind == "opencode":
         from core.brain.opencode import OpenCodeBrain
         brain = OpenCodeBrain(

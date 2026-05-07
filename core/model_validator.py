@@ -1,0 +1,539 @@
+"""Model-config validation engine — Day 1 of model-management UX.
+
+Pure function ``validate_models_config(config, brain_kind, *,
+available_models_per_brain=None)`` returning a list of
+``ValidationFinding`` records. Used by:
+
+  - **Daemon startup** (this Day 1 commit) — ``main.py`` invokes the
+    validator after reading ``brain.kind`` and logs each finding at
+    severity-appropriate level. Doesn't crash; same posture as
+    ``brain_kind()`` falling back on a typo.
+  - **Day 2: ``/model`` slash command** — every ``/model set`` runs
+    the validator on the proposed-config-after-this-edit and refuses
+    to write on ``error``-severity findings.
+  - **Day 4: dashboard saves** — same gate, server-side.
+
+Day 1 ships **zero user-facing value**. The only observable effect
+is new lines in the daemon's startup log file (``~/.vexis/logs/``)
+when the user's existing config has issues. There is no slash
+command, no dashboard surface, no behavior change to any in-flight
+flow. This is deliberate — the validator is the foundation every
+other surface depends on; landing it as one tight, testable commit
+keeps the per-day blast radius bounded. Greppable for
+``model_validator`` to confirm wiring.
+
+The seven rules are documented in
+``.plans/model-management-ux-research.md`` §4 "Validation engine."
+The suggested-fix template constants are exported so Day 2's
+``BrainModelNotFoundError`` (per the §4 "Spawn-site error
+vocabulary" section) can import the same copy — the validator and
+the spawn-site backstop must emit identical wording so the user
+sees a coherent error story across both surfaces.
+
+Design citation: ``.plans/model-management-ux-research.md`` §4 + §6
+Day 1.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+from core.yaml_config import (
+    DEFAULT_SUBSYSTEM_TIERS,
+    VALID_BRAIN_KINDS,
+    model_for_tier_from_config,
+    subsystem_tier_from_config,
+)
+
+log = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Public dataclass
+# ──────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ValidationFinding:
+    """One severity-tagged finding from the validator.
+
+    ``severity``: ``"error"`` | ``"warning"`` | ``"info"``.
+        - ``error``: the slash command and dashboard refuse to write.
+          Daemon startup logs at ``ERROR`` level.
+        - ``warning``: surfaces in the UI but writes proceed. Daemon
+          startup logs at ``WARNING`` level. Matches the daemon's
+          existing fall-through-to-default posture.
+        - ``info``: hygiene observation. Daemon startup logs at
+          ``INFO`` level. Surfaces in the dashboard's "advisory" row.
+
+    ``subsystem``: subsystem name when the finding is per-subsystem;
+        ``None`` for whole-config issues (e.g. invalid
+        ``brain.kind``).
+
+    ``problem``: human-readable description of what's wrong.
+
+    ``suggested_fix``: actionable text. Same string the spawn-site
+        backstop (Day 2's ``BrainModelNotFoundError``) emits when it
+        catches the same condition at runtime — see §4 "Spawn-site
+        error vocabulary."
+    """
+
+    severity: str
+    subsystem: str | None
+    problem: str
+    suggested_fix: str
+
+
+# ──────────────────────────────────────────────────────────────────
+# Suggested-fix template constants
+#
+# Single source of truth for the wording the validator AND the Day 2
+# spawn-site BrainModelNotFoundError emit. Day 2 imports these so
+# the exception's ``suggested_fix`` field carries the identical copy
+# the validator would have shown pre-write.
+# ──────────────────────────────────────────────────────────────────
+
+
+UNKNOWN_BRAIN_FIX = (
+    "Set brain.kind to one of: claude-code, opencode, null. "
+    "Daemon falls back to claude-code on invalid input."
+)
+
+UNKNOWN_SUBSYSTEM_FIX_TEMPLATE = (
+    "Remove the unknown key. Known subsystems: {known}"
+)
+
+EMPTY_TIER_FIX_TEMPLATE = (
+    "models.subsystems.{subsystem} (or legacy models.{subsystem}) "
+    "resolves to empty. Set to a tier "
+    "(tiny/small/medium/large) or remove the key."
+)
+
+OPENCODE_FORMAT_FIX_TEMPLATE = (
+    "'{model_id}' is a bare alias; opencode requires "
+    "provider/model shape. Switch to abstract tier 'small' "
+    "(resolves to anthropic/claude-haiku-3-5) or pick an explicit "
+    "provider/model from /model list opencode. "
+    "Run: /model set {subsystem} small"
+)
+
+CLAUDE_CODE_FORMAT_FIX_TEMPLATE = (
+    "'{model_id}' contains '/' (opencode's provider/model shape). "
+    "claude-code expects an alias (sonnet/opus/haiku) or a full "
+    "name (claude-sonnet-4-6). If you intended this exact id, "
+    "this warning is informational only — claude may still accept "
+    "it as a full model id."
+)
+
+UNKNOWN_MODEL_FIX_TEMPLATE = (
+    "'{model_id}' is not in the discovered model set for "
+    "{brain_kind}. May be a stale alias or a typo. Run "
+    "/model list {brain_kind} to see what's available."
+)
+
+DEAD_KNOB_FIX_TEMPLATE = (
+    "The '{subsystem}' subsystem is declared in "
+    "DEFAULT_SUBSYSTEM_TIERS but no live "
+    "subsystem_tier(\"{subsystem}\") caller exists in core/. "
+    "Safe to remove from your config; the constant should be "
+    "cleaned up in a separate maintenance pass alongside the "
+    "CLAUDE.md reorganisation."
+)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Top-level keys under ``models:`` that are NOT subsystem names.
+# Used by rule 2 to skip false positives when scanning legacy keys.
+# ──────────────────────────────────────────────────────────────────
+
+
+# Note ``brain`` is here rather than in ``DEFAULT_SUBSYSTEM_TIERS``
+# because it's a foreground-display-only knob (read by
+# ``model_brain()`` for the dashboard, never by ``subsystem_tier``
+# for an aux spawn). The validator treats it as a known special key
+# so ``models.brain: default`` doesn't trip rule 2.
+LEGACY_TOP_LEVEL_KEYS: frozenset[str] = frozenset({
+    "brain",        # foreground-display only
+    "subsystems",   # new-schema sub-block
+    "tiers",        # per-brain tier override sub-block
+})
+
+
+# ──────────────────────────────────────────────────────────────────
+# Live-caller scan (rule 7 input)
+# ──────────────────────────────────────────────────────────────────
+
+
+_LIVE_CALLERS_CACHE: set[str] | None = None
+_LIVE_CALLER_PATTERN = re.compile(
+    r'subsystem_tier\(\s*["\']([\w_]+)["\']'
+)
+
+
+def _live_subsystem_callers() -> set[str]:
+    """Return the set of subsystem names with a live
+    ``subsystem_tier(<name>)`` call site anywhere in ``core/``.
+
+    Cached on first call; the source tree doesn't change at runtime.
+    Tests can clear the cache via :func:`_reset_live_callers_cache`.
+
+    Implementation: literal-string regex grep across all .py files
+    under ``core/``. False-positive surface: a docstring or comment
+    mentioning the literal call shape — acceptable for v1, since the
+    interesting signal is the EMPTY set per name (which a comment
+    can't fake into present-but-dead).
+
+    Excludes ``core/model_validator.py`` itself so the test pattern
+    we'd write to verify rule 7 doesn't accidentally count as a live
+    caller.
+    """
+    global _LIVE_CALLERS_CACHE
+    if _LIVE_CALLERS_CACHE is not None:
+        return _LIVE_CALLERS_CACHE
+
+    callers: set[str] = set()
+    core_dir = Path(__file__).parent
+
+    for py_path in core_dir.rglob("*.py"):
+        if py_path.name == "model_validator.py":
+            continue
+        try:
+            text = py_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for match in _LIVE_CALLER_PATTERN.finditer(text):
+            callers.add(match.group(1))
+
+    _LIVE_CALLERS_CACHE = callers
+    return callers
+
+
+def _reset_live_callers_cache() -> None:
+    """Test hook: clear the live-callers cache so unit tests can
+    re-scan after monkeypatching the source tree (rare). Production
+    code never calls this — the cache is correct for the daemon's
+    lifetime."""
+    global _LIVE_CALLERS_CACHE
+    _LIVE_CALLERS_CACHE = None
+
+
+# ──────────────────────────────────────────────────────────────────
+# Per-rule helpers
+# ──────────────────────────────────────────────────────────────────
+
+
+def _check_brain_kind(
+    config: dict, brain_kind: str,
+) -> list[ValidationFinding]:
+    """Rule 1: ``brain.kind`` validity.
+
+    Severity ``warning`` — matches the daemon's actual fallback
+    behavior at ``yaml_config.brain_kind()`` (warns + falls back to
+    ``claude-code`` on unknown value, doesn't crash). The slash
+    command separately refuses to write on this case as a *policy*
+    decision (typos are user-hostile to recover from), but the
+    severity itself is warning, not error.
+    """
+    brain_block = config.get("brain") if isinstance(config, dict) else None
+    if not isinstance(brain_block, dict):
+        return []
+    raw_kind = brain_block.get("kind")
+    if not isinstance(raw_kind, str) or not raw_kind.strip():
+        return []
+    cleaned = raw_kind.strip()
+    if cleaned in VALID_BRAIN_KINDS:
+        return []
+    return [
+        ValidationFinding(
+            severity="warning",
+            subsystem=None,
+            problem=(
+                f"brain.kind={raw_kind!r} is not a recognised brain. "
+                f"Daemon will fall back to 'claude-code' at startup."
+            ),
+            suggested_fix=UNKNOWN_BRAIN_FIX,
+        )
+    ]
+
+
+def _check_known_subsystems(
+    config: dict, brain_kind: str,
+) -> list[ValidationFinding]:
+    """Rule 2: subsystem name validity.
+
+    Two sub-checks:
+      - 2a (legacy raw-string): every key under ``models:`` that
+        isn't a known top-level special (``brain``, ``subsystems``,
+        ``tiers``) and isn't a known subsystem is ignored at
+        runtime — surface as a warning so the user knows their
+        config has dead keys.
+      - 2b (new schema): every key under ``models.subsystems.<name>``
+        must be a known subsystem; same warning shape.
+
+    ``models.brain`` is a known special key (foreground-display
+    only); doesn't trip this rule.
+    """
+    findings: list[ValidationFinding] = []
+    models = config.get("models") if isinstance(config, dict) else None
+    if not isinstance(models, dict):
+        return findings
+
+    known_csv = ", ".join(sorted(DEFAULT_SUBSYSTEM_TIERS.keys()))
+
+    # 2a: scan legacy raw-string keys at the top level of ``models:``.
+    for key in models:
+        if not isinstance(key, str):
+            continue
+        if key in LEGACY_TOP_LEVEL_KEYS:
+            continue
+        if key in DEFAULT_SUBSYSTEM_TIERS:
+            continue
+        findings.append(
+            ValidationFinding(
+                severity="warning",
+                subsystem=None,
+                problem=(
+                    f"models.{key} is not a recognised subsystem; "
+                    f"the value is ignored at runtime."
+                ),
+                suggested_fix=UNKNOWN_SUBSYSTEM_FIX_TEMPLATE.format(
+                    known=known_csv,
+                ),
+            )
+        )
+
+    # 2b: scan models.subsystems.<name>.
+    subs = models.get("subsystems")
+    if isinstance(subs, dict):
+        for key in subs:
+            if not isinstance(key, str):
+                continue
+            if key in DEFAULT_SUBSYSTEM_TIERS:
+                continue
+            findings.append(
+                ValidationFinding(
+                    severity="warning",
+                    subsystem=key,
+                    problem=(
+                        f"models.subsystems.{key} is not a "
+                        f"recognised subsystem; the value is ignored "
+                        f"at runtime."
+                    ),
+                    suggested_fix=UNKNOWN_SUBSYSTEM_FIX_TEMPLATE.format(
+                        known=known_csv,
+                    ),
+                )
+            )
+
+    return findings
+
+
+def _check_per_subsystem(
+    config: dict,
+    brain_kind: str,
+    available_models_per_brain: dict[str, set[str]] | None,
+) -> list[ValidationFinding]:
+    """Rules 3, 4, 5, 6 — all per-subsystem and require resolving
+    the configured tier through the brain. Bundled into one pass so
+    each subsystem is resolved exactly once.
+    """
+    findings: list[ValidationFinding] = []
+    models = config.get("models") if isinstance(config, dict) else None
+    models_section = models if isinstance(models, dict) else {}
+
+    discovered = (
+        available_models_per_brain.get(brain_kind, set())
+        if available_models_per_brain
+        else set()
+    )
+
+    for subsystem in DEFAULT_SUBSYSTEM_TIERS:
+        tier = subsystem_tier_from_config(models_section, subsystem)
+        resolved = model_for_tier_from_config(
+            models_section, brain_kind, tier,
+        )
+
+        # Rule 3: empty-string resolution. ``subsystem_tier_from_config``
+        # already filters empty strings to ``None`` so the resolved
+        # value can only be empty if some upstream code path bypasses
+        # the helper. Defense in depth.
+        if isinstance(resolved, str) and not resolved.strip():
+            findings.append(
+                ValidationFinding(
+                    severity="error",
+                    subsystem=subsystem,
+                    problem=(
+                        f"{subsystem} resolves to an empty model id."
+                    ),
+                    suggested_fix=EMPTY_TIER_FIX_TEMPLATE.format(
+                        subsystem=subsystem,
+                    ),
+                )
+            )
+            continue
+
+        # Rule 3-corollary: ``None`` resolved value means "let the
+        # brain pick its native default" — that's intentional, no
+        # finding fires for it.
+        if resolved is None:
+            continue
+
+        # Rule 4: opencode requires provider/model shape.
+        if brain_kind == "opencode" and "/" not in resolved:
+            findings.append(
+                ValidationFinding(
+                    severity="error",
+                    subsystem=subsystem,
+                    problem=(
+                        f"{subsystem} resolves to bare alias "
+                        f"{resolved!r} on opencode; the spawn would "
+                        f"fail with 'Model not found: {resolved}/.'."
+                    ),
+                    suggested_fix=OPENCODE_FORMAT_FIX_TEMPLATE.format(
+                        model_id=resolved, subsystem=subsystem,
+                    ),
+                )
+            )
+            continue
+
+        # Rule 5: claude-code with provider/model shape is suspicious.
+        if brain_kind == "claude-code" and "/" in resolved:
+            findings.append(
+                ValidationFinding(
+                    severity="warning",
+                    subsystem=subsystem,
+                    problem=(
+                        f"{subsystem} resolves to {resolved!r} "
+                        f"(provider/model shape) on claude-code; "
+                        f"unusual."
+                    ),
+                    suggested_fix=CLAUDE_CODE_FORMAT_FIX_TEMPLATE.format(
+                        model_id=resolved,
+                    ),
+                )
+            )
+            # Don't ``continue`` — rule 6 may still fire for the same
+            # subsystem if discovery is enabled. Both findings together
+            # give the user the full picture.
+
+        # Rule 6: available-models membership (advisory; only fires
+        # when discovery data is supplied).
+        if discovered and resolved not in discovered:
+            findings.append(
+                ValidationFinding(
+                    severity="warning",
+                    subsystem=subsystem,
+                    problem=(
+                        f"{subsystem} resolves to {resolved!r} but "
+                        f"that id isn't in the discovered set for "
+                        f"{brain_kind}."
+                    ),
+                    suggested_fix=UNKNOWN_MODEL_FIX_TEMPLATE.format(
+                        model_id=resolved, brain_kind=brain_kind,
+                    ),
+                )
+            )
+
+    return findings
+
+
+def _check_dead_knobs(
+    config: dict, brain_kind: str,
+) -> list[ValidationFinding]:
+    """Rule 7: dead-knob hygiene.
+
+    Generic check — for every name in ``DEFAULT_SUBSYSTEM_TIERS``
+    that has no live ``subsystem_tier(<name>)`` caller in ``core/``,
+    surface an info-level finding. Today this fires for
+    ``migration_classifier`` (the Day 9 audit finding); after the
+    cleanup pass referenced in the suggested-fix copy it would fire
+    for nothing — but the rule stays as a tripwire for "did anyone
+    re-add a knob without wiring it?" hygiene drift.
+    """
+    findings: list[ValidationFinding] = []
+    callers = _live_subsystem_callers()
+    for subsystem in sorted(DEFAULT_SUBSYSTEM_TIERS):
+        if subsystem in callers:
+            continue
+        findings.append(
+            ValidationFinding(
+                severity="info",
+                subsystem=subsystem,
+                problem=(
+                    f"{subsystem} declared in DEFAULT_SUBSYSTEM_TIERS "
+                    f"but no live spawn caller reads it."
+                ),
+                suggested_fix=DEAD_KNOB_FIX_TEMPLATE.format(
+                    subsystem=subsystem,
+                ),
+            )
+        )
+    return findings
+
+
+# ──────────────────────────────────────────────────────────────────
+# Public entry
+# ──────────────────────────────────────────────────────────────────
+
+
+def validate_models_config(
+    config: dict,
+    brain_kind: str,
+    *,
+    available_models_per_brain: dict[str, set[str]] | None = None,
+) -> list[ValidationFinding]:
+    """Run all seven rules against a config dict + brain kind.
+
+    Pure function — no disk I/O, no global state mutation (the
+    rule-7 live-callers cache is read-only after first init; tests
+    that need a fresh scan call :func:`_reset_live_callers_cache`).
+
+    Args:
+      config: the full ``~/.vexis/config.yaml`` parsed dict, OR a
+        proposed-after-this-edit dict the slash command builds before
+        committing the write. The validator doesn't care which.
+      brain_kind: the brain to validate against. The daemon passes
+        the result of ``brain_kind()`` here; the slash command
+        passes the brain that's about to be active (which may be
+        the new value if the user is changing brain.kind in the
+        same edit).
+      available_models_per_brain: optional discovery data.
+        ``{"opencode": {"anthropic/claude-haiku-3-5", ...}}``. When
+        provided, rule 6 fires; when None or empty, rule 6 is
+        silently skipped (the format-shape rules 4 and 5 still
+        fire as best-effort proxies).
+
+    Returns the findings in deterministic order: per-rule, then
+    alphabetical by subsystem within rules where it matters.
+    Stable order so the daemon log doesn't churn between starts
+    when nothing changed.
+    """
+    findings: list[ValidationFinding] = []
+    findings.extend(_check_brain_kind(config, brain_kind))
+    findings.extend(_check_known_subsystems(config, brain_kind))
+    findings.extend(
+        _check_per_subsystem(
+            config, brain_kind, available_models_per_brain,
+        )
+    )
+    findings.extend(_check_dead_knobs(config, brain_kind))
+    return findings
+
+
+def log_findings(findings: list[ValidationFinding]) -> None:
+    """Emit findings to the daemon log at severity-appropriate
+    levels. Day 1's startup wiring; Day 2+ surfaces use the
+    findings list directly.
+    """
+    for f in findings:
+        prefix = f"model_validator [{f.subsystem or '<global>'}]"
+        msg = f"{prefix}: {f.problem} | fix: {f.suggested_fix}"
+        if f.severity == "error":
+            log.error(msg)
+        elif f.severity == "warning":
+            log.warning(msg)
+        else:
+            log.info(msg)
