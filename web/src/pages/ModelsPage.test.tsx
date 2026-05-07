@@ -111,6 +111,14 @@ function buildFixture(
     },
     brain_inventory: ["claude-code", "null", "opencode"],
     global_findings: [],
+    // Day 4 additions — defaults for the read-only test cases.
+    available_models: {
+      "claude-code": ["haiku", "sonnet", "opus"],
+      opencode: [],
+      null: [],
+    },
+    has_comments: false,
+    model_ux_enabled: false,
     ...overrides,
   };
 }
@@ -164,8 +172,8 @@ describe("ModelsPage", () => {
   it("renders the brain banner with the active brain.kind", async () => {
     await renderWithFixture(buildFixture({ brain_kind: "opencode" }));
     expect(await screen.findByText("opencode")).toBeInTheDocument();
-    // Inventory list rendered too.
-    expect(screen.getByText(/available:/i)).toBeInTheDocument();
+    // Brain section header rendered.
+    expect(screen.getByText("Brain")).toBeInTheDocument();
   });
 
   // ────────────────────────────────────────────────────────────────

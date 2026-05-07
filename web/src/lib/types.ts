@@ -499,4 +499,53 @@ export interface ModelsState {
   // Whole-config findings (subsystem=null) — brain.kind validity,
   // unknown legacy keys, etc.
   global_findings: ModelValidationFinding[];
+  // ── Day 4 additions ────────────────────────────────────────
+  // Per-brain available model lists, sourced from
+  // core.model_discovery (5-min in-process cache). Used to
+  // populate the dashboard's per-row dropdowns.
+  available_models: Record<string, string[]>;
+  // True iff ~/.vexis/config.yaml currently has YAML comments.
+  // Self-managing across daemon restarts (after the first
+  // mutation comments are gone, so this stays false until the
+  // user manually re-comments). Drives the dashboard's
+  // comment-preservation confirm modal.
+  has_comments: boolean;
+  // model_ux.enabled gate; UI surfaces a disabled banner if false.
+  model_ux_enabled: boolean;
+}
+
+// ── Mutation response shapes ───────────────────────────────────
+
+export interface ModelSetResponse {
+  ok: true;
+  subsystem: string;
+  value: string;
+  resolved_tier: string | null;
+  resolved_model_id: string | null;
+  // Path of the .bak file when comment-preservation backup
+  // fired; null when skipped (no comments in current config).
+  backup_path: string | null;
+}
+
+export interface ModelResetResponse {
+  ok: true;
+  // "all subsystems" or the subsystem name reset.
+  scope: string;
+  backup_path: string | null;
+}
+
+export interface ModelBrainResponse {
+  ok: true;
+  kind: string;
+  // Always true for brain.kind changes — read-once at startup.
+  restart_required: boolean;
+  // Preview-mode validator findings against the proposed brain.
+  // Surfaced informationally; the write proceeded regardless.
+  warnings: ModelValidationFinding[];
+  backup_path: string | null;
+}
+
+export interface ModelDiscoveryRefreshResponse {
+  ok: true;
+  available_models: Record<string, string[]>;
 }

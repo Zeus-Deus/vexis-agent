@@ -14,6 +14,10 @@ import type {
   LearningJudgeResult,
   LearningState,
   MemoryState,
+  ModelBrainResponse,
+  ModelDiscoveryRefreshResponse,
+  ModelResetResponse,
+  ModelSetResponse,
   ModelsState,
   RelationshipsCandidatesState,
   RelationshipsLiveState,
@@ -172,6 +176,19 @@ export const api = {
   tailscale: (token: string) => call<TailscaleStatus>(token, "/tailscale/status"),
   goals: (token: string) => call<GoalsState>(token, "/goals"),
   models: (token: string) => call<ModelsState>(token, "/models"),
+  setModel: (
+    token: string,
+    body: { subsystem: string; value: string },
+  ) =>
+    call<ModelSetResponse>(token, "/models/set", { method: "POST", body }),
+  resetModel: (token: string, body: { subsystem?: string } = {}) =>
+    call<ModelResetResponse>(token, "/models/reset", { method: "POST", body }),
+  setBrain: (token: string, body: { kind: string }) =>
+    call<ModelBrainResponse>(token, "/models/brain", { method: "POST", body }),
+  refreshModelDiscovery: (token: string) =>
+    call<ModelDiscoveryRefreshResponse>(
+      token, "/models/discovery/refresh", { method: "POST" },
+    ),
   pauseGoal: (token: string) =>
     call<GoalRecord>(token, "/goals/pause", { method: "POST" }),
   resumeGoal: (token: string) =>
