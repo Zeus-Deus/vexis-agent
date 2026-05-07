@@ -27,7 +27,7 @@ session — a single injection payload that lands here is permanent.
 The pattern list is small and biased toward jailbreak phrases, lifted
 verbatim from Hermes (12 regex + invisible-unicode guard).
 
-Frozen-snapshot pattern (in brains/claude_code.py):
+Frozen-snapshot pattern (in core/brain/claude_code.py):
 At session start the brain captures ``format_for_system_prompt(...)``
 once and reuses it for every turn of that session. Mid-session
 ``add`` / ``replace`` / ``remove`` mutate disk + return live state in
