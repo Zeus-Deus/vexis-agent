@@ -84,6 +84,50 @@ _NOTHING_TO_CANCEL = "Nothing to cancel — I'm not working on anything right no
 # them without rendering their own copies. The §4 command matrix in
 # `.plans/goal-command-research.md` is the source of truth for the
 # wording — drift surfaces as a test failure.
+# /model UX templates (Day 2 of model-management UX research).
+# Source-of-truth for wording: ``.plans/model-management-ux-research.md``
+# §4. Drift surfaces as test failures.
+_MODEL_DISABLED_NOTE = (
+    "/model is disabled. Set model_ux.enabled: true in "
+    "~/.vexis/config.yaml to turn it on. (Off by default until "
+    "the Day 5 dogfood pass clears.)"
+)
+_MODEL_USAGE = (
+    "/model — show current resolution\n"
+    "/model list — enumerate subsystems + brains\n"
+    "/model list <brain> — list models for that brain\n"
+    "/model set brain <name> — change brain.kind (restart required)\n"
+    "/model set <subsystem> <tier-or-name> — set subsystem assignment\n"
+    "/model reset [<subsystem>] — back to defaults"
+)
+_MODEL_INVALID_BRAIN_KIND_TMPL = (
+    "Won't write — '{kind}' is not a valid brain.kind. "
+    "Use one of: claude-code, opencode, null."
+)
+_MODEL_VALIDATOR_ERROR_TMPL = (
+    "Won't write — validator rejected the proposed config:\n"
+    "{problems}\n"
+    "Fix and re-try, or /model status verbose for the full report."
+)
+_MODEL_SET_OK_TMPL = (
+    "✓ {key} → {value} (resolves to {resolved} on {brain})\n"
+    "Takes effect on the next {key} call."
+)
+_MODEL_SET_BRAIN_OK_TMPL = (
+    "✓ brain.kind → {kind}\n"
+    "⚠ Restart vexis to take effect (e.g. systemctl --user "
+    "restart vexis-agent). brain.kind is read once at startup."
+)
+_MODEL_RESET_OK_TMPL = (
+    "✓ Reset {scope}. New resolution table available via /model."
+)
+_MODEL_BACKUP_REPLY_TMPL = (
+    "📋 Backed up commented config to ~/.vexis/config.yaml.bak. "
+    "Future edits won't re-back-up until you re-add comments to "
+    "your config."
+)
+
+
 _GOAL_DISABLED_NOTE = (
     "/goal is disabled. Set goals.enabled: true in ~/.vexis/config.yaml "
     "to turn it on."
@@ -377,6 +421,7 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("curator", self._on_curator))
         self._app.add_handler(CommandHandler("learning", self._on_learning))
         self._app.add_handler(CommandHandler("goal", self._on_goal))
+        self._app.add_handler(CommandHandler("model", self._on_model))
         self._app.add_handler(CommandHandler("dashboard", self._on_dashboard))
         self._app.add_handler(CommandHandler("tailscale", self._on_tailscale))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
@@ -1229,6 +1274,296 @@ class TelegramTransport:
         await self._dispatch_to_brain(
             msg.get_bot(), msg.chat_id, user.id, goal_text
         )
+
+    async def _on_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Dispatch /model [status|list|set|reset|...].
+
+        Day 2 of model-management UX. Behind ``model_ux_enabled()``
+        — flag default off until Day 5 dogfood. Even with the flag
+        off, the spawn-site BrainModelNotFoundError backstop fires
+        regardless because it's catching real errors that should
+        always have actionable messaging.
+
+        Subcommand grammar (per
+        ``.plans/model-management-ux-research.md`` §4):
+
+          /model                   show current resolution table
+          /model status            same as bare /model
+          /model list              enumerate subsystems + brains
+          /model list <brain>      list models for that brain
+          /model set brain <name>  change brain.kind (restart req)
+          /model set <name> <val>  set per-subsystem assignment
+          /model reset             reset all subsystems to defaults
+          /model reset <name>      reset one subsystem
+
+        Every ``set`` runs the validator pre-write; refuses to
+        write on error-severity findings. Every write runs the
+        comment-presence-gated backup helper before the atomic
+        rewrite — preserves user-curated comments in
+        ``~/.vexis/config.yaml.bak`` (self-managing across daemon
+        restarts; see core/yaml_config_writer.py).
+        """
+        from core.model_validator import (
+            validate_models_config,
+        )
+        from core.yaml_config import (
+            DEFAULT_SUBSYSTEM_TIERS,
+            VALID_BRAIN_KINDS,
+            _read_raw,
+            brain_kind,
+            model_for_tier_from_config,
+            model_ux_enabled,
+            subsystem_tier_from_config,
+        )
+        from core.yaml_config_writer import (
+            atomic_write_yaml,
+            backup_if_commented,
+        )
+        from core.paths import vexis_dir
+
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /model from user_id=%s", user.id)
+            return
+
+        if not model_ux_enabled():
+            await msg.reply_text(_MODEL_DISABLED_NOTE)
+            return
+
+        args = ctx.args or []
+        sub = args[0].lower() if args else "status"
+
+        # ── status ─────────────────────────────────────────────
+        if sub == "status":
+            await msg.reply_text(self._model_status_text())
+            return
+
+        # ── list ───────────────────────────────────────────────
+        if sub == "list":
+            target_brain = args[1] if len(args) > 1 else None
+            await msg.reply_text(self._model_list_text(target_brain))
+            return
+
+        # ── reset ──────────────────────────────────────────────
+        if sub == "reset":
+            target = args[1] if len(args) > 1 else None
+            cfg_path = vexis_dir() / "config.yaml"
+            backup_msg = ""
+            if cfg_path.exists():
+                bak = backup_if_commented(cfg_path)
+                if bak is not None:
+                    backup_msg = "\n" + _MODEL_BACKUP_REPLY_TMPL
+            current = _read_raw()
+            models = dict(current.get("models") or {})
+            if target is None:
+                # Reset every subsystem assignment (legacy + new schema)
+                # but leave models.tiers and models.brain alone.
+                models.pop("subsystems", None)
+                for sub_name in list(models):
+                    if sub_name in DEFAULT_SUBSYSTEM_TIERS:
+                        models.pop(sub_name)
+                scope = "all subsystems"
+            else:
+                if target not in DEFAULT_SUBSYSTEM_TIERS:
+                    await msg.reply_text(
+                        f"Unknown subsystem '{target}'. Known: "
+                        f"{', '.join(sorted(DEFAULT_SUBSYSTEM_TIERS))}"
+                    )
+                    return
+                # Pop both the legacy and the new-schema slots.
+                models.pop(target, None)
+                subs_block = models.get("subsystems")
+                if isinstance(subs_block, dict):
+                    subs_block.pop(target, None)
+                    if not subs_block:
+                        models.pop("subsystems", None)
+                scope = target
+            new_cfg = {**current, "models": models}
+            if not models:
+                new_cfg.pop("models", None)
+            atomic_write_yaml(cfg_path, new_cfg)
+            await msg.reply_text(
+                _MODEL_RESET_OK_TMPL.format(scope=scope) + backup_msg
+            )
+            return
+
+        # ── set ────────────────────────────────────────────────
+        if sub == "set":
+            if len(args) < 3:
+                await msg.reply_text(_MODEL_USAGE)
+                return
+            key = args[1].lower()
+            value = args[2]
+
+            cfg_path = vexis_dir() / "config.yaml"
+            current = _read_raw()
+
+            # Special case: /model set brain <name>
+            if key == "brain":
+                # Policy refusal on invalid kind even though the
+                # validator's rule 1 only warns (severity matches
+                # daemon fallback). Typos here are user-hostile to
+                # recover from — the user thinks they switched but
+                # didn't.
+                if value not in VALID_BRAIN_KINDS:
+                    await msg.reply_text(
+                        _MODEL_INVALID_BRAIN_KIND_TMPL.format(kind=value)
+                    )
+                    return
+                # Backup → write → reply with restart-required note.
+                backup_msg = ""
+                if cfg_path.exists():
+                    bak = backup_if_commented(cfg_path)
+                    if bak is not None:
+                        backup_msg = "\n" + _MODEL_BACKUP_REPLY_TMPL
+                brain_block = dict(current.get("brain") or {})
+                brain_block["kind"] = value
+                new_cfg = {**current, "brain": brain_block}
+                atomic_write_yaml(cfg_path, new_cfg)
+                await msg.reply_text(
+                    _MODEL_SET_BRAIN_OK_TMPL.format(kind=value) + backup_msg
+                )
+                return
+
+            # Per-subsystem set — write to models.subsystems.<key> = value.
+            if key not in DEFAULT_SUBSYSTEM_TIERS:
+                await msg.reply_text(
+                    f"Unknown subsystem '{key}'. Known: "
+                    f"{', '.join(sorted(DEFAULT_SUBSYSTEM_TIERS))}"
+                )
+                return
+
+            # Build the proposed config and run validator pre-write.
+            proposed = self._proposed_set_subsystem(current, key, value)
+            findings = validate_models_config(proposed, brain_kind())
+            errors = [f for f in findings if f.severity == "error"]
+            if errors:
+                problems = "\n".join(
+                    f"  • [{f.subsystem or '<global>'}] "
+                    f"{f.problem}\n    → {f.suggested_fix}"
+                    for f in errors
+                )
+                await msg.reply_text(
+                    _MODEL_VALIDATOR_ERROR_TMPL.format(problems=problems)
+                )
+                return
+
+            # Validator clean → backup → write → reply.
+            backup_msg = ""
+            if cfg_path.exists():
+                bak = backup_if_commented(cfg_path)
+                if bak is not None:
+                    backup_msg = "\n" + _MODEL_BACKUP_REPLY_TMPL
+            atomic_write_yaml(cfg_path, proposed)
+
+            # Resolve what the new value actually maps to so the
+            # reply tells the user what their next call will use.
+            resolved = model_for_tier_from_config(
+                proposed.get("models"),
+                brain_kind(),
+                subsystem_tier_from_config(proposed.get("models"), key),
+            )
+            await msg.reply_text(
+                _MODEL_SET_OK_TMPL.format(
+                    key=key, value=value,
+                    resolved=resolved or "<brain default>",
+                    brain=brain_kind(),
+                ) + backup_msg
+            )
+            return
+
+        # Unknown subcommand → usage.
+        await msg.reply_text(_MODEL_USAGE)
+
+    @staticmethod
+    def _proposed_set_subsystem(
+        current: dict, subsystem: str, value: str,
+    ) -> dict:
+        """Build the proposed config dict for ``/model set <name>
+        <value>``. Pure function; the writer never sees a partial
+        edit."""
+        models = dict(current.get("models") or {})
+        subs = dict(models.get("subsystems") or {})
+        subs[subsystem] = value
+        models["subsystems"] = subs
+        return {**current, "models": models}
+
+    def _model_status_text(self) -> str:
+        """Render the current resolution table for ``/model``
+        (bare) and ``/model status``."""
+        from core.model_validator import validate_models_config
+        from core.yaml_config import (
+            DEFAULT_SUBSYSTEM_TIERS,
+            _read_raw,
+            brain_kind,
+            model_for_tier_from_config,
+            subsystem_tier_from_config,
+        )
+
+        cfg = _read_raw()
+        kind = brain_kind()
+        models = cfg.get("models") or {}
+        lines = [f"Current resolution (brain: {kind}):"]
+        max_name = max(len(n) for n in DEFAULT_SUBSYSTEM_TIERS)
+        for name in sorted(DEFAULT_SUBSYSTEM_TIERS):
+            tier = subsystem_tier_from_config(models, name)
+            resolved = model_for_tier_from_config(models, kind, tier)
+            tier_str = tier or "default"
+            resolved_str = resolved or "<brain default>"
+            lines.append(
+                f"  {name.ljust(max_name)}  {tier_str:<8} → {resolved_str}"
+            )
+        findings = validate_models_config(cfg, kind)
+        non_info = [f for f in findings if f.severity != "info"]
+        if non_info:
+            lines.append("")
+            lines.append(f"Validator: {len(non_info)} issue(s):")
+            for f in non_info:
+                lines.append(
+                    f"  ⚠ [{f.subsystem or '<global>'}] {f.problem}"
+                )
+        return "\n".join(lines)
+
+    def _model_list_text(self, target_brain: str | None) -> str:
+        """Render ``/model list`` (subsystems + brains) or
+        ``/model list <brain>`` (per-brain model hints)."""
+        from core.yaml_config import (
+            DEFAULT_SUBSYSTEM_TIERS,
+            VALID_BRAIN_KINDS,
+        )
+
+        if target_brain is None:
+            lines = ["Subsystems:"]
+            for name in sorted(DEFAULT_SUBSYSTEM_TIERS):
+                lines.append(f"  • {name} (default tier: {DEFAULT_SUBSYSTEM_TIERS[name]})")
+            lines.append("")
+            lines.append("Brains:")
+            for k in sorted(VALID_BRAIN_KINDS):
+                lines.append(f"  • {k}")
+            lines.append("")
+            lines.append("Per-brain model lists: /model list <brain>")
+            return "\n".join(lines)
+
+        if target_brain == "claude-code":
+            return (
+                "claude-code accepts:\n"
+                "  Aliases: sonnet, opus, haiku\n"
+                "  Full names: claude-haiku-4-5, claude-sonnet-4-6, "
+                "claude-opus-4-1, etc.\n"
+                "  Reference: https://docs.anthropic.com/claude/models"
+            )
+        if target_brain == "opencode":
+            return (
+                "opencode accepts ~270 models across ~20 providers.\n"
+                "Format: provider/model (e.g. anthropic/claude-haiku-3-5).\n"
+                "Run `opencode models` in a shell to see the live list.\n"
+                "Day 4 will surface the dashboard picker; for now, the "
+                "shell is the discovery path."
+            )
+        return f"Unknown brain '{target_brain}'. Known: {', '.join(sorted(VALID_BRAIN_KINDS))}"
 
     async def _run_goal_hook(self, bot, chat_id: int, last_response: str) -> None:
         """After-each-turn hook called inside ``_drain_chat``.
