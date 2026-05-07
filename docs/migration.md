@@ -10,6 +10,15 @@ abstraction shipped opencode as opt-in; the claude-code path is
 byte-equivalent to pre-Phase-C behaviour. If you didn't change
 anything, nothing changed.
 
+> **Day 5 of model UX (post-rollout)**: the `/model` slash
+> command and the dashboard's Models tab now drive brain
+> switches and per-subsystem assignments. The YAML-edit-and-
+> restart recipe below still works but is no longer required.
+> See [`docs/model-ux.md`](model-ux.md) for the recommended
+> path. The both-brains-in-one-config recipe in this doc is
+> still the right answer for users who flip back and forth
+> frequently.
+
 ## Opting into opencode
 
 1. **Install opencode**:

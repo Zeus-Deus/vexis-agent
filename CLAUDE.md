@@ -399,3 +399,13 @@ End-user docs: `docs/brains.md` (per-brain reference),
 `docs/migration.md` (opt-in / opt-out flow + the legacy-keys
 migration recipe), `docs/dogfood-checklist.md` (12 manual
 flows that gate "ready for daily use" on a fresh install).
+
+**Model UX shipped.** The deferred `/model` slash + dashboard
+work referenced above landed in 5 days
+(.plans/model-management-ux-research.md). `model_ux.enabled`
+default flipped to `true` at Day 5 close. Brain switching and
+per-subsystem model assignment are now first-class UX surfaces;
+the YAML-edit-and-restart workflow remains supported but is no
+longer required. See `docs/model-ux.md` for the resolution
+table, hot-reload-vs-restart matrix, validator + spawn-site
+backstop, and the comment-preservation backup mechanism.
