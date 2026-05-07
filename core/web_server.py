@@ -1038,6 +1038,19 @@ class WebDashboard:
         async def post_goals_clear() -> dict:
             return await self._goals_clear()
 
+        # ----- /api/v1/models — Day 3 of model UX -----
+        # Read-only resolution table backing the dashboard's
+        # Models tab. Day 4 will add POST endpoints for edits.
+        # Until then this endpoint is the dashboard's only data
+        # source; the slash command (Day 2) is the only mutation
+        # surface and is flag-gated behind ``model_ux.enabled``.
+        @app.get(
+            "/api/v1/models",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_models() -> dict:
+            return await asyncio.to_thread(self._models_payload)
+
         # ----- frontend bootstrap -----
 
         index_html = self._config.web_dist / "index.html"
@@ -1493,6 +1506,46 @@ class WebDashboard:
                 for sid, state in history_pairs
             ],
         }
+
+    def _models_payload(self) -> dict:
+        """Day 3 of model UX — read-only resolution table for the
+        dashboard's Models tab.
+
+        Delegates to ``core.model_validator.build_resolution_table``
+        which is the single source of truth shared with the slash
+        command's ``/model status`` text rendering. The contract
+        test in ``tests/test_models_api.py`` pins that both surfaces
+        return byte-identical per-subsystem resolution data.
+
+        Graceful degradation: if config parsing fails (corrupt
+        ``~/.vexis/config.yaml``), the validator still runs against
+        the empty fallback dict ``yaml_config._read_raw`` returns
+        and the dashboard surfaces a clean default-state table
+        rather than 500-ing. Validator findings (which include the
+        config-parse failure context if any) carry the diagnostic.
+        """
+        from core.model_validator import build_resolution_table
+        from core.yaml_config import _read_raw, brain_kind
+        try:
+            cfg = _read_raw()
+            kind = brain_kind()
+            return build_resolution_table(cfg, kind)
+        except Exception:
+            log.exception("models payload build failed; returning empty fallback")
+            # Defensive: return an empty-but-shaped table so the
+            # dashboard renders a clean error state instead of 500.
+            return {
+                "brain_kind": "claude-code",
+                "subsystems": [],
+                "tier_overrides": {},
+                "brain_inventory": [],
+                "global_findings": [{
+                    "severity": "error",
+                    "subsystem": None,
+                    "problem": "models payload build failed; see daemon log",
+                    "suggested_fix": "check daemon log for stack trace",
+                }],
+            }
 
     def _build_goal_manager(self, session_uuid: str):
         """Construct a GoalManager bound to the live store.

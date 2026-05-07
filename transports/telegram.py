@@ -1493,37 +1493,46 @@ class TelegramTransport:
 
     def _model_status_text(self) -> str:
         """Render the current resolution table for ``/model``
-        (bare) and ``/model status``."""
-        from core.model_validator import validate_models_config
+        (bare) and ``/model status``.
+
+        Pulls structured data from ``build_resolution_table`` —
+        the same helper the dashboard's GET /api/v1/models endpoint
+        consumes. Renders to plain text. The contract test in
+        ``tests/test_models_api.py`` pins that the slash text and
+        the dashboard JSON expose the same per-subsystem
+        resolution data byte-for-byte (catches drift before it
+        ships).
+        """
+        from core.model_validator import build_resolution_table
         from core.yaml_config import (
             DEFAULT_SUBSYSTEM_TIERS,
             _read_raw,
             brain_kind,
-            model_for_tier_from_config,
-            subsystem_tier_from_config,
         )
 
-        cfg = _read_raw()
-        kind = brain_kind()
-        models = cfg.get("models") or {}
+        table = build_resolution_table(_read_raw(), brain_kind())
+        kind = table["brain_kind"]
         lines = [f"Current resolution (brain: {kind}):"]
         max_name = max(len(n) for n in DEFAULT_SUBSYSTEM_TIERS)
-        for name in sorted(DEFAULT_SUBSYSTEM_TIERS):
-            tier = subsystem_tier_from_config(models, name)
-            resolved = model_for_tier_from_config(models, kind, tier)
-            tier_str = tier or "default"
-            resolved_str = resolved or "<brain default>"
+        for row in table["subsystems"]:
+            tier_str = row["resolved_tier"] or "default"
+            resolved_str = row["resolved_model_id"] or "<brain default>"
             lines.append(
-                f"  {name.ljust(max_name)}  {tier_str:<8} → {resolved_str}"
+                f"  {row['name'].ljust(max_name)}  "
+                f"{tier_str:<8} → {resolved_str}"
             )
-        findings = validate_models_config(cfg, kind)
-        non_info = [f for f in findings if f.severity != "info"]
+        non_info = [
+            f for f in (table["global_findings"] + [
+                f for row in table["subsystems"] for f in row["findings"]
+            ])
+            if f["severity"] != "info"
+        ]
         if non_info:
             lines.append("")
             lines.append(f"Validator: {len(non_info)} issue(s):")
             for f in non_info:
                 lines.append(
-                    f"  ⚠ [{f.subsystem or '<global>'}] {f.problem}"
+                    f"  ⚠ [{f['subsystem'] or '<global>'}] {f['problem']}"
                 )
         return "\n".join(lines)
 

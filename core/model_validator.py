@@ -539,6 +539,160 @@ def validate_models_config(
     return findings
 
 
+def build_resolution_table(
+    config: dict,
+    brain_kind: str,
+    *,
+    available_models_per_brain: dict[str, set[str]] | None = None,
+) -> dict:
+    """Single source of truth for the resolution-table data the
+    ``/model status`` slash command, the ``GET /api/v1/models``
+    endpoint, and the dashboard Models tab all consume.
+
+    Both the slash command's text rendering and the API endpoint's
+    JSON response derive from this dict. The contract test in
+    ``tests/test_models_api.py`` pins the per-subsystem resolution
+    data byte-for-byte across both surfaces — drift surfaces as a
+    test failure.
+
+    Returns a structured dict keyed for JSON serialisation:
+
+    .. code-block:: python
+
+        {
+            "brain_kind": "claude-code",
+            "subsystems": [
+                {
+                    "name": "curator",
+                    "configured": "small",   # raw value or None
+                    "resolved_tier": "small",
+                    "resolved_model_id": "haiku",
+                    "findings": [...],       # findings for this subsystem
+                },
+                ...
+            ],
+            "tier_overrides": {
+                "tiny":   {"configured": None,    "default": "haiku"},
+                "small":  {"configured": None,    "default": "haiku"},
+                "medium": {"configured": "opus",  "default": "sonnet"},
+                "large":  {"configured": None,    "default": "sonnet"},
+            },
+            "brain_inventory": ["claude-code", "null", "opencode"],
+            "global_findings": [...],   # whole-config findings (subsystem=None)
+        }
+
+    Findings are emitted as plain dicts (severity/subsystem/problem/
+    suggested_fix) rather than ValidationFinding instances so the
+    payload serialises cleanly.
+
+    Args same as :func:`validate_models_config`.
+    """
+    models_section = (
+        config.get("models") if isinstance(config, dict) else None
+    )
+    if not isinstance(models_section, dict):
+        models_section = {}
+
+    findings = validate_models_config(
+        config, brain_kind,
+        available_models_per_brain=available_models_per_brain,
+    )
+
+    # Bucket findings by subsystem so per-row payloads carry only
+    # their own findings; whole-config findings (subsystem=None) go
+    # into the top-level global_findings list.
+    by_subsystem: dict[str | None, list[ValidationFinding]] = {}
+    for f in findings:
+        by_subsystem.setdefault(f.subsystem, []).append(f)
+
+    def _finding_dict(f: ValidationFinding) -> dict:
+        return {
+            "severity": f.severity,
+            "subsystem": f.subsystem,
+            "problem": f.problem,
+            "suggested_fix": f.suggested_fix,
+        }
+
+    subs_block = models_section.get("subsystems") if isinstance(
+        models_section, dict
+    ) else None
+    subs_block_dict = subs_block if isinstance(subs_block, dict) else {}
+
+    subsystem_rows: list[dict] = []
+    for name in sorted(DEFAULT_SUBSYSTEM_TIERS):
+        # Configured value: NEW schema wins over legacy raw-string.
+        configured: str | None = None
+        v = subs_block_dict.get(name)
+        if isinstance(v, str) and v.strip():
+            configured = v.strip()
+        else:
+            v = models_section.get(name)
+            if isinstance(v, str) and v.strip():
+                configured = v.strip()
+
+        resolved_tier = subsystem_tier_from_config(models_section, name)
+        resolved_model_id = model_for_tier_from_config(
+            models_section, brain_kind, resolved_tier,
+        )
+
+        subsystem_rows.append({
+            "name": name,
+            "configured": configured,
+            "resolved_tier": resolved_tier,
+            "resolved_model_id": resolved_model_id,
+            "findings": [
+                _finding_dict(f) for f in by_subsystem.get(name, [])
+            ],
+        })
+
+    # Tier overrides per the configured brain. Computed against the
+    # built-in default map so the payload tells the user "you set X
+    # vs the default Y." Only the active brain's overrides surface
+    # — the dashboard's tier-override editor (Day 4) will handle the
+    # cross-brain case via per-tab tabs.
+    tier_overrides: dict[str, dict[str, str | None]] = {}
+    default_map: dict[str, str] = {}
+    if brain_kind == "claude-code":
+        from core.yaml_config import DEFAULT_TIER_MAP_CLAUDE_CODE
+        default_map = DEFAULT_TIER_MAP_CLAUDE_CODE
+    elif brain_kind == "opencode":
+        from core.yaml_config import DEFAULT_TIER_MAP_OPENCODE
+        default_map = DEFAULT_TIER_MAP_OPENCODE
+
+    tiers_section = models_section.get("tiers") if isinstance(
+        models_section, dict
+    ) else None
+    brain_tier_block = (
+        tiers_section.get(brain_kind) if isinstance(tiers_section, dict) else None
+    )
+    brain_tier_block = (
+        brain_tier_block if isinstance(brain_tier_block, dict) else {}
+    )
+    for tier in ("tiny", "small", "medium", "large"):
+        v = brain_tier_block.get(tier)
+        configured_override: str | None = (
+            v.strip() if isinstance(v, str) and v.strip() else None
+        )
+        tier_overrides[tier] = {
+            "configured": configured_override,
+            "default": default_map.get(tier),
+        }
+
+    # Whole-config findings (subsystem=None) — brain.kind validity,
+    # unknown-legacy-key warnings, etc.
+    global_findings = [
+        _finding_dict(f) for f in by_subsystem.get(None, [])
+    ]
+
+    return {
+        "brain_kind": brain_kind,
+        "subsystems": subsystem_rows,
+        "tier_overrides": tier_overrides,
+        "brain_inventory": sorted(VALID_BRAIN_KINDS),
+        "global_findings": global_findings,
+    }
+
+
 def log_findings(findings: list[ValidationFinding]) -> None:
     """Emit findings to the daemon log at severity-appropriate
     levels. Day 1's startup wiring; Day 2+ surfaces use the
