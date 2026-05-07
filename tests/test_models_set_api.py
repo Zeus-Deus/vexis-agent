@@ -131,8 +131,9 @@ def test_post_set_requires_token(client: TestClient):
 def test_post_set_disabled_when_flag_off(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    """Without overriding model_ux_enabled, the endpoint refuses
-    with 403."""
+    """Explicitly setting model_ux_enabled=False refuses
+    mutations with 403. Day 5 default-flipped to True; this test
+    covers users who keep the explicit opt-out."""
     cfg_dir = tmp_path / "vexis"
     cfg_dir.mkdir()
     monkeypatch.setattr("core.paths.vexis_dir", lambda: cfg_dir)
@@ -140,7 +141,11 @@ def test_post_set_disabled_when_flag_off(
     monkeypatch.setattr(
         "core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
     )
-    # Don't override model_ux_enabled here — default is False.
+    # Force model_ux_enabled False explicitly. Day 5 default
+    # flipped to True so this test pins the explicit opt-out.
+    monkeypatch.setattr(
+        "core.yaml_config.model_ux_enabled", lambda: False,
+    )
 
     dashboard = WebDashboard.__new__(WebDashboard)
     dashboard._workspace = tmp_path  # type: ignore[attr-defined]
@@ -456,7 +461,11 @@ def test_post_discovery_refresh_not_flag_gated(
     monkeypatch.setattr(
         "core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
     )
-    # Don't override model_ux_enabled — stays False.
+    # Force model_ux_enabled False explicitly so this test
+    # exercises the "flag off" case post-Day-5 default flip.
+    monkeypatch.setattr(
+        "core.yaml_config.model_ux_enabled", lambda: False,
+    )
     dashboard = WebDashboard.__new__(WebDashboard)
     dashboard._workspace = tmp_path  # type: ignore[attr-defined]
     dashboard._token = _TOKEN  # type: ignore[attr-defined]

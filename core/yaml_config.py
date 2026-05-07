@@ -101,12 +101,16 @@ DEFAULT_LEARNING_MAX_ENTRIES_PER_SESSION = 2
 # ``core.goal_state.DEFAULT_MAX_TURNS``.
 DEFAULT_GOALS_ENABLED = True
 DEFAULT_GOALS_MAX_TURNS = 20
-# /model UX feature flag. Default off — Day 2 lands the slash
-# command + spawn-site backstop, but the slash is gated behind
-# this flag until Day 5 dogfood clears. The backstop fires
-# regardless of the flag because it's catching real spawn errors
-# that should always have actionable messaging.
-DEFAULT_MODEL_UX_ENABLED = False
+# /model UX feature flag. Default ON since Day 5 (the rollout
+# close after dogfood cleared). The slash command + dashboard
+# edit affordances are first-class production surfaces; the
+# YAML-edit-and-restart workflow remains supported but is no
+# longer required. Set ``model_ux.enabled: false`` in
+# ``~/.vexis/config.yaml`` to silence both surfaces explicitly.
+# The spawn-site BrainModelNotFoundError backstop fires
+# regardless of this flag because it's catching real spawn
+# errors that should always have actionable messaging.
+DEFAULT_MODEL_UX_ENABLED = True
 # Day 4 v2 calibration: raised from 280 → 400. Day 4 eval surfaced
 # the LLM consistently producing 290-340 char lessons for technical
 # content (multilingual RAG, cinema-time-bound, code-review brevity).
@@ -320,15 +324,14 @@ def learning_triage_enabled() -> bool:
 def model_ux_enabled() -> bool:
     """``/model`` slash command + dashboard tab feature gate.
 
-    Default OFF (Day 2 lands the slash command but flag-gated
-    until Day 5 dogfood clears). The spawn-site
+    Default ON since Day 5 (rollout close). The spawn-site
     ``BrainModelNotFoundError`` backstop fires regardless of this
     flag because it's catching real spawn errors that should
     always have actionable messaging — the flag only gates the
     user-facing UX surfaces (slash + dashboard).
 
-    Override via ``model_ux.enabled: true`` in
-    ``~/.vexis/config.yaml``.
+    Override via ``model_ux.enabled: false`` in
+    ``~/.vexis/config.yaml`` to silence both surfaces explicitly.
     """
     raw = _section("model_ux").get("enabled", DEFAULT_MODEL_UX_ENABLED)
     return bool(raw)
