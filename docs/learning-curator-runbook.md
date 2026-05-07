@@ -1,9 +1,65 @@
 # Learning curator — operational runbook
 
-Operational reference for the v2 learning curator: shadow-mode flip,
-migration from v1, audit surfaces, eval gate. Standing design facts
-live in `CLAUDE.md` and `.plans/learning-curator-v2-research.md`;
-this file holds the runtime / one-time recipes.
+Operational reference for the v2 learning curator: recursion
+guard, shadow-mode flip, two-tier review, coherence curator
+(v3a), migration from v1, audit surfaces, eval gate. Standing
+design facts live in `CLAUDE.md` and
+`.plans/learning-curator-v2-research.md`; this file holds the
+runtime / one-time recipes.
+
+## Recursion guard
+
+Each `claude -p` review fork writes a NEW session JSONL into
+the same projects directory the curator scans for
+eligibility — so without protections the curator would review
+its own reviews on the next tick. Four mechanisms keep that
+from happening:
+
+1. **Persistent spawned-UUIDs registry** at
+   `~/.vexis/learning/spawned.json`. Every review fork's
+   session UUID is appended before the spawn returns;
+   `list_eligible_sessions` unions this with the in-memory set
+   so a daemon restart doesn't drop the exclusion list.
+
+2. **Content-prefix filter.** `list_eligible_sessions` opens
+   each candidate JSONL and skips any whose first user message
+   starts with `CURATOR_REVIEW_PROMPT_PREFIX`. This is the
+   load-bearing filter — env vars set on the spawn (e.g.
+   `VEXIS_CURATOR=1`, `VEXIS_GOAL_JUDGE=1`) are forensic-only
+   markers for audit logs; no curator code path reads them for
+   filtering. The unit test `test_curator_prompt_invariant`
+   asserts that the rendered prompt actually starts with the
+   constant, so future prompt edits surface a test failure
+   rather than a silent filter regression.
+
+3. **Max-attempts cap** at `MAX_REVIEW_FAILURES=3`. After three
+   consecutive failures the curator pins the session's
+   `last_message_at_review_time` so the eligibility gate
+   filters it until the user adds new content (which advances
+   the JSONL's `last_message_timestamp` past the pinned
+   snapshot, reopening eligibility). Bounds runaway retry
+   loops on transcripts the verifier consistently rejects.
+
+4. **Single-instance PID lock** at `~/.vexis/daemon.pid`
+   (acquired in `main.acquire_daemon_lock` before any work).
+   Two concurrent daemons can't fan out into each other's
+   spawns; the second startup exits 2 with a clear pointer to
+   the live PID.
+
+### Cleanup
+
+`scripts/clean_curator_jsonls.py` (dry-run by default,
+`--apply` to act) moves curator-owned JSONLs out of a
+workspace's projects directory and into a timestamped archive
+under `~/.vexis/learning/curator-jsonl-archive/`. Use this if
+you're cleaning up after a historical recursion event — the
+four mechanisms above prevent recurrence on a fresh install.
+
+Postmortem on the May 2026 fanout that motivated the four
+mechanisms (in-memory-only registry didn't survive daemon
+restart; 2,165 of 2,207 JSONLs in the workspace projects dir
+were curator-owned reviews of past curator reviews):
+`.plans/learning-curator-recursion-fix.md`.
 
 ## Shadow mode
 
@@ -54,6 +110,51 @@ Failure modes:
 The audit trail records `triage_skipped` and `triage_result`
 (`YES` / `NO` / `FAIL_OPEN` / `ERROR` / `DISABLED`) per session so
 parse-failure rates and quality drift are visible in `run.json`.
+
+## Coherence curator (v3a)
+
+Third curator. Runs inline inside the learning curator's tick:
+for every verified lesson, a `claude -p` "judge" call decides
+whether the lesson body is properly grounded in the cited
+evidence string. **Advisory-only — never blocks a write.**
+
+Three verdicts:
+
+- **COHERENT** — silent; no annotation written.
+- **NEAR_MISS_REVIEW** — soft annotation in the shadow file,
+  so borderline cases stay auditable.
+- **INCOHERENT** — hard `Coherence: FLAGGED (<reason>)`
+  annotation in the shadow file.
+
+### Five surfaces
+
+1. **Inline `Coherence:` line** in `MEMORY-SHADOW.md` /
+   `USER-SHADOW.md` / staged `SKILL.md` entries. The
+   annotation travels with the lesson.
+2. **`## Coherence flags` section in per-tick `REPORT.md`** —
+   omitted when empty so clean ticks don't carry boilerplate.
+3. **`Coherence flags (last N tick reports):` row in
+   `/learning audit`** — Telegram surface for at-a-glance
+   tracking.
+4. **`summary.coherence = {flagged, near_miss, by_reason}` in
+   `run.json`** — machine-readable for the dashboard's
+   Learning tab.
+5. **`/learning coherence-audit [--shadow-only]`** — re-judge
+   already-promoted entries on demand. Degraded mode (no
+   transcript context); useful for periodic sweeps over the
+   live MEMORY / USER / SKILLS to catch drift the original
+   judge missed.
+
+Configuration knobs in `~/.vexis/config.yaml`:
+
+```yaml
+models:
+  coherence_judge: sonnet  # default; tier 'small' on the
+                           # new schema (legacy raw-string
+                           # passthrough on claude-code)
+```
+
+Full design + prompt: `.plans/coherence-curator-research.md`.
 
 ## Soak windows (recommended; from `.plans/learning-curator-v2-research.md` §3.4)
 
