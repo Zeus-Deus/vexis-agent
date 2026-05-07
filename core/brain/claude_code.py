@@ -44,6 +44,7 @@ from core.brain.base import (
     BrainCancelled,
     BrainError,
     BrainHealth,
+    BrainModelNotFoundError,
     BrainNotInstalled,
     BrainTimeoutError,
     McpServerSpec,
@@ -92,6 +93,20 @@ BRAIN_TIMEOUT_SECONDS = 1800
 # around 4 MB base64); cheap because we only ever hold one line in
 # the buffer at a time.
 _BRAIN_STREAM_LIMIT_BYTES = 32 * 1024 * 1024
+
+# Day 2 model UX: claude-code prints the bad-model diagnostic to
+# STDOUT (not stderr) and exits 1. Verified empirically:
+#   $ claude --model definitely-not-a-real-model -p "hi"
+#   exit=1, stderr=(empty)
+#   stdout: "There's an issue with the selected model
+#           (definitely-not-a-real-model). It may not exist or
+#           you may not have access to it. Run --model to pick
+#           a different model."
+# The substring below is the stable prefix; the parenthetical
+# changes per call but the leading sentence is canonical.
+_CC_MODEL_NOT_FOUND_STDOUT_MARKER = (
+    "There's an issue with the selected model"
+)
 
 # How many session UUIDs to cache system prompts for. Each entry is
 # small (a few KB), but rotations accrete over a long-running daemon
@@ -505,6 +520,7 @@ class ClaudeCodeBrain(Brain):
         env_overrides: dict[str, str] | None = None,
         allow_tools: bool = False,
         cwd: Path | None = None,
+        subsystem: str | None = None,
     ) -> AuxResult:
         """Phase B implementation. Spawns ``claude -p`` synchronously
         via :func:`subprocess.run` (wrapped in :func:`asyncio.to_thread`
@@ -570,6 +586,33 @@ class ClaudeCodeBrain(Brain):
 
             stdout = (cp.stdout or b"").decode("utf-8", errors="replace")
             stderr = (cp.stderr or b"").decode("utf-8", errors="replace")
+
+            # Day 2 model UX: spawn-site backstop. claude-code's
+            # bad-model diagnostic lands on stdout with a stable
+            # prefix; non-zero exit confirms the rejection. We
+            # raise a structured BrainModelNotFoundError carrying
+            # the same suggested_fix copy the validator emits
+            # pre-write so the caller's surface (curator log /
+            # dashboard / slash) shows the same actionable text
+            # regardless of which gate caught the condition.
+            if (
+                cp.returncode != 0
+                and _CC_MODEL_NOT_FOUND_STDOUT_MARKER in stdout
+                and model_id  # only attribute the failure when we set --model
+            ):
+                from core.model_validator import (
+                    CLAUDE_CODE_MODEL_NOT_FOUND_FIX_TEMPLATE,
+                )
+                raise BrainModelNotFoundError(
+                    subsystem=subsystem or "<unknown>",
+                    model_id=model_id,
+                    brain_kind="claude-code",
+                    suggested_fix=CLAUDE_CODE_MODEL_NOT_FOUND_FIX_TEMPLATE.format(
+                        model_id=model_id,
+                        subsystem=subsystem or "this subsystem",
+                    ),
+                )
+
             return AuxResult(
                 stdout=stdout,
                 stderr=stderr,

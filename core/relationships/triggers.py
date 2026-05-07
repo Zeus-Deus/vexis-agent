@@ -297,6 +297,7 @@ async def _classifier_call(
             timeout_seconds=CLASSIFIER_TIMEOUT_SECONDS,
             env_overrides={RELATIONSHIPS_CLASSIFIER_ENV_VAR: "1"},
             cwd=workspace,
+            subsystem="relationships_classifier",
         )
     except BrainTimeoutError:
         log.warning("relationships.classifier_subprocess_timeout")

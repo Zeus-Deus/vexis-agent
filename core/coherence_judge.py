@@ -653,6 +653,7 @@ def run_coherence_judge(
                 timeout_seconds=COHERENCE_JUDGE_TIMEOUT_SECONDS,
                 env_overrides={COHERENCE_JUDGE_ENV_VAR: "1"},
                 cwd=workspace,
+                subsystem="coherence_judge",
             )
         )
     except BrainTimeoutError:

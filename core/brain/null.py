@@ -142,6 +142,7 @@ class BrainNull(Brain):
         env_overrides: dict[str, str] | None = None,
         allow_tools: bool = False,
         cwd: Path | None = None,
+        subsystem: str | None = None,
     ) -> AuxResult:
         self._aux_records.append({
             "prompt": prompt,
@@ -150,6 +151,7 @@ class BrainNull(Brain):
             "env_overrides": dict(env_overrides) if env_overrides else None,
             "allow_tools": allow_tools,
             "cwd": cwd,
+            "subsystem": subsystem,
         })
         if self._pending_aux_exc is not None:
             exc = self._pending_aux_exc

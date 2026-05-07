@@ -1327,6 +1327,7 @@ def _run_triage(
                 timeout_seconds=LEARNING_TRIAGE_TIMEOUT_SECONDS,
                 env_overrides={RECURSION_ENV_VAR: "1"},
                 cwd=workspace,
+                subsystem="learning_triage",
             )
         )
     except BrainTimeoutError:
@@ -1495,6 +1496,7 @@ def run_review(
                 timeout_seconds=LEARNING_REVIEW_TIMEOUT_SECONDS,
                 env_overrides={RECURSION_ENV_VAR: "1"},
                 cwd=workspace,
+                subsystem="learning_review",
             )
         )
     except BrainTimeoutError:

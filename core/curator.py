@@ -412,6 +412,7 @@ def run_phase2(
                 env_overrides={"VEXIS_CURATOR": "1"},
                 allow_tools=True,  # consolidation writes files
                 cwd=workspace,
+                subsystem="curator",
             )
         )
     except BrainTimeoutError:

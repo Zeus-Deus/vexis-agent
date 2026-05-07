@@ -94,6 +94,65 @@ class BrainAuthRequired(BrainError):
     """
 
 
+class BrainModelNotFoundError(BrainError):
+    """The brain CLI rejected the configured model id at spawn time.
+
+    Day 2 of model-management UX (model UX research §4 "Spawn-site
+    error vocabulary") — the structured backstop the validator's
+    rule 4/5 catch-all relies on. The validator catches the same
+    condition pre-write at every UX surface; this exception is the
+    safety net for cases the validator missed (stale claude-code
+    discovery list, opencode discovery cache empty, validator rule
+    edge case in flight).
+
+    Per-brain detection:
+
+      - **claude-code**: stdout substring ``"There's an issue with
+        the selected model"`` AND ``returncode != 0``. Verified
+        empirically — claude-code prints the diagnostic to STDOUT
+        (not stderr) and exits 1.
+      - **opencode**: typed JSON event ``{"type":"error","error":{
+        "name":"UnknownError","data":{"message":"Model not
+        found:..."}}}`` parsed from ``opencode run --format json``
+        stdout. Verified empirically — opencode exits 0 even on
+        bad model in JSON mode; the typed event is the reliable
+        signal.
+
+    Attributes are populated by the per-brain spawn_aux on detection
+    so every consumer (curator log, dashboard error toast, slash-
+    command failure reply) shows the same actionable text the
+    validator would have shown if it'd caught the case pre-write.
+    The ``suggested_fix`` field carries the canonical copy imported
+    from ``core.model_validator``'s template constants — single
+    source of truth across validator and backstop.
+
+    This exception is NOT a subclass-of-subclass — it sits at the
+    same level as ``SessionLost`` / ``BrainAuthRequired`` because
+    the recovery semantic is distinct: caller should NOT retry
+    (the model id won't fix itself), should surface the
+    suggested_fix to the user, and should expect the same error
+    on the next spawn until the user runs ``/model set
+    <subsystem> <new-id>``.
+    """
+
+    def __init__(
+        self,
+        *,
+        subsystem: str,
+        model_id: str,
+        brain_kind: str,
+        suggested_fix: str,
+    ) -> None:
+        self.subsystem = subsystem
+        self.model_id = model_id
+        self.brain_kind = brain_kind
+        self.suggested_fix = suggested_fix
+        super().__init__(
+            f"Model {model_id!r} rejected by {brain_kind} for "
+            f"subsystem {subsystem!r}. Fix: {suggested_fix}"
+        )
+
+
 # ──────────────────────────────────────────────────────────────────
 # BrainEvent — normalised event stream
 #
@@ -290,6 +349,7 @@ class Brain(ABC):
         env_overrides: dict[str, str] | None = None,
         allow_tools: bool = False,
         cwd: Path | None = None,
+        subsystem: str | None = None,
     ) -> AuxResult:
         """Run a one-shot fresh-session aux call.
 
@@ -325,6 +385,14 @@ class Brain(ABC):
         curator tick). Override only for cases where a different cwd
         is meaningful (rare).
 
+        ``subsystem`` is the caller's subsystem name (``"curator"`` /
+        ``"goal_judge"`` / etc.) — feeds the
+        ``BrainModelNotFoundError.subsystem`` field on detection so
+        the surfaced error tells the user which subsystem to fix.
+        Optional with default ``None`` for back-compat with test
+        callers that don't care; production callers should always
+        pass it.
+
         Used by the learning curator, coherence judge, goal judge,
         relationships extractor, and relationships classifier — each
         consumes ``AuxResult.stdout`` and treats a non-zero
@@ -335,6 +403,11 @@ class Brain(ABC):
             BrainNotInstalled: brain binary missing from PATH.
             BrainAuthRequired: brain binary present but not authed
                 (best-effort detection — depends on stderr shape).
+            BrainModelNotFoundError: brain CLI rejected the
+                configured model id at spawn time. Carries
+                actionable suggested_fix imported from
+                ``core.model_validator``'s template constants —
+                same vocabulary the validator emits pre-write.
             BrainError: catch-all for other subprocess failures
                 (OSError, FileNotFoundError on the binary itself).
         """

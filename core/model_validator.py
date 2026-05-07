@@ -134,6 +134,22 @@ UNKNOWN_MODEL_FIX_TEMPLATE = (
     "/model list {brain_kind} to see what's available."
 )
 
+# Spawn-site backstop for claude-code's "model doesn't exist or no
+# access" error. The validator can't pre-catch this case for
+# claude-code (no live model-discovery probe; rule 6 only fires
+# when ``available_models_per_brain`` is supplied which Day 4 only
+# wires for opencode). Day 2's BrainModelNotFoundError imports this
+# constant when claude-code's spawn_aux detects the on-stdout
+# rejection — keeps the suggested_fix wording consistent with the
+# rest of the validator's vocabulary.
+CLAUDE_CODE_MODEL_NOT_FOUND_FIX_TEMPLATE = (
+    "claude-code rejected '{model_id}' for {subsystem}: model may "
+    "not exist or you may not have access. Try a known alias "
+    "(haiku/sonnet/opus) or a current full name from "
+    "https://docs.anthropic.com/claude/models. "
+    "Run: /model set {subsystem} small  (resolves to haiku)"
+)
+
 DEAD_KNOB_FIX_TEMPLATE = (
     "The '{subsystem}' subsystem is declared in "
     "DEFAULT_SUBSYSTEM_TIERS but no live "

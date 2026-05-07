@@ -268,6 +268,7 @@ async def judge_goal(
             timeout_seconds=GOAL_JUDGE_TIMEOUT_SECONDS,
             env_overrides={GOAL_JUDGE_ENV_VAR: "1"},
             cwd=workspace,
+            subsystem="goal_judge",
         )
     except BrainTimeoutError:
         return "continue", (

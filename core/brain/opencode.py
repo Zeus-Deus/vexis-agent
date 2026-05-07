@@ -90,6 +90,7 @@ from core.brain.base import (
     BrainCancelled,
     BrainError,
     BrainHealth,
+    BrainModelNotFoundError,
     BrainNotInstalled,
     BrainTimeoutError,
     McpServerSpec,
@@ -469,6 +470,52 @@ async def _read_opencode_event_stream(
         session_lost_via_event=session_lost,
         saw_any_event=saw_any_event,
     )
+
+
+# Day 2 model UX: opencode bad-model detector. Mirrors
+# ``_is_session_not_found_error`` shape — checks the typed error
+# event the JSON event stream emits when ``--model`` references
+# an unknown id. Verified empirically: opencode exits 0 even on
+# bad model in ``--format json`` mode; the error event is the
+# reliable signal.
+_MODEL_NOT_FOUND_MESSAGE_MARKER = "model not found"
+
+
+def _detect_model_not_found(stdout: str) -> bool:
+    """Scan an opencode JSON event stream for a bad-model marker.
+
+    Returns True when any line in ``stdout`` parses as a JSON
+    object with ``type == "error"`` AND
+    ``error.data.message`` containing ``"Model not found"``
+    (case-insensitive). Defensive scan — malformed lines, non-dict
+    events, and missing fields all skip without raising.
+
+    Used by ``spawn_aux`` to raise ``BrainModelNotFoundError`` with
+    the same suggested_fix copy the validator's rule 4 emits
+    pre-write.
+    """
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(evt, dict):
+            continue
+        if evt.get("type") != "error":
+            continue
+        err = evt.get("error")
+        if not isinstance(err, dict):
+            continue
+        data = err.get("data")
+        if not isinstance(data, dict):
+            continue
+        msg = data.get("message")
+        if isinstance(msg, str) and _MODEL_NOT_FOUND_MESSAGE_MARKER in msg.lower():
+            return True
+    return False
 
 
 def _is_session_not_found_error(err: object) -> bool:
@@ -860,6 +907,7 @@ class OpenCodeBrain(Brain):
         env_overrides: dict[str, str] | None = None,
         allow_tools: bool = False,
         cwd: Path | None = None,
+        subsystem: str | None = None,
     ) -> AuxResult:
         """Run an aux call against ``opencode run``.
 
@@ -924,6 +972,31 @@ class OpenCodeBrain(Brain):
 
             stdout = (cp.stdout or b"").decode("utf-8", errors="replace")
             stderr = (cp.stderr or b"").decode("utf-8", errors="replace")
+
+            # Day 2 model UX: spawn-site backstop. opencode in
+            # ``--format json`` mode exits 0 even on bad model;
+            # the diagnostic surfaces as a typed error event in
+            # the JSON stream:
+            #   {"type":"error","error":{"name":"UnknownError",
+            #    "data":{"message":"Model not found: <id>/."}}}
+            # Verified empirically. Parse the event stream once
+            # for the marker; on detection raise a structured
+            # BrainModelNotFoundError with the same suggested_fix
+            # copy the validator's rule 4 emits pre-write.
+            if model and _detect_model_not_found(stdout):
+                from core.model_validator import (
+                    OPENCODE_FORMAT_FIX_TEMPLATE,
+                )
+                raise BrainModelNotFoundError(
+                    subsystem=subsystem or "<unknown>",
+                    model_id=model,
+                    brain_kind="opencode",
+                    suggested_fix=OPENCODE_FORMAT_FIX_TEMPLATE.format(
+                        model_id=model,
+                        subsystem=subsystem or "this subsystem",
+                    ),
+                )
+
             # Aux callers consume ``stdout`` as the agent's reply
             # text. opencode --format json emits one JSON event
             # per line; we extract the concatenated ``text`` events

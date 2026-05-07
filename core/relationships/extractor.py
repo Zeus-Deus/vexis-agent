@@ -283,6 +283,7 @@ async def extract_relationships(
             timeout_seconds=EXTRACTOR_TIMEOUT_SECONDS,
             env_overrides={EXTRACTOR_ENV_VAR: "1"},
             cwd=workspace,
+            subsystem="relationships_extractor",
         )
         stdout = aux.stdout
         if aux.returncode != 0:
