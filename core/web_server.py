@@ -176,6 +176,7 @@ class WebDashboard:
         browser: BrowserTools,
         learning: LearningController | None,
         config: DashboardConfig,
+        running_brain_kind: str | None = None,
     ) -> None:
         self._workspace = workspace
         self._sessions = sessions
@@ -185,6 +186,12 @@ class WebDashboard:
         self._browser = browser
         self._learning = learning
         self._config = config
+        # Day 5 of model UX: the dashboard payload's
+        # check_brain_kind_consistency canary needs to know what
+        # brain class the daemon actually instantiated. main.py
+        # passes the kind string at construction; tests omit it
+        # (default None → no canary check fires).
+        self._running_brain_kind = running_brain_kind
 
         # Issue a fresh token immediately so the Telegram /dashboard
         # handler can read it as soon as the daemon's PTB layer comes up.
@@ -1587,8 +1594,16 @@ class WebDashboard:
             cfg = _read_raw()
             kind = brain_kind()
             available = discovery_for_validator(VALID_BRAIN_KINDS)
+            # Defensive getattr — Day 5 added _running_brain_kind
+            # via the new constructor parameter. Existing test
+            # fixtures that bypass __init__ via __new__ don't set
+            # it; default to None so the canary stays silent for
+            # them rather than raising AttributeError.
+            running_kind = getattr(self, "_running_brain_kind", None)
             table = build_resolution_table(
-                cfg, kind, available_models_per_brain=available,
+                cfg, kind,
+                available_models_per_brain=available,
+                running_brain_kind=running_kind,
             )
             # Day 4 additions on top of the Day 3 shape.
             table["available_models"] = {

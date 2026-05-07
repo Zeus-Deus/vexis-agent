@@ -339,6 +339,14 @@ async def _run() -> None:
             port=dashboard_port,
             web_dist=Path(__file__).resolve().parent / "web" / "dist",
         ),
+        # Day 5 of model UX: the canary-check helper needs to know
+        # what brain class the daemon actually instantiated so the
+        # dashboard payload's global_findings can surface the
+        # "edited brain.kind without restarting" warning. ``_kind``
+        # is the value ``brain_kind()`` returned at startup; the
+        # check runs on every dashboard poll against the
+        # current on-disk value.
+        running_brain_kind=_kind,
     )
 
     transport = TelegramTransport(

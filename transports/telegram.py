@@ -1502,15 +1502,35 @@ class TelegramTransport:
         the dashboard JSON expose the same per-subsystem
         resolution data byte-for-byte (catches drift before it
         ships).
+
+        Day 5 wires the running brain kind through the helper so
+        the "edited brain.kind without restarting" canary surfaces
+        in the slash output too. Pulled from the message handler's
+        brain reference via the ``brain_instance_to_kind`` mapper
+        — keeps the slash decoupled from the brain class hierarchy.
         """
-        from core.model_validator import build_resolution_table
+        from core.model_validator import (
+            brain_instance_to_kind,
+            build_resolution_table,
+        )
         from core.yaml_config import (
             DEFAULT_SUBSYSTEM_TIERS,
             _read_raw,
             brain_kind,
         )
 
-        table = build_resolution_table(_read_raw(), brain_kind())
+        # Defensive getattr — Day 5 added the running-brain
+        # consistency check that pulls through self._handler._brain.
+        # Some test fixtures construct TelegramTransport via
+        # __new__ and never set _handler; default the canary to
+        # silent (running=None) for them rather than raising.
+        handler = getattr(self, "_handler", None)
+        brain = getattr(handler, "_brain", None) if handler is not None else None
+        running_kind = brain_instance_to_kind(brain) if brain is not None else None
+        table = build_resolution_table(
+            _read_raw(), brain_kind(),
+            running_brain_kind=running_kind,
+        )
         kind = table["brain_kind"]
         lines = [f"Current resolution (brain: {kind}):"]
         max_name = max(len(n) for n in DEFAULT_SUBSYSTEM_TIERS)

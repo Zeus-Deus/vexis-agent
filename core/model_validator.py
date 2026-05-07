@@ -539,11 +539,69 @@ def validate_models_config(
     return findings
 
 
+def brain_instance_to_kind(brain: object) -> str:
+    """Map a brain instance to its canonical ``brain.kind`` string.
+
+    Used by the ``check_brain_kind_consistency`` canary so the
+    dashboard payload and the slash command's status text can
+    both compute the running kind without coupling to the brain
+    class hierarchy. Returns ``"<unknown>"`` for any brain class
+    not in the registered set.
+    """
+    name = type(brain).__name__
+    return _BRAIN_CLASS_TO_KIND.get(name, "<unknown>")
+
+
+_BRAIN_CLASS_TO_KIND: dict[str, str] = {
+    "ClaudeCodeBrain": "claude-code",
+    "OpenCodeBrain": "opencode",
+    "BrainNull": "null",
+}
+
+
+def check_brain_kind_consistency(
+    on_disk_kind: str, running_kind: str,
+) -> ValidationFinding | None:
+    """Return a warning finding if the on-disk ``brain.kind`` and
+    the running brain instance disagree, else ``None``.
+
+    Day 5's "user edited brain.kind and forgot to restart"
+    canary. Fires whenever the dashboard or slash surface is
+    refreshed (5 s poll cadence on the dashboard; per-invocation
+    on the slash). At daemon startup the two always match by
+    construction (``main.py`` reads ``brain.kind`` and
+    instantiates accordingly) — the canary fires only after the
+    user mutates the on-disk value while the daemon is running.
+
+    Severity ``warning`` — matches the daemon's existing
+    fall-back-to-default posture for ``brain.kind`` issues. The
+    suggested fix is the literal restart instruction.
+    """
+    if on_disk_kind == running_kind:
+        return None
+    return ValidationFinding(
+        severity="warning",
+        subsystem=None,
+        problem=(
+            f"on-disk brain.kind={on_disk_kind!r} differs from the "
+            f"running brain class ({running_kind!r}). The current "
+            f"daemon process is still using {running_kind!r}; the "
+            f"new value will take effect on next restart."
+        ),
+        suggested_fix=(
+            f"Restart vexis (e.g. systemctl --user restart "
+            f"vexis-agent) to switch from {running_kind!r} to "
+            f"{on_disk_kind!r}."
+        ),
+    )
+
+
 def build_resolution_table(
     config: dict,
     brain_kind: str,
     *,
     available_models_per_brain: dict[str, set[str]] | None = None,
+    running_brain_kind: str | None = None,
 ) -> dict:
     """Single source of truth for the resolution-table data the
     ``/model status`` slash command, the ``GET /api/v1/models``
@@ -683,6 +741,18 @@ def build_resolution_table(
     global_findings = [
         _finding_dict(f) for f in by_subsystem.get(None, [])
     ]
+
+    # Day 5 canary: surface the "user edited brain.kind and forgot
+    # to restart" warning inline alongside the validator findings.
+    # When ``running_brain_kind`` is supplied (dashboard payload or
+    # slash status), compare against the on-disk ``brain_kind``
+    # parameter and append a warning if they disagree.
+    if running_brain_kind is not None:
+        consistency = check_brain_kind_consistency(
+            brain_kind, running_brain_kind,
+        )
+        if consistency is not None:
+            global_findings.append(_finding_dict(consistency))
 
     return {
         "brain_kind": brain_kind,
