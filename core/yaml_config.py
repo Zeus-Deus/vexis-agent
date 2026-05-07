@@ -599,8 +599,49 @@ DEFAULT_TIER_MAP_OPENCODE: dict[str, str] = {
 }
 
 
+def subsystem_tier_from_config(
+    models_section: Any, name: str
+) -> str | None:
+    """Pure-function variant of :func:`subsystem_tier` that takes the
+    ``models`` section dict directly rather than reading from disk.
+
+    Day 1 of model UX (model_management-ux-research.md §6 Day 1)
+    extracts this so ``core.model_validator`` can validate hypothetical
+    configs (the proposed-config-after-this-edit shape Day 2's slash
+    command needs) without monkeypatching ``_read_raw``. Public
+    :func:`subsystem_tier` is now a one-line delegate.
+
+    Same resolution order as :func:`subsystem_tier`:
+      1. ``models.subsystems.<name>``
+      2. ``models.<name>`` (legacy raw-string)
+      3. ``DEFAULT_SUBSYSTEM_TIERS[name]``
+      4. ``None``
+    """
+    section = models_section if isinstance(models_section, dict) else {}
+
+    # Path 1: new schema, models.subsystems.<name>
+    subs = section.get("subsystems")
+    if isinstance(subs, dict):
+        v = subs.get(name)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # Path 2: legacy raw-string key, models.<name>
+    v = section.get(name)
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+
+    # Path 3: per-subsystem default
+    return DEFAULT_SUBSYSTEM_TIERS.get(name)
+
+
 def subsystem_tier(name: str) -> str | None:
     """Return the configured tier (or legacy raw model) for a subsystem.
+
+    Reads ``~/.vexis/config.yaml`` on every call (no caching — the
+    file is small and config edits should propagate at the next
+    spawn boundary). Pure-function variant exposed as
+    :func:`subsystem_tier_from_config` for the validator.
 
     Resolution order:
       1. ``models.subsystems.<name>`` — new schema, returned as-is.
@@ -619,23 +660,46 @@ def subsystem_tier(name: str) -> str | None:
     ``Brain.spawn_aux(prompt, model_tier=subsystem_tier("curator"))``;
     the brain implementation handles tier→native translation.
     """
-    raw = _read_raw().get("models")
-    section = raw if isinstance(raw, dict) else {}
+    return subsystem_tier_from_config(_read_raw().get("models"), name)
 
-    # Path 1: new schema, models.subsystems.<name>
-    subs = section.get("subsystems")
-    if isinstance(subs, dict):
-        v = subs.get(name)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
 
-    # Path 2: legacy raw-string key, models.<name>
-    v = section.get(name)
-    if isinstance(v, str) and v.strip():
-        return v.strip()
+def model_for_tier_from_config(
+    models_section: Any, brain_kind: str, tier: str | None,
+) -> str | None:
+    """Pure-function variant of :func:`model_for_tier` that takes the
+    ``models`` section dict directly rather than reading from disk.
 
-    # Path 3: per-subsystem default
-    return DEFAULT_SUBSYSTEM_TIERS.get(name)
+    Day 1 of model UX extracts this so ``core.model_validator`` can
+    validate hypothetical configs without monkeypatching
+    ``_read_raw``. Public :func:`model_for_tier` is now a one-line
+    delegate.
+    """
+    if tier is None:
+        return None
+    cleaned = tier.strip()
+    if not cleaned or cleaned.lower() == "default":
+        return None
+
+    # Legacy raw-model string — pass through untranslated.
+    if cleaned not in ABSTRACT_TIERS:
+        return cleaned
+
+    # Abstract tier — look up in config first, then per-brain defaults.
+    if isinstance(models_section, dict):
+        tiers_section = models_section.get("tiers")
+        if isinstance(tiers_section, dict):
+            brain_section = tiers_section.get(brain_kind)
+            if isinstance(brain_section, dict):
+                v = brain_section.get(cleaned)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+
+    if brain_kind == "claude-code":
+        return DEFAULT_TIER_MAP_CLAUDE_CODE.get(cleaned)
+    if brain_kind == "opencode":
+        return DEFAULT_TIER_MAP_OPENCODE.get(cleaned)
+
+    return None
 
 
 def model_for_tier(brain_kind: str, tier: str | None) -> str | None:
@@ -662,34 +726,14 @@ def model_for_tier(brain_kind: str, tier: str | None) -> str | None:
     ``"claude-code"`` in Phase B), abstract tiers fall through to
     ``None`` — Phase C will add ``models.tiers.opencode.<tier>``
     defaults.
+
+    Pure-function variant exposed as :func:`model_for_tier_from_config`
+    for the validator (which works on hypothetical config dicts,
+    not the on-disk file).
     """
-    if tier is None:
-        return None
-    cleaned = tier.strip()
-    if not cleaned or cleaned.lower() == "default":
-        return None
-
-    # Legacy raw-model string — pass through untranslated.
-    if cleaned not in ABSTRACT_TIERS:
-        return cleaned
-
-    # Abstract tier — look up in config first, then per-brain defaults.
-    raw = _read_raw().get("models")
-    if isinstance(raw, dict):
-        tiers_section = raw.get("tiers")
-        if isinstance(tiers_section, dict):
-            brain_section = tiers_section.get(brain_kind)
-            if isinstance(brain_section, dict):
-                v = brain_section.get(cleaned)
-                if isinstance(v, str) and v.strip():
-                    return v.strip()
-
-    if brain_kind == "claude-code":
-        return DEFAULT_TIER_MAP_CLAUDE_CODE.get(cleaned)
-    if brain_kind == "opencode":
-        return DEFAULT_TIER_MAP_OPENCODE.get(cleaned)
-
-    return None
+    return model_for_tier_from_config(
+        _read_raw().get("models"), brain_kind, tier,
+    )
 
 
 # --------------------------------------------------------------------
