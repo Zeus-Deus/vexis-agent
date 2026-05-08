@@ -513,20 +513,24 @@ def test_contract_slash_status_and_api_share_resolution_data(
     slash_text = transport._model_status_text()
 
     # Each API row's resolution data appears verbatim in the slash
-    # text. Pin name + resolved-tier + resolved-model triple.
+    # text. Polish-pass display rules (2026-05-08) live in
+    # ``format_resolution_display`` in core/model_validator — both
+    # surfaces share it (slash uses directly; dashboard mirrors
+    # the same rules in TS via ``formatConfiguredCell`` /
+    # ``formatResolvesToCell``). Pin via the shared helper so any
+    # drift surfaces as a contract violation.
+    from core.model_validator import format_resolution_display
     for row in api_data["subsystems"]:
         name = row["name"]
-        resolved_tier = row["resolved_tier"] or "default"
-        resolved_id = row["resolved_model_id"] or "<brain default>"
-        # Slash renders rows as "  curator    small    → haiku"
-        # — the substrings must all appear.
+        expected = format_resolution_display(
+            row["configured"], row["resolved_model_id"],
+        )
         assert name in slash_text, f"slash missing subsystem {name!r}"
-        assert (
-            f"{resolved_tier:<8} → {resolved_id}" in slash_text
-        ), (
-            f"slash row for {name!r} doesn't render the API's "
-            f"resolution data: tier={resolved_tier!r}, "
-            f"resolved={resolved_id!r}"
+        assert expected in slash_text, (
+            f"slash row for {name!r} doesn't render the expected "
+            f"display string {expected!r} (configured="
+            f"{row['configured']!r}, resolved="
+            f"{row['resolved_model_id']!r})"
         )
 
     # API's brain_kind matches the slash header.

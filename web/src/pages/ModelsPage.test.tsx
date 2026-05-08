@@ -10,7 +10,7 @@
 // Plus a few cross-cutting smokes (brain banner, empty state).
 
 import { describe, expect, it, vi, afterEach } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { ModelsPage } from "./ModelsPage";
 import type { ModelsState } from "../lib/types";
 import * as apiMod from "../lib/api";
@@ -220,46 +220,18 @@ describe("ModelsPage", () => {
   });
 
   // ────────────────────────────────────────────────────────────────
-  // Tier overrides — collapsible
+  // Tier overrides section removed in 2026-05-08 polish pass —
+  // tiers are no longer a user-facing input. Pin the absence so a
+  // future regression that re-renders the section surfaces here.
   // ────────────────────────────────────────────────────────────────
 
-  it("collapses tier overrides by default and expands on click", async () => {
+  it("does NOT render the Tier overrides section", async () => {
     await renderWithFixture(buildFixture());
-    // Toggle button is present.
-    const toggle = screen.getByRole("button", { name: /per-tier mapping/i });
-    expect(toggle).toBeInTheDocument();
-    expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    // Tier rows are NOT in the DOM yet — collapsed.
-    expect(screen.queryByText("tiny")).not.toBeInTheDocument();
-
-    // Click to expand.
-    fireEvent.click(toggle);
-    expect(toggle.getAttribute("aria-expanded")).toBe("true");
-    // Now tier rows are visible.
-    expect(screen.getByText("tiny")).toBeInTheDocument();
-    expect(screen.getByText("small")).toBeInTheDocument();
-    expect(screen.getByText("medium")).toBeInTheDocument();
-    expect(screen.getByText("large")).toBeInTheDocument();
-    // Overridden value (medium → opus) renders.
-    expect(screen.getByText("opus")).toBeInTheDocument();
-  });
-
-  it("shows '(none set)' when no tier overrides are configured", async () => {
-    const fixture = buildFixture({
-      tier_overrides: {
-        tiny: { configured: null, default: "haiku" },
-        small: { configured: null, default: "haiku" },
-        medium: { configured: null, default: "sonnet" },
-        large: { configured: null, default: "sonnet" },
-      },
-    });
-    await renderWithFixture(fixture);
-    expect(screen.getByText(/none set/i)).toBeInTheDocument();
-  });
-
-  it("shows the override count when tier overrides are present", async () => {
-    await renderWithFixture(buildFixture()); // 1 override (medium)
-    expect(screen.getByText(/1 overridden/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Tier overrides/i)).not.toBeInTheDocument();
+    // The collapsible toggle is gone too.
+    expect(
+      screen.queryByRole("button", { name: /per-tier mapping/i }),
+    ).not.toBeInTheDocument();
   });
 
   // ────────────────────────────────────────────────────────────────
@@ -303,5 +275,43 @@ describe("ModelsPage", () => {
     expect(
       screen.queryByText(/Validator \(whole config\)/i),
     ).not.toBeInTheDocument();
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // Polish-pass v2 display rules (2026-05-08, after dogfood):
+  //   - configured cell shows just "(default)" when unset; the
+  //     resolves-to column carries the model name
+  //   - resolves-to column is ALWAYS populated (no blanking) —
+  //     earlier blanking attempt looked broken in the table
+  // ────────────────────────────────────────────────────────────────
+
+  it("renders unconfigured row's configured cell as '(default)'", async () => {
+    // Read-only display when configured is null. Earlier polish
+    // tried inline "(default → haiku)" but that duplicated the
+    // resolves-to column data. Bare "(default)" is the right
+    // table-cell call; the next column shows the resolution.
+    await renderWithFixture(buildFixture());
+    const matches = screen.getAllByText("(default)");
+    expect(matches.length).toBeGreaterThan(0);
+    // The inline-arrow form must NOT appear in the read-only
+    // table cell (it lives in the slash-text format only).
+    expect(screen.queryByText("(default → haiku)")).not.toBeInTheDocument();
+  });
+
+  it("populates the resolves-to cell with the resolved model id", async () => {
+    // Pin the v2 fix: resolves-to is always populated. Earlier
+    // polish blanked it when configured=null OR configured==resolved
+    // — that produced a column full of em-dashes that read as
+    // broken (user dogfood feedback). Always-populated is what
+    // users expect from a labeled table column.
+    await renderWithFixture(buildFixture());
+    // Most rows in the fixture have configured=null and
+    // resolved="haiku" — pin the column has "haiku" in those rows.
+    const haikuMatches = screen.getAllByText("haiku");
+    expect(haikuMatches.length).toBeGreaterThan(0);
+    // goal_judge has configured="sonnet" + resolved="sonnet" —
+    // resolves-to still shows "sonnet" (no blanking).
+    expect(screen.getByText("goal_judge")).toBeInTheDocument();
+    expect(screen.getAllByText("sonnet").length).toBeGreaterThan(0);
   });
 });

@@ -350,6 +350,8 @@ class Brain(ABC):
         allow_tools: bool = False,
         cwd: Path | None = None,
         subsystem: str | None = None,
+        reasoning_level: str | None = None,
+        context_window: int | None = None,
     ) -> AuxResult:
         """Run a one-shot fresh-session aux call.
 
@@ -392,6 +394,25 @@ class Brain(ABC):
         Optional with default ``None`` for back-compat with test
         callers that don't care; production callers should always
         pass it.
+
+        ``reasoning_level`` is the per-call reasoning effort level
+        (``"low"`` / ``"medium"`` / ``"high"`` / ``"max"`` on
+        claude-code; arbitrary variant names like ``"high"`` /
+        ``"max"`` on opencode — what's accepted is per-model, see
+        :func:`core.model_discovery.reasoning_levels_for`).
+        ``None`` (the default) means "let the brain pick the
+        default reasoning". Each brain translates to its native
+        flag: claude-code uses ``--effort <level>``; opencode uses
+        ``--variant <level>``. Subsystems read this from
+        ``core.yaml_config.subsystem_reasoning`` and pass through.
+
+        ``context_window`` is reserved for future per-call context
+        sizing. Currently both shipping brains (claude-code,
+        opencode) expose only a single context size per model id —
+        no CLI flag exists to override. The kwarg is accepted for
+        API stability but ignored by the implementations; if a
+        future brain exposes a runtime context flag, the impl
+        will start consuming this. Defaults to ``None``.
 
         Used by the learning curator, coherence judge, goal judge,
         relationships extractor, and relationships classifier — each

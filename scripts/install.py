@@ -308,6 +308,11 @@ class InstallPlan:
                 self.workspace_symlink.link, self.workspace_symlink.target
             )
             ws_action.apply()
+        # Pre-commit hook for dashboard builds (added 2026-05-08).
+        # Idempotent: silently skips if the source script is missing
+        # (older checkouts) or the .git/ dir doesn't exist (rare —
+        # not in a git checkout).
+        _install_dashboard_precommit_hook(self.repo)
         # Brain-side MCP config write.
         brain = self._brain_factory()
         try:
@@ -318,6 +323,79 @@ class InstallPlan:
                 type(brain).__name__,
             )
             return None
+
+
+def _install_dashboard_precommit_hook(repo: Path) -> None:
+    """Install ``scripts/pre-commit-dashboard-build`` as the git
+    pre-commit hook. Idempotent + chained — preserves any existing
+    hook by chaining the dashboard build behind it.
+
+    Why chained: if the user already has a pre-commit hook (e.g.
+    a linter), overwriting it would silently lose that behavior.
+    Chained pattern: existing hook becomes ``pre-commit.local``
+    if present, and our installed hook calls it first.
+
+    Silent fail-fast cases:
+      - ``.git/hooks/`` doesn't exist (not a git checkout, e.g.
+        running install in a tarball extraction)
+      - source script is missing (older checkout, partial repo)
+    """
+    src = repo / "scripts" / "pre-commit-dashboard-build"
+    hooks_dir = repo / ".git" / "hooks"
+    if not src.is_file() or not hooks_dir.is_dir():
+        return
+
+    hook_path = hooks_dir / "pre-commit"
+    desired_marker = "# vexis-dashboard-build hook"
+
+    # If our hook is already the active one (matches our marker),
+    # no-op — keeps re-runs of install.py from churning.
+    if hook_path.is_file():
+        try:
+            content = hook_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            content = ""
+        if desired_marker in content:
+            return  # already installed, nothing to do
+
+        # Existing non-vexis hook present — preserve it as
+        # pre-commit.local so the chain can call it first.
+        local_path = hooks_dir / "pre-commit.local"
+        if not local_path.exists():
+            try:
+                shutil.move(str(hook_path), str(local_path))
+                local_path.chmod(0o755)
+            except OSError as exc:
+                log.warning(
+                    "could not preserve existing pre-commit hook: %s", exc,
+                )
+                return
+
+    # Write the chained wrapper. Calls the local hook first (if it
+    # exists) so existing user hooks keep firing, then runs the
+    # dashboard rebuild.
+    wrapper = (
+        "#!/usr/bin/env bash\n"
+        f"{desired_marker}\n"
+        "# Chains the original pre-commit (preserved as\n"
+        "# pre-commit.local during install) before the dashboard\n"
+        "# rebuild. Edit scripts/pre-commit-dashboard-build to\n"
+        "# change the rebuild behavior; re-run scripts/install.py\n"
+        "# to refresh this wrapper.\n"
+        "set -euo pipefail\n"
+        'HOOKS_DIR="$(dirname "$0")"\n'
+        'REPO_ROOT="$(git rev-parse --show-toplevel)"\n'
+        'if [[ -x "$HOOKS_DIR/pre-commit.local" ]]; then\n'
+        '    "$HOOKS_DIR/pre-commit.local" "$@"\n'
+        "fi\n"
+        f'exec "$REPO_ROOT/scripts/pre-commit-dashboard-build" "$@"\n'
+    )
+    try:
+        hook_path.write_text(wrapper, encoding="utf-8")
+        hook_path.chmod(0o755)
+        log.info("installed git pre-commit hook for dashboard rebuild")
+    except OSError as exc:
+        log.warning("could not install pre-commit hook: %s", exc)
 
 
 # ──────────────────────────────────────────────────────────────────

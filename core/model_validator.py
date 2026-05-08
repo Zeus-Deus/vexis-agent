@@ -613,6 +613,40 @@ def check_brain_kind_consistency(
     )
 
 
+def format_resolution_display(
+    configured: str | None,
+    resolved_model_id: str | None,
+) -> str:
+    """Render a single subsystem resolution into the slash's
+    one-column display string. Three cases (added 2026-05-08
+    polish pass — see also dashboard mirror at
+    ``web/src/pages/ModelsPage.tsx``):
+
+      1. ``configured is None`` → user hasn't opted in; show
+         ``"(default → <resolved>)"`` so the user knows what
+         reset would give them. Falls back to ``"(default)"``
+         alone when ``resolved_model_id`` is also None (no brain
+         default — rare, only for unknown subsystems).
+
+      2. ``configured == resolved_model_id`` → picker-written
+         model that resolves to itself, OR a legacy alias that
+         passes through. Drop the redundant ``"X → X"`` arrow:
+         single string ``"<configured>"``.
+
+      3. Otherwise → translation happened (tier or alias →
+         model). Show the arrow: ``"<configured> → <resolved>"``.
+         Falls back to ``"<configured> → <brain default>"`` when
+         ``resolved_model_id`` is None.
+    """
+    if configured is None:
+        if resolved_model_id is None:
+            return "(default)"
+        return f"(default → {resolved_model_id})"
+    if configured == resolved_model_id:
+        return configured
+    return f"{configured} → {resolved_model_id or '<brain default>'}"
+
+
 def build_resolution_table(
     config: dict,
     brain_kind: str,

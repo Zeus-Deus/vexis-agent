@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import type {
   ModelSubsystemRow,
-  ModelTierOverride,
   ModelValidationFinding,
   ModelsState,
 } from "../lib/types";
@@ -245,7 +244,12 @@ export function ModelsPage({ token, onAuthFail }: ModelsPageProps) {
         onSet={onSetSubsystem}
         onReset={onResetSubsystem}
       />
-      <TierOverrides overrides={state.tier_overrides} brain={state.brain_kind} />
+      {/* Tier overrides section removed in 2026-05-08 polish pass —
+          tiers stopped being a user-facing input (see ResolutionRow's
+          dropdown). The per-tier mapping table was implementation-
+          detail surfacing without a UX purpose now that the dropdown
+          surfaces only model names + (default). API still ships the
+          tier_overrides field for back-compat / future re-add. */}
       <AvailableModelsHint
         brain={state.brain_kind}
         availableModels={state.available_models[state.brain_kind] ?? []}
@@ -436,11 +440,14 @@ function GlobalFindings({ findings }: { findings: ModelValidationFinding[] }) {
 // the picker UI only.
 const PICKER_OMITTED_ALIASES = new Set(["haiku", "sonnet", "opus"]);
 
-// Tier-fallbacks-advanced bucket lives at the bottom of the
-// dropdown. Same set as `model_validator.ABSTRACT_TIERS`; pinned
-// here so the picker doesn't need to round-trip through the API
-// for what's structurally a constant.
-const TIER_FALLBACKS = ["tiny", "small", "medium", "large"];
+// (Tier fallbacks were previously offered as a separate
+// "Tier fallbacks (advanced)" optgroup at the bottom of the
+// dropdown; removed in the 2026-05-08 polish pass — tiers are
+// an implementation detail of fallback resolution, not a
+// user-facing input. Users who want to set a tier explicitly
+// can edit YAML; the dropdown surfaces only model names + the
+// (default) option, which is what a tier fallback effectively
+// IS in the picker world.)
 
 // Threshold above which the per-row search/filter input renders.
 // claude-code (~9 models) doesn't need it; opencode (~250 across
@@ -565,17 +572,54 @@ function totalOptionCount(byProvider: Record<string, string[]>): number {
 // Check whether row.configured is already represented by any
 // option the dropdown would otherwise render. If not, the picker
 // surfaces it under a dedicated "Current" optgroup so the user's
-// existing pick stays visible even if it's a legacy alias or a
-// model that's since been removed from discovery.
+// existing pick stays visible even if it's a legacy alias, a
+// legacy tier value, or a model that's since been removed from
+// discovery. Tiers no longer show in the dropdown by default
+// (2026-05-08 polish pass), so legacy tier configs land in the
+// Current bucket too — keeps the <select> value valid.
 function configuredAlreadyVisible(
   configured: string,
   byProvider: Record<string, string[]>,
 ): boolean {
-  if (TIER_FALLBACKS.includes(configured)) return true;
   for (const models of Object.values(byProvider)) {
     if (models.includes(configured)) return true;
   }
   return false;
+}
+
+// Render the configured-column display string for the table.
+// Differs from the slash format (which is one column inline →
+// uses the "(default → <resolved>)" arrow form): the table has
+// a dedicated resolves-to column that carries the model name,
+// so the configured cell stays minimal.
+//
+// Cases:
+//   1. configured is null → "(default)" (the resolves-to column
+//      shows what default actually maps to).
+//   2. configured set → render the configured value as-is. The
+//      resolves-to column shows the translated/passthrough value.
+function formatConfiguredCell(
+  configured: string | null,
+  _resolved: string | null,
+): string {
+  if (configured === null) return "(default)";
+  return configured;
+}
+
+// Render the resolves-to-column display. ALWAYS populated with
+// the resolved model id (or "<brain default>" when null) — the
+// table's two columns have clear roles: configured = what's set,
+// resolves-to = what it actually is. Pre-2026-05-08 attempt to
+// blank this for the configured=null and configured==resolved
+// cases produced a column full of em-dashes which read as broken
+// rather than concise (see /model dashboard issue 2 dogfood);
+// the simpler always-populated rule is what users expect from a
+// table.
+function formatResolvesToCell(
+  _configured: string | null,
+  resolved: string | null,
+): string {
+  return resolved ?? "<brain default>";
 }
 
 function ResolutionRow({
@@ -650,7 +694,7 @@ function ResolutionRow({
                 className="font-data text-[12px] bg-[var(--color-base)] border border-[var(--color-border)] px-1.5 py-0.5 text-[var(--color-fg)]"
               >
                 <option value="" disabled>
-                  (default — falls back to tier)
+                  (default)
                 </option>
                 {currentNeedsBucket && row.configured !== null && (
                   <optgroup label="Current">
@@ -666,13 +710,6 @@ function ResolutionRow({
                     ))}
                   </optgroup>
                 ))}
-                <optgroup label="Tier fallbacks (advanced)">
-                  {TIER_FALLBACKS.map((t) => (
-                    <option key={t} value={t}>
-                      {t}
-                    </option>
-                  ))}
-                </optgroup>
               </select>
               {row.configured !== null && (
                 <button
@@ -688,11 +725,18 @@ function ResolutionRow({
             </div>
           </>
         ) : (
-          row.configured ?? <Dim>(default)</Dim>
+          row.configured ?? (
+            <Dim>{formatConfiguredCell(null, row.resolved_model_id)}</Dim>
+          )
         )}
       </span>
       <span className="text-[var(--color-fg-2)]">
-        {row.resolved_model_id ?? <Dim>&lt;brain default&gt;</Dim>}
+        {/* Resolves-to cell: always populated with the resolved
+            model id. Earlier polish-pass attempt to blank this
+            for default / no-translation cases produced a column
+            full of em-dashes that read as broken; users expect
+            a populated column. */}
+        {formatResolvesToCell(row.configured, row.resolved_model_id)}
       </span>
       <span className="text-right">
         <StatusBadge worst={worst} findings={row.findings} />
@@ -745,71 +789,11 @@ function pickWorst(
 
 // ---- Tier overrides (collapsible) -------------------------------
 
-function TierOverrides({
-  overrides,
-  brain,
-}: {
-  overrides: Record<string, ModelTierOverride>;
-  brain: string;
-}) {
-  const [open, setOpen] = useState(false);
-  const tiers = ["tiny", "small", "medium", "large"];
-  const overridden = tiers.filter(
-    (t) => overrides[t]?.configured !== null && overrides[t]?.configured !== undefined,
-  );
-  return (
-    <Section
-      title="Tier overrides"
-      trailing={
-        overridden.length === 0
-          ? "(none set)"
-          : `${overridden.length} overridden`
-      }
-    >
-      <Card>
-        <button
-          type="button"
-          aria-expanded={open}
-          onClick={() => setOpen((v) => !v)}
-          className="w-full px-4 py-2 text-left font-data text-[11px] uppercase-tight text-[var(--color-fg-dim)] hover:text-[var(--color-fg)] flex items-center gap-2"
-        >
-          <span>{open ? "▾" : "▸"}</span>
-          <span>{open ? "hide" : "show"} per-tier mapping</span>
-        </button>
-        {open && (
-          <div className="px-4 pb-3 font-data text-[12px]">
-            <div
-              className="grid items-baseline gap-x-4 text-[10.5px] uppercase-tight text-[var(--color-fg-dim)] py-1 border-b border-[var(--color-border)]"
-              style={{ gridTemplateColumns: "1fr 1.5fr 1.5fr" }}
-            >
-              <span>tier</span>
-              <span>configured</span>
-              <span>{brain} default</span>
-            </div>
-            {tiers.map((t) => {
-              const ov = overrides[t];
-              return (
-                <div
-                  key={t}
-                  className="grid items-baseline gap-x-4 py-1 border-b border-[var(--color-border)] last:border-b-0"
-                  style={{ gridTemplateColumns: "1fr 1.5fr 1.5fr" }}
-                >
-                  <span className="text-[var(--color-fg)]">{t}</span>
-                  <span className="text-[var(--color-fg-2)]">
-                    {ov?.configured ?? <Dim>(default)</Dim>}
-                  </span>
-                  <span className="text-[var(--color-fg-dim)]">
-                    {ov?.default ?? <Dim>—</Dim>}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </Card>
-    </Section>
-  );
-}
+// (TierOverrides component removed in 2026-05-08 polish pass —
+// tiers are no longer a user-facing input and the section was
+// surfacing implementation-detail data with no UX purpose. The
+// API still ships the tier_overrides field so a future re-add
+// (or external consumer) can use it.)
 
 
 // ---- Available models hint --------------------------------------

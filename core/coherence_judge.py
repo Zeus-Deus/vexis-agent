@@ -69,7 +69,7 @@ from core.brain.base import (
     BrainTimeoutError,
 )
 from core.transcripts import TranscriptMessage
-from core.yaml_config import subsystem_tier
+from core.yaml_config import subsystem_reasoning, subsystem_tier
 
 log = logging.getLogger(__name__)
 
@@ -650,6 +650,7 @@ def run_coherence_judge(
             brain.spawn_aux(
                 prompt,
                 model_tier=subsystem_tier("coherence_judge"),
+                reasoning_level=subsystem_reasoning("coherence_judge"),
                 timeout_seconds=COHERENCE_JUDGE_TIMEOUT_SECONDS,
                 env_overrides={COHERENCE_JUDGE_ENV_VAR: "1"},
                 cwd=workspace,

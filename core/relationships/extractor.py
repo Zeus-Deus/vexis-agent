@@ -52,7 +52,7 @@ from core.relationships.consent import _fact_id
 from core.relationships.store import RelationshipsStore
 from core.relationships.triggers import derive_slug
 from core.transcripts import TranscriptMessage
-from core.yaml_config import subsystem_tier
+from core.yaml_config import subsystem_reasoning, subsystem_tier
 
 log = logging.getLogger(__name__)
 
@@ -280,6 +280,7 @@ async def extract_relationships(
         aux = await brain.spawn_aux(
             prompt,
             model_tier=subsystem_tier("relationships_extractor"),
+            reasoning_level=subsystem_reasoning("relationships_extractor"),
             timeout_seconds=EXTRACTOR_TIMEOUT_SECONDS,
             env_overrides={EXTRACTOR_ENV_VAR: "1"},
             cwd=workspace,

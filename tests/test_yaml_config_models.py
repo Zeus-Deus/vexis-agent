@@ -156,3 +156,72 @@ models:
 """
     with _patch_config(tmp_path, body=body):
         assert yaml_config.model_learning_review() == "sonnet"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Dict-shaped subsystem values (added 2026-05-08 for reasoning)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_subsystem_tier_extracts_model_from_dict_value(tmp_path):
+    """``models.subsystems.<name>`` accepts the new dict shape
+    ``{model: <id>, reasoning: <level>}`` for the reasoning-level
+    feature. ``subsystem_tier`` extracts the model id transparently
+    so all the existing resolution paths (validator rule 6,
+    spawn-site model_for_tier, ...) keep working unchanged."""
+    body = """
+models:
+  subsystems:
+    curator:
+      model: claude-sonnet-4-6
+      reasoning: high
+"""
+    with _patch_config(tmp_path, body=body):
+        assert yaml_config.subsystem_tier("curator") == "claude-sonnet-4-6"
+        assert yaml_config.subsystem_reasoning("curator") == "high"
+
+
+def test_subsystem_tier_string_value_still_works(tmp_path):
+    """Backwards-compat pin: plain string values (the pre-reasoning
+    shape) keep returning the string as the tier and ``None`` as
+    the reasoning level. Existing configs survive untouched."""
+    body = """
+models:
+  subsystems:
+    curator: claude-sonnet-4-6
+"""
+    with _patch_config(tmp_path, body=body):
+        assert yaml_config.subsystem_tier("curator") == "claude-sonnet-4-6"
+        assert yaml_config.subsystem_reasoning("curator") is None
+
+
+def test_subsystem_reasoning_returns_none_when_unset(tmp_path):
+    """No subsystem block / no reasoning key → None. Picker writes
+    the dict shape only when the user explicitly picks a level;
+    when they pick "(default — brain picks)" we write the plain
+    string and reasoning falls through to None here."""
+    body = """
+models:
+  subsystems:
+    curator:
+      model: claude-sonnet-4-6
+"""
+    with _patch_config(tmp_path, body=body):
+        assert yaml_config.subsystem_reasoning("curator") is None
+
+
+def test_subsystem_tier_dict_with_empty_model_falls_through(tmp_path):
+    """Defensive: a dict with an empty/missing ``model`` key falls
+    through to the per-subsystem default (same posture as the
+    string-value case). Reasoning still extracts cleanly even
+    though model is missing."""
+    body = """
+models:
+  subsystems:
+    curator:
+      reasoning: high
+"""
+    with _patch_config(tmp_path, body=body):
+        # curator's default tier is small per DEFAULT_SUBSYSTEM_TIERS.
+        assert yaml_config.subsystem_tier("curator") == "small"
+        assert yaml_config.subsystem_reasoning("curator") == "high"

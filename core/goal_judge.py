@@ -43,7 +43,7 @@ from core.brain.base import (
     BrainNotInstalled,
     BrainTimeoutError,
 )
-from core.yaml_config import subsystem_tier
+from core.yaml_config import subsystem_reasoning, subsystem_tier
 
 log = logging.getLogger(__name__)
 
@@ -265,6 +265,7 @@ async def judge_goal(
         result = await brain.spawn_aux(
             prompt,
             model_tier=subsystem_tier("goal_judge"),
+            reasoning_level=subsystem_reasoning("goal_judge"),
             timeout_seconds=GOAL_JUDGE_TIMEOUT_SECONDS,
             env_overrides={GOAL_JUDGE_ENV_VAR: "1"},
             cwd=workspace,

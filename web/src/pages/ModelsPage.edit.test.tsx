@@ -131,23 +131,25 @@ describe("ModelsPage edit affordances", () => {
     expect(screen.getByText(/Edit affordances are off/i)).toBeInTheDocument();
   });
 
-  it("dropdown options include full names + tier fallbacks but NOT aliases", async () => {
-    // Day 2 of model picker UX changed the dropdown shape:
-    //   - Aliases (haiku/sonnet/opus on claude-code) are filtered
-    //     out per `.plans/model-picker-ux-research.md` §5 cleanup 5
-    //     — picker enforces version pinning by surfacing only full
-    //     names. The typed-arg path on /model still accepts aliases.
-    //   - Tier fallbacks moved into a dedicated optgroup at the
-    //     bottom; still selectable, just visually grouped under
-    //     "(advanced)".
+  it("dropdown options include full names but NOT aliases or tiers", async () => {
+    // Polish-pass (2026-05-08) removed the tier-fallbacks
+    // optgroup entirely — tiers are an implementation detail of
+    // fallback resolution, not a user-facing input. Users wanting
+    // to set a tier explicitly can edit YAML; the dropdown
+    // surfaces only model names + the (default) option.
+    //
+    // Aliases (haiku/sonnet/opus on claude-code) stay filtered
+    // per `.plans/model-picker-ux-research.md` §5 cleanup 5 —
+    // picker enforces version pinning by surfacing only full
+    // names. The typed-arg path on /model still accepts aliases.
     await renderWithFixture(buildFixture());
     const select = screen.getByLabelText("Set curator") as HTMLSelectElement;
     const optionTexts = Array.from(select.options).map((o) => o.textContent);
-    // Tier fallbacks present in their advanced bucket.
-    expect(optionTexts).toContain("tiny");
-    expect(optionTexts).toContain("small");
-    expect(optionTexts).toContain("medium");
-    expect(optionTexts).toContain("large");
+    // Tier fallbacks ABSENT (dropped from dropdown post-polish).
+    expect(optionTexts).not.toContain("tiny");
+    expect(optionTexts).not.toContain("small");
+    expect(optionTexts).not.toContain("medium");
+    expect(optionTexts).not.toContain("large");
     // Full names present.
     expect(optionTexts).toContain("claude-haiku-4-5");
     // Aliases absent — picker omits them.
@@ -178,28 +180,48 @@ describe("ModelsPage edit affordances", () => {
     expect(groupOptions).not.toContain("haiku");
   });
 
-  it("dropdown places 'Tier fallbacks (advanced)' optgroup at the bottom", async () => {
+  it("dropdown does NOT include a 'Tier fallbacks (advanced)' optgroup", async () => {
+    // Polish-pass pin (2026-05-08): tier-fallbacks bucket was
+    // removed entirely. Tiers stay valid YAML but aren't a
+    // user-facing dropdown input anymore.
     await renderWithFixture(buildFixture());
     const select = screen.getByLabelText("Set curator") as HTMLSelectElement;
     const groups = select.querySelectorAll("optgroup");
     const labels = Array.from(groups).map((g) => g.getAttribute("label"));
-    // Last optgroup is the tier-fallbacks bucket.
-    expect(labels[labels.length - 1]).toBe("Tier fallbacks (advanced)");
-    const tierGroup = groups[groups.length - 1];
-    const tierOptions = Array.from(
-      tierGroup.querySelectorAll("option"),
-    ).map((o) => o.value);
-    expect(tierOptions).toEqual(["tiny", "small", "medium", "large"]);
+    expect(labels).not.toContain("Tier fallbacks (advanced)");
   });
 
-  it("default-empty option label telegraphs the tier-fallback framing", async () => {
+  it("default-empty option label uses '(default)' when no resolved id", async () => {
+    // Edge case: subsystem with no brain default (resolved is
+    // null). Polish-pass falls back to bare "(default)" rather
+    // than rendering "(default → null)".
+    const fixture = buildFixture({
+      subsystems: [
+        {
+          name: "curator",
+          configured: null,
+          resolved_tier: null,
+          resolved_model_id: null,
+          findings: [],
+        },
+      ],
+    });
+    await renderWithFixture(fixture);
+    const select = screen.getByLabelText("Set curator") as HTMLSelectElement;
+    expect(select.options[0].textContent).toBe("(default)");
+  });
+
+  it("default-empty option label is bare '(default)' (resolves-to column shows the model)", async () => {
+    // Polish-pass v2 (2026-05-08, after dogfood): the inline
+    // "(default → haiku)" form duplicated the resolves-to column
+    // data in the table view. Simplified to just "(default)" —
+    // the next column carries the resolved model name. Slash
+    // text keeps the inline-arrow form because it's a single
+    // column there.
     await renderWithFixture(buildFixture());
     const select = screen.getByLabelText("Set curator") as HTMLSelectElement;
-    // First option is the empty-default placeholder.
     expect(select.options[0].value).toBe("");
-    expect(select.options[0].textContent).toBe(
-      "(default — falls back to tier)",
-    );
+    expect(select.options[0].textContent).toBe("(default)");
   });
 
   it("renders 'Current' optgroup when configured value is not in normal options", async () => {
@@ -346,8 +368,10 @@ describe("ModelsPage edit affordances", () => {
     const labels = Array.from(groups).map((g) => g.getAttribute("label"));
     expect(labels).toContain("anthropic");
     expect(labels).toContain("openai");
-    // Tier-fallbacks bucket always renders regardless of filter.
-    expect(labels).toContain("Tier fallbacks (advanced)");
+    // Polish-pass (2026-05-08): tier-fallbacks bucket no longer
+    // exists — confirm it stays absent across filter operations
+    // (no resurrection from a stale code path).
+    expect(labels).not.toContain("Tier fallbacks (advanced)");
   });
 
   it("search filter collapses provider buckets that have no matches", async () => {
@@ -393,21 +417,25 @@ describe("ModelsPage edit affordances", () => {
   });
 
   it("selecting a value POSTs to /api/v1/models/set", async () => {
+    // Switched from "large" (tier) to "claude-haiku-4-5" (real
+    // model id) per polish-pass — tiers were dropped from the
+    // dropdown on 2026-05-08; selecting them via fireEvent fails
+    // because the option doesn't exist.
     const setSpy = vi
       .spyOn(apiMod.api, "setModel")
       .mockResolvedValue({
         ok: true,
         subsystem: "curator",
-        value: "large",
-        resolved_tier: "large",
-        resolved_model_id: "sonnet",
+        value: "claude-haiku-4-5",
+        resolved_tier: "claude-haiku-4-5",
+        resolved_model_id: "claude-haiku-4-5",
         backup_path: null,
       } satisfies ModelSetResponse);
     await renderWithFixture(buildFixture());
     const select = screen.getByLabelText("Set curator") as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: "large" } });
+    fireEvent.change(select, { target: { value: "claude-haiku-4-5" } });
     await waitFor(() => expect(setSpy).toHaveBeenCalledWith(
-      TOKEN, { subsystem: "curator", value: "large" },
+      TOKEN, { subsystem: "curator", value: "claude-haiku-4-5" },
     ));
   });
 
@@ -417,7 +445,8 @@ describe("ModelsPage edit affordances", () => {
 
   it("optimistically updates the dropdown before POST resolves", async () => {
     // Use a pending promise that we control so we can inspect the
-    // DOM between optimistic update and POST resolution.
+    // DOM between optimistic update and POST resolution. Switched
+    // to a real model id post-polish (tiers no longer in dropdown).
     let resolveSet: (v: ModelSetResponse) => void;
     const setPromise = new Promise<ModelSetResponse>((res) => {
       resolveSet = res;
@@ -426,17 +455,18 @@ describe("ModelsPage edit affordances", () => {
     await renderWithFixture(buildFixture());
 
     const select = screen.getByLabelText("Set curator") as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: "large" } });
+    fireEvent.change(select, { target: { value: "claude-haiku-4-5" } });
 
     // Optimistic update lands synchronously: the dropdown's
-    // current value is now "large" even though the POST hasn't
-    // returned yet.
-    await waitFor(() => expect(select.value).toBe("large"));
+    // current value is now the new model id even though the POST
+    // hasn't returned yet.
+    await waitFor(() => expect(select.value).toBe("claude-haiku-4-5"));
 
     // Resolve and clean up.
     resolveSet!({
-      ok: true, subsystem: "curator", value: "large",
-      resolved_tier: "large", resolved_model_id: "sonnet",
+      ok: true, subsystem: "curator", value: "claude-haiku-4-5",
+      resolved_tier: "claude-haiku-4-5",
+      resolved_model_id: "claude-haiku-4-5",
       backup_path: null,
     });
   });

@@ -36,6 +36,7 @@ import pytest
 # subprocess shell hop.
 from scripts.install import (
     SymlinkAction,
+    _install_dashboard_precommit_hook,
     brain_binary_for_kind,
     brain_install_hint,
     build_plan,
@@ -421,3 +422,104 @@ def test_main_apply_invocation(
     assert rc == 0
     assert (fake_workspace / ".mcp.json").is_file()
     assert (fake_workspace / "AGENTS.md").is_symlink()
+
+
+# ──────────────────────────────────────────────────────────────────
+# Pre-commit hook installer (added 2026-05-08 dashboard-build hook)
+# ──────────────────────────────────────────────────────────────────
+
+
+def _seed_repo_with_hook_source(repo: Path) -> None:
+    """Mimic the vexis-agent repo layout enough for the hook
+    installer: a ``.git/hooks/`` dir + the source script the
+    installer copies from."""
+    (repo / ".git" / "hooks").mkdir(parents=True)
+    (repo / "scripts").mkdir(parents=True, exist_ok=True)
+    (repo / "scripts" / "pre-commit-dashboard-build").write_text(
+        "#!/usr/bin/env bash\necho rebuild\n", encoding="utf-8",
+    )
+
+
+def test_install_hook_writes_chained_wrapper(tmp_path: Path):
+    """Fresh checkout: no existing hook → installer writes the
+    chained wrapper that calls our dashboard-build script."""
+    repo = tmp_path / "repo"
+    _seed_repo_with_hook_source(repo)
+
+    _install_dashboard_precommit_hook(repo)
+
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    assert hook.is_file()
+    content = hook.read_text(encoding="utf-8")
+    assert "vexis-dashboard-build hook" in content
+    assert "pre-commit-dashboard-build" in content
+    # Executable bit set so git actually runs it.
+    assert hook.stat().st_mode & 0o100
+
+
+def test_install_hook_idempotent(tmp_path: Path):
+    """Re-running the installer when our hook is already in place
+    is a no-op: same content, no churn."""
+    repo = tmp_path / "repo"
+    _seed_repo_with_hook_source(repo)
+
+    _install_dashboard_precommit_hook(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    first_content = hook.read_text(encoding="utf-8")
+    first_mtime = hook.stat().st_mtime
+
+    _install_dashboard_precommit_hook(repo)
+    assert hook.read_text(encoding="utf-8") == first_content
+    assert hook.stat().st_mtime == first_mtime  # not rewritten
+
+
+def test_install_hook_preserves_existing_user_hook(tmp_path: Path):
+    """If the user already has a pre-commit hook (e.g. a linter),
+    the installer chains rather than overwrites: existing hook
+    moves to ``pre-commit.local`` and the wrapper calls it first."""
+    repo = tmp_path / "repo"
+    _seed_repo_with_hook_source(repo)
+
+    existing = repo / ".git" / "hooks" / "pre-commit"
+    existing.write_text(
+        "#!/usr/bin/env bash\necho user-hook-runs\n", encoding="utf-8",
+    )
+    existing.chmod(0o755)
+
+    _install_dashboard_precommit_hook(repo)
+
+    # User's hook was preserved as pre-commit.local.
+    local = repo / ".git" / "hooks" / "pre-commit.local"
+    assert local.is_file()
+    assert "user-hook-runs" in local.read_text(encoding="utf-8")
+    assert local.stat().st_mode & 0o100
+
+    # Our wrapper is now in place and references the local one.
+    new_hook = repo / ".git" / "hooks" / "pre-commit"
+    new_content = new_hook.read_text(encoding="utf-8")
+    assert "vexis-dashboard-build hook" in new_content
+    assert "pre-commit.local" in new_content
+
+
+def test_install_hook_silent_when_no_git_dir(tmp_path: Path):
+    """Tarball install (no .git/) → silent skip, no crash."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "pre-commit-dashboard-build").write_text(
+        "#!/usr/bin/env bash\n", encoding="utf-8",
+    )
+    # No .git/hooks/ dir.
+
+    # Must not raise.
+    _install_dashboard_precommit_hook(repo)
+
+
+def test_install_hook_silent_when_source_script_missing(tmp_path: Path):
+    """Older checkout without the hook source → silent skip."""
+    repo = tmp_path / "repo"
+    (repo / ".git" / "hooks").mkdir(parents=True)
+    # No scripts/pre-commit-dashboard-build present.
+
+    _install_dashboard_precommit_hook(repo)
+    assert not (repo / ".git" / "hooks" / "pre-commit").exists()

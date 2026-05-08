@@ -521,6 +521,8 @@ class ClaudeCodeBrain(Brain):
         allow_tools: bool = False,
         cwd: Path | None = None,
         subsystem: str | None = None,
+        reasoning_level: str | None = None,
+        context_window: int | None = None,
     ) -> AuxResult:
         """Phase B implementation. Spawns ``claude -p`` synchronously
         via :func:`subprocess.run` (wrapped in :func:`asyncio.to_thread`
@@ -551,6 +553,21 @@ class ClaudeCodeBrain(Brain):
         model_id = model_for_tier("claude-code", model_tier)
         if model_id:
             argv += ["--model", model_id]
+        # Reasoning effort flag — added 2026-05-08 for the picker's
+        # reasoning step. claude-code's CLI accepts ``--effort
+        # <level>`` (low/medium/high/xhigh/max). The picker only
+        # surfaces levels the API capability response advertises
+        # for the chosen model, but we don't validate here at the
+        # spawn level; the CLI itself errors out cleanly on an
+        # unsupported level/model pair. ``None`` → no flag, brain
+        # picks default.
+        if reasoning_level:
+            argv += ["--effort", reasoning_level]
+        # context_window: accepted for ABC stability but inert —
+        # claude-code's CLI has no runtime context flag (probe
+        # 2026-05-08 against `claude --help`). Documented in
+        # Brain.spawn_aux's docstring.
+        _ = context_window
         argv.append(prompt)
         if allow_tools:
             argv += ["--permission-mode", "bypassPermissions"]

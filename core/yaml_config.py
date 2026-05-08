@@ -625,6 +625,35 @@ DEFAULT_TIER_MAP_OPENCODE: dict[str, str] = {
 }
 
 
+def _extract_subsystem_value_and_reasoning(
+    raw: Any,
+) -> tuple[str | None, str | None]:
+    """Unpack a ``models.subsystems.<name>`` raw value into
+    ``(model_or_tier, reasoning_level)``.
+
+    Two shapes accepted:
+
+      - String (current shape): ``"small"`` or ``"claude-sonnet-4-6"``
+        → returned as ``(value, None)``.
+      - Dict (added 2026-05-08 for reasoning-level support):
+        ``{model: "claude-sonnet-4-6", reasoning: "high"}`` →
+        returned as ``("claude-sonnet-4-6", "high")``. The
+        ``reasoning`` key is optional; missing → second tuple
+        element is None.
+
+    Empty / non-string values fall through to ``(None, None)``."""
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip(), None
+    if isinstance(raw, dict):
+        model = raw.get("model")
+        reasoning = raw.get("reasoning")
+        return (
+            model.strip() if isinstance(model, str) and model.strip() else None,
+            reasoning.strip() if isinstance(reasoning, str) and reasoning.strip() else None,
+        )
+    return None, None
+
+
 def subsystem_tier_from_config(
     models_section: Any, name: str
 ) -> str | None:
@@ -638,7 +667,10 @@ def subsystem_tier_from_config(
     :func:`subsystem_tier` is now a one-line delegate.
 
     Same resolution order as :func:`subsystem_tier`:
-      1. ``models.subsystems.<name>``
+      1. ``models.subsystems.<name>`` (string OR
+         ``{model: ..., reasoning: ...}`` dict — the dict shape was
+         added for reasoning-level support; the value extraction
+         pulls out the model id transparently)
       2. ``models.<name>`` (legacy raw-string)
       3. ``DEFAULT_SUBSYSTEM_TIERS[name]``
       4. ``None``
@@ -648,9 +680,11 @@ def subsystem_tier_from_config(
     # Path 1: new schema, models.subsystems.<name>
     subs = section.get("subsystems")
     if isinstance(subs, dict):
-        v = subs.get(name)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
+        value, _reasoning = _extract_subsystem_value_and_reasoning(
+            subs.get(name)
+        )
+        if value:
+            return value
 
     # Path 2: legacy raw-string key, models.<name>
     v = section.get(name)
@@ -659,6 +693,35 @@ def subsystem_tier_from_config(
 
     # Path 3: per-subsystem default
     return DEFAULT_SUBSYSTEM_TIERS.get(name)
+
+
+def subsystem_reasoning_from_config(
+    models_section: Any, name: str
+) -> str | None:
+    """Pure-function lookup for the reasoning level configured for
+    ``name`` under the new dict-shaped ``models.subsystems.<name>``.
+
+    Returns ``None`` when:
+      - the subsystem isn't configured at all,
+      - the value is a plain string (current shape — no reasoning),
+      - the dict has no ``reasoning`` key or it's empty.
+
+    Callers (aux subsystems, picker) splat this into
+    ``brain.spawn_aux(reasoning_level=subsystem_reasoning(name))``
+    so a None passes through cleanly to "let the brain pick the
+    default reasoning"."""
+    section = models_section if isinstance(models_section, dict) else {}
+    subs = section.get("subsystems")
+    if not isinstance(subs, dict):
+        return None
+    _model, reasoning = _extract_subsystem_value_and_reasoning(subs.get(name))
+    return reasoning
+
+
+def subsystem_reasoning(name: str) -> str | None:
+    """Disk-reading wrapper for :func:`subsystem_reasoning_from_config`.
+    Same call shape as :func:`subsystem_tier`."""
+    return subsystem_reasoning_from_config(_read_raw().get("models"), name)
 
 
 def subsystem_tier(name: str) -> str | None:

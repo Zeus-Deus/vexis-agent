@@ -55,6 +55,7 @@ from core.yaml_config import (
     learning_max_entries_per_session,
     learning_max_entry_chars,
     learning_triage_enabled,
+    subsystem_reasoning,
     subsystem_tier,
 )
 
@@ -1324,6 +1325,7 @@ def _run_triage(
             brain.spawn_aux(
                 prompt,
                 model_tier=subsystem_tier("learning_triage"),
+                reasoning_level=subsystem_reasoning("learning_triage"),
                 timeout_seconds=LEARNING_TRIAGE_TIMEOUT_SECONDS,
                 env_overrides={RECURSION_ENV_VAR: "1"},
                 cwd=workspace,
@@ -1493,6 +1495,7 @@ def run_review(
             brain.spawn_aux(
                 prompt,
                 model_tier=subsystem_tier("learning_review"),
+                reasoning_level=subsystem_reasoning("learning_review"),
                 timeout_seconds=LEARNING_REVIEW_TIMEOUT_SECONDS,
                 env_overrides={RECURSION_ENV_VAR: "1"},
                 cwd=workspace,

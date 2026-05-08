@@ -74,6 +74,7 @@ from core.yaml_config import (
     curator_enabled,
     curator_interval_hours,
     curator_stale_after_days,
+    subsystem_reasoning,
     subsystem_tier,
 )
 
@@ -408,6 +409,7 @@ def run_phase2(
             brain.spawn_aux(
                 prompt,
                 model_tier=subsystem_tier("curator"),
+                reasoning_level=subsystem_reasoning("curator"),
                 timeout_seconds=PHASE2_TIMEOUT_SECONDS,
                 env_overrides={"VEXIS_CURATOR": "1"},
                 allow_tools=True,  # consolidation writes files

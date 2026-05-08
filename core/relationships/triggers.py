@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 
 from core.identity_threat import check_named_third_party
 from core.relationships.quoted import strip_quoted_blocks
-from core.yaml_config import subsystem_tier
+from core.yaml_config import subsystem_reasoning, subsystem_tier
 
 CLASSIFIER_TIMEOUT_SECONDS = 12.0
 CLASSIFIER_CONFIDENCE_THRESHOLD = 0.75
@@ -294,6 +294,7 @@ async def _classifier_call(
         result = await brain.spawn_aux(
             prompt,
             model_tier=subsystem_tier("relationships_classifier"),
+            reasoning_level=subsystem_reasoning("relationships_classifier"),
             timeout_seconds=CLASSIFIER_TIMEOUT_SECONDS,
             env_overrides={RELATIONSHIPS_CLASSIFIER_ENV_VAR: "1"},
             cwd=workspace,

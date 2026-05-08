@@ -908,6 +908,8 @@ class OpenCodeBrain(Brain):
         allow_tools: bool = False,
         cwd: Path | None = None,
         subsystem: str | None = None,
+        reasoning_level: str | None = None,
+        context_window: int | None = None,
     ) -> AuxResult:
         """Run an aux call against ``opencode run``.
 
@@ -919,13 +921,28 @@ class OpenCodeBrain(Brain):
         """
         from core.yaml_config import model_for_tier
 
+        # Reasoning + context flags — added 2026-05-08 for the
+        # picker's reasoning step. opencode's CLI accepts
+        # ``--variant <name>`` (per-model variant names like
+        # ``high``, ``max``, ``minimal`` come from the model's
+        # ``variants`` block in ``opencode models --verbose``).
+        # ``None`` → no flag, opencode picks the default. The
+        # CLI errors cleanly on an unsupported variant/model
+        # combination.
         argv: list[str] = [
             "opencode", "run",
             "--format", "json",
             "--agent", VEXIS_AUX_AGENT_NAME,
             "--dangerously-skip-permissions",
-            prompt,
         ]
+        if reasoning_level:
+            argv += ["--variant", reasoning_level]
+        # context_window: accepted for ABC stability but inert —
+        # opencode's CLI has no runtime context flag (probe
+        # 2026-05-08 against `opencode run --help`). Documented in
+        # Brain.spawn_aux's docstring.
+        _ = context_window
+        argv.append(prompt)
         model = model_for_tier("opencode", model_tier)
 
         # Aux call has no system prompt of its own — the prompt is

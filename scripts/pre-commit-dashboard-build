@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Pre-commit hook: rebuild + stage the dashboard bundle whenever
+# any tracked frontend source changes.
+#
+# Installed by ``scripts/install.py`` into ``.git/hooks/pre-commit``
+# (git hooks live outside the index and aren't tracked themselves —
+# the install step handles propagation across clones).
+#
+# Why this exists: the daemon serves whatever's in ``web/dist/``;
+# editing ``web/src/**`` without running ``npm run build`` means the
+# user sees stale dashboard behavior despite a fresh daemon
+# restart. This hook makes that drift impossible — every commit
+# that touches the source also commits a fresh bundle.
+#
+# Belt-and-suspenders: ``core/web_server.py::_warn_if_dashboard_bundle_stale``
+# also fires a banner WARNING at daemon boot if the on-disk bundle
+# is older than any source file, in case this hook isn't installed
+# (fresh clone, opted out, etc).
+#
+# Exit codes:
+#   0 — hook ran cleanly (rebuild happened or wasn't needed)
+#   1 — rebuild failed; commit is aborted so broken state can't land
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+WEB_DIR="$REPO_ROOT/web"
+
+# Only act when frontend source was actually staged. Cheap exit
+# for the common case (commits that don't touch the dashboard).
+STAGED_FRONTEND=$(
+    git diff --cached --name-only --diff-filter=ACMR \
+        | grep -E '^web/src/.*\.(ts|tsx|css|html)$' || true
+)
+STAGED_PACKAGE=$(
+    git diff --cached --name-only --diff-filter=ACMR \
+        | grep -E '^web/(package\.json|package-lock\.json|vite\.config|tsconfig)' || true
+)
+
+if [[ -z "$STAGED_FRONTEND" && -z "$STAGED_PACKAGE" ]]; then
+    exit 0
+fi
+
+# Confirm npm exists before we try to invoke it. Fresh clones
+# without node installed should error cleanly rather than crashing
+# in the middle of a build.
+if ! command -v npm >/dev/null 2>&1; then
+    echo "pre-commit: npm not found — install Node.js to enable" >&2
+    echo "             auto-rebuild of the dashboard bundle on commit." >&2
+    echo "             (Skipping rebuild; commit will proceed but the" >&2
+    echo "              bundle may go stale.)" >&2
+    exit 0
+fi
+
+echo "pre-commit: rebuilding dashboard bundle (web/src/ changed)" >&2
+
+# Run the build. Fail the commit if it errors so broken state
+# can't land — same blast radius as a failing test.
+(
+    cd "$WEB_DIR"
+    npm run build >/dev/null 2>&1
+) || {
+    echo "pre-commit: dashboard build failed — aborting commit" >&2
+    echo "             Run 'cd web && npm run build' to see the error." >&2
+    exit 1
+}
+
+# Try to stage the rebuilt bundle so source + bundle land in the
+# same commit. Tolerates the gitignored-dist case (which is the
+# current default — see web/.gitignore): if dist is ignored,
+# ``git add`` exits non-zero with the "paths ignored" message,
+# which we swallow so the commit can still proceed. The daemon
+# detector ``_warn_if_dashboard_bundle_stale`` is the safety net
+# in that mode (warns at boot if source > bundle on disk). To
+# ship the bundle in-repo, un-gitignore ``web/dist`` and the add
+# below will start succeeding silently.
+if git add "$WEB_DIR/dist" 2>/dev/null; then
+    echo "pre-commit: dashboard bundle rebuilt + staged" >&2
+else
+    echo "pre-commit: dashboard bundle rebuilt (dist is gitignored;" >&2
+    echo "             bundle stays local — daemon detector warns" >&2
+    echo "             at boot if source > bundle on disk)." >&2
+fi
+exit 0

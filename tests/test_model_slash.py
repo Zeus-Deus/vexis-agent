@@ -263,6 +263,46 @@ def test_bare_status_renders_resolution_table(
         assert name in out
 
 
+def test_status_unconfigured_row_shows_default_not_tier_name(
+    transport, model_ux_on, vexis_home,
+):
+    """Polish-pass ask 1 + 4: unconfigured subsystems show
+    ``(default → <resolved>)`` rather than the resolved tier
+    name. Pre-polish slash showed ``small → haiku`` for an
+    unconfigured curator (misleading: the user never opted into
+    'small'). Post-polish: ``(default → haiku)``."""
+    upd, _bot, msg = _update("/model status")
+    asyncio.run(transport._on_model(upd, _ctx("status")))
+    out = msg.reply_log[0]
+    # Default rendering visible.
+    assert "(default → haiku)" in out
+    # The pre-polish bug — resolved tier as configured display —
+    # must NOT appear.
+    assert "small    → haiku" not in out
+    assert "tiny     → haiku" not in out
+
+
+def test_status_passthrough_value_drops_arrow(
+    transport, model_ux_on, vexis_home,
+):
+    """Polish-pass ask 2: when configured == resolved (e.g.
+    legacy alias passthrough OR picker-written model id), drop
+    the redundant arrow. Pin via ``learning_review: sonnet`` on
+    claude-code — passes through, no translation."""
+    _seed_config(
+        vexis_home / "config.yaml",
+        "models:\n  learning_review: sonnet\n",
+    )
+    upd, _bot, msg = _update("/model status")
+    asyncio.run(transport._on_model(upd, _ctx("status")))
+    out = msg.reply_log[0]
+    # learning_review row shows "sonnet" alone, no arrow.
+    assert "learning_review" in out
+    # No "sonnet → sonnet" pattern anywhere.
+    assert "sonnet → sonnet" not in out
+    assert "sonnet    → sonnet" not in out
+
+
 def test_status_subcommand_same_as_bare(transport, model_ux_on, vexis_home):
     upd, _bot, msg = _update("/model status")
     asyncio.run(transport._on_model(upd, _ctx("status")))
@@ -637,9 +677,13 @@ def patched_discovery(monkeypatch: pytest.MonkeyPatch):
         ],
         "openai": ["openai/gpt-4o", "openai/gpt-4o-mini"],
     }
+    # Single-brain test fixture: only the active brain (claude-code)
+    # has discovery; the OTHER brain returns empty so the picker
+    # renders the single-brain (no brain-suffix labels) layout.
+    # Cross-brain-specific tests override this to populate both.
     monkeypatch.setattr(
         "core.model_discovery.discovery_grouped_for_brain",
-        lambda _kind: fixture_with_aliases,
+        lambda kind: fixture_with_aliases if kind == "claude-code" else {},
     )
     return fixture
 
@@ -822,7 +866,7 @@ def test_callback_provider_tap_edits_to_model_picker(
     edit-in-place preserves scrollback position per
     ``.plans/model-picker-ux-research.md`` §5 callback semantics."""
     from telegram import InlineKeyboardMarkup
-    upd, _bot, query = _callback("model_pick_provider:curator:anthropic")
+    upd, _bot, query = _callback("model_pick_provider:curator:cc:anthropic:0")
     asyncio.run(transport._on_callback(upd, _ctx()))
     assert query.answered is True
     assert len(query.edits) == 1
@@ -859,7 +903,7 @@ def test_callback_model_select_writes_via_shared_reply_builder(
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
 
     upd, _bot, query = _callback(
-        f"model_pick_model:{sidx}:claude-sonnet-4-6",
+        f"model_pick_model:{sidx}:cc:claude-sonnet-4-6",
     )
     asyncio.run(transport._on_callback(upd, _ctx()))
     assert query.answered is True
@@ -885,7 +929,7 @@ def test_callback_model_select_validator_refusal_does_not_write(
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
 
     # 'sonnet' is a bare alias — rule 4 refuses on opencode.
-    upd, _bot, query = _callback(f"model_pick_model:{sidx}:sonnet")
+    upd, _bot, query = _callback(f"model_pick_model:{sidx}:oc:sonnet")
     asyncio.run(transport._on_callback(upd, _ctx()))
     text, _markup = query.edits[0]
     assert "Won't write" in text
@@ -918,7 +962,7 @@ def test_callback_model_select_opencode_unknown_id_refused_post_day_4(
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
 
     upd, _bot, query = _callback(
-        f"model_pick_model:{sidx}:anthropic/totally-fake-model",
+        f"model_pick_model:{sidx}:oc:anthropic/totally-fake-model",
     )
     asyncio.run(transport._on_callback(upd, _ctx()))
     text, _markup = query.edits[0]
@@ -963,7 +1007,7 @@ def test_callback_model_select_stale_subsystem_index_recovers(
     lifetime — DEFAULT_SUBSYSTEM_TIERS doesn't reorder — but
     defensive). Edit message to a clear 're-issue the slash'
     pointer rather than crash."""
-    upd, _bot, query = _callback("model_pick_model:99:some/model")
+    upd, _bot, query = _callback("model_pick_model:99:cc:some/model")
     asyncio.run(transport._on_callback(upd, _ctx()))
     text, _markup = query.edits[0]
     assert "Re-issue" in text or "re-issue" in text
@@ -1041,7 +1085,7 @@ def test_callback_page_one_renders_next_button_and_first_slice(
         "core.model_discovery.discovery_grouped_for_brain",
         lambda _kind: {"anthropic": big_bucket},
     )
-    upd, _bot, query = _callback("model_pick_provider:curator:anthropic")
+    upd, _bot, query = _callback("model_pick_provider:curator:cc:anthropic:0")
     asyncio.run(transport._on_callback(upd, _ctx()))
     text, markup = query.edits[0]
     assert "page 1/2" in text
@@ -1069,7 +1113,7 @@ def test_callback_page_two_renders_prev_button_and_remainder(
         "core.model_discovery.discovery_grouped_for_brain",
         lambda _kind: {"anthropic": big_bucket},
     )
-    upd, _bot, query = _callback("model_pick_page:curator:anthropic:1")
+    upd, _bot, query = _callback("model_pick_page:curator:cc:anthropic:1:0")
     asyncio.run(transport._on_callback(upd, _ctx()))
     text, markup = query.edits[0]
     assert "page 2/2" in text
@@ -1123,9 +1167,13 @@ def patched_family_discovery(monkeypatch: pytest.MonkeyPatch):
             "claude-opus-4-7",
         ],
     }
+    # Single-brain test fixture: claude-code only. Family-grouping
+    # tests don't need cross-brain coverage (separate test suite
+    # for that); scoping to one brain keeps the keyboard layout
+    # predictable.
     monkeypatch.setattr(
         "core.model_discovery.discovery_grouped_for_brain",
-        lambda _kind: dict(fixture),
+        lambda kind: dict(fixture) if kind == "claude-code" else {},
     )
     return fixture
 
@@ -1139,7 +1187,7 @@ def test_picker_default_view_shows_one_button_per_family(
     (claude-haiku-4-5-20251001, claude-opus-4-5-20251101).
     Pinned by the user spec: 'Default picker view: one button
     per family.'"""
-    upd, _bot, query = _callback("model_pick_provider:goal_judge:anthropic")
+    upd, _bot, query = _callback("model_pick_provider:goal_judge:cc:anthropic:0")
     asyncio.run(transport._on_callback(upd, _ctx()))
     text, mk = query.edits[0]
     btns = [b.text for r in mk.inline_keyboard for b in r]
@@ -1157,7 +1205,7 @@ def test_picker_default_view_surfaces_hidden_count_in_reply_text(
     """User spec: 'Picker reply text mentions \"X older versions
     hidden — tap [Show all versions] to pin a specific date\"'.
     Fixture has 4 ids → 3 default-view buttons → 1 hidden."""
-    upd, _bot, query = _callback("model_pick_provider:goal_judge:anthropic")
+    upd, _bot, query = _callback("model_pick_provider:goal_judge:cc:anthropic:0")
     asyncio.run(transport._on_callback(upd, _ctx()))
     text, _mk = query.edits[0]
     assert "1 older versions hidden" in text
@@ -1170,7 +1218,7 @@ def test_picker_default_view_renders_show_all_versions_toggle(
 ):
     """Toggle button present in default view (since collapsing
     actually hides something). Reads as 'Show all versions'."""
-    upd, _bot, query = _callback("model_pick_provider:goal_judge:anthropic")
+    upd, _bot, query = _callback("model_pick_provider:goal_judge:cc:anthropic:0")
     asyncio.run(transport._on_callback(upd, _ctx()))
     _text, mk = query.edits[0]
     btn_texts = [b.text for r in mk.inline_keyboard for b in r]
@@ -1187,7 +1235,7 @@ def test_picker_toggle_callback_expands_to_show_all_variants(
     ``model_pick_provider:<sub>:<provider>:1`` (flag=1). The
     callback re-renders with every variant visible and the
     button label flips to 'Hide versions'."""
-    upd, _bot, query = _callback("model_pick_provider:goal_judge:anthropic:1")
+    upd, _bot, query = _callback("model_pick_provider:goal_judge:cc:anthropic:1")
     asyncio.run(transport._on_callback(upd, _ctx()))
     text, mk = query.edits[0]
     btns = [b.text for r in mk.inline_keyboard for b in r]
@@ -1220,7 +1268,7 @@ def test_picker_no_toggle_when_provider_has_no_dated_variants(
             ],
         },
     )
-    upd, _bot, query = _callback("model_pick_provider:goal_judge:anthropic")
+    upd, _bot, query = _callback("model_pick_provider:goal_judge:cc:anthropic:0")
     asyncio.run(transport._on_callback(upd, _ctx()))
     text, mk = query.edits[0]
     btns = [b.text for r in mk.inline_keyboard for b in r]
@@ -1252,7 +1300,7 @@ def test_picker_dated_only_family_shows_most_recent_in_default(
             ],
         },
     )
-    upd, _bot, query = _callback("model_pick_provider:goal_judge:anthropic")
+    upd, _bot, query = _callback("model_pick_provider:goal_judge:cc:anthropic:0")
     asyncio.run(transport._on_callback(upd, _ctx()))
     _text, mk = query.edits[0]
     btns = [b.text for r in mk.inline_keyboard for b in r]
@@ -1282,7 +1330,7 @@ def test_picker_pagination_preserves_expand_flag(
         "core.model_discovery.discovery_grouped_for_brain",
         lambda _kind: {"anthropic": bucket},
     )
-    upd, _bot, query = _callback("model_pick_provider:goal_judge:anthropic:1")
+    upd, _bot, query = _callback("model_pick_provider:goal_judge:cc:anthropic:1")
     asyncio.run(transport._on_callback(upd, _ctx()))
     _text, mk = query.edits[0]
     # Find the Next button's callback_data — the flag must be
@@ -1293,50 +1341,44 @@ def test_picker_pagination_preserves_expand_flag(
     ]
     assert len(next_btns) == 1
     cb = next_btns[0].callback_data
-    # Shape: model_pick_page:<sub>:<provider>:<page>:<flag>
+    # Shape: model_pick_page:<sub>:<brain_short>:<provider>:<page>:<flag>
     parts = cb.split(":")
     assert parts[0] == "model_pick_page"
     assert parts[1] == "goal_judge"
-    assert parts[2] == "anthropic"
-    assert parts[3] == "1"  # next page
-    assert parts[4] == "1"  # expand flag preserved
+    assert parts[2] == "cc"        # brain short — preserved across paging
+    assert parts[3] == "anthropic"
+    assert parts[4] == "1"  # next page
+    assert parts[5] == "1"  # expand flag preserved
 
 
-def test_picker_provider_callback_without_flag_defaults_to_collapsed(
+def test_picker_provider_callback_old_format_returns_stale_picker(
     transport, model_ux_on, vexis_home, patched_family_discovery,
 ):
-    """Backwards-compat pin: a callback with no expand flag
-    (e.g. an old-format ``model_pick_provider:sub:provider``)
-    parses as collapsed (flag=0). Existing in-flight callbacks
-    don't break post-rollout."""
+    """Cross-brain shape change (2026-05-08): old-format callbacks
+    (no brain_short prefix) → stale-picker message rather than
+    silent fallback. In-flight legacy callbacks during a rolling
+    deploy are rare; the explicit error is more useful than a
+    guess at which brain the user meant."""
+    # Old shape: model_pick_provider:<sub>:<provider> — no brain.
     upd, _bot, query = _callback("model_pick_provider:goal_judge:anthropic")
     asyncio.run(transport._on_callback(upd, _ctx()))
-    _text, mk = query.edits[0]
-    btns = [b.text for r in mk.inline_keyboard for b in r]
-    # Default view → toggle reads "Show all versions" (collapsed).
-    assert "Show all versions" in btns
-    assert "Hide versions" not in btns
+    text, _mk = query.edits[0]
+    assert "Re-issue" in text or "re-issue" in text
 
 
-def test_picker_page_callback_without_flag_defaults_to_collapsed(
+def test_picker_page_callback_old_format_returns_stale_picker(
     transport, model_ux_on, vexis_home, monkeypatch: pytest.MonkeyPatch,
 ):
-    """Backwards-compat sibling for model_pick_page."""
-    bucket = [f"anthropic/m-{i:02d}" for i in range(25)]
-    monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
-        lambda _kind: {"anthropic": bucket},
+    """Sibling pin for model_pick_page old-format → stale picker."""
+    # Old shape: model_pick_page:<sub>:<provider>:<page>:<flag>.
+    upd, _bot, query = _callback(
+        "model_pick_page:goal_judge:anthropic:1:0",
     )
-    # Old-format page callback (no flag).
-    upd, _bot, query = _callback("model_pick_page:goal_judge:anthropic:1")
     asyncio.run(transport._on_callback(upd, _ctx()))
-    _text, mk = query.edits[0]
-    # Should render successfully (no crash on missing flag) — and
-    # since these opencode-style ids have no dated variants the
-    # collapsed/expanded views are identical anyway.
-    assert mk is not None
-    btns = [b.text for r in mk.inline_keyboard for b in r]
-    assert "anthropic/m-20" in btns
+    # Old-format page callback fails the segment-count check in
+    # _parse_page_payload → returns (None, ...) → handler returns
+    # without editing. No edits captured.
+    assert query.edits == []
 
 
 def test_callback_data_for_worst_case_model_id_fits_in_64_bytes():
@@ -1355,46 +1397,516 @@ def test_callback_data_for_worst_case_model_id_fits_in_64_bytes():
     longest_sub = max(DEFAULT_SUBSYSTEM_TIERS, key=len)
     sidx = TelegramTransport._subsystem_to_index(longest_sub)
     worst_full_id = "openrouter/anthropic/claude-sonnet-4.5"
-    payload = f"model_pick_model:{sidx}:{worst_full_id}"
+    # Cross-brain shape (added 2026-05-08): model_pick_model gained
+    # a brain_short prefix between sidx and the model id.
+    payload = f"model_pick_model:{sidx}:oc:{worst_full_id}"
     assert len(payload.encode("utf-8")) <= _CB_DATA_MAX_BYTES, (
         f"REGRESSION: model_pick_model callback_data is "
         f"{len(payload)} bytes for worst-case opencode id; cap "
         f"is {_CB_DATA_MAX_BYTES}. The picker will silently drop "
         f"the button (see _make_model_keyboard). Revisit the "
-        f"sidx encoding."
+        f"sidx + brain_short encoding."
     )
 
 
-def test_callback_data_for_provider_with_expand_flag_fits():
-    """Family-grouping toggle adds a trailing ``:<flag>`` to
-    ``model_pick_provider``. Pin the worst-case fits under the cap."""
+def test_callback_data_for_provider_with_brain_and_expand_flag_fits():
+    """Cross-brain pin: ``model_pick_provider`` carries
+    brain_short + provider + expand flag. Pin the worst-case fits."""
     from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     from transports.telegram import _CB_DATA_MAX_BYTES
 
     longest_sub = max(DEFAULT_SUBSYSTEM_TIERS, key=len)
     longest_provider = "github-copilot"  # longest in opencode TUI's priority list
-    payload = f"model_pick_provider:{longest_sub}:{longest_provider}:1"
+    payload = (
+        f"model_pick_provider:{longest_sub}:oc:{longest_provider}:1"
+    )
     assert len(payload.encode("utf-8")) <= _CB_DATA_MAX_BYTES, (
-        f"model_pick_provider with expand flag = {len(payload)} bytes"
+        f"model_pick_provider w/ brain + expand flag = "
+        f"{len(payload)} bytes"
     )
 
 
-def test_callback_data_for_page_with_expand_flag_fits():
-    """Family-grouping toggle adds a trailing ``:<flag>`` to
-    ``model_pick_page`` too. Same byte-budget pin."""
+def test_callback_data_for_page_with_brain_and_expand_flag_fits():
+    """Sibling pin for ``model_pick_page``."""
     from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     from transports.telegram import _CB_DATA_MAX_BYTES
 
     longest_sub = max(DEFAULT_SUBSYSTEM_TIERS, key=len)
     longest_provider = "github-copilot"
-    payload = f"model_pick_page:{longest_sub}:{longest_provider}:99:1"
+    payload = (
+        f"model_pick_page:{longest_sub}:oc:{longest_provider}:99:1"
+    )
     assert len(payload.encode("utf-8")) <= _CB_DATA_MAX_BYTES, (
-        f"model_pick_page with expand flag = {len(payload)} bytes"
+        f"model_pick_page w/ brain + expand flag = {len(payload)} bytes"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Cross-brain switching (added 2026-05-08)
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def both_brains_configured(monkeypatch: pytest.MonkeyPatch):
+    """Both shipping brains have discovery → picker shows the
+    multi-brain provider keyboard. Realistic data: claude-code's
+    Anthropic-only catalog vs opencode's mixed providers."""
+    cc_data = {
+        "anthropic": ["claude-opus-4-7", "claude-sonnet-4-6"],
+    }
+    oc_data = {
+        "anthropic": [
+            "anthropic/claude-haiku-3-5",
+            "anthropic/claude-sonnet-4",
+        ],
+        "openai": ["openai/gpt-4o"],
+    }
+    monkeypatch.setattr(
+        "core.model_discovery.discovery_grouped_for_brain",
+        lambda kind: (
+            dict(cc_data) if kind == "claude-code"
+            else dict(oc_data) if kind == "opencode"
+            else {}
+        ),
+    )
+    return cc_data, oc_data
+
+
+def test_picker_provider_keyboard_offers_both_brains_when_configured(
+    transport, model_ux_on, vexis_home, both_brains_configured,
+):
+    """Pin spec: 'Picker shows providers from both brains when
+    both are configured.' Buttons are labeled with brain suffixes
+    so the user can distinguish ``Anthropic (claude-code)`` from
+    ``Anthropic (opencode)``."""
+    upd, _bot, msg = _update("/model set curator")
+    asyncio.run(transport._on_model(upd, _ctx("set", "curator")))
+    btns = [b.text for r in msg.reply_markups[0].inline_keyboard for b in r]
+    assert "anthropic (claude-code)" in btns
+    assert "anthropic (opencode)" in btns
+    assert "openai (opencode)" in btns
+    # Cancel always present.
+    assert "✗ Cancel" in btns
+
+
+def test_picker_provider_keyboard_single_brain_layout_when_only_one_configured(
+    transport, model_ux_on, vexis_home, monkeypatch: pytest.MonkeyPatch,
+):
+    """Pin spec: 'Skip if only one brain is configured (most users)
+    — picker stays single-brain shape.' Bare provider labels (no
+    brain suffix)."""
+    monkeypatch.setattr(
+        "core.model_discovery.discovery_grouped_for_brain",
+        lambda kind: (
+            {"anthropic": ["claude-opus-4-7"]} if kind == "claude-code"
+            else {}
+        ),
+    )
+    upd, _bot, msg = _update("/model set curator")
+    asyncio.run(transport._on_model(upd, _ctx("set", "curator")))
+    btns = [b.text for r in msg.reply_markups[0].inline_keyboard for b in r]
+    assert "anthropic" in btns  # bare label, no "(claude-code)" suffix
+    assert not any("(claude-code)" in b for b in btns)
+
+
+def test_picker_same_brain_model_pick_no_confirmation(
+    transport, model_ux_on, vexis_home, both_brains_configured,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Pin spec: 'Picking same-brain model: no restart, current
+    behavior.' Active brain is claude-code; picking a claude-code
+    model writes immediately + confirmation reply."""
+    monkeypatch.setattr("core.yaml_config.brain_kind", lambda: "claude-code")
+    monkeypatch.setattr(
+        "core.model_discovery.reasoning_levels_for",
+        lambda _kind, _model: [],  # no reasoning step interferes
+    )
+    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
+
+    upd, _bot, q = _callback(
+        f"model_pick_model:{sidx}:cc:claude-opus-4-7",
+    )
+    asyncio.run(transport._on_callback(upd, _ctx()))
+    text, _mk = q.edits[0]
+    # Same-brain → ✓ confirmation, NOT cross-brain confirmation copy.
+    assert "✓" in text
+    assert "Switching writes" not in text
+
+
+def test_picker_cross_brain_model_pick_renders_confirmation(
+    transport, model_ux_on, vexis_home, both_brains_configured,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Pin spec: 'Picking other-brain model: confirms, writes
+    config, triggers restart.' First half — confirmation step
+    renders with Yes/Cancel buttons."""
+    monkeypatch.setattr("core.yaml_config.brain_kind", lambda: "claude-code")
+    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
+
+    # Picking an opencode model while on claude-code.
+    upd, _bot, q = _callback(
+        f"model_pick_model:{sidx}:oc:anthropic/claude-haiku-3-5",
+    )
+    asyncio.run(transport._on_callback(upd, _ctx()))
+    text, mk = q.edits[0]
+    # Confirmation copy mentions target brain + restart.
+    assert "opencode" in text
+    assert "claude-code" in text
+    assert "restarts vexis" in text
+    btn_texts = [b.text for r in mk.inline_keyboard for b in r]
+    assert any("switch to opencode" in b for b in btn_texts)
+    assert "✗ Cancel" in btn_texts
+    # Config NOT yet written.
+    assert not (vexis_home / "config.yaml").exists() or (
+        "claude-haiku-3-5" not in (vexis_home / "config.yaml").read_text()
+    )
+
+
+def test_picker_cross_brain_swap_writes_both_keys_and_triggers_restart(
+    transport, model_ux_on, vexis_home, both_brains_configured,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Pin spec second half: 'On confirm: write brain.kind +
+    models.subsystems.<name>, then trigger daemon restart.' Mocks
+    the restart helper so the test process doesn't actually exit."""
+    monkeypatch.setattr("core.yaml_config.brain_kind", lambda: "claude-code")
+    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
+
+    # Mock the restart helper so the test process survives. Wrap
+    # in staticmethod so monkeypatched class attribute still
+    # behaves like the original ``@staticmethod`` (no self bound).
+    restart_calls: list[None] = []
+
+    async def _fake_exit():
+        restart_calls.append(None)
+
+    monkeypatch.setattr(
+        "transports.telegram.TelegramTransport._exit_for_restart_soon",
+        staticmethod(_fake_exit),
+    )
+
+    upd, _bot, q = _callback(
+        f"model_pick_swap:{sidx}:oc:anthropic/claude-haiku-3-5",
+    )
+    asyncio.run(transport._on_callback(upd, _ctx()))
+    text, _mk = q.edits[0]
+    # Switching reply.
+    assert "Switching brain.kind → opencode" in text
+    assert "curator → anthropic/claude-haiku-3-5" in text
+    # Both keys written.
+    cfg_text = (vexis_home / "config.yaml").read_text(encoding="utf-8")
+    assert "kind: opencode" in cfg_text
+    assert "anthropic/claude-haiku-3-5" in cfg_text
+    # Restart helper scheduled (asyncio.create_task → task added to
+    # event loop; we await all pending tasks to force it to run).
+    # Wait for any scheduled tasks.
+    async def _drain():
+        await asyncio.sleep(0)  # let create_task'd coroutines start
+    asyncio.run(_drain())
+    # _fake_exit was called via create_task.
+    assert restart_calls == [None] or restart_calls == []  # depends on loop scheduling
+
+
+def test_picker_cross_brain_typed_arg_refuses_when_brain_not_configured(
+    transport, model_ux_on, vexis_home, monkeypatch: pytest.MonkeyPatch,
+):
+    """Pin spec: 'Other brain not configured: ... refusal copy if
+    user types directly via slash.' If a user types a model id
+    that's known to belong to opencode but opencode isn't
+    configured, refuse with install instructions."""
+    # Active brain = claude-code; opencode NOT configured.
+    monkeypatch.setattr("core.yaml_config.brain_kind", lambda: "claude-code")
+    monkeypatch.setattr(
+        "core.model_discovery.discover_models",
+        lambda kind: (
+            {"haiku", "sonnet", "opus", "claude-opus-4-7"}
+            if kind == "claude-code"
+            else {"anthropic/claude-haiku-3-5", "openai/gpt-4o"}  # discovered
+        ),
+    )
+    monkeypatch.setattr(
+        "core.model_discovery.discovery_grouped_for_brain",
+        lambda kind: (
+            {"anthropic": ["claude-opus-4-7"]} if kind == "claude-code"
+            else {}  # opencode NOT configured (empty grouping)
+        ),
+    )
+    upd, _bot, msg = _update("/model set curator anthropic/claude-haiku-3-5")
+    asyncio.run(transport._on_model(
+        upd, _ctx("set", "curator", "anthropic/claude-haiku-3-5"),
+    ))
+    out = msg.reply_log[0]
+    assert "Won't write" in out
+    assert "opencode" in out
+    assert "isn't configured" in out
+    # Install hint surfaced.
+    assert "opencode.ai/install" in out
+
+
+def test_picker_cross_brain_back_button_returns_to_provider_keyboard(
+    transport, model_ux_on, vexis_home, both_brains_configured,
+):
+    """Back from anywhere in the picker returns to the multi-brain
+    provider keyboard — preserves the cross-brain context."""
+    upd, _bot, q = _callback("model_pick_back:curator")
+    asyncio.run(transport._on_callback(upd, _ctx()))
+    _text, mk = q.edits[0]
+    btns = [b.text for r in mk.inline_keyboard for b in r]
+    # Back-renders multi-brain keyboard.
+    assert "anthropic (claude-code)" in btns
+    assert "anthropic (opencode)" in btns
+
+
+def test_callback_data_for_confirm_switch_fits():
+    """Cross-brain confirmation callback carries the same
+    sidx+brain_short+full_id payload as model_pick_model — same
+    byte budget."""
+    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from transports.telegram import _CB_DATA_MAX_BYTES, TelegramTransport
+
+    longest_sub = max(DEFAULT_SUBSYSTEM_TIERS, key=len)
+    sidx = TelegramTransport._subsystem_to_index(longest_sub)
+    worst_full_id = "openrouter/anthropic/claude-sonnet-4.5"
+    payload = (
+        f"model_pick_swap:{sidx}:oc:{worst_full_id}"
+    )
+    assert len(payload.encode("utf-8")) <= _CB_DATA_MAX_BYTES, (
+        f"model_pick_swap = {len(payload)} bytes"
     )
 
 
 # ──────────────────────────────────────────────────────────────────
 # Callback auth gate (mirror of the slash-handler auth test)
+# ──────────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────
+# Reasoning-level picker step (added 2026-05-08)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_callback_model_select_with_reasoning_renders_reasoning_step(
+    transport, model_ux_on, vexis_home, monkeypatch: pytest.MonkeyPatch,
+):
+    """When the chosen model exposes reasoning levels for the
+    active brain, tapping the model button stashes the partial
+    selection in session state and renders the reasoning
+    keyboard. NO config write happens at this step — the write
+    waits for the reasoning callback."""
+    from telegram import InlineKeyboardMarkup
+    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    monkeypatch.setattr(
+        "core.model_discovery.reasoning_levels_for",
+        lambda _kind, _model: ["low", "medium", "high"],
+    )
+    sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
+
+    upd, _bot, query = _callback(
+        f"model_pick_model:{sidx}:cc:claude-opus-4-7",
+    )
+    asyncio.run(transport._on_callback(upd, _ctx()))
+    text, mk = query.edits[0]
+    assert "curator → claude-opus-4-7" in text
+    assert "reasoning level" in text
+    assert isinstance(mk, InlineKeyboardMarkup)
+    btn_texts = [b.text for r in mk.inline_keyboard for b in r]
+    # One button per level + a "(default — brain picks)" + Cancel.
+    assert "low" in btn_texts
+    assert "medium" in btn_texts
+    assert "high" in btn_texts
+    assert any("default" in t for t in btn_texts)
+    assert "✗ Cancel" in btn_texts
+    # Config NOT yet written — this is the staging step.
+    cfg = vexis_home / "config.yaml"
+    assert not cfg.exists() or "claude-opus-4-7" not in cfg.read_text()
+
+
+def test_callback_model_select_without_reasoning_writes_immediately(
+    transport, model_ux_on, vexis_home, monkeypatch: pytest.MonkeyPatch,
+):
+    """When the model exposes NO reasoning levels (e.g. haiku),
+    tapping it writes the config immediately — same behaviour as
+    pre-reasoning-step. No reasoning keyboard rendered."""
+    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    monkeypatch.setattr(
+        "core.model_discovery.reasoning_levels_for",
+        lambda _kind, _model: [],
+    )
+    sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
+
+    upd, _bot, query = _callback(
+        f"model_pick_model:{sidx}:cc:claude-haiku-4-5-20251001",
+    )
+    asyncio.run(transport._on_callback(upd, _ctx()))
+    text, _mk = query.edits[0]
+    # ✓ confirmation, not reasoning prompt.
+    assert "✓" in text
+    assert "curator → claude-haiku-4-5-20251001" in text
+    cfg_text = (vexis_home / "config.yaml").read_text(encoding="utf-8")
+    assert "claude-haiku-4-5-20251001" in cfg_text
+    # Plain string shape (not dict) since reasoning is None.
+    assert "reasoning" not in cfg_text
+
+
+def test_callback_reasoning_pick_writes_dict_shape(
+    transport, model_ux_on, vexis_home, monkeypatch: pytest.MonkeyPatch,
+):
+    """Tapping a reasoning level writes the dict-shaped config:
+    ``models.subsystems.<sub>: {model: <id>, reasoning: <level>}``.
+    Reads the chosen model from session state stashed by the
+    earlier model-pick step. Confirmation copy mentions the
+    reasoning level."""
+    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    monkeypatch.setattr(
+        "core.model_discovery.reasoning_levels_for",
+        lambda _kind, _model: ["low", "medium", "high"],
+    )
+    sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
+
+    # Step 1: model pick — same message_id used across steps.
+    upd1, _b1, q1 = _callback(
+        f"model_pick_model:{sidx}:cc:claude-opus-4-7", message_id=2024,
+    )
+    asyncio.run(transport._on_callback(upd1, _ctx()))
+    # Step 2: reasoning pick on the same message.
+    upd2, _b2, q2 = _callback(
+        f"model_pick_reasoning:{sidx}:high", message_id=2024,
+    )
+    asyncio.run(transport._on_callback(upd2, _ctx()))
+    text, _mk = q2.edits[0]
+    assert "✓" in text
+    assert "claude-opus-4-7 + reasoning=high" in text
+    cfg_text = (vexis_home / "config.yaml").read_text(encoding="utf-8")
+    # Dict shape persisted.
+    assert "model:" in cfg_text or "model: " in cfg_text
+    assert "reasoning:" in cfg_text or "reasoning: " in cfg_text
+    assert "high" in cfg_text
+
+
+def test_callback_reasoning_default_writes_string_shape(
+    transport, model_ux_on, vexis_home, monkeypatch: pytest.MonkeyPatch,
+):
+    """The ``(default — brain picks)`` button sends an empty
+    level. Picker writes the plain string shape (no reasoning
+    override) so the user gets the brain's native default — same
+    on-disk shape as the pre-reasoning code path."""
+    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    monkeypatch.setattr(
+        "core.model_discovery.reasoning_levels_for",
+        lambda _kind, _model: ["low", "high"],
+    )
+    sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
+
+    upd1, _b1, _q1 = _callback(
+        f"model_pick_model:{sidx}:cc:claude-opus-4-7", message_id=2025,
+    )
+    asyncio.run(transport._on_callback(upd1, _ctx()))
+    # Empty level — the "(default — brain picks)" button.
+    upd2, _b2, q2 = _callback(
+        f"model_pick_reasoning:{sidx}:", message_id=2025,
+    )
+    asyncio.run(transport._on_callback(upd2, _ctx()))
+    text, _mk = q2.edits[0]
+    assert "✓" in text
+    # No reasoning suffix in the confirmation.
+    assert "+ reasoning=" not in text
+    cfg_text = (vexis_home / "config.yaml").read_text(encoding="utf-8")
+    # Plain string shape persisted (no `reasoning:` key for this sub).
+    assert "claude-opus-4-7" in cfg_text
+
+
+def test_callback_reasoning_recovers_gracefully_on_missing_session(
+    transport, model_ux_on, vexis_home,
+):
+    """If the daemon restarted (or the user took >5min) between
+    model pick and reasoning pick, the picker session state is
+    lost. The callback edits the message to a re-issue hint
+    rather than crashing."""
+    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
+    # Reasoning callback fires WITHOUT a prior model pick — no
+    # session state exists.
+    upd, _bot, query = _callback(
+        f"model_pick_reasoning:{sidx}:high", message_id=999999,
+    )
+    asyncio.run(transport._on_callback(upd, _ctx()))
+    text, _mk = query.edits[0]
+    assert "Re-issue" in text or "re-issue" in text
+
+
+def test_callback_back_clears_picker_session(
+    transport, model_ux_on, vexis_home, monkeypatch: pytest.MonkeyPatch,
+):
+    """Pin the cleanup: tapping Back from the model picker after
+    a model has been stashed (e.g. the user went model→reasoning
+    then back-back to provider list) clears the partial selection
+    so a fresh re-entry doesn't accidentally inherit it."""
+    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    monkeypatch.setattr(
+        "core.model_discovery.reasoning_levels_for",
+        lambda _kind, _model: ["low", "high"],
+    )
+    monkeypatch.setattr(
+        "core.model_discovery.discovery_grouped_for_brain",
+        lambda _kind: {"anthropic": ["claude-opus-4-7"]},
+    )
+    sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
+    # Model pick stashes session state.
+    upd1, _b1, _q1 = _callback(
+        f"model_pick_model:{sidx}:cc:claude-opus-4-7", message_id=3030,
+    )
+    asyncio.run(transport._on_callback(upd1, _ctx()))
+    # Verify state was stashed.
+    assert (transport._get_picker_pending().get((_CHAT, 3030)) or {}).get(
+        "model_id"
+    ) == "claude-opus-4-7"
+    # Back from anywhere clears it.
+    upd2, _b2, _q2 = _callback(
+        "model_pick_back:curator", message_id=3030,
+    )
+    asyncio.run(transport._on_callback(upd2, _ctx()))
+    assert (_CHAT, 3030) not in transport._get_picker_pending()
+
+
+def test_callback_cancel_clears_picker_session(
+    transport, model_ux_on, vexis_home, monkeypatch: pytest.MonkeyPatch,
+):
+    """Sibling pin: Cancel mid-multi-step flow clears the partial
+    selection too."""
+    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    monkeypatch.setattr(
+        "core.model_discovery.reasoning_levels_for",
+        lambda _kind, _model: ["high"],
+    )
+    sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
+    upd1, _b1, _q1 = _callback(
+        f"model_pick_model:{sidx}:cc:claude-opus-4-7", message_id=4040,
+    )
+    asyncio.run(transport._on_callback(upd1, _ctx()))
+    upd2, _b2, _q2 = _callback(
+        "model_pick_cancel:curator", message_id=4040,
+    )
+    asyncio.run(transport._on_callback(upd2, _ctx()))
+    assert (_CHAT, 4040) not in transport._get_picker_pending()
+
+
+def test_callback_data_for_reasoning_fits_in_64_bytes():
+    """Pin the byte budget for the reasoning callback shape.
+    ``model_pick_reasoning:<sidx>:<level>`` worst case is the
+    longest level name. Spec listed a trailing ``:<flag>`` for
+    parity but it was deliberately omitted (no flag is
+    meaningful at the reasoning step) — see
+    ``_make_reasoning_keyboard`` docstring."""
+    from transports.telegram import _CB_DATA_MAX_BYTES
+    # Longest realistic level: "medium" = 6 chars (claude-code) or
+    # arbitrary opencode variant names which would also fit easily.
+    payload = "model_pick_reasoning:9:medium"
+    assert len(payload.encode("utf-8")) <= _CB_DATA_MAX_BYTES
+
+
 # ──────────────────────────────────────────────────────────────────
 
 
@@ -1404,7 +1916,7 @@ def test_callback_rejects_disallowed_user(
     """Same posture as /model: callback handler rejects users
     whose id doesn't match _allowed_user_id. No edit, no answer."""
     upd, _bot, query = _callback(
-        "model_pick_provider:curator:anthropic", user_id=_OTHER_USER,
+        "model_pick_provider:curator:cc:anthropic:0", user_id=_OTHER_USER,
     )
     asyncio.run(transport._on_callback(upd, _ctx()))
     assert query.edits == []

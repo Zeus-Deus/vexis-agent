@@ -104,6 +104,103 @@ def _token_fingerprint(token: str) -> str:
 # Default port. Can be overridden by VEXIS_DASHBOARD_PORT in the env.
 DEFAULT_DASHBOARD_PORT = 8766
 
+
+# Source-vs-bundle freshness check (added 2026-05-08). Frontend
+# changes need ``npm run build`` to compile ``web/src/**`` →
+# ``web/dist/assets/index-*.js``; the daemon doesn't run the build,
+# it just serves whatever's already in ``web/dist/``. Without this
+# check, a forgotten build means the user sees stale dashboard
+# behavior despite restarting the daemon — exactly the trap that
+# bit on 2026-05-08 with the tier-fallbacks polish pass. We log a
+# banner WARNING at dashboard startup so it surfaces immediately
+# in the boot log; complementary to the pre-commit hook that
+# auto-rebuilds on commit.
+_DASHBOARD_SRC_EXTENSIONS = (".tsx", ".ts", ".css", ".html")
+_DASHBOARD_STALE_BANNER = (
+    "\n"
+    "  ╭───────────────────────────────────────────────────────────╮\n"
+    "  │  STALE DASHBOARD BUNDLE                                   │\n"
+    "  │                                                           │\n"
+    "  │  web/src/{src_rel} is newer than the compiled bundle.\n"
+    "  │  Source mtime:  {src_mtime}\n"
+    "  │  Bundle mtime:  {bundle_mtime}\n"
+    "  │                                                           │\n"
+    "  │  Run: cd web && npm run build                             │\n"
+    "  │  then hard-refresh your browser (Ctrl+Shift+R).           │\n"
+    "  ╰───────────────────────────────────────────────────────────╯"
+)
+
+
+def _warn_if_dashboard_bundle_stale(web_dist: Path) -> None:
+    """Compare source mtimes under ``web/src/`` against the
+    compiled bundle in ``web_dist``. Log a banner WARNING if any
+    source file is newer than the newest bundle file.
+
+    Silent fail-fast cases:
+      - ``web_dist`` doesn't exist (fresh checkout, no build yet —
+        a separate code path already 404s the dashboard route)
+      - ``web/src/`` doesn't exist (test fixtures pointing at
+        synthetic paths)
+      - any I/O error during the walk (defensive — must never
+        block daemon startup)
+
+    Walks the source tree once; cheap (typically <100 files) and
+    fires once per daemon boot. No caching needed."""
+    try:
+        bundle_dir = web_dist / "assets"
+        src_dir = web_dist.parent / "src"
+        if not bundle_dir.exists() or not src_dir.exists():
+            return
+
+        bundle_files = [
+            p for p in bundle_dir.iterdir()
+            if p.is_file() and p.suffix in (".js", ".css")
+        ]
+        if not bundle_files:
+            return  # no bundle yet, no comparison possible
+
+        newest_bundle_mtime = max(p.stat().st_mtime for p in bundle_files)
+
+        # Find the newest source file across all watched extensions.
+        # ``rglob('*')`` is sufficient — small tree, no recursion concerns.
+        newest_src_path: Path | None = None
+        newest_src_mtime = 0.0
+        for src_file in src_dir.rglob("*"):
+            if not src_file.is_file():
+                continue
+            if src_file.suffix not in _DASHBOARD_SRC_EXTENSIONS:
+                continue
+            mtime = src_file.stat().st_mtime
+            if mtime > newest_src_mtime:
+                newest_src_mtime = mtime
+                newest_src_path = src_file
+
+        if newest_src_path is None:
+            return
+
+        if newest_src_mtime > newest_bundle_mtime:
+            from datetime import datetime, timezone
+            src_rel = newest_src_path.relative_to(src_dir)
+
+            def _fmt(ts: float) -> str:
+                return (
+                    datetime.fromtimestamp(ts, tz=timezone.utc)
+                    .strftime("%Y-%m-%d %H:%M:%S UTC")
+                )
+
+            log.warning(
+                _DASHBOARD_STALE_BANNER.format(
+                    src_rel=str(src_rel),
+                    src_mtime=_fmt(newest_src_mtime),
+                    bundle_mtime=_fmt(newest_bundle_mtime),
+                )
+            )
+    except OSError:
+        # Defensive — never block daemon startup on a freshness
+        # check failure. The trade-off here is silent skip vs
+        # crash; silent is the safe call.
+        pass
+
 # Tailscale serve path. The dashboard owns the root of the tailnet
 # host; the livestream side-process uses /vexis. Tailscale's longest-
 # prefix matching means both can coexist — /vexis/* routes to livestream,
@@ -242,6 +339,15 @@ class WebDashboard:
         """Bind uvicorn, configure Tailscale Serve. Idempotent on re-call."""
         if self._serve_task is not None:
             return
+
+        # Stale-bundle detector (added 2026-05-08): the daemon
+        # serves whatever's in ``web/dist/`` — if the user edits
+        # frontend source but forgets to ``npm run build``, they'll
+        # see old behavior in their browser despite a fresh daemon
+        # restart. Log a banner WARNING at boot so the next
+        # ``journalctl -u vexis-agent`` (or whatever supervisor
+        # they're on) surfaces the issue immediately.
+        _warn_if_dashboard_bundle_stale(self._config.web_dist)
 
         # log_config=None silences uvicorn's default logger setup so it
         # inherits our root logger (rotating file + stderr) instead of

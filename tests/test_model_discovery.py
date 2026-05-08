@@ -888,6 +888,274 @@ def test_live_discovery_returns_api_response_verbatim_plus_aliases(
     assert models == expected
 
 
+# ──────────────────────────────────────────────────────────────────
+# Brain-configured detection (cross-brain picker, 2026-05-08)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_is_brain_configured_returns_true_when_provider_grouping_nonempty(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        md, "discovery_grouped_for_brain",
+        lambda kind: (
+            {"anthropic": ["claude-opus-4-7"]} if kind == "claude-code"
+            else {}
+        ),
+    )
+    assert md.is_brain_configured("claude-code") is True
+    assert md.is_brain_configured("opencode") is False
+
+
+def test_is_brain_configured_null_brain_always_true():
+    """null is the test fake — pickers shouldn't render under null
+    in production but the helper returns True trivially."""
+    assert md.is_brain_configured("null") is True
+
+
+def test_configured_brains_returns_subset(monkeypatch: pytest.MonkeyPatch):
+    """Excludes ``null``; orders claude-code first, then opencode."""
+    monkeypatch.setattr(
+        md, "discovery_grouped_for_brain",
+        lambda kind: (
+            {"anthropic": ["x"]} if kind in ("claude-code", "opencode")
+            else {}
+        ),
+    )
+    assert md.configured_brains() == ["claude-code", "opencode"]
+
+
+def test_configured_brains_only_one(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        md, "discovery_grouped_for_brain",
+        lambda kind: {"anthropic": ["x"]} if kind == "claude-code" else {},
+    )
+    assert md.configured_brains() == ["claude-code"]
+
+
+def test_model_belongs_to_brain_finds_owner(monkeypatch: pytest.MonkeyPatch):
+    """Resolves a typed model id to the brain that has it in the
+    discovered set. Used by the typed-arg slash refusal path."""
+    monkeypatch.setattr(
+        md, "discover_models",
+        lambda kind: (
+            {"claude-opus-4-7"} if kind == "claude-code"
+            else {"anthropic/claude-haiku-3-5"} if kind == "opencode"
+            else set()
+        ),
+    )
+    assert md.model_belongs_to_brain("claude-opus-4-7") == "claude-code"
+    assert (
+        md.model_belongs_to_brain("anthropic/claude-haiku-3-5")
+        == "opencode"
+    )
+    assert md.model_belongs_to_brain("totally-unknown") is None
+
+
+# ──────────────────────────────────────────────────────────────────
+# Per-model capability discovery (reasoning levels)
+# ──────────────────────────────────────────────────────────────────
+
+
+def _api_payload_with_capabilities(*entries: dict) -> dict:
+    return {"data": list(entries), "has_more": False}
+
+
+def test_claude_code_capabilities_extracts_supported_effort_levels(
+    force_oauth_token,
+):
+    """``capabilities.effort.{level}.supported = true`` lands in
+    the per-model reasoning_levels list. Models with
+    ``effort.supported = false`` get an empty list."""
+    payload = _api_payload_with_capabilities(
+        {
+            "id": "claude-opus-4-7",
+            "capabilities": {
+                "effort": {
+                    "supported": True,
+                    "low": {"supported": True},
+                    "medium": {"supported": True},
+                    "high": {"supported": True},
+                    "max": {"supported": True},
+                },
+            },
+        },
+        {
+            "id": "claude-haiku-4-5-20251001",
+            "capabilities": {"effort": {"supported": False}},
+        },
+    )
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_fake_http_response(payload),
+    ):
+        caps = md.discover_claude_code_capabilities()
+    assert caps["claude-opus-4-7"]["reasoning_levels"] == [
+        "low", "medium", "high", "max",
+    ]
+    assert caps["claude-haiku-4-5-20251001"]["reasoning_levels"] == []
+
+
+def test_claude_code_capabilities_handles_missing_capabilities_block(
+    force_oauth_token,
+):
+    """Defensive: an entry without a capabilities block (shouldn't
+    happen against the real API but defensive). Returns empty
+    reasoning_levels for it."""
+    payload = _api_payload_with_capabilities(
+        {"id": "claude-foo", "display_name": "Foo"},  # no capabilities
+    )
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_fake_http_response(payload),
+    ):
+        caps = md.discover_claude_code_capabilities()
+    assert caps["claude-foo"]["reasoning_levels"] == []
+
+
+def test_claude_code_capabilities_returns_empty_on_failure(no_auth):
+    """No auth → empty dict (not the hardcoded fallback). Picker
+    treats empty as 'no capability data, skip the reasoning step'."""
+    caps = md.discover_claude_code_capabilities()
+    assert caps == {}
+
+
+def test_reasoning_levels_for_unknown_model_returns_empty(force_oauth_token):
+    """A model id not in the capability map → empty list. Picker
+    skips the reasoning step rather than crashing."""
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_fake_http_response(_api_payload("claude-opus-4-7")),
+    ):
+        levels = md.reasoning_levels_for("claude-code", "claude-mythical-9000")
+    assert levels == []
+
+
+def test_reasoning_levels_for_unknown_brain_returns_empty():
+    """Future brains without discovery hooks → empty list."""
+    assert md.reasoning_levels_for("future-brain", "anything") == []
+    assert md.reasoning_levels_for("null", "anything") == []
+
+
+def test_opencode_capabilities_parses_variants_keys():
+    """Pin the opencode parser: ``variants`` keys become reasoning
+    levels for each model. Variants whose payloads don't look
+    reasoning-shaped (no ``thinking`` / ``reasoningEffort``) are
+    skipped."""
+    fake_stdout = """\
+github-copilot/claude-opus-4.5
+{
+  "id": "claude-opus-4.5",
+  "providerID": "github-copilot",
+  "variants": {
+    "max": {"thinking": {"type": "enabled", "budgetTokens": 31999}},
+    "high": {"thinking": {"type": "enabled", "budgetTokens": 16000}}
+  }
+}
+opencode/nemotron-3-super-free
+{
+  "id": "nemotron-3-super-free",
+  "providerID": "opencode",
+  "variants": {
+    "low": {"reasoningEffort": "low"},
+    "medium": {"reasoningEffort": "medium"},
+    "high": {"reasoningEffort": "high"}
+  }
+}
+anthropic/claude-no-variants
+{
+  "id": "claude-no-variants",
+  "variants": {}
+}
+"""
+    with patch(
+        "subprocess.run", return_value=_fake_completed(fake_stdout),
+    ):
+        caps = md.discover_opencode_capabilities()
+    assert caps["github-copilot/claude-opus-4.5"]["reasoning_levels"] == [
+        "high", "max",
+    ]
+    assert caps["opencode/nemotron-3-super-free"]["reasoning_levels"] == [
+        "high", "low", "medium",
+    ]
+    # Model with empty variants block: no reasoning levels.
+    assert caps["anthropic/claude-no-variants"]["reasoning_levels"] == []
+
+
+def test_opencode_capabilities_skips_malformed_blocks():
+    """Defensive: a block whose JSON is malformed (mid-line truncation
+    or whatever) gets silently skipped rather than crashing the whole
+    discovery. Other models still parse."""
+    fake_stdout = """\
+provider/good-model
+{
+  "id": "good-model",
+  "variants": {"high": {"thinking": {"budgetTokens": 1}}}
+}
+provider/bad-model
+{
+  "id": "bad-model"
+  this isn't valid JSON
+provider/another-good
+{
+  "id": "another-good",
+  "variants": {"low": {"reasoningEffort": "low"}}
+}
+"""
+    with patch(
+        "subprocess.run", return_value=_fake_completed(fake_stdout),
+    ):
+        caps = md.discover_opencode_capabilities()
+    # The good models parsed.
+    assert "provider/good-model" in caps
+    # The bad block didn't crash discovery.
+
+
+def test_opencode_capabilities_missing_binary_returns_empty():
+    """Binary missing → empty dict. Same posture as
+    ``discover_opencode_models``."""
+    with patch("subprocess.run", side_effect=FileNotFoundError()):
+        caps = md.discover_opencode_capabilities()
+    assert caps == {}
+
+
+def test_reasoning_levels_for_dispatches_per_brain(force_oauth_token):
+    """Brain dispatch: claude-code → /v1/models capabilities;
+    opencode → opencode parser. Pin the routing."""
+    api_payload = _api_payload_with_capabilities({
+        "id": "claude-opus-4-7",
+        "capabilities": {
+            "effort": {
+                "supported": True,
+                "low": {"supported": True},
+                "high": {"supported": True},
+            },
+        },
+    })
+    oc_stdout = """\
+github-copilot/claude-opus-4.5
+{
+  "id": "claude-opus-4.5",
+  "variants": {"max": {"thinking": {"budgetTokens": 1}}}
+}
+"""
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_fake_http_response(api_payload),
+    ):
+        cc_levels = md.reasoning_levels_for(
+            "claude-code", "claude-opus-4-7",
+        )
+    assert cc_levels == ["low", "high"]
+    with patch(
+        "subprocess.run", return_value=_fake_completed(oc_stdout),
+    ):
+        oc_levels = md.reasoning_levels_for(
+            "opencode", "github-copilot/claude-opus-4.5",
+        )
+    assert oc_levels == ["max"]
+
+
 def test_discovery_grouped_for_validator_builds_dict():
     """Sibling of ``discovery_for_validator`` with provider grouping.
     Used by ``_models_payload`` to populate the dashboard's

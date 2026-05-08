@@ -143,6 +143,8 @@ class BrainNull(Brain):
         allow_tools: bool = False,
         cwd: Path | None = None,
         subsystem: str | None = None,
+        reasoning_level: str | None = None,
+        context_window: int | None = None,
     ) -> AuxResult:
         self._aux_records.append({
             "prompt": prompt,
@@ -152,6 +154,8 @@ class BrainNull(Brain):
             "allow_tools": allow_tools,
             "cwd": cwd,
             "subsystem": subsystem,
+            "reasoning_level": reasoning_level,
+            "context_window": context_window,
         })
         if self._pending_aux_exc is not None:
             exc = self._pending_aux_exc

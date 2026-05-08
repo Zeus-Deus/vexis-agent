@@ -374,7 +374,286 @@ def refresh_claude_code_models() -> set[str]:
     hardcoded fallback if the live fetch fails — same posture as
     the cached path)."""
     invalidate_discovery_cache("claude-code")
+    invalidate_discovery_cache("claude-code-capabilities")
     return discover_claude_code_models()
+
+
+# ──────────────────────────────────────────────────────────────────
+# Per-model capability discovery (reasoning levels)
+# ──────────────────────────────────────────────────────────────────
+
+
+# /v1/models response carries a ``capabilities.effort`` block per
+# model: ``{supported: bool, low: {supported: bool}, medium: {...},
+# high: {...}, max: {...}}``. Some models (haiku) have
+# ``effort.supported: false`` with no per-level keys; others
+# (opus-4-7) have all four levels supported. Probe (2026-05-07)
+# confirmed the levels match the claude CLI's ``--effort`` flag
+# values, except CLI also accepts ``xhigh`` which is NOT in the
+# API response — so the picker only shows levels the API
+# advertises (source of truth = capability response, not CLI).
+_CLAUDE_CODE_REASONING_LEVELS = ("low", "medium", "high", "max")
+
+
+def _extract_claude_code_reasoning_levels(model_entry: dict) -> list[str]:
+    """Pull supported reasoning levels from a /v1/models entry.
+
+    Returns an empty list when the model doesn't support reasoning
+    at all (``capabilities.effort.supported`` is False, or the
+    capabilities block is absent entirely). Picker uses the empty
+    list as the signal to skip the reasoning step for that model."""
+    if not isinstance(model_entry, dict):
+        return []
+    caps = model_entry.get("capabilities")
+    if not isinstance(caps, dict):
+        return []
+    effort = caps.get("effort")
+    if not isinstance(effort, dict) or not effort.get("supported"):
+        return []
+    out: list[str] = []
+    for level in _CLAUDE_CODE_REASONING_LEVELS:
+        sub = effort.get(level)
+        if isinstance(sub, dict) and sub.get("supported"):
+            out.append(level)
+    return out
+
+
+def _discover_claude_code_capabilities_uncached() -> dict[str, dict]:
+    """One-shot capability fetch. Same auth + fallback posture as
+    :func:`_discover_claude_code_models_uncached` — if any failure
+    fires, return an empty dict (callers treat empty as "no
+    capability data; skip the reasoning step")."""
+    headers = _build_anthropic_request_headers()
+    if headers is None:
+        return {}
+    req = urllib.request.Request(_ANTHROPIC_MODELS_URL, headers=headers)
+    try:
+        with urllib.request.urlopen(
+            req, timeout=_CLAUDE_CODE_DISCOVERY_TIMEOUT_SECONDS,
+        ) as resp:
+            body = resp.read().decode("utf-8")
+    except (urllib.error.HTTPError, urllib.error.URLError,
+            TimeoutError, OSError):
+        return {}
+    try:
+        payload = json.loads(body)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            return {}
+    except json.JSONDecodeError:
+        return {}
+    out: dict[str, dict] = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("id")
+        if not isinstance(model_id, str):
+            continue
+        out[model_id] = {
+            "reasoning_levels": _extract_claude_code_reasoning_levels(entry),
+        }
+    return out
+
+
+def discover_claude_code_capabilities() -> dict[str, dict]:
+    """Per-model capability map for claude-code, keyed by model id.
+
+    Each value is ``{reasoning_levels: list[str]}``. Cached for 5
+    minutes via :func:`_cached`. Returns an empty dict on any
+    discovery failure — callers (picker, validator) treat the
+    empty case as "no capability data, skip reasoning step".
+
+    Aliases (haiku/sonnet/opus) inherit empty capability lists
+    because /v1/models doesn't return them; the picker filters
+    aliases out before consulting capabilities anyway."""
+    return _cached(
+        "claude-code-capabilities",
+        _discover_claude_code_capabilities_uncached,
+    )
+
+
+# Opencode capability discovery — parse ``opencode models --verbose``
+# output. The verbose format is multi-block: each block is a
+# ``provider/model_id`` header line followed by a pretty-printed
+# JSON object on subsequent lines. We parse via a state machine:
+# read header, then read until balanced braces, parse the JSON
+# block. ``variants`` keys are the supported reasoning levels;
+# ``capabilities.reasoning: false`` (or absent) means the model
+# doesn't support reasoning at all. CLI flag is ``--variant
+# <name>``.
+
+
+def _parse_opencode_verbose(text: str) -> dict[str, dict]:
+    """Extract per-model capability data from ``opencode models
+    --verbose`` output.
+
+    Returns ``{provider/model_id: {reasoning_levels: [...]}}``
+    keyed by full id (matches what
+    :func:`discover_opencode_models` returns).
+
+    Robust to malformed blocks — silently skips any block that
+    doesn't parse rather than crashing the whole discovery."""
+    out: dict[str, dict] = {}
+    lines = text.splitlines()
+    header_re = re.compile(r"^[a-z0-9._/-]+$")
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        # Heuristic: a header line is a single token of
+        # provider/model id chars, followed immediately by '{'.
+        if (
+            line
+            and header_re.match(line)
+            and i + 1 < n
+            and lines[i + 1].lstrip().startswith("{")
+        ):
+            full_id = line.strip()
+            # Capture the JSON block via brace counting (handles
+            # nested objects in the metadata).
+            depth = 0
+            j = i + 1
+            block_lines: list[str] = []
+            while j < n:
+                cur = lines[j]
+                block_lines.append(cur)
+                depth += cur.count("{") - cur.count("}")
+                j += 1
+                if depth == 0:
+                    break
+            try:
+                meta = json.loads("\n".join(block_lines))
+            except json.JSONDecodeError:
+                i = j
+                continue
+            variants = meta.get("variants")
+            reasoning_levels: list[str] = []
+            if isinstance(variants, dict) and variants:
+                # Only keep variants that look reasoning-shaped.
+                # Each variant's value should be a dict with
+                # ``thinking`` or ``reasoningEffort``. Skip variants
+                # whose values are non-dict (defensive).
+                for name, payload in variants.items():
+                    if not isinstance(payload, dict):
+                        continue
+                    if "thinking" in payload or "reasoningEffort" in payload:
+                        reasoning_levels.append(name)
+            out[full_id] = {"reasoning_levels": sorted(reasoning_levels)}
+            i = j
+            continue
+        i += 1
+    return out
+
+
+def _discover_opencode_capabilities_uncached() -> dict[str, dict]:
+    """One-shot ``opencode models --verbose`` fetch. Same failure
+    posture as :func:`_discover_opencode_models_uncached`; empty
+    dict on any error so the picker skips the reasoning step."""
+    try:
+        proc = subprocess.run(
+            ["opencode", "models", "--verbose"],
+            capture_output=True,
+            text=True,
+            timeout=_OPENCODE_DISCOVERY_TIMEOUT_SECONDS,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    return _parse_opencode_verbose(proc.stdout)
+
+
+def discover_opencode_capabilities() -> dict[str, dict]:
+    """Per-model capability map for opencode, keyed by full
+    ``provider/model_id``. Same shape and posture as
+    :func:`discover_claude_code_capabilities`."""
+    return _cached(
+        "opencode-capabilities",
+        _discover_opencode_capabilities_uncached,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Brain-configured detection (cross-brain picker, 2026-05-08)
+# ──────────────────────────────────────────────────────────────────
+
+
+def is_brain_configured(brain_kind: str) -> bool:
+    """Return True iff the brain has at least one provider with
+    discovered models — the proxy for "binary installed AND auth
+    present". Reuses :func:`discovery_grouped_for_brain` so the
+    cache is shared and discovery never fires twice for the same
+    check.
+
+    Used by the picker to decide whether to offer cross-brain
+    switching (only when the OTHER brain has at least one
+    discoverable model). The non-active brain's discovery hits
+    its respective subprocess/API; failure → empty grouping →
+    treated as "not configured", which is the desired UX (don't
+    offer a brain you can't switch to).
+
+    ``null`` brain returns True trivially (it never has discovery
+    but it's the test fake — pickers shouldn't be invoked under
+    null in production)."""
+    if brain_kind == "null":
+        return True
+    grouped = discovery_grouped_for_brain(brain_kind)
+    return any(grouped.values())
+
+
+def configured_brains() -> list[str]:
+    """List of currently-configured brain kinds (subset of
+    ``["claude-code", "opencode"]``, excluding ``null``).
+
+    Used by the picker's provider step to decide single-brain vs.
+    multi-brain provider keyboard rendering. Empty list when
+    neither brain has discovery (rare — usually means a fresh
+    install before authentication completes)."""
+    return [
+        k for k in ("claude-code", "opencode")
+        if is_brain_configured(k)
+    ]
+
+
+def model_belongs_to_brain(model_id: str) -> str | None:
+    """Return the brain kind that has ``model_id`` in its
+    discovered set, or ``None`` when no configured brain has it.
+
+    Used by the typed-arg slash path to detect the case where a
+    user types a model id that belongs to a brain they don't have
+    configured — refusal copy then points at install/auth
+    instructions for the missing brain instead of letting the
+    write proceed and the spawn fail.
+
+    When multiple brains have the same id (rare; could happen if
+    a future brain reuses Anthropic ids verbatim), claude-code
+    wins by precedence — first-match in the iteration order."""
+    for kind in ("claude-code", "opencode"):
+        models = discover_models(kind)
+        if model_id in models:
+            return kind
+    return None
+
+
+def reasoning_levels_for(brain_kind: str, model_id: str) -> list[str]:
+    """Return the reasoning levels supported by ``model_id`` on
+    ``brain_kind``. Empty list = no reasoning support OR
+    capability data unavailable; in either case the picker skips
+    the reasoning step for that model.
+
+    Brain dispatch matches :func:`discover_models`. Unknown brains
+    return empty (no reasoning step)."""
+    if brain_kind == "claude-code":
+        caps = discover_claude_code_capabilities()
+    elif brain_kind == "opencode":
+        caps = discover_opencode_capabilities()
+    else:
+        return []
+    entry = caps.get(model_id)
+    if not isinstance(entry, dict):
+        return []
+    levels = entry.get("reasoning_levels")
+    return list(levels) if isinstance(levels, list) else []
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -638,10 +917,13 @@ def _cached(key: str, fetcher) -> set[str]:
 
 __all__ = [
     "MODEL_DISCOVERY_CLAUDE_CODE",
+    "configured_brains",
     "default_view_models",
+    "discover_claude_code_capabilities",
     "discover_claude_code_models",
     "discover_claude_code_models_by_provider",
     "discover_models",
+    "discover_opencode_capabilities",
     "discover_opencode_models",
     "discover_opencode_models_by_provider",
     "discovery_for_validator",
@@ -651,6 +933,9 @@ __all__ = [
     "family_id_for",
     "group_models_by_family",
     "invalidate_discovery_cache",
+    "is_brain_configured",
+    "model_belongs_to_brain",
+    "reasoning_levels_for",
     "refresh_claude_code_models",
     "refresh_opencode_models",
 ]

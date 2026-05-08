@@ -150,6 +150,44 @@ _PICKER_HIDDEN_VERSIONS_TMPL = (
     " ({n} older versions hidden — tap [Show all versions] to "
     "pin a specific date.)"
 )
+# Reasoning-step prompt — added 2026-05-08. Surfaces after the
+# model step when the chosen model exposes reasoning levels via
+# the brain's capability discovery (effort levels on claude-code,
+# variant names on opencode). Models that don't expose any
+# reasoning level skip this step entirely.
+_PICKER_REASONING_PROMPT_TMPL = (
+    "{subsystem} → {model}. Pick a reasoning level (or default)."
+)
+# Cross-brain switch templates (added 2026-05-08).
+_PICKER_CROSS_BRAIN_CONFIRM_TMPL = (
+    "{model} runs on {target_brain} (current: {current_brain}).\n\n"
+    "Switching writes both brain.kind AND your {subsystem} assignment, "
+    "then restarts vexis. In-flight turns drop; scheduled fires within "
+    "the next ~30s might miss.{supervisor_note}\n\n"
+    "(Reasoning level isn't picked across the switch — re-run "
+    "/model set {subsystem} after restart if you want one.)"
+)
+_PICKER_CROSS_BRAIN_NO_SUPERVISOR_TMPL = (
+    "\n\n⚠ No supervisor detected (INVOCATION_ID unset). Daemon will "
+    "exit; you'll need to restart manually."
+)
+_MODEL_CROSS_BRAIN_SWITCHING_TMPL = (
+    "✓ Switching brain.kind → {target_brain}, {subsystem} → {model}.\n"
+    "Restarting now…{supervisor_note}"
+)
+_MODEL_CROSS_BRAIN_BRAIN_NOT_CONFIGURED_TMPL = (
+    "Won't write — model {model!r} requires brain '{required}', which "
+    "isn't configured on this system.\n\n"
+    "Install + auth steps for {required}:\n{install}"
+)
+_INSTALL_HINT_CLAUDE_CODE = (
+    "  curl -fsSL https://claude.ai/install.sh | bash\n"
+    "  claude  # login on first run"
+)
+_INSTALL_HINT_OPENCODE = (
+    "  curl -fsSL https://opencode.ai/install | bash\n"
+    "  opencode providers login"
+)
 _PICKER_NO_DISCOVERY_TMPL = (
     "No discovered models for brain '{brain}'. Use the typed-arg "
     "path:\n  /model set {subsystem} <model-name>\n"
@@ -441,6 +479,15 @@ class TelegramTransport:
         # Telegram bot commands can't contain hyphens, so /confirm-delete from
         # the spec becomes /confirm_delete here.
         self._pending_deletes: dict[str, datetime] = {}
+        # Per-process picker session state. Keyed on (chat_id,
+        # message_id) of the picker reply; value is the partial
+        # selection accumulated mid-flow (after a model is picked
+        # but before a reasoning level is). Used by the multi-step
+        # picker so the reasoning callback can recover the
+        # already-chosen model without exceeding the 64-byte
+        # callback_data budget. Dies on daemon restart — user
+        # re-issues /model set <sub> and starts a fresh picker.
+        self._picker_pending: dict[tuple[int, int], dict] = {}
         # concurrent_updates(True) is load-bearing for /cancel: PTB's default
         # serializes every update through one task, so a /cancel sent while
         # a brain call is in flight queues behind it for up to 30 minutes
@@ -800,64 +847,139 @@ class TelegramTransport:
         elif action == "delete":
             reply = self._arm_delete_confirmation(payload)
         elif action == "model_pick_provider":
-            # Day 3 of model picker UX. payload = "<subsystem>:<provider>"
-            # OR (post-family-grouping)
-            # "<subsystem>:<provider>:<expand_flag>". Missing flag
-            # defaults to 0 (collapsed default view) so older
-            # callbacks-in-flight stay backwards-compatible.
-            subsystem, _, rest = payload.partition(":")
-            if ":" in rest:
-                provider, _, flag_str = rest.partition(":")
-                expanded = flag_str == "1"
-            else:
-                provider = rest
-                expanded = False
+            # payload = "<subsystem>:<brain_short>:<provider>:<flag>"
+            # (post-cross-brain shape; brain_short ∈ {cc, oc}).
+            # Older formats (no brain_short) come back as
+            # "stale picker" — daemon-restart wipes picker
+            # sessions anyway so in-flight legacy callbacks are
+            # rare.
+            subsystem, brain_kind_resolved, provider, expanded = (
+                self._parse_provider_payload(payload)
+            )
+            if subsystem is None:
+                await query.edit_message_text(
+                    _PICKER_STALE_SUBSYSTEM_TMPL.format(subsystem=payload)
+                )
+                return
             await self._render_model_picker(
-                query, subsystem, provider, page=0, expanded=expanded,
+                query, subsystem, provider, page=0,
+                expanded=expanded, brain_kind=brain_kind_resolved,
             )
             return
         elif action == "model_pick_page":
-            # payload = "<subsystem>:<provider>:<page>" OR (post-
-            # family-grouping) "<subsystem>:<provider>:<page>:<flag>".
-            # Missing flag → collapsed view; same backwards-compat
-            # posture as model_pick_provider.
-            subsystem, _, rest = payload.partition(":")
-            provider, _, rest2 = rest.partition(":")
-            if ":" in rest2:
-                page_str, _, flag_str = rest2.partition(":")
-                expanded = flag_str == "1"
-            else:
-                page_str = rest2
-                expanded = False
-            try:
-                page = int(page_str)
-            except ValueError:
+            # payload = "<sub>:<brain_short>:<provider>:<page>:<flag>"
+            subsystem, brain_kind_resolved, provider, page, expanded = (
+                self._parse_page_payload(payload)
+            )
+            if subsystem is None or page is None:
                 return
             await self._render_model_picker(
-                query, subsystem, provider, page=page, expanded=expanded,
+                query, subsystem, provider, page=page,
+                expanded=expanded, brain_kind=brain_kind_resolved,
             )
             return
         elif action == "model_pick_model":
-            # payload = "<sidx>:<provider/model_id>" (sidx is the
-            # sorted-DEFAULT_SUBSYSTEM_TIERS index — see
-            # _subsystem_to_index docstring for the budget rationale).
-            sidx_str, _, model_id = payload.partition(":")
+            # payload = "<sidx>:<brain_short>:<full_id>" (sidx is the
+            # sorted-DEFAULT_SUBSYSTEM_TIERS index; brain_short is
+            # cc/oc — see _BRAIN_TO_SHORT for the byte-budget
+            # rationale).
+            sidx_str, _, rest = payload.partition(":")
+            brain_short, _, model_id = rest.partition(":")
             subsystem = self._index_to_subsystem(sidx_str)
-            if subsystem is None or not model_id:
-                # Stale picker (subsystems re-ordered since render?
-                # shouldn't happen across daemon lifetime but
-                # defensive). Edit message rather than crash.
+            target_brain = self._SHORT_TO_BRAIN.get(brain_short)
+            if subsystem is None or not model_id or target_brain is None:
                 await query.edit_message_text(
                     _PICKER_STALE_SUBSYSTEM_TMPL.format(subsystem=sidx_str)
                 )
                 return
+            # Cross-brain check (added 2026-05-08): if the picked
+            # model's brain isn't the active brain, render the
+            # confirmation step instead of writing immediately.
+            # Confirmation flow handles brain.kind switch + restart.
+            from core.yaml_config import brain_kind
+            if target_brain != brain_kind():
+                await self._render_cross_brain_confirm(
+                    query, subsystem, target_brain, model_id,
+                )
+                return
+            # Same-brain: existing reasoning-step gate. If the
+            # chosen model exposes reasoning levels, stash + render
+            # reasoning picker; otherwise write immediately.
+            from core.model_discovery import reasoning_levels_for
+            levels = reasoning_levels_for(target_brain, model_id)
+            if levels:
+                key = self._picker_session_key(query)
+                if key is not None:
+                    self._get_picker_pending()[key] = {
+                        "subsystem": subsystem,
+                        "model_id": model_id,
+                    }
+                await self._render_reasoning_picker(
+                    query, subsystem, model_id, levels,
+                )
+                return
             _ok, reply = self._apply_subsystem_set(subsystem, model_id)
+            await query.edit_message_text(reply)
+            return
+        elif action == "model_pick_swap":
+            # payload = "<sidx>:<brain_short>:<full_id>" — same
+            # shape as model_pick_model. User confirmed they want
+            # to switch brains. Write both brain.kind AND the
+            # subsystem assignment, then trigger restart.
+            sidx_str, _, rest = payload.partition(":")
+            brain_short, _, model_id = rest.partition(":")
+            subsystem = self._index_to_subsystem(sidx_str)
+            target_brain = self._SHORT_TO_BRAIN.get(brain_short)
+            if subsystem is None or not model_id or target_brain is None:
+                await query.edit_message_text(
+                    _PICKER_STALE_SUBSYSTEM_TMPL.format(subsystem=sidx_str)
+                )
+                return
+            await self._handle_cross_brain_switch(
+                query, subsystem, target_brain, model_id,
+            )
+            return
+        elif action == "model_pick_reasoning":
+            # payload = "<sidx>:<level>" (level may be empty string
+            # = "default; no reasoning override"). Recovers the
+            # previously-chosen model from picker session state
+            # keyed on (chat_id, message_id) — see
+            # _picker_pending docstring.
+            sidx_str, _, level = payload.partition(":")
+            subsystem = self._index_to_subsystem(sidx_str)
+            key = self._picker_session_key(query)
+            stash = self._get_picker_pending().pop(key, None) if key else None
+            if (
+                subsystem is None
+                or stash is None
+                or stash.get("subsystem") != subsystem
+                or not stash.get("model_id")
+            ):
+                # Daemon restart between model-pick and
+                # reasoning-pick → state lost. Recover gracefully
+                # by telling the user to re-issue.
+                await query.edit_message_text(
+                    _PICKER_STALE_SUBSYSTEM_TMPL.format(
+                        subsystem=subsystem or sidx_str
+                    )
+                )
+                return
+            reasoning = level.strip() or None
+            _ok, reply = self._apply_subsystem_set(
+                subsystem, stash["model_id"], reasoning=reasoning,
+            )
             await query.edit_message_text(reply)
             return
         elif action == "model_pick_back":
             # payload = "<subsystem>" — re-render the provider
             # picker over the existing message so the user lands
             # back at the provider step without scrollback drift.
+            # Also clear any reasoning-step session state — Back
+            # from anywhere in the picker resets the partial
+            # selection.
+            key = self._picker_session_key(query)
+            if key is not None:
+                self._get_picker_pending().pop(key, None)
             await self._render_provider_picker(
                 msg=None, subsystem=payload, edit_query=query,
             )
@@ -880,6 +1002,12 @@ class TelegramTransport:
             chat_id = query.message.chat.id if query.message else None
             message_id = query.message.message_id if query.message else None
             bot = query.message.get_bot() if query.message else None
+            # Clear picker session state if the cancel happens
+            # mid-multi-step flow (e.g. user picked a model but
+            # cancelled before picking reasoning).
+            key = self._picker_session_key(query)
+            if key is not None:
+                self._get_picker_pending().pop(key, None)
             if bot is not None and chat_id is not None and message_id is not None:
                 try:
                     await bot.delete_message(
@@ -1664,6 +1792,7 @@ class TelegramTransport:
 
     def _apply_subsystem_set(
         self, subsystem: str, value: str,
+        reasoning: str | None = None,
     ) -> tuple[bool, str]:
         """Validate + write + render the reply for a per-subsystem
         ``models.subsystems.<sub> = <value>`` mutation.
@@ -1673,6 +1802,12 @@ class TelegramTransport:
         callback can decide between editing the picker reply
         (success) or showing a refusal toast that preserves the
         picker state (validator error).
+
+        ``reasoning`` (added 2026-05-08): when set, writes the
+        dict shape ``models.subsystems.<sub>: {model: <value>,
+        reasoning: <level>}``. When None (the default), writes
+        the plain string shape — preserves backwards-compat for
+        configs that were never touched by the reasoning picker.
 
         Reply text matches the typed-arg path byte-for-byte
         (including the conditional comment-preservation backup
@@ -1697,7 +1832,40 @@ class TelegramTransport:
 
         cfg_path = vexis_dir() / "config.yaml"
         current = _read_raw()
-        proposed = self._proposed_set_subsystem(current, subsystem, value)
+        # Cross-brain refusal (added 2026-05-08): if the value is a
+        # known model id of an UNCONFIGURED brain, refuse with an
+        # install/auth pointer rather than silently writing a
+        # config that the spawn would later reject. Only fires for
+        # the typed-arg path on the slash; the picker handles
+        # cross-brain via the confirm-and-restart flow instead.
+        # Skipped when the value is one of the unambiguous shapes
+        # (abstract tier or model already known to the active brain).
+        from core.model_discovery import (
+            is_brain_configured,
+            model_belongs_to_brain,
+        )
+        from core.yaml_config import ABSTRACT_TIERS
+        if value not in ABSTRACT_TIERS:
+            owner = model_belongs_to_brain(value)
+            current_kind = brain_kind()
+            if (
+                owner is not None
+                and owner != current_kind
+                and not is_brain_configured(owner)
+            ):
+                install_hint = (
+                    _INSTALL_HINT_CLAUDE_CODE if owner == "claude-code"
+                    else _INSTALL_HINT_OPENCODE
+                )
+                return (
+                    False,
+                    _MODEL_CROSS_BRAIN_BRAIN_NOT_CONFIGURED_TMPL.format(
+                        model=value, required=owner, install=install_hint,
+                    ),
+                )
+        proposed = self._proposed_set_subsystem(
+            current, subsystem, value, reasoning=reasoning,
+        )
         # Day 4 of model picker UX wires discovery into the slash
         # write path so rule 6 (available-models membership) actually
         # fires here — without it, the picker would write opencode
@@ -1736,10 +1904,16 @@ class TelegramTransport:
             brain_kind(),
             subsystem_tier_from_config(proposed.get("models"), subsystem),
         )
+        # Confirmation copy includes the reasoning level when set
+        # so the user has visual proof their pick stuck. Plain
+        # writes (reasoning=None) keep the original short form.
+        reasoning_suffix = (
+            f" + reasoning={reasoning}" if reasoning else ""
+        )
         return (
             True,
             _MODEL_SET_OK_TMPL.format(
-                key=subsystem, value=value,
+                key=subsystem, value=value + reasoning_suffix,
                 resolved=resolved or "<brain default>",
                 brain=brain_kind(),
             ) + backup_msg,
@@ -1748,13 +1922,27 @@ class TelegramTransport:
     @staticmethod
     def _proposed_set_subsystem(
         current: dict, subsystem: str, value: str,
+        reasoning: str | None = None,
     ) -> dict:
         """Build the proposed config dict for ``/model set <name>
         <value>``. Pure function; the writer never sees a partial
-        edit."""
+        edit.
+
+        Two write shapes:
+          - ``reasoning=None`` (default) → plain string under
+            ``models.subsystems.<sub>: <value>``. Backwards
+            compatible with every config that pre-dates the
+            reasoning picker.
+          - ``reasoning="<level>"`` → dict shape under
+            ``models.subsystems.<sub>: {model: <value>,
+            reasoning: <level>}``. Picker writes this when the
+            user picks a reasoning level after the model step."""
         models = dict(current.get("models") or {})
         subs = dict(models.get("subsystems") or {})
-        subs[subsystem] = value
+        if reasoning:
+            subs[subsystem] = {"model": value, "reasoning": reasoning}
+        else:
+            subs[subsystem] = value
         models["subsystems"] = subs
         return {**current, "models": models}
 
@@ -1798,29 +1986,64 @@ class TelegramTransport:
             return sortlist[idx]
         return None
 
+    # Brain-kind ↔ short-code map for callback_data. The picker
+    # encodes brain in the callback because cross-brain switching
+    # (added 2026-05-08) means a button can reference a model
+    # under a brain other than the active one. Two-char codes
+    # keep the byte budget under Telegram's 64-byte cap on the
+    # worst-case ``model_pick_model:<sidx>:<brain>:<full_id>``
+    # shape (the longest opencode id is 38 bytes; using full
+    # brain names ``"claude-code"``/``"opencode"`` would push past
+    # the cap).
+    _BRAIN_TO_SHORT: dict[str, str] = {"claude-code": "cc", "opencode": "oc"}
+    _SHORT_TO_BRAIN: dict[str, str] = {"cc": "claude-code", "oc": "opencode"}
+
     @classmethod
     def _make_provider_keyboard(
-        cls, subsystem: str, providers: list[str],
+        cls, subsystem: str,
+        providers_per_brain: dict[str, list[str]],
     ) -> InlineKeyboardMarkup:
-        """One button per provider, plus a Cancel row. Provider
-        order matches the API's (anthropic first, then alphabetical
-        — see ``core.model_discovery._sort_providers``).
+        """One button per (brain, provider) combo, plus a Cancel
+        row. ``providers_per_brain`` is ordered:
+        ``{brain_kind: [provider_name, ...]}``. Brain order in the
+        dict (claude-code first, then opencode) drives row order.
+
+        When only one brain is in the dict (the common case), the
+        button label is just the provider name (matches pre-cross-
+        brain behavior). When multiple brains are present, labels
+        gain a ``" (<brain>)"`` suffix so the user can distinguish
+        ``Anthropic (claude-code)`` from ``Anthropic (opencode)``.
 
         Aliases are NOT exposed as separate buttons here per the
-        Day 2 alias-omission decision in
-        ``.plans/model-picker-ux-research.md`` §5: bare aliases
-        (haiku/sonnet/opus) drift over time as Anthropic releases
-        new models behind the same name, so the picker enforces
-        version pinning by surfacing only full ids. Users who want
-        an alias keep using the typed-arg path."""
+        ``.plans/model-picker-ux-research.md`` §5 alias-omission
+        decision: bare aliases (haiku/sonnet/opus) drift over time
+        as Anthropic releases new models behind the same name, so
+        the picker enforces version pinning by surfacing only full
+        ids. Users who want an alias keep using the typed-arg path."""
         rows: list[list[InlineKeyboardButton]] = []
-        for provider in providers:
-            data = f"model_pick_provider:{subsystem}:{provider}"
-            # Subsystem name + provider name + 19-byte prefix; both
-            # fit comfortably under 64 bytes for realistic values
-            # (longest subsystem 'relationships_classifier' = 24,
-            # longest provider 'github-copilot' = 14 → 58 bytes).
-            rows.append([InlineKeyboardButton(text=provider, callback_data=data)])
+        multi_brain = len(providers_per_brain) > 1
+        for brain, providers in providers_per_brain.items():
+            brain_short = cls._BRAIN_TO_SHORT.get(brain)
+            if brain_short is None:
+                continue  # null or future brain — picker doesn't offer it
+            for provider in providers:
+                # Always include the trailing :0 flag (collapsed
+                # default view) so the parser's segment-count
+                # check matches the rendered shape. The toggle
+                # button rebuilds the same callback with :1 to
+                # flip into expanded view.
+                data = (
+                    f"model_pick_provider:{subsystem}:{brain_short}:"
+                    f"{provider}:0"
+                )
+                # Worst-case byte budget: prefix(19) + sub(24) +
+                # short(2) + provider(14) + flag(1) + 4 separators
+                # = 64 bytes. At the cap; longer inputs would need
+                # encoding revisits.
+                label = f"{provider} ({brain})" if multi_brain else provider
+                rows.append([InlineKeyboardButton(
+                    text=label, callback_data=data,
+                )])
         rows.append([InlineKeyboardButton(
             text="✗ Cancel",
             callback_data=f"model_pick_cancel:{subsystem}",
@@ -1831,6 +2054,7 @@ class TelegramTransport:
     def _make_model_keyboard(
         cls, subsystem: str, provider: str, models: list[str],
         page: int = 0, expanded: bool = False,
+        brain_kind: str | None = None,
     ) -> InlineKeyboardMarkup:
         """Model picker for a given provider. Aliases already
         filtered out by the caller (the picker uses full ids only).
@@ -1870,6 +2094,14 @@ class TelegramTransport:
         visible_set = expanded_models if expanded else collapsed
 
         sidx = cls._subsystem_to_index(subsystem)
+        # ``brain_kind`` is required after the cross-brain switch
+        # work (2026-05-08) — it threads through every callback so
+        # the model-tap handler knows which brain's discovery to
+        # use AND so cross-brain selections trigger the
+        # confirmation flow. Default to claude-code for safety
+        # when callers haven't migrated yet (only the typed-arg
+        # path could hit this; production picker always passes it).
+        brain_short = cls._BRAIN_TO_SHORT.get(brain_kind or "claude-code", "cc")
         total_pages = max(1, (len(visible_set) + cls._PICKER_PAGE_SIZE - 1) // cls._PICKER_PAGE_SIZE)
         page = max(0, min(page, total_pages - 1))
         start = page * cls._PICKER_PAGE_SIZE
@@ -1877,17 +2109,17 @@ class TelegramTransport:
         rows: list[list[InlineKeyboardButton]] = []
 
         if total_pages > 1:
-            # Pagination preserves the expand flag — within an
-            # expanded view, paging through the longer list keeps
-            # the same view mode.
+            # Pagination preserves the expand flag AND the brain
+            # short — paging within an expanded view of one brain's
+            # provider doesn't accidentally swap to the other brain.
             nav: list[InlineKeyboardButton] = []
             flag = 1 if expanded else 0
             if page > 0:
                 nav.append(InlineKeyboardButton(
                     text="← Prev",
                     callback_data=(
-                        f"model_pick_page:{subsystem}:{provider}:"
-                        f"{page - 1}:{flag}"
+                        f"model_pick_page:{subsystem}:{brain_short}:"
+                        f"{provider}:{page - 1}:{flag}"
                     ),
                 ))
             nav.append(InlineKeyboardButton(
@@ -1898,17 +2130,19 @@ class TelegramTransport:
                 nav.append(InlineKeyboardButton(
                     text="Next →",
                     callback_data=(
-                        f"model_pick_page:{subsystem}:{provider}:"
-                        f"{page + 1}:{flag}"
+                        f"model_pick_page:{subsystem}:{brain_short}:"
+                        f"{provider}:{page + 1}:{flag}"
                     ),
                 ))
             rows.append(nav)
 
         for m in visible:
-            data = f"model_pick_model:{sidx}:{m}"
+            # Brain short is part of model_pick_model so the handler
+            # knows which brain owns this id (cross-brain switching).
+            data = f"model_pick_model:{sidx}:{brain_short}:{m}"
             if len(data.encode("utf-8")) > _CB_DATA_MAX_BYTES:
                 # Defensive: a realistic full id should always fit
-                # under 64 bytes with the sidx prefix, but if a
+                # under 64 bytes with sidx + brain_short, but if a
                 # discovery source ever ships a freakishly long id
                 # we silently skip it rather than crash. The user
                 # can still typed-arg-set it via the slash if they
@@ -1923,17 +2157,16 @@ class TelegramTransport:
 
         if has_hidden:
             # Toggle re-renders the same provider with the flipped
-            # flag from page 0. callback_data shape:
-            # ``model_pick_provider:<sub>:<provider>:<flag>`` —
-            # reuses the existing provider-tap action with an
-            # explicit flag rather than adding a separate
-            # ``model_pick_toggle`` action.
+            # flag from page 0. Carries brain short so toggling
+            # within a cross-brain provider's models stays on that
+            # brain.
             toggle_label = "Hide versions" if expanded else "Show all versions"
             new_flag = 0 if expanded else 1
             rows.append([InlineKeyboardButton(
                 text=toggle_label,
                 callback_data=(
-                    f"model_pick_provider:{subsystem}:{provider}:{new_flag}"
+                    f"model_pick_provider:{subsystem}:{brain_short}:"
+                    f"{provider}:{new_flag}"
                 ),
             )])
 
@@ -1956,11 +2189,22 @@ class TelegramTransport:
         ``edit_query`` is None) or by editing an existing picker
         message (when called from the Back button's callback).
 
-        Discovery may be empty for null brain or for opencode
-        without binary; in that case the picker degrades to a
-        text-only fallback steering the user to the typed-arg
-        path or to /model refresh."""
-        from core.model_discovery import discovery_grouped_for_brain
+        Cross-brain (added 2026-05-08): queries discovery for
+        EVERY configured brain (per :func:`configured_brains`).
+        When both shipping brains are configured, providers from
+        both appear in the same keyboard with brain-suffix labels
+        (e.g. ``Anthropic (claude-code)`` vs ``Anthropic (opencode)``).
+        Picking a model from a non-active brain triggers the
+        cross-brain confirmation step (see ``model_pick_model``
+        callback handler).
+
+        When only one brain is configured, the keyboard renders
+        with bare provider labels (no brain suffix) — matches
+        pre-cross-brain behavior for single-brain users."""
+        from core.model_discovery import (
+            configured_brains,
+            discovery_grouped_for_brain,
+        )
         from core.yaml_config import (
             _read_raw,
             brain_kind,
@@ -1968,21 +2212,30 @@ class TelegramTransport:
         )
 
         kind = brain_kind()
-        grouped = discovery_grouped_for_brain(kind)
-        # Filter aliases out of the picker per the Day 2 decision —
-        # buckets that are empty after filtering collapse out of
-        # the keyboard (matches the dashboard's behavior).
+        # Query each configured brain. The active brain always
+        # comes first in the dict iteration order (so its
+        # providers render at the top of the keyboard) — this
+        # reads naturally as "your current brain's providers,
+        # then the other brain's".
+        all_brains = configured_brains()
+        ordered = [kind] if kind in all_brains else []
+        ordered += [b for b in all_brains if b != kind]
         aliases = {"haiku", "sonnet", "opus"}
-        filtered = {
-            p: [m for m in models if m not in aliases]
-            for p, models in grouped.items()
-        }
-        filtered = {p: models for p, models in filtered.items() if models}
+        per_brain: dict[str, list[str]] = {}
+        for b in ordered:
+            grouped = discovery_grouped_for_brain(b)
+            filtered = {
+                p: [m for m in models if m not in aliases]
+                for p, models in grouped.items()
+            }
+            providers = [p for p, models in filtered.items() if models]
+            if providers:
+                per_brain[b] = providers
 
-        if not filtered:
-            # No discovery data → text-only fallback. Same wording
-            # whether opencode binary is missing or null brain is
-            # active; the actionable next step is the same.
+        if not per_brain:
+            # No discovery data on any configured brain → text-only
+            # fallback. Same wording whether opencode binary is
+            # missing or null brain is active.
             text = _PICKER_NO_DISCOVERY_TMPL.format(
                 brain=kind, subsystem=subsystem,
             )
@@ -2001,9 +2254,7 @@ class TelegramTransport:
             subsystem=subsystem,
             current=current_value or "default",
         )
-        keyboard = self._make_provider_keyboard(
-            subsystem, list(filtered.keys()),
-        )
+        keyboard = self._make_provider_keyboard(subsystem, per_brain)
         if edit_query is not None:
             await edit_query.edit_message_text(text, reply_markup=keyboard)
         else:
@@ -2012,6 +2263,7 @@ class TelegramTransport:
     async def _render_model_picker(
         self, query, subsystem: str, provider: str,
         page: int = 0, expanded: bool = False,
+        brain_kind: str | None = None,
     ) -> None:
         """Edit the existing picker message to show the model
         keyboard for ``provider``. Called from the
@@ -2025,6 +2277,13 @@ class TelegramTransport:
         the user just sees the freshly-grouped list, which is
         fine.
 
+        ``brain_kind`` (added 2026-05-08): the brain whose
+        discovery to query. Defaults to the active brain when
+        unset (the typed-arg path may call without specifying).
+        Cross-brain pickers always pass this so the right
+        brain's models render — even when the user is browsing
+        the OTHER brain's providers from the unified keyboard.
+
         ``expanded`` toggles family-grouping: False (default) shows
         one button per family via ``default_view_models``; True
         shows every dated variant. Reply text gains a
@@ -2035,9 +2294,10 @@ class TelegramTransport:
             discovery_grouped_for_brain,
             expanded_view_models,
         )
-        from core.yaml_config import brain_kind
+        from core.yaml_config import brain_kind as active_brain_kind
 
-        grouped = discovery_grouped_for_brain(brain_kind())
+        kind = brain_kind or active_brain_kind()
+        grouped = discovery_grouped_for_brain(kind)
         aliases = {"haiku", "sonnet", "opus"}
         models = [m for m in grouped.get(provider, []) if m not in aliases]
         if not models:
@@ -2078,8 +2338,269 @@ class TelegramTransport:
         )
         keyboard = self._make_model_keyboard(
             subsystem, provider, models, page=page, expanded=expanded,
+            brain_kind=kind,
         )
         await query.edit_message_text(text, reply_markup=keyboard)
+
+    @classmethod
+    def _parse_provider_payload(
+        cls, payload: str,
+    ) -> tuple[str | None, str, str, bool]:
+        """Parse ``model_pick_provider`` callback_data payload.
+
+        Expected shape (post-cross-brain):
+        ``<subsystem>:<brain_short>:<provider>:<flag>`` — 4 parts.
+        Returns ``(subsystem | None, brain_kind, provider, expanded)``;
+        subsystem is None when the payload doesn't unpack cleanly
+        (callback handler renders a stale-picker message)."""
+        parts = payload.split(":")
+        if len(parts) != 4:
+            return None, "claude-code", "", False
+        sub, brain_short, provider, flag = parts
+        brain = cls._SHORT_TO_BRAIN.get(brain_short)
+        if brain is None:
+            return None, "claude-code", "", False
+        return sub, brain, provider, flag == "1"
+
+    @classmethod
+    def _parse_page_payload(
+        cls, payload: str,
+    ) -> tuple[str | None, str, str, int | None, bool]:
+        """Parse ``model_pick_page`` callback_data payload.
+
+        Expected shape:
+        ``<subsystem>:<brain_short>:<provider>:<page>:<flag>`` — 5 parts."""
+        parts = payload.split(":")
+        if len(parts) != 5:
+            return None, "claude-code", "", None, False
+        sub, brain_short, provider, page_str, flag = parts
+        brain = cls._SHORT_TO_BRAIN.get(brain_short)
+        if brain is None:
+            return None, "claude-code", "", None, False
+        try:
+            page = int(page_str)
+        except ValueError:
+            return None, "claude-code", "", None, False
+        return sub, brain, provider, page, flag == "1"
+
+    @staticmethod
+    def _picker_session_key(query) -> tuple[int, int] | None:
+        """Return ``(chat_id, message_id)`` for a picker callback's
+        message, or ``None`` if the message reference isn't fully
+        populated (defensive — Telegram's CallbackQuery.message can
+        be absent in edge cases). Used as the
+        :attr:`_picker_pending` dict key for multi-step picker
+        sessions."""
+        msg = getattr(query, "message", None)
+        if msg is None:
+            return None
+        chat = getattr(msg, "chat", None)
+        chat_id = getattr(chat, "id", None) if chat is not None else None
+        message_id = getattr(msg, "message_id", None)
+        if chat_id is None or message_id is None:
+            return None
+        return (chat_id, message_id)
+
+    def _get_picker_pending(self) -> dict[tuple[int, int], dict]:
+        """Defensive accessor for :attr:`_picker_pending`. Test
+        fixtures construct ``TelegramTransport`` via ``__new__``
+        and skip ``__init__``, so the attribute may not exist.
+        Lazy-init on first access keeps both production code and
+        bare-bones test fixtures working without per-test setup
+        boilerplate."""
+        pending = getattr(self, "_picker_pending", None)
+        if pending is None:
+            pending = {}
+            self._picker_pending = pending
+        return pending
+
+    @classmethod
+    def _make_reasoning_keyboard(
+        cls, subsystem: str, levels: list[str],
+    ) -> InlineKeyboardMarkup:
+        """Reasoning-level picker. One button per level (driven
+        from the brain's per-model capability discovery — the
+        caller has already filtered to levels the chosen model
+        supports), plus a ``(default)`` button that writes
+        ``reasoning=None`` (brain picks default).
+
+        callback_data shape: ``model_pick_reasoning:<sidx>:<level>``.
+        Spec lists a trailing ``:<flag>`` for parity with the
+        provider/page callbacks; deliberately omitted here because
+        no flag is meaningful at the reasoning step (no
+        expand-toggle to flip). Documented inline so the absence
+        is obvious.
+
+        Byte budget: longest sidx=1 byte + longest level (e.g.
+        ``medium``=6) + prefix ``model_pick_reasoning:``=21 bytes
+        = 30 bytes total. Comfortably under 64."""
+        sidx = cls._subsystem_to_index(subsystem)
+        rows: list[list[InlineKeyboardButton]] = []
+        for level in levels:
+            rows.append([InlineKeyboardButton(
+                text=level,
+                callback_data=f"model_pick_reasoning:{sidx}:{level}",
+            )])
+        # Sentinel: empty string for "no reasoning override; brain
+        # picks default". Stays under-budget. Decoded in the
+        # callback as "reasoning=None".
+        rows.append([InlineKeyboardButton(
+            text="(default — brain picks)",
+            callback_data=f"model_pick_reasoning:{sidx}:",
+        )])
+        rows.append([InlineKeyboardButton(
+            text="✗ Cancel",
+            callback_data=f"model_pick_cancel:{subsystem}",
+        )])
+        return InlineKeyboardMarkup(rows)
+
+    async def _render_reasoning_picker(
+        self, query, subsystem: str, model_id: str, levels: list[str],
+    ) -> None:
+        """Edit the picker reply to show the reasoning-level
+        keyboard. Caller has already verified that ``levels`` is
+        non-empty (single-level lists still render — let the user
+        confirm the only available level rather than auto-picking
+        on their behalf)."""
+        text = _PICKER_REASONING_PROMPT_TMPL.format(
+            subsystem=subsystem, model=model_id,
+        )
+        keyboard = self._make_reasoning_keyboard(subsystem, levels)
+        await query.edit_message_text(text, reply_markup=keyboard)
+
+    # ── Cross-brain switch (added 2026-05-08) ──────────────────────
+
+    @staticmethod
+    def _supervisor_detected() -> bool:
+        """systemd sets ``INVOCATION_ID`` for spawned services.
+        Use that as the canary for "supervisor will restart us
+        cleanly". Other supervisor patterns (s6, runit, nohup
+        loops) likely don't set it; users on those configurations
+        get the explicit warning in the cross-brain confirm copy."""
+        import os
+        return bool(os.environ.get("INVOCATION_ID"))
+
+    @classmethod
+    def _make_cross_brain_confirm_keyboard(
+        cls, subsystem: str, target_brain: str, model_id: str,
+    ) -> InlineKeyboardMarkup:
+        """Two-button confirm keyboard for cross-brain switching.
+        callback_data shape mirrors model_pick_model so the byte
+        budget is identical (worst case 60 bytes)."""
+        sidx = cls._subsystem_to_index(subsystem)
+        brain_short = cls._BRAIN_TO_SHORT.get(target_brain, "cc")
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                text=f"✓ Yes, switch to {target_brain}",
+                callback_data=(
+                    f"model_pick_swap:{sidx}:{brain_short}:"
+                    f"{model_id}"
+                ),
+            )],
+            [InlineKeyboardButton(
+                text="✗ Cancel",
+                callback_data=f"model_pick_cancel:{subsystem}",
+            )],
+        ])
+
+    async def _render_cross_brain_confirm(
+        self, query, subsystem: str, target_brain: str, model_id: str,
+    ) -> None:
+        """Render the cross-brain-switch confirmation keyboard.
+        User has just tapped a model whose brain != current brain.
+        Confirmation copy includes the supervisor warning when
+        no INVOCATION_ID is set so the user knows they'll need
+        to manually restart."""
+        from core.yaml_config import brain_kind
+        supervisor_note = (
+            "" if self._supervisor_detected()
+            else _PICKER_CROSS_BRAIN_NO_SUPERVISOR_TMPL
+        )
+        text = _PICKER_CROSS_BRAIN_CONFIRM_TMPL.format(
+            model=model_id,
+            target_brain=target_brain,
+            current_brain=brain_kind(),
+            subsystem=subsystem,
+            supervisor_note=supervisor_note,
+        )
+        keyboard = self._make_cross_brain_confirm_keyboard(
+            subsystem, target_brain, model_id,
+        )
+        await query.edit_message_text(text, reply_markup=keyboard)
+
+    async def _handle_cross_brain_switch(
+        self, query, subsystem: str, target_brain: str, model_id: str,
+    ) -> None:
+        """Confirmed cross-brain switch: write brain.kind +
+        subsystem assignment, send the "restarting" reply, then
+        schedule the daemon exit so the supervisor restarts us.
+
+        Daemon exits via :func:`_request_daemon_restart` after a
+        small delay so the Telegram reply has time to flush. If
+        no supervisor is configured the daemon dies; user has to
+        manually restart (warning surfaced in the confirm copy)."""
+        from core.yaml_config import _read_raw, brain_kind
+        from core.yaml_config_writer import (
+            atomic_write_yaml, backup_if_commented,
+        )
+        from core.paths import vexis_dir
+
+        cfg_path = vexis_dir() / "config.yaml"
+        current = _read_raw()
+        # Build the proposed config: brain.kind switch + subsystem
+        # assignment. Plain string subsystem value (no reasoning) —
+        # post-restart capability data may differ; user re-runs the
+        # picker if they want a reasoning level.
+        proposed = self._proposed_set_subsystem(
+            current, subsystem, model_id, reasoning=None,
+        )
+        brain_block = dict(proposed.get("brain") or {})
+        brain_block["kind"] = target_brain
+        proposed["brain"] = brain_block
+        # Backup commented config before mutating (same posture as
+        # the typed-arg paths).
+        if cfg_path.exists():
+            backup_if_commented(cfg_path)
+        atomic_write_yaml(cfg_path, proposed)
+
+        supervisor_note = (
+            "" if self._supervisor_detected()
+            else _PICKER_CROSS_BRAIN_NO_SUPERVISOR_TMPL
+        )
+        await query.edit_message_text(
+            _MODEL_CROSS_BRAIN_SWITCHING_TMPL.format(
+                target_brain=target_brain,
+                subsystem=subsystem,
+                model=model_id,
+                supervisor_note=supervisor_note,
+            )
+        )
+        # Schedule the exit so the reply flushes first. asyncio
+        # task survives the handler return and fires from the
+        # main event loop tick.
+        log.info(
+            "cross-brain switch: %s → %s (%s); requesting restart "
+            "(current brain=%s)",
+            subsystem, model_id, target_brain, brain_kind(),
+        )
+        asyncio.create_task(self._exit_for_restart_soon())
+
+    @staticmethod
+    async def _exit_for_restart_soon() -> None:
+        """Brief sleep so the Telegram reply has time to flush,
+        then ``os._exit(0)`` for the supervisor to restart us.
+
+        ``os._exit`` (not ``sys.exit``) is intentional — sys.exit
+        raises SystemExit which asyncio's task wrapper catches and
+        logs, so the process doesn't actually terminate.
+        ``os._exit`` is immediate and unconditional, which is what
+        we want for restart. Skips Python cleanup (atexit handlers,
+        gc finalizers) — fine for restart since the supervisor
+        comes back up clean."""
+        import os
+        await asyncio.sleep(0.5)
+        log.info("cross-brain switch: exiting now for supervisor restart")
+        os._exit(0)
 
     def _model_status_text(self) -> str:
         """Render the current resolution table for ``/model``
@@ -2102,6 +2623,7 @@ class TelegramTransport:
         from core.model_validator import (
             brain_instance_to_kind,
             build_resolution_table,
+            format_resolution_display,
         )
         from core.yaml_config import (
             DEFAULT_SUBSYSTEM_TIERS,
@@ -2125,11 +2647,17 @@ class TelegramTransport:
         lines = [f"Current resolution (brain: {kind}):"]
         max_name = max(len(n) for n in DEFAULT_SUBSYSTEM_TIERS)
         for row in table["subsystems"]:
-            tier_str = row["resolved_tier"] or "default"
-            resolved_str = row["resolved_model_id"] or "<brain default>"
+            # Polish-pass display rules (2026-05-08): use
+            # ``format_resolution_display`` so unconfigured
+            # subsystems show "(default → <resolved>)" rather than
+            # the resolved tier name; picker-written models that
+            # resolve to themselves drop the redundant "X → X"
+            # arrow. Dashboard mirrors the same rules in TS.
+            display = format_resolution_display(
+                row["configured"], row["resolved_model_id"],
+            )
             lines.append(
-                f"  {row['name'].ljust(max_name)}  "
-                f"{tier_str:<8} → {resolved_str}"
+                f"  {row['name'].ljust(max_name)}  {display}"
             )
         non_info = [
             f for f in (table["global_findings"] + [
