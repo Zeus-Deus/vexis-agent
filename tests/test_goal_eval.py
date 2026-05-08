@@ -76,7 +76,7 @@ def test_eval_clear_done_explicit_completion(tmp_path: Path) -> None:
         "- vexis-screenshot-2.png\n\n"
         "That's three files. The listing is complete."
     )
-    verdict, reason = judge_goal(tmp_path, goal, reply)
+    verdict, reason, _ = judge_goal(tmp_path, goal, reply)
     print(f"\n[a clear-done] verdict={verdict} reason={reason!r}")
     assert verdict == "done", (
         f"clear-done case got verdict={verdict} reason={reason!r}; "
@@ -102,7 +102,7 @@ def test_eval_clear_continue_partial(tmp_path: Path) -> None:
         "command now works and discovers tests in the tests/ directory. "
         "Next I'll set up ruff."
     )
-    verdict, reason = judge_goal(tmp_path, goal, reply)
+    verdict, reason, _ = judge_goal(tmp_path, goal, reply)
     print(f"\n[b clear-continue] verdict={verdict} reason={reason!r}")
     assert verdict == "continue", (
         f"clear-continue case got verdict={verdict} reason={reason!r}; "
@@ -128,7 +128,7 @@ def test_eval_unachievable_maps_to_done(tmp_path: Path) -> None:
         "subdirectory you want to clean up, I can help with that "
         "instead."
     )
-    verdict, reason = judge_goal(tmp_path, goal, reply)
+    verdict, reason, _ = judge_goal(tmp_path, goal, reply)
     print(f"\n[c unachievable→done] verdict={verdict} reason={reason!r}")
     assert verdict == "done", (
         f"unachievable case got verdict={verdict} reason={reason!r}; "
@@ -154,7 +154,7 @@ def test_eval_ambiguous_advisory(tmp_path: Path) -> None:
         "social media. I haven't actually tried the conversion on a "
         "real video yet."
     )
-    verdict, reason = judge_goal(tmp_path, goal, reply)
+    verdict, reason, _ = judge_goal(tmp_path, goal, reply)
     print(f"\n[d ambiguous] verdict={verdict} reason={reason!r}  (advisory)")
     # No assertion — record-only. Human reviewing the eval output
     # decides whether the verdict was reasonable.
@@ -180,7 +180,7 @@ def test_eval_empty_response_continues(tmp_path: Path) -> None:
             "the pre-spawn short-circuit should have caught it"
         )
 
-    verdict, reason = judge_goal(
+    verdict, reason, _ = judge_goal(
         tmp_path, "do something", "", spawn=fail_if_called
     )
     print(f"\n[e empty→continue] verdict={verdict} reason={reason!r}")
@@ -213,7 +213,7 @@ def test_eval_subprocess_error_fails_open_to_continue(tmp_path: Path) -> None:
             stderr=b"rate limit exceeded",
         )
 
-    verdict, reason = judge_goal(
+    verdict, reason, _ = judge_goal(
         tmp_path,
         "ship the thing",
         "I made progress on it",

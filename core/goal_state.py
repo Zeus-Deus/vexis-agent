@@ -69,6 +69,18 @@ class TerminalGoalError(Exception):
 # burns at most this many turns before auto-pausing.
 DEFAULT_MAX_TURNS = 20
 
+# After this many consecutive judge *parse* failures (empty stdout,
+# non-JSON prose, or schema-shaped JSON missing the ``done`` key) the
+# manager auto-pauses with a config-pointer message. Transport / spawn
+# / non-zero-exit errors do NOT count toward this — those are transient
+# and fail-open silently. Mirrors Hermes
+# (``hermes_cli/goals.py:DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES``); the
+# guard exists because a misconfigured ``goal_judge`` tier (small/tiny,
+# or a model that doesn't follow strict JSON) would otherwise burn the
+# whole 20-turn budget producing identical "judge reply was not JSON"
+# log lines before the budget backstop fires.
+DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
+
 # Allowed status enum. Mirrors Hermes ``GoalState.status``.
 _VALID_STATUSES: frozenset[str] = frozenset({
     "active", "paused", "done", "cleared",
@@ -143,6 +155,14 @@ class GoalState:
     last_verdict: str | None = None
     last_reason: str | None = None
     paused_reason: str | None = None
+    # Consecutive judge-output parse failures (empty stdout, non-JSON
+    # prose, schema-shaped JSON missing the ``done`` key). Reset to 0
+    # on any usable judge reply (including transport errors, which
+    # don't count). When this hits
+    # ``DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES`` the manager auto-pauses
+    # with a config-pointer message — see
+    # :meth:`GoalManager.evaluate_after_turn`.
+    consecutive_parse_failures: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Render to the ``goals.json`` row shape (see module docstring)."""
@@ -172,6 +192,16 @@ class GoalState:
             max_turns = int(raw.get("max_turns", DEFAULT_MAX_TURNS) or DEFAULT_MAX_TURNS)
         except (TypeError, ValueError):
             max_turns = DEFAULT_MAX_TURNS
+        # Tolerant parse: missing key (older rows pre-Day 5) → 0;
+        # garbage → 0. Same posture as turns_used / max_turns above.
+        try:
+            consecutive_parse_failures = int(
+                raw.get("consecutive_parse_failures", 0) or 0
+            )
+        except (TypeError, ValueError):
+            consecutive_parse_failures = 0
+        if consecutive_parse_failures < 0:
+            consecutive_parse_failures = 0
         return cls(
             goal=str(raw.get("goal", "") or ""),
             status=status,
@@ -182,6 +212,7 @@ class GoalState:
             last_verdict=verdict,
             last_reason=raw.get("last_reason") or None,
             paused_reason=raw.get("paused_reason") or None,
+            consecutive_parse_failures=consecutive_parse_failures,
         )
 
 
@@ -455,6 +486,7 @@ class GoalStateStore:
 
 
 __all__ = [
+    "DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES",
     "DEFAULT_MAX_TURNS",
     "GoalState",
     "GoalStateStore",

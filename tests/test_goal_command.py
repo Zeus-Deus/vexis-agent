@@ -751,7 +751,7 @@ def test_user_message_arrives_first_during_goal_hook(
         # call returns the (verdict, reason) tuple.
         with mock.patch(
             "core.goal_manager.judge_goal",
-            new=mock.AsyncMock(return_value=("continue", "more")),
+            new=mock.AsyncMock(return_value=("continue", "more", False)),
         ):
             await transport._run_goal_hook(bot, _CHAT, "brain reply")
 
@@ -798,9 +798,11 @@ def test_continuation_arrives_first_then_user_message(
         # pre-decided verdict so the test stays deterministic.
         judge_calls.append(last_response)
         # First call: continue. Second (after user turn): done.
+        # Day 5: judge_goal returns ``(verdict, reason, parse_failed)``;
+        # parse_failed=False here because both replies are well-formed.
         if len(judge_calls) == 1:
-            return ("continue", "needs more work")
-        return ("done", "user closed it out")
+            return ("continue", "needs more work", False)
+        return ("done", "user closed it out", False)
 
     async def scenario() -> None:
         # Drain claimed; queue empty.
@@ -887,7 +889,7 @@ def test_post_cancel_resume_kicks_loop_again(
         await transport._running_tasks.claim(_CHAT)
         with mock.patch(
             "core.goal_manager.judge_goal",
-            new=mock.AsyncMock(return_value=("continue", "more")),
+            new=mock.AsyncMock(return_value=("continue", "more", False)),
         ):
             await transport._run_goal_hook(bot, _CHAT, "brain reply after resume")
         # Continuation is in the queue.
@@ -992,7 +994,7 @@ def test_budget_exhaustion_renders_pause_message_at_transport_layer(
         await transport._running_tasks.claim(_CHAT)
         with mock.patch(
             "core.goal_manager.judge_goal",
-            new=mock.AsyncMock(return_value=("continue", "not yet")),
+            new=mock.AsyncMock(return_value=("continue", "not yet", False)),
         ):
             # Turn 1 → continue, enqueues continuation.
             await transport._run_goal_hook(bot, _CHAT, "reply 1")

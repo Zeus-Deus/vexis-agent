@@ -152,19 +152,28 @@ def _truncate(text: str, limit: int) -> str:
 # ──────────────────────────────────────────────────────────────────
 
 
-def _parse_judge_response(raw: str) -> tuple[bool, str]:
-    """Parse the judge reply into ``(done, reason)``.
+def _parse_judge_response(raw: str) -> tuple[bool, str, bool]:
+    """Parse the judge reply into ``(done, reason, parse_failed)``.
 
     Tolerates: clean JSON, fence-wrapped JSON, JSON embedded in
     prose, stringified booleans (``"true"``/``"yes"``/``"done"``/``"1"``
     map to ``True``; everything else to ``False``).
 
-    Fail-open: any parse/schema failure returns ``(False, "<error>")``,
-    which :func:`judge_goal` then maps to ``verdict="continue"`` —
-    the budget is the backstop, not retries.
+    Fail-open: any parse/schema failure returns
+    ``(False, "<error>", True)`` — :func:`judge_goal` then maps the
+    boolean to ``verdict="continue"`` and propagates the
+    ``parse_failed`` flag so the manager can auto-pause after N
+    consecutive parse failures (see
+    :data:`core.goal_state.DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES`).
+
+    ``parse_failed=True`` flags the cases the auto-pause guard exists
+    to catch — empty body, non-JSON prose, malformed JSON. A
+    successful parse returns ``parse_failed=False`` regardless of
+    the verdict (a clean ``"continue"`` doesn't burn the budget the
+    way a stream of garbage replies would).
     """
     if not raw:
-        return False, "judge returned empty response"
+        return False, "judge returned empty response", True
 
     body = raw.strip()
     fence = _FENCE_RE.search(body)
@@ -177,7 +186,7 @@ def _parse_judge_response(raw: str) -> tuple[bool, str]:
         if match:
             parsed = _try_parse_object(match.group(0))
     if not isinstance(parsed, dict):
-        return False, f"judge reply was not JSON: {_truncate(raw, 200)!r}"
+        return False, f"judge reply was not JSON: {_truncate(raw, 200)!r}", True
 
     done_val = parsed.get("done")
     if isinstance(done_val, str):
@@ -188,7 +197,7 @@ def _parse_judge_response(raw: str) -> tuple[bool, str]:
     reason = str(reason_val).strip() if reason_val is not None else ""
     if not reason:
         reason = "no reason provided"
-    return done, reason
+    return done, reason, False
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -222,21 +231,37 @@ async def judge_goal(
     goal: str,
     last_response: str,
     brain: Brain,
-) -> tuple[str, str]:
+) -> tuple[str, str, bool]:
     """Ask the auxiliary judge whether ``goal`` is satisfied by ``last_response``.
 
-    Returns ``(verdict, reason)`` where verdict is one of:
+    Returns ``(verdict, reason, parse_failed)`` where verdict is one of:
 
       * ``"done"`` — judge confirmed the goal is satisfied (or that
         it's unachievable/blocked, which the prompt explicitly maps
         to DONE).
       * ``"continue"`` — judge said keep going, OR a fail-open
         fallback from any subprocess / parse / schema error. The
-        20-turn budget is the backstop.
+        turn budget and the consecutive-parse-failures auto-pause are
+        the backstops.
       * ``"skipped"`` — pre-spawn short-circuit. Only one condition
         produces it: empty goal text. The brain turn that preceded
         this call still happened, so the manager folds skipped into
         ``continue`` for budget accounting.
+
+    ``parse_failed`` is True only when the judge call **succeeded but
+    its output was unusable** — empty stdout, non-JSON prose, or
+    schema-shaped JSON missing the ``done`` key. Spawn errors,
+    timeouts, and non-zero exits return ``parse_failed=False`` because
+    those are transient (network / auth / rate-limit shapes) and a
+    flaky transport must not trip the auto-pause meant for bad judge
+    models. The empty-goal and empty-response short-circuits also
+    return ``False`` for the same reason — they aren't model output.
+
+    The manager (:meth:`core.goal_manager.GoalManager.evaluate_after_turn`)
+    increments ``state.consecutive_parse_failures`` on True and resets
+    to 0 on False; when the counter hits
+    :data:`core.goal_state.DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES` it
+    auto-pauses with a config-pointer message.
 
     ``workspace`` is passed as ``cwd`` to ``brain.spawn_aux`` so
     spawned JSONLs land in the workspace's transcript directory
@@ -252,12 +277,12 @@ async def judge_goal(
     and spawn errors are unchanged from pre-Phase-B.
     """
     if not goal.strip():
-        return "skipped", "empty goal"
+        return "skipped", "empty goal", False
     if not last_response.strip():
         # The brain turn produced no substantive reply. Almost
         # certainly not done yet — count the turn (caller does that)
         # and continue. Don't spawn the judge for nothing.
-        return "continue", "empty response (nothing to evaluate)"
+        return "continue", "empty response (nothing to evaluate)", False
 
     prompt = _render_prompt(goal, last_response)
 
@@ -272,24 +297,37 @@ async def judge_goal(
             subsystem="goal_judge",
         )
     except BrainTimeoutError:
-        return "continue", (
-            f"judge timed out after {GOAL_JUDGE_TIMEOUT_SECONDS}s"
+        # Transient transport failure — does NOT count as a parse
+        # failure. A flaky network shouldn't trip the auto-pause meant
+        # for bad judge models.
+        return (
+            "continue",
+            f"judge timed out after {GOAL_JUDGE_TIMEOUT_SECONDS}s",
+            False,
         )
     except (BrainNotInstalled, BrainAuthRequired) as exc:
-        return "continue", f"judge spawn failed: {exc}"
+        return "continue", f"judge spawn failed: {exc}", False
     except BrainError as exc:
-        return "continue", f"judge spawn failed: {exc}"
+        return "continue", f"judge spawn failed: {exc}", False
 
     if result.returncode != 0:
+        # Non-zero exit (rate limit, auth blip, etc.) is also transient.
         body = (result.stderr or result.stdout).strip()
-        return "continue", f"judge exited {result.returncode}: {body[:300]}"
+        return (
+            "continue",
+            f"judge exited {result.returncode}: {body[:300]}",
+            False,
+        )
 
-    done, reason = _parse_judge_response(result.stdout)
+    done, reason, parse_failed = _parse_judge_response(result.stdout)
     verdict = "done" if done else "continue"
     log.info(
-        "goal judge: verdict=%s reason=%s", verdict, _truncate(reason, 120)
+        "goal judge: verdict=%s reason=%s parse_failed=%s",
+        verdict,
+        _truncate(reason, 120),
+        parse_failed,
     )
-    return verdict, reason
+    return verdict, reason, parse_failed
 
 
 __all__ = [

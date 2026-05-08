@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any
 
 from core.goal_judge import judge_goal
 from core.goal_state import (
+    DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES,
     DEFAULT_MAX_TURNS,
     GoalState,
     GoalStateStore,
@@ -355,7 +356,7 @@ class GoalManager:
         state.turns_used += 1
         state.last_turn_at = datetime.now(timezone.utc)
 
-        verdict, reason = await judge_goal(
+        verdict, reason, parse_failed = await judge_goal(
             self._workspace, state.goal, last_response, brain
         )
         # Cache the cited verdict on disk so /goal status can show it
@@ -364,6 +365,18 @@ class GoalManager:
         # for budget/queue accounting.
         state.last_verdict = verdict if verdict in ("done", "continue", "skipped") else None
         state.last_reason = reason
+
+        # Track consecutive judge parse failures. Reset on any usable
+        # reply, including transport / spawn errors (parse_failed=False)
+        # so a flaky brain doesn't trip the auto-pause meant for bad
+        # judge models. Mirrors Hermes
+        # (`hermes_cli/goals.py:493-505`). The reset happens before the
+        # done branch so a "done" verdict that follows a stretch of
+        # parse failures doesn't leave a stale counter on the row.
+        if parse_failed:
+            state.consecutive_parse_failures += 1
+        else:
+            state.consecutive_parse_failures = 0
 
         if verdict == "done":
             state.status = "done"
@@ -375,6 +388,45 @@ class GoalManager:
                 "verdict": "done",
                 "reason": reason,
                 "message": f"✓ Goal achieved: {reason}",
+            }
+
+        # Auto-pause when the judge model can't produce the expected
+        # JSON verdict N turns in a row. Points the user at the
+        # ``models.subsystems.goal_judge`` knob so they can route this
+        # side task to a stricter tier (or model id) that follows the
+        # contract. Without this guard, a misconfigured ``goal_judge``
+        # tier (small/tiny, or a non-strict-JSON model) would burn the
+        # entire turn budget producing identical "judge reply was not
+        # JSON" log lines before the budget backstop fires.
+        #
+        # Checked BEFORE the budget backstop on purpose: when both
+        # would fire on the same turn, the parse-failure message is
+        # the actionable one (config fix), while the budget message
+        # would just say "20/20 turns used" without explaining why the
+        # judge never agreed.
+        if state.consecutive_parse_failures >= DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES:
+            state.status = "paused"
+            state.paused_reason = (
+                f"judge model returned unparseable output "
+                f"{state.consecutive_parse_failures} turns in a row"
+            )
+            self._store.save(self._session_uuid, state)
+            return {
+                "status": "paused",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "continue",
+                "reason": reason,
+                "message": (
+                    f"⏸ Goal paused — the judge model "
+                    f"({state.consecutive_parse_failures} turns) isn't "
+                    "returning the required JSON verdict. Route the "
+                    "judge to a stricter tier in ~/.vexis/config.yaml:\n"
+                    "  models:\n"
+                    "    subsystems:\n"
+                    "      goal_judge: large\n"
+                    "Then /goal resume to continue."
+                ),
             }
 
         # Budget exhausted — auto-pause with a paused_reason that
