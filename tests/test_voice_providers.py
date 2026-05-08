@@ -238,6 +238,45 @@ def test_resolve_piper_binary_trusts_explicit_unconditionally() -> None:
     assert _resolve_piper_binary("/some/explicit/path") == "/some/explicit/path"
 
 
+def test_piper_factory_without_binary_config_passes_none(
+    vexis_config: Path,
+) -> None:
+    """Regression: when ``voice.tts.binary`` is unset in config, the
+    factory MUST pass ``None`` to PiperTTS — not the literal string
+    ``"piper"``. Passing the string short-circuits the resolver
+    (which trusts any truthy ``explicit`` value) and PATH lookup
+    falls through to ``/usr/bin/piper`` (the GTK gaming-mouse tool
+    on Arch). Caught the hard way live; pinned here so a refactor
+    can't quietly resurrect it.
+    """
+    vexis_config.write_text(
+        "voice:\n  enabled: true\n  tts:\n    provider: piper\n",
+        encoding="utf-8",
+    )
+    provider = tts_provider()
+    assert isinstance(provider, PiperTTS)
+    assert provider._explicit_binary is None
+
+
+def test_piper_factory_with_binary_config_forwards_path(
+    vexis_config: Path,
+) -> None:
+    """Symmetric: when the user pins ``voice.tts.binary`` it gets
+    forwarded verbatim (after tilde expansion) so the resolver's
+    explicit-trust branch fires."""
+    vexis_config.write_text(
+        "voice:\n"
+        "  enabled: true\n"
+        "  tts:\n"
+        "    provider: piper\n"
+        "    binary: /custom/piper\n",
+        encoding="utf-8",
+    )
+    provider = tts_provider()
+    assert isinstance(provider, PiperTTS)
+    assert provider._explicit_binary == "/custom/piper"
+
+
 def test_resolve_piper_binary_returns_none_when_nothing_found(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

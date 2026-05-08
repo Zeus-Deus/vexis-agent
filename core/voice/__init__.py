@@ -83,9 +83,16 @@ def tts_provider() -> TTSProvider:
         # Optional explicit binary path — sidesteps collisions with
         # other ``piper`` binaries on the user's system (the Arch
         # ``piper`` gaming-mouse tool being the canonical example).
+        # IMPORTANT: pass None (not "piper") when unset, so the
+        # provider's _resolve_piper_binary kicks in and walks the
+        # candidate list. Passing "piper" would short-circuit the
+        # resolver because it treats any truthy value as trusted —
+        # then PATH lookup finds /usr/bin/piper (the GTK tool) and
+        # we'd be back to the bug this whole resolver was built to
+        # avoid.
         binary_str = yaml_config.voice_tts_binary()
         binary = (
-            str(Path(binary_str).expanduser()) if binary_str else "piper"
+            str(Path(binary_str).expanduser()) if binary_str else None
         )
         return PiperTTS(voice_model_path=model_path, binary=binary)
     if name in ("null", ""):
