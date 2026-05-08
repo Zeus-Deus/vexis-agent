@@ -427,3 +427,89 @@ def test_multiple_cleared_records_cumulate(tmp_path: Path) -> None:
     # break the audit trail.
     raw = json.loads(path.read_text(encoding="utf-8"))
     assert set(raw["goals"].keys()) == {"sid-1", "sid-2", "sid-3"}
+
+
+# ──────────────────────────────────────────────────────────────────
+# Day 5 — consecutive_parse_failures field
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_consecutive_parse_failures_defaults_to_zero() -> None:
+    """A fresh GoalState starts with the counter at 0 — the
+    auto-pause fires off a positive count, so the default must be
+    zero or every newly set goal would auto-pause on its first turn."""
+    state = GoalState(goal="g")
+    assert state.consecutive_parse_failures == 0
+
+
+def test_consecutive_parse_failures_roundtrip(tmp_path: Path) -> None:
+    """The counter persists through save → load. Required for the
+    counter to survive a daemon restart mid-loop — without it, a
+    misconfigured judge could keep burning the budget after every
+    restart."""
+    store = GoalStateStore(tmp_path / "goals.json")
+    state = GoalState(
+        goal="g",
+        status="active",
+        turns_used=2,
+        consecutive_parse_failures=2,
+    )
+    store.save("sid", state)
+    out = store.load("sid")
+    assert out is not None
+    assert out.consecutive_parse_failures == 2
+
+
+def test_old_rows_without_counter_default_to_zero(tmp_path: Path) -> None:
+    """Rows written before Day 5 have no ``consecutive_parse_failures``
+    key. Loading them must not raise — the field should default to 0
+    so the counter starts fresh on the next evaluation. Mirrors the
+    same tolerance ``turns_used`` and ``max_turns`` get."""
+    path = tmp_path / "goals.json"
+    legacy = {
+        "version": GoalStateStore.SCHEMA_VERSION,
+        "goals": {
+            "old-sid": {
+                "goal": "legacy goal",
+                "status": "active",
+                "turns_used": 5,
+                "max_turns": 20,
+                # Note: no consecutive_parse_failures key.
+            }
+        },
+    }
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    store = GoalStateStore(path)
+    out = store.load("old-sid")
+    assert out is not None
+    assert out.goal == "legacy goal"
+    assert out.consecutive_parse_failures == 0
+
+
+def test_garbage_counter_value_clamped_to_zero(tmp_path: Path) -> None:
+    """A ``consecutive_parse_failures`` value that's not a valid int
+    (or is negative) must clamp to 0 rather than raise. Same
+    defensive posture ``turns_used`` and ``max_turns`` use — a single
+    garbage row must not poison the load."""
+    path = tmp_path / "goals.json"
+    bad = {
+        "version": GoalStateStore.SCHEMA_VERSION,
+        "goals": {
+            "sid-1": {
+                "goal": "g",
+                "status": "active",
+                "consecutive_parse_failures": "not-a-number",
+            },
+            "sid-2": {
+                "goal": "g",
+                "status": "active",
+                "consecutive_parse_failures": -42,
+            },
+        },
+    }
+    path.write_text(json.dumps(bad), encoding="utf-8")
+    store = GoalStateStore(path)
+    s1 = store.load("sid-1")
+    s2 = store.load("sid-2")
+    assert s1 is not None and s1.consecutive_parse_failures == 0
+    assert s2 is not None and s2.consecutive_parse_failures == 0

@@ -64,23 +64,30 @@ def _judge(workspace: Path, goal: str, reply: str, brain: BrainNull):
 
 
 def test_parse_clean_json_done():
-    done, reason = _parse_judge_response('{"done": true, "reason": "achieved"}')
+    done, reason, parse_failed = _parse_judge_response(
+        '{"done": true, "reason": "achieved"}'
+    )
     assert done is True
     assert reason == "achieved"
+    assert parse_failed is False
 
 
 def test_parse_clean_json_continue():
-    done, reason = _parse_judge_response('{"done": false, "reason": "more work"}')
+    done, reason, parse_failed = _parse_judge_response(
+        '{"done": false, "reason": "more work"}'
+    )
     assert done is False
     assert reason == "more work"
+    assert parse_failed is False
 
 
 def test_parse_fence_wrapped_json():
     """```json ... ``` is the most common wrapper we see in practice."""
     raw = '```json\n{"done": true, "reason": "shipped"}\n```'
-    done, reason = _parse_judge_response(raw)
+    done, reason, parse_failed = _parse_judge_response(raw)
     assert done is True
     assert reason == "shipped"
+    assert parse_failed is False
 
 
 def test_parse_json_embedded_in_prose():
@@ -90,33 +97,44 @@ def test_parse_json_embedded_in_prose():
         'Looking at the response, the goal seems satisfied. '
         'Verdict: {"done": true, "reason": "deliverable produced"}'
     )
-    done, reason = _parse_judge_response(raw)
+    done, reason, parse_failed = _parse_judge_response(raw)
     assert done is True
     assert reason == "deliverable produced"
+    assert parse_failed is False
 
 
 def test_parse_stringified_done_values():
     """'true', 'yes', 'done', '1' all map to True (case-insensitive)."""
     for s in ("true", "yes", "done", "1", "TRUE", "Yes"):
-        done, _ = _parse_judge_response(f'{{"done": "{s}", "reason": "r"}}')
+        done, _, parse_failed = _parse_judge_response(
+            f'{{"done": "{s}", "reason": "r"}}'
+        )
         assert done is True, f"expected True for {s!r}"
+        assert parse_failed is False
     for s in ("false", "no", "0", "not yet"):
-        done, _ = _parse_judge_response(f'{{"done": "{s}", "reason": "r"}}')
+        done, _, parse_failed = _parse_judge_response(
+            f'{{"done": "{s}", "reason": "r"}}'
+        )
         assert done is False, f"expected False for {s!r}"
+        assert parse_failed is False
 
 
 def test_parse_malformed_json_fails_open():
-    """Non-JSON returns ``(False, <error>)`` so judge_goal can map to
-    verdict='continue' — the budget is the backstop."""
-    done, reason = _parse_judge_response("this is not json at all")
+    """Non-JSON returns ``(False, <error>, True)`` so judge_goal can
+    map to verdict='continue' AND flag the parse failure for the
+    consecutive-parse-failures auto-pause counter."""
+    done, reason, parse_failed = _parse_judge_response("this is not json at all")
     assert done is False
     assert reason  # non-empty error message
+    assert parse_failed is True
 
 
 def test_parse_empty_response():
-    done, reason = _parse_judge_response("")
+    """Empty stdout from a successful judge call → parse_failed=True."""
+    done, reason, parse_failed = _parse_judge_response("")
     assert done is False
     assert reason == "judge returned empty response"
+    assert parse_failed is True
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -126,28 +144,36 @@ def test_parse_empty_response():
 
 def test_empty_goal_returns_skipped(tmp_path: Path) -> None:
     """The pre-spawn short-circuit. The manager guards against calling
-    with empty goal text in practice; this is defense-in-depth."""
+    with empty goal text in practice; this is defense-in-depth.
+
+    parse_failed=False — empty goal isn't model output, so it must
+    NOT count toward the consecutive-parse-failures auto-pause."""
     brain = BrainNull()
-    verdict, reason = _judge(tmp_path, "", "agent reply", brain)
+    verdict, reason, parse_failed = _judge(tmp_path, "", "agent reply", brain)
     assert verdict == "skipped"
     assert reason == "empty goal"
+    assert parse_failed is False
     # Confirm we never called spawn_aux for empty input.
     assert brain.aux_calls() == []
 
-    verdict, _ = _judge(tmp_path, "   ", "agent reply", brain)
+    verdict, _, parse_failed = _judge(tmp_path, "   ", "agent reply", brain)
     assert verdict == "skipped"
+    assert parse_failed is False
     assert brain.aux_calls() == []
 
 
 def test_empty_response_returns_continue_without_spawn(tmp_path: Path) -> None:
-    """An empty assistant reply returns ('continue', ...) WITHOUT
+    """An empty assistant reply returns ('continue', ..., False) WITHOUT
     spawning the judge — there's nothing to evaluate. Distinct from
     'skipped': the brain turn that produced the empty reply still
-    counted, so the manager increments the budget."""
+    counted, so the manager increments the budget. parse_failed=False
+    because the judge wasn't even called — this is a vexis-side
+    short-circuit, not unparseable model output."""
     brain = BrainNull()
-    verdict, reason = _judge(tmp_path, "ship the thing", "", brain)
+    verdict, reason, parse_failed = _judge(tmp_path, "ship the thing", "", brain)
     assert verdict == "continue"
     assert "empty response" in reason
+    assert parse_failed is False
     assert brain.aux_calls() == []  # never spawned
 
 
@@ -158,16 +184,18 @@ def test_empty_response_returns_continue_without_spawn(tmp_path: Path) -> None:
 
 def test_judge_says_done(tmp_path: Path) -> None:
     brain = _brain_returning('{"done": true, "reason": "shipped"}')
-    verdict, reason = _judge(tmp_path, "ship", "I shipped it.", brain)
+    verdict, reason, parse_failed = _judge(tmp_path, "ship", "I shipped it.", brain)
     assert verdict == "done"
     assert reason == "shipped"
+    assert parse_failed is False
 
 
 def test_judge_says_continue(tmp_path: Path) -> None:
     brain = _brain_returning('{"done": false, "reason": "halfway"}')
-    verdict, reason = _judge(tmp_path, "ship", "made progress", brain)
+    verdict, reason, parse_failed = _judge(tmp_path, "ship", "made progress", brain)
     assert verdict == "continue"
     assert reason == "halfway"
+    assert parse_failed is False
 
 
 def test_unachievable_per_prompt_maps_to_done(tmp_path: Path) -> None:
@@ -179,7 +207,7 @@ def test_unachievable_per_prompt_maps_to_done(tmp_path: Path) -> None:
     brain = _brain_returning(
         '{"done": true, "reason": "needs API key from user"}'
     )
-    verdict, reason = _judge(
+    verdict, reason, _ = _judge(
         tmp_path, "ship", "I cannot proceed without an API key.", brain
     )
     assert verdict == "done"
@@ -194,49 +222,80 @@ def test_unachievable_per_prompt_maps_to_done(tmp_path: Path) -> None:
 def test_brain_timeout_returns_continue(tmp_path: Path) -> None:
     """``BrainTimeoutError`` from ``spawn_aux`` → verdict='continue'.
     Pre-Phase-B this caught ``subprocess.TimeoutExpired``; the
-    semantic is unchanged, only the exception type differs."""
+    semantic is unchanged, only the exception type differs.
+
+    Day 5 invariant: parse_failed=False on transport errors so a
+    flaky brain doesn't trip the parse-failure auto-pause."""
     brain = BrainNull()
     brain.next_aux_raises(BrainTimeoutError("aux timed out"))
-    verdict, reason = _judge(tmp_path, "goal", "reply", brain)
+    verdict, reason, parse_failed = _judge(tmp_path, "goal", "reply", brain)
     assert verdict == "continue"
     assert "timed out" in reason
+    assert parse_failed is False
 
 
 def test_brain_not_installed_returns_continue(tmp_path: Path) -> None:
     """``BrainNotInstalled`` (binary missing) → verdict='continue'.
-    Pre-Phase-B this caught ``OSError``/``FileNotFoundError``."""
+    Pre-Phase-B this caught ``OSError``/``FileNotFoundError``.
+
+    parse_failed=False — spawn errors are transient, not parse failures."""
     brain = BrainNull()
     brain.next_aux_raises(BrainNotInstalled("claude not on PATH"))
-    verdict, reason = _judge(tmp_path, "goal", "reply", brain)
+    verdict, reason, parse_failed = _judge(tmp_path, "goal", "reply", brain)
     assert verdict == "continue"
     assert "spawn failed" in reason
+    assert parse_failed is False
 
 
 def test_brain_error_returns_continue(tmp_path: Path) -> None:
     """Any other ``BrainError`` from ``spawn_aux`` → verdict='continue'.
-    Catch-all for OSError-shaped failures other than missing-binary."""
+    Catch-all for OSError-shaped failures other than missing-binary.
+
+    parse_failed=False — opaque transport errors are transient."""
     brain = BrainNull()
     brain.next_aux_raises(BrainError("opaque subprocess failure"))
-    verdict, reason = _judge(tmp_path, "goal", "reply", brain)
+    verdict, reason, parse_failed = _judge(tmp_path, "goal", "reply", brain)
     assert verdict == "continue"
     assert "spawn failed" in reason
+    assert parse_failed is False
 
 
 def test_nonzero_exit_returns_continue(tmp_path: Path) -> None:
+    """Non-zero exit code (rate limit, auth blip, etc.) is transient.
+    parse_failed=False — the model never had a chance to emit output."""
     brain = _brain_returning("", returncode=2, stderr="rate limited")
-    verdict, reason = _judge(tmp_path, "goal", "reply", brain)
+    verdict, reason, parse_failed = _judge(tmp_path, "goal", "reply", brain)
     assert verdict == "continue"
     assert "exited 2" in reason
     assert "rate limited" in reason
+    assert parse_failed is False
 
 
 def test_malformed_response_returns_continue(tmp_path: Path) -> None:
     """Non-zero return is a hard fail; non-JSON in stdout maps the
-    judge to 'continue' via fail-open in the parser."""
+    judge to 'continue' via fail-open in the parser.
+
+    parse_failed=True here — the subprocess succeeded (returncode=0)
+    but the model emitted unparseable text. This is exactly the case
+    the consecutive-parse-failures auto-pause exists to catch."""
     brain = _brain_returning("the model rambled but never emitted JSON")
-    verdict, reason = _judge(tmp_path, "goal", "reply", brain)
+    verdict, reason, parse_failed = _judge(tmp_path, "goal", "reply", brain)
     assert verdict == "continue"
     assert reason  # parser's error string
+    assert parse_failed is True
+
+
+def test_empty_judge_stdout_flagged_as_parse_failure(tmp_path: Path) -> None:
+    """returncode=0 but stdout is empty → parse_failed=True.
+    Distinct from the empty-response short-circuit (caller-side
+    check) and from non-zero exits (transport-side error). This is
+    the exact failure mode that prompted the guard: a weak judge
+    model that returns nothing for a strict-JSON request."""
+    brain = _brain_returning("")
+    verdict, reason, parse_failed = _judge(tmp_path, "goal", "agent reply", brain)
+    assert verdict == "continue"
+    assert "empty" in reason.lower()
+    assert parse_failed is True
 
 
 # ──────────────────────────────────────────────────────────────────

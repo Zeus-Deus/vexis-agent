@@ -202,15 +202,20 @@ def test_persistence_across_managers(store: GoalStateStore) -> None:
 # ──────────────────────────────────────────────────────────────────
 
 
-def _patch_judge(verdict: str, reason: str):
+def _patch_judge(verdict: str, reason: str, *, parse_failed: bool = False):
     """Patch ``core.goal_manager.judge_goal`` (the import the manager
     uses) to return a fixed verdict. Local helper because every
     evaluate test needs it. Phase B: ``judge_goal`` is async, so we
     use ``AsyncMock`` to make ``await judge_goal(...)`` resolve to
-    the fixed tuple."""
+    the fixed tuple.
+
+    Day 5 (parse-failure auto-pause): ``judge_goal`` now returns
+    ``(verdict, reason, parse_failed)``. Default ``parse_failed=False``
+    so existing call sites don't change; tests exercising the
+    parse-failure path opt in explicitly."""
     return mock.patch(
         "core.goal_manager.judge_goal",
-        new=mock.AsyncMock(return_value=(verdict, reason)),
+        new=mock.AsyncMock(return_value=(verdict, reason, parse_failed)),
     )
 
 
@@ -582,3 +587,244 @@ def test_continuation_prompt_starts_with_verbatim_prefix(
     assert CONTINUATION_PROMPT_TEMPLATE.startswith(
         "[Continuing toward your standing goal]"
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Day 5 — Auto-pause on consecutive judge parse failures
+# ──────────────────────────────────────────────────────────────────
+#
+# Regression bait: a misconfigured ``goal_judge`` tier (small/tiny, or
+# any model that doesn't follow strict JSON) used to burn the entire
+# 20-turn budget producing identical "judge reply was not JSON" log
+# lines before the budget backstop fired. The guard ported here from
+# Hermes (``hermes_cli/goals.py:DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES``)
+# auto-pauses after 3 consecutive parse failures with a config-pointer
+# message. Tests below pin:
+#
+#   * the threshold (3, not 2 not 4)
+#   * counter increments only on parse_failed=True
+#   * counter resets on any usable reply (good verdict OR transport
+#     error; both are parse_failed=False)
+#   * the message body cites the config knob the user must turn
+#   * the counter is durable across GoalManager reloads
+
+
+def _patch_judge_parse_failure(reason: str = "judge reply was not JSON"):
+    """Convenience: patch ``judge_goal`` to return a parse-failure
+    verdict (continue, parse_failed=True). Mirrors the shape returned
+    by ``_parse_judge_response`` for non-JSON / empty input."""
+    return _patch_judge("continue", reason, parse_failed=True)
+
+
+def test_evaluate_increments_parse_failure_counter(
+    store: GoalStateStore,
+) -> None:
+    """Each parse-failure verdict increments the counter by 1."""
+    mgr = _mgr(store, max_turns=20)
+    mgr.set("g")
+    with _patch_judge_parse_failure():
+        _evaluate_sync(mgr, "rambling reply 1")
+    assert mgr.state is not None
+    assert mgr.state.consecutive_parse_failures == 1
+
+    with _patch_judge_parse_failure():
+        _evaluate_sync(mgr, "rambling reply 2")
+    assert mgr.state.consecutive_parse_failures == 2
+
+
+def test_evaluate_auto_pauses_after_three_parse_failures(
+    store: GoalStateStore,
+) -> None:
+    """The 3rd consecutive parse-failure verdict flips status →
+    paused with a config-pointer message; no continuation is enqueued.
+
+    Pins the exact threshold matching
+    ``DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES`` (=3). Mirrors hermes'
+    `test_auto_pause_after_three_consecutive_parse_failures`."""
+    from core.goal_state import DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES
+
+    assert DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES == 3
+
+    mgr = _mgr(store, max_turns=20)
+    mgr.set("g")
+    with _patch_judge_parse_failure():
+        d1 = _evaluate_sync(mgr, "step 1")
+        assert d1["should_continue"] is True
+        assert mgr.state is not None
+        assert mgr.state.consecutive_parse_failures == 1
+
+        d2 = _evaluate_sync(mgr, "step 2")
+        assert d2["should_continue"] is True
+        assert mgr.state.consecutive_parse_failures == 2
+
+        d3 = _evaluate_sync(mgr, "step 3")
+        # Auto-pause fires here.
+        assert d3["should_continue"] is False
+        assert d3["status"] == "paused"
+        assert d3["continuation_prompt"] is None
+        assert mgr.state.consecutive_parse_failures == 3
+        assert mgr.state.status == "paused"
+        # The paused_reason cites the auto-pause cause for /goal status.
+        assert mgr.state.paused_reason is not None
+        assert "unparseable" in mgr.state.paused_reason
+        assert "3 turns" in mgr.state.paused_reason
+        # The message points the user at the config surface to fix it.
+        assert "models" in d3["message"]
+        assert "subsystems" in d3["message"]
+        assert "goal_judge" in d3["message"]
+        assert "config.yaml" in d3["message"]
+        assert "/goal resume" in d3["message"]
+
+
+def test_parse_failure_counter_resets_on_clean_continue(
+    store: GoalStateStore,
+) -> None:
+    """A single clean (parse_failed=False) judge reply resets the
+    counter — a one-off model hiccup followed by a good reply does
+    NOT auto-pause."""
+    mgr = _mgr(store, max_turns=20)
+    mgr.set("g")
+    with _patch_judge_parse_failure():
+        _evaluate_sync(mgr, "step 1")
+        _evaluate_sync(mgr, "step 2")
+    assert mgr.state is not None
+    assert mgr.state.consecutive_parse_failures == 2
+
+    with _patch_judge("continue", "making progress", parse_failed=False):
+        d = _evaluate_sync(mgr, "step 3")
+    assert d["should_continue"] is True
+    assert mgr.state.consecutive_parse_failures == 0
+    assert mgr.state.status == "active"
+
+
+def test_parse_failure_counter_resets_on_done_verdict(
+    store: GoalStateStore,
+) -> None:
+    """Even when the prior turns were parse failures, a final 'done'
+    verdict resets the counter on the way through. The reset happens
+    BEFORE the done branch returns — verified by reading the on-disk
+    state after the done verdict (the row is saved with the reset
+    counter, not the stale count)."""
+    mgr = _mgr(store, max_turns=20)
+    mgr.set("g")
+    with _patch_judge_parse_failure():
+        _evaluate_sync(mgr, "step 1")
+        _evaluate_sync(mgr, "step 2")
+    assert mgr.state is not None
+    assert mgr.state.consecutive_parse_failures == 2
+
+    with _patch_judge("done", "shipped it", parse_failed=False):
+        d = _evaluate_sync(mgr, "final step")
+    assert d["verdict"] == "done"
+    # Counter reset survived the save into the done branch.
+    assert mgr.state.consecutive_parse_failures == 0
+
+
+def test_transport_errors_do_not_count_as_parse_failures(
+    store: GoalStateStore,
+) -> None:
+    """API / transport errors return parse_failed=False from
+    judge_goal — they're transient. The counter MUST stay at 0 across
+    any number of these so a flaky network doesn't trip the auto-pause
+    meant for bad judge models."""
+    mgr = _mgr(store, max_turns=20)
+    mgr.set("g")
+
+    # Five consecutive transport-style errors (continue, parse_failed=False).
+    with _patch_judge("continue", "judge spawn failed: BrainTimeoutError", parse_failed=False):
+        for _ in range(5):
+            d = _evaluate_sync(mgr, "still going")
+            assert d["should_continue"] is True
+    assert mgr.state is not None
+    assert mgr.state.consecutive_parse_failures == 0
+    assert mgr.state.status == "active"
+
+
+def test_parse_failure_counter_persists_across_reload(
+    store: GoalStateStore,
+) -> None:
+    """The counter must be durable so cross-session resumes (or a
+    daemon restart mid-loop) carry it forward. Without persistence,
+    a restart would silently reset the counter and let a misconfigured
+    judge keep burning the budget."""
+    mgr1 = _mgr(store, "persist-sid")
+    mgr1.set("g")
+    with _patch_judge_parse_failure():
+        _evaluate_sync(mgr1, "r1")
+        _evaluate_sync(mgr1, "r2")
+    assert mgr1.state is not None
+    assert mgr1.state.consecutive_parse_failures == 2
+
+    # Fresh manager re-loads from disk.
+    mgr2 = _mgr(store, "persist-sid")
+    assert mgr2.state is not None
+    assert mgr2.state.consecutive_parse_failures == 2
+
+    # Third parse failure on the fresh manager triggers the auto-pause —
+    # confirms the durable counter participates in the threshold check.
+    with _patch_judge_parse_failure():
+        d = _evaluate_sync(mgr2, "r3")
+    assert d["should_continue"] is False
+    assert d["status"] == "paused"
+    assert mgr2.state is not None
+    assert mgr2.state.status == "paused"
+
+
+def test_parse_failure_auto_pause_takes_priority_over_budget(
+    store: GoalStateStore,
+) -> None:
+    """When both the parse-failure threshold AND the budget would
+    fire on the same turn, the parse-failure message wins. It's the
+    actionable one — the budget message would just say "N/N turns
+    used" without explaining why the judge never agreed."""
+    mgr = _mgr(store, max_turns=3)
+    mgr.set("g")
+    with _patch_judge_parse_failure():
+        # Turns 1, 2 burn the parse-failure counter to 2.
+        _evaluate_sync(mgr, "r1")
+        _evaluate_sync(mgr, "r2")
+        # Turn 3 — counter hits 3 AND turns_used hits 3. The
+        # parse-failure branch is checked first, so the paused_reason
+        # is the unparseable-output one, not the budget one.
+        d = _evaluate_sync(mgr, "r3")
+    assert d["should_continue"] is False
+    assert d["status"] == "paused"
+    assert mgr.state is not None
+    assert mgr.state.paused_reason is not None
+    assert "unparseable" in mgr.state.paused_reason
+    # And NOT the budget paused_reason — even though both conditions
+    # were live on the same turn.
+    assert "budget exhausted" not in mgr.state.paused_reason
+
+
+def test_resume_does_not_reset_parse_failure_counter(
+    store: GoalStateStore,
+) -> None:
+    """``/goal resume`` resets ``turns_used`` to 0 but does NOT reset
+    ``consecutive_parse_failures``. Matches hermes' intentional
+    choice: if the user resumes without actually fixing the
+    ``goal_judge`` config, the very first post-resume parse failure
+    (counter going from 3 → 4 → still ≥ threshold) re-pauses
+    immediately, surfacing the misconfiguration loudly. A single
+    GOOD judge reply post-resume resets the counter to 0 via the
+    normal evaluate path, so a fixed config recovers cleanly."""
+    mgr = _mgr(store, max_turns=20)
+    mgr.set("g")
+    with _patch_judge_parse_failure():
+        _evaluate_sync(mgr, "r1")
+        _evaluate_sync(mgr, "r2")
+        _evaluate_sync(mgr, "r3")
+    assert mgr.state is not None
+    assert mgr.state.status == "paused"
+    assert mgr.state.consecutive_parse_failures == 3
+
+    mgr.resume()
+    assert mgr.state is not None
+    assert mgr.state.status == "active"
+    # Counter is NOT reset by resume itself — stays at 3.
+    assert mgr.state.consecutive_parse_failures == 3
+    # …but a single clean reply post-resume resets it via the normal
+    # evaluate path (proving a fixed config recovers).
+    with _patch_judge("continue", "making progress", parse_failed=False):
+        _evaluate_sync(mgr, "post-resume good reply")
+    assert mgr.state.consecutive_parse_failures == 0
