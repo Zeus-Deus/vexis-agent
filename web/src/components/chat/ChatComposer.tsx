@@ -28,6 +28,11 @@ interface ChatComposerProps {
   // Surfaced as an inline error string above the composer (parent
   // owns the rendering — composer just signals).
   onVoiceError: (message: string) => void;
+  // Voice-call mode entry. ChatPage owns the modal state; we just
+  // render the entry button. Hidden when STT *and* TTS aren't both
+  // available — call mode without one or the other isn't useful.
+  callModeAvailable: boolean;
+  onOpenCallMode: () => void;
   // Attachment queue is parent-owned so drag-drop and paste handlers
   // on the conversation pane can also append into it.
   attachmentQueue: QueuedAttachment[];
@@ -47,6 +52,8 @@ export function ChatComposer({
   sttAvailable,
   onVoiceCapture,
   onVoiceError,
+  callModeAvailable,
+  onOpenCallMode,
   attachmentQueue,
   setAttachmentQueue,
   onAttachmentError,
@@ -158,6 +165,26 @@ export function ChatComposer({
               onRecordingComplete={onVoiceCapture}
               onError={onVoiceError}
             />
+          )}
+          {callModeAvailable && (
+            <button
+              type="button"
+              onClick={onOpenCallMode}
+              disabled={pending}
+              aria-label="Start voice call"
+              title="Voice call — hands-free conversation"
+              className={[
+                "shrink-0 rounded-md flex items-center justify-center",
+                "px-3 py-2.5 md:px-2.5 md:py-1.5",
+                "transition-colors select-none",
+                "border border-[var(--color-accent-2)]",
+                "text-[var(--color-accent)] hover:text-[var(--color-fg)]",
+                "hover:border-[var(--color-accent)] hover:bg-[var(--color-accent)]/10",
+                "disabled:opacity-40 disabled:cursor-not-allowed",
+              ].join(" ")}
+            >
+              <span aria-hidden className="text-base leading-none">📞</span>
+            </button>
           )}
           <button
             type="button"

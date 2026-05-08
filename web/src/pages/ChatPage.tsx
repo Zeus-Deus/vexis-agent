@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import type { ChatSession, QueuedAttachment, VoiceInfo } from "../lib/types";
 import { ChatSidebar } from "../components/chat/ChatSidebar";
@@ -7,6 +7,18 @@ import {
   type ChatMessage,
 } from "../components/chat/ChatMessages";
 import { ChatComposer } from "../components/chat/ChatComposer";
+
+// Lazy-load voice call mode + its dependencies (vad-web,
+// onnxruntime-web, the Silero ONNX model wasm). These add ~900 KB
+// to the bundle when bundled into the main chunk; deferring them
+// behind an ``import()`` boundary means users who never tap the
+// 📞 button never download them. Suspense fallback shows nothing
+// because we only mount the component while ``callOpen`` is true.
+const VoiceCallMode = lazy(() =>
+  import("../components/chat/VoiceCallMode").then((m) => ({
+    default: m.VoiceCallMode,
+  })),
+);
 
 interface ChatPageProps {
   token: string;
@@ -63,6 +75,12 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
   // need to push into the same queue without going through the
   // composer. Clears after a successful send.
   const [attachmentQueue, setAttachmentQueue] = useState<QueuedAttachment[]>([]);
+
+  // Voice call mode — opens a full-screen overlay with VAD-driven
+  // hands-free conversation. The component owns its own mic +
+  // playback; we just track open/closed and forward each turn back
+  // here so the conversation buffer reflects what was said.
+  const [callOpen, setCallOpen] = useState(false);
 
   const activeName = sessions?.find((s) => s.is_active)?.name ?? "";
   const messages = activeName ? buffers[activeName] ?? [] : [];
@@ -319,6 +337,28 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
     setError(message);
   }, []);
 
+  // Voice-call-mode each-turn callback. Both transcript and reply
+  // can be null when the turn errored out (empty transcription, for
+  // instance) — in that case we don't append anything; call mode
+  // shows the error state inside the modal.
+  const handleCallTurn = useCallback(
+    (transcript: string | null, reply: string | null) => {
+      if (!activeName) return;
+      const ts = Date.now();
+      const next: ChatMessage[] = [];
+      if (transcript) {
+        next.push({ role: "user", content: transcript, ts });
+      }
+      if (reply) {
+        next.push({ role: "assistant", content: reply, ts: ts + 1 });
+      }
+      if (next.length > 0) {
+        setMessages(activeName, (prev) => [...prev, ...next]);
+      }
+    },
+    [activeName, setMessages],
+  );
+
   const handleNew = useCallback(async () => {
     setPendingName("__new__");
     try {
@@ -473,8 +513,14 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
             <button
               type="button"
               onClick={toggleTtsMute}
-              aria-label={ttsMuted ? "Unmute voice replies" : "Mute voice replies"}
-              title={ttsMuted ? "Voice replies muted — tap to unmute" : "Tap to mute voice replies"}
+              aria-label={
+                ttsMuted ? "Unmute spoken replies" : "Mute spoken replies"
+              }
+              title={
+                ttsMuted
+                  ? "Spoken replies muted (you can still send voice; replies are text-only). Tap to enable speech."
+                  : "Spoken replies on. Tap to mute."
+              }
               className={[
                 "shrink-0 w-9 h-9 flex items-center justify-center rounded-md",
                 "border border-[var(--color-border-strong)] transition-colors",
@@ -493,14 +539,23 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
         </div>
         {/* Desktop TTS toggle — same control, surfaced as a tiny
             corner button so it's reachable without the mobile
-            header. Hidden when TTS is unavailable. */}
+            header. Hidden when TTS is unavailable. Label is
+            "spoken replies" rather than "voice" because muting
+            doesn't affect voice INPUT — only whether the assistant
+            reads its replies aloud. */}
         {voiceInfo?.tts.available && (
           <div className="hidden md:flex justify-end px-4 sm:px-6 pt-2">
             <button
               type="button"
               onClick={toggleTtsMute}
-              aria-label={ttsMuted ? "Unmute voice replies" : "Mute voice replies"}
-              title={ttsMuted ? "Voice replies muted — click to unmute" : "Click to mute voice replies"}
+              aria-label={
+                ttsMuted ? "Unmute spoken replies" : "Mute spoken replies"
+              }
+              title={
+                ttsMuted
+                  ? "Spoken replies muted (voice input still works). Click to enable speech."
+                  : "Spoken replies on. Click to mute."
+              }
               className={[
                 "text-xs flex items-center gap-1 px-2 py-1 rounded",
                 "transition-colors",
@@ -511,7 +566,7 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
               ].join(" ")}
             >
               <span aria-hidden>{ttsMuted ? "🔇" : "🔊"}</span>
-              <span>{ttsMuted ? "Voice off" : "Voice on"}</span>
+              <span>{ttsMuted ? "Replies muted" : "Spoken replies"}</span>
             </button>
           </div>
         )}
@@ -528,11 +583,29 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
           sttAvailable={voiceInfo?.stt.available ?? false}
           onVoiceCapture={handleVoiceCapture}
           onVoiceError={handleVoiceError}
+          callModeAvailable={
+            // Hands-free call mode needs both halves wired. Either
+            // missing → button doesn't render so the user can't
+            // open a half-functional modal.
+            (voiceInfo?.stt.available ?? false) &&
+            (voiceInfo?.tts.available ?? false)
+          }
+          onOpenCallMode={() => setCallOpen(true)}
           attachmentQueue={attachmentQueue}
           setAttachmentQueue={setAttachmentQueue}
           onAttachmentError={(m) => setError(m)}
         />
       </div>
+      {callOpen && (
+        <Suspense fallback={null}>
+          <VoiceCallMode
+            token={token}
+            open={callOpen}
+            onTurn={handleCallTurn}
+            onClose={() => setCallOpen(false)}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

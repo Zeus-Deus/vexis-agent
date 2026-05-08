@@ -1692,6 +1692,22 @@ class WebDashboard:
                 name="assets",
             )
 
+        # Static asset directories that ship inside web/public/ — Vite
+        # copies these verbatim into web/dist/ at build time. Each gets
+        # its own mount so the SPA catchall below doesn't intercept
+        # them and serve index.html.
+        #   - /vad: Silero VAD onnx + audio worklet (voice call mode)
+        #   - /ort: onnxruntime-web wasm runtime (loaded by VAD)
+        # Add new directories here when they're added to web/public/.
+        for static_subdir in ("vad", "ort"):
+            d = self._config.web_dist / static_subdir
+            if d.is_dir():
+                app.mount(
+                    f"/{static_subdir}",
+                    StaticFiles(directory=str(d)),
+                    name=static_subdir,
+                )
+
         # Catch-all so client-side routing keeps working: any unmatched
         # GET (that isn't an API call) returns index.html. Necessary for
         # deep links once the frontend grows tabs.
