@@ -374,15 +374,20 @@ function BrainBanner({
   return (
     <Section title="Brain">
       <Card>
-        <div className="px-4 py-3 flex items-baseline gap-3 font-data text-[12px]">
-          <span className="text-[var(--color-fg-dim)] uppercase-tight text-[10px]">
-            kind
-          </span>
-          <span className="text-[var(--color-accent)] text-[14px]">
-            {brain}
-          </span>
+        {/* Mobile: stack the kind row and the switch-to row so the
+            brain-name + switcher buttons each get their own line.
+            Desktop: original single row with switcher floated right. */}
+        <div className="px-4 py-3 flex flex-col sm:flex-row sm:items-baseline gap-2 sm:gap-3 font-data text-[12px]">
+          <div className="flex items-baseline gap-3">
+            <span className="text-[var(--color-fg-dim)] uppercase-tight text-[10px]">
+              kind
+            </span>
+            <span className="text-[var(--color-accent)] text-[14px]">
+              {brain}
+            </span>
+          </div>
           {modelUxEnabled && others.length > 0 && (
-            <span className="ml-auto flex items-baseline gap-2">
+            <div className="sm:ml-auto flex flex-wrap items-baseline gap-x-2 gap-y-1">
               <span className="text-[10px] uppercase-tight text-[var(--color-fg-dim)]">
                 switch to:
               </span>
@@ -396,7 +401,7 @@ function BrainBanner({
                   {k}
                 </button>
               ))}
-            </span>
+            </div>
           )}
         </div>
         <p className="px-4 pb-3 font-data text-[10.5px] text-[var(--color-fg-dim)]">
@@ -497,11 +502,12 @@ function ResolutionTable({
         {rows.length === 0 ? (
           <EmptyState glyph="○" title="No subsystems registered." />
         ) : (
-          <div className="px-4 py-3 font-data text-[12px]">
-            <div
-              className="grid items-baseline gap-x-4 text-[10.5px] uppercase-tight text-[var(--color-fg-dim)] pb-2 border-b border-[var(--color-border)]"
-              style={{ gridTemplateColumns: "1.5fr 1.5fr 1fr 0.4fr" }}
-            >
+          <div className="px-3 sm:px-4 py-3 font-data text-[12px]">
+            {/* Header row hidden on mobile — each ResolutionRow
+                carries inline column labels on narrow viewports
+                so the desktop column-header row is redundant
+                noise there. */}
+            <div className="hidden sm:grid items-baseline gap-x-4 text-[10.5px] uppercase-tight text-[var(--color-fg-dim)] pb-2 border-b border-[var(--color-border)] sm:grid-cols-[1.5fr_1.5fr_1fr_0.4fr]">
               <span>subsystem</span>
               <span>configured</span>
               <span>resolves to</span>
@@ -668,12 +674,24 @@ function ResolutionRow({
     !configuredAlreadyVisible(row.configured, filteredByProvider);
 
   return (
-    <div
-      className="grid items-baseline gap-x-4 py-1.5 border-b border-[var(--color-border)] last:border-b-0"
-      style={{ gridTemplateColumns: "1.5fr 1.5fr 1fr 0.4fr" }}
-    >
-      <span className="text-[var(--color-fg)]">{row.name}</span>
-      <span className="text-[var(--color-fg-2)] flex flex-col items-stretch gap-1">
+    /* Mobile (< sm): single-column stack with inline cell labels
+       (CONFIGURED / RESOLVES TO) above each value, status badge
+       floats top-right next to the subsystem name. Desktop
+       (sm:+): the original 4-column grid; cell labels hidden
+       (the header row above carries them). */
+    <div className="grid grid-cols-1 sm:grid-cols-[1.5fr_1.5fr_1fr_0.4fr] items-baseline gap-x-4 gap-y-1 sm:gap-y-0 py-3 sm:py-1.5 border-b border-[var(--color-border)] last:border-b-0">
+      {/* Subsystem name + mobile-only status badge */}
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[var(--color-fg)]">{row.name}</span>
+        <span className="sm:hidden">
+          <StatusBadge worst={worst} findings={row.findings} />
+        </span>
+      </div>
+      {/* Configured column (the dropdown / read-only value) */}
+      <div className="text-[var(--color-fg-2)] flex flex-col items-stretch gap-1">
+        <span className="sm:hidden text-[10px] uppercase-tight text-[var(--color-fg-dim)]">
+          configured
+        </span>
         {editable ? (
           <>
             {showSearch && (
@@ -691,7 +709,10 @@ function ResolutionRow({
                 aria-label={`Set ${row.name}`}
                 value={row.configured ?? ""}
                 onChange={(e) => onSet(row.name, e.target.value)}
-                className="font-data text-[12px] bg-[var(--color-base)] border border-[var(--color-border)] px-1.5 py-0.5 text-[var(--color-fg)]"
+                /* Mobile: full width so the touch target is wide
+                   and provider/model labels don't truncate. Desktop:
+                   natural width within the column. */
+                className="flex-1 sm:flex-none font-data text-[12px] bg-[var(--color-base)] border border-[var(--color-border)] px-1.5 py-1 sm:py-0.5 text-[var(--color-fg)] min-w-0"
               >
                 <option value="" disabled>
                   (default)
@@ -717,7 +738,7 @@ function ResolutionRow({
                   onClick={() => onReset(row.name)}
                   title="reset to default"
                   aria-label={`Reset ${row.name}`}
-                  className="text-[10px] uppercase-tight text-[var(--color-fg-dim)] hover:text-[var(--color-error)]"
+                  className="text-[10px] uppercase-tight text-[var(--color-fg-dim)] hover:text-[var(--color-error)] shrink-0"
                 >
                   reset
                 </button>
@@ -729,16 +750,17 @@ function ResolutionRow({
             <Dim>{formatConfiguredCell(null, row.resolved_model_id)}</Dim>
           )
         )}
-      </span>
-      <span className="text-[var(--color-fg-2)]">
-        {/* Resolves-to cell: always populated with the resolved
-            model id. Earlier polish-pass attempt to blank this
-            for default / no-translation cases produced a column
-            full of em-dashes that read as broken; users expect
-            a populated column. */}
+      </div>
+      {/* Resolves-to column — always populated. Mobile gets inline label. */}
+      <div className="text-[var(--color-fg-2)] break-all">
+        <span className="sm:hidden text-[10px] uppercase-tight text-[var(--color-fg-dim)] block">
+          resolves to
+        </span>
         {formatResolvesToCell(row.configured, row.resolved_model_id)}
-      </span>
-      <span className="text-right">
+      </div>
+      {/* Status badge — desktop renders here, mobile renders inline
+          with the subsystem name above. */}
+      <span className="hidden sm:block sm:text-right">
         <StatusBadge worst={worst} findings={row.findings} />
       </span>
     </div>

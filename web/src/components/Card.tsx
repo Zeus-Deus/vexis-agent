@@ -45,7 +45,7 @@ interface SectionProps {
 export function Section({ title, trailing, children, className }: SectionProps) {
   return (
     <section className={classNames("space-y-3", className)}>
-      <header className="flex items-baseline justify-between">
+      <header className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
         <h2 className="uppercase-tight text-xs text-[var(--color-fg-2)]">
           {title}
         </h2>

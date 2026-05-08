@@ -84,7 +84,7 @@ export function App() {
         onChange={handleTabChange}
         trailing={<HostLine />}
       />
-      <main className="flex-1 max-w-[1400px] w-full mx-auto px-5 py-8">
+      <main className="flex-1 max-w-[1400px] w-full mx-auto px-3 sm:px-5 py-6 sm:py-8">
         {tab === "memory" && (
           <MemoryPage token={token} onAuthFail={handleAuthFail} />
         )}
@@ -121,9 +121,11 @@ export function App() {
 function TopBar() {
   return (
     <header className="border-b border-[var(--color-border)]">
-      <div className="max-w-[1400px] w-full mx-auto px-5 py-4 flex items-baseline gap-4">
+      <div className="max-w-[1400px] w-full mx-auto px-3 sm:px-5 py-4 flex items-baseline gap-4">
         <Logotype />
-        <div className="ml-auto font-data text-[10.5px] text-[var(--color-fg-dim)] uppercase tracking-widest">
+        {/* Tagline hidden on mobile — saves header width for the
+            logotype + keeps the top bar from overflowing on phones. */}
+        <div className="ml-auto hidden sm:block font-data text-[10.5px] text-[var(--color-fg-dim)] uppercase tracking-widest">
           internal · tailnet only
         </div>
       </div>
@@ -161,9 +163,13 @@ function HostLine() {
 function Footer() {
   return (
     <footer className="border-t border-[var(--color-border)] mt-auto">
-      <div className="max-w-[1400px] w-full mx-auto px-5 py-3 flex items-baseline gap-4 font-data text-[10px] text-[var(--color-fg-dim)] uppercase tracking-widest">
+      <div className="max-w-[1400px] w-full mx-auto px-3 sm:px-5 py-3 flex items-baseline gap-4 font-data text-[10px] text-[var(--color-fg-dim)] uppercase tracking-widest">
         <span>read-only · with six actions</span>
-        <span className="ml-auto">
+        {/* Long nav-summary hidden on mobile — would either wrap
+            into multiple lines or push the footer off-screen on
+            phones. The tab nav above is the source of truth for
+            what pages exist. */}
+        <span className="ml-auto hidden md:inline">
           mem · skills · curator · status · browser · learning · goals · models · tailscale
         </span>
       </div>

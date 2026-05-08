@@ -295,14 +295,19 @@ function HistorySection({ records }: { records: GoalRecord[] }) {
       ) : (
         <Card>
           <div className="overflow-x-auto">
-            <table className="w-full text-[11.5px] font-data">
+            {/* min-w forces the table to its natural width on narrow
+                viewports so overflow-x-auto kicks in (without a min,
+                w-full would compress columns into 60-px slivers and
+                wrap text into towers). 720px fits all 6 columns
+                comfortably; below that the user scrolls horizontally. */}
+            <table className="w-full min-w-[720px] text-[11.5px] font-data">
               <thead>
                 <tr className="text-left uppercase-tight text-[10px] text-[var(--color-fg-dim)]">
-                  <th className="px-5 py-3 font-normal">status</th>
+                  <th className="px-5 py-3 font-normal whitespace-nowrap">status</th>
                   <th className="px-2 py-3 font-normal">goal</th>
-                  <th className="px-2 py-3 font-normal text-right">turns</th>
-                  <th className="px-2 py-3 font-normal">created</th>
-                  <th className="px-2 py-3 font-normal">last turn</th>
+                  <th className="px-2 py-3 font-normal text-right whitespace-nowrap">turns</th>
+                  <th className="px-2 py-3 font-normal whitespace-nowrap">created</th>
+                  <th className="px-2 py-3 font-normal whitespace-nowrap">last turn</th>
                   <th className="px-5 py-3 font-normal">reason</th>
                 </tr>
               </thead>
@@ -340,13 +345,13 @@ function HistoryRow({ record }: { record: GoalRecord }) {
       <td className="px-2 py-3 align-top text-[var(--color-fg)]" title={record.goal}>
         {truncated}
       </td>
-      <td className="px-2 py-3 align-top tabular-nums text-[var(--color-fg-2)] text-right">
+      <td className="px-2 py-3 align-top tabular-nums text-[var(--color-fg-2)] text-right whitespace-nowrap">
         {record.turns_used}/{record.max_turns}
       </td>
-      <td className="px-2 py-3 align-top text-[var(--color-fg-dim)]">
+      <td className="px-2 py-3 align-top text-[var(--color-fg-dim)] whitespace-nowrap">
         {relativeTime(record.created_at)}
       </td>
-      <td className="px-2 py-3 align-top text-[var(--color-fg-dim)]">
+      <td className="px-2 py-3 align-top text-[var(--color-fg-dim)] whitespace-nowrap">
         {relativeTime(record.last_turn_at)}
       </td>
       <td className="px-5 py-3 align-top text-[var(--color-fg-2)]">

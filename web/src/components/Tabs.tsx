@@ -20,7 +20,7 @@ export function Tabs({ tabs, active, onChange, trailing }: TabsProps) {
   // buttons against the same 1400px column the top bar and main use.
   return (
     <nav className="border-b border-[var(--color-border)]">
-      <div className="max-w-[1400px] w-full mx-auto px-5 flex items-stretch">
+      <div className="max-w-[1400px] w-full mx-auto px-3 sm:px-5 flex items-stretch">
         <ul className="flex flex-1 items-stretch overflow-x-auto">
           {tabs.map((tab) => {
             const isActive = tab.id === active;
