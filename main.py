@@ -34,6 +34,7 @@ from core.sessions import SessionStore
 from core.web_server import DEFAULT_DASHBOARD_PORT, DashboardConfig, WebDashboard
 from tools.browser import BrowserTools, get_manager as get_browser_manager
 from transports.telegram import TelegramTransport
+from transports.web import WebChatTransport
 
 log = logging.getLogger(__name__)
 
@@ -341,6 +342,17 @@ async def _run() -> None:
         workspace=workspace, notifier=notifier, brain=brain,
     )
 
+    # Web chat bridges the dashboard chat UI to the same MessageHandler
+    # the Telegram transport uses. Sharing the handler means both
+    # transports see the same SessionStore and Notifier — slash commands
+    # in Telegram and clicks in the chat sidebar mutate the same state.
+    # The chat_id namespace is partitioned (transports/web.py:WEB_CHAT_ID)
+    # so the per-chat notifier buffers don't cross-contaminate.
+    web_chat = WebChatTransport(
+        handler=handler,
+        allowed_user_id=config.telegram_allowed_user_id,
+    )
+
     dashboard_port = _dashboard_port_from_env()
     dashboard = WebDashboard(
         workspace=workspace,
@@ -354,6 +366,7 @@ async def _run() -> None:
             port=dashboard_port,
             web_dist=Path(__file__).resolve().parent / "web" / "dist",
         ),
+        chat=web_chat,
         # Day 5 of model UX: the canary-check helper needs to know
         # what brain class the daemon actually instantiated so the
         # dashboard payload's global_findings can surface the

@@ -40,9 +40,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 
@@ -80,7 +80,16 @@ from core.yaml_config import (
     curator_interval_hours,
     curator_stale_after_days,
 )
+from core.voice import (
+    STTUnavailable,
+    TTSUnavailable,
+    VoiceError,
+    stt_provider,
+    tts_provider,
+    voice_enabled,
+)
 from tools.browser import BrowserTools
+from transports.web import WebChatTransport
 from tools.browser.profile import (
     default_profile_name as browser_default_profile_name,
     profile_dir as browser_profile_dir,
@@ -103,6 +112,34 @@ def _token_fingerprint(token: str) -> str:
 
 # Default port. Can be overridden by VEXIS_DASHBOARD_PORT in the env.
 DEFAULT_DASHBOARD_PORT = 8766
+
+
+def _format_attachments_hint(raw: list) -> str:
+    """Format an attachment list for the brain prompt.
+
+    Each attachment is a ``{path, name, mime}`` dict the UI got from
+    POST /chat/attach. We render a small block the brain can recognise
+    and act on — claude-code already knows how to read files via its
+    Read tool, so paths alone are sufficient.
+
+    Filters out malformed entries silently (no raise) so a
+    misbehaving client can't break sends — they'll just see the
+    attachment hint missing if their payload was wrong.
+    """
+    lines: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        name = entry.get("name") or entry.get("path")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        mime = entry.get("mime")
+        suffix = f" ({mime})" if isinstance(mime, str) and mime.strip() else ""
+        lines.append(f"- {name}{suffix} → {path}")
+    if not lines:
+        return ""
+    return "[ATTACHMENTS — files at these paths]\n" + "\n".join(lines)
 
 
 # Source-vs-bundle freshness check (added 2026-05-08). Frontend
@@ -274,6 +311,7 @@ class WebDashboard:
         learning: LearningController | None,
         config: DashboardConfig,
         running_brain_kind: str | None = None,
+        chat: WebChatTransport | None = None,
     ) -> None:
         self._workspace = workspace
         self._sessions = sessions
@@ -283,6 +321,11 @@ class WebDashboard:
         self._browser = browser
         self._learning = learning
         self._config = config
+        # Optional — when None the /api/v1/chat/* routes return 503.
+        # Tests that don't exercise chat omit it. main.py wires it
+        # alongside the Telegram transport so both share one
+        # MessageHandler (and therefore one SessionStore + Notifier).
+        self._chat = chat
         # Day 5 of model UX: the dashboard payload's
         # check_brain_kind_consistency canary needs to know what
         # brain class the daemon actually instantiated. main.py
@@ -1203,6 +1246,424 @@ class WebDashboard:
                 self._models_discovery_refresh,
             )
 
+        # ----- chat (web transport for the dashboard chat UI) -----
+        #
+        # All routes share three contracts:
+        #   - 503 when ``self._chat`` was constructed without a
+        #     transport (test fixtures, dashboard-only smoke).
+        #   - User-text size cap at 32 KiB so a runaway paste can't
+        #     starve the brain or fill the JSONL with a single message.
+        #     Far above any reasonable typed/transcribed message; well
+        #     below the kind of payload that suggests a misuse.
+        #   - Handler return values are forwarded verbatim as ``reply``;
+        #     a ``None`` (handler suppressed the message — only happens
+        #     when the user_id check fails, which can't happen behind
+        #     the auth gate today, but we 401 it to keep the contract
+        #     honest in case a future code path opens that hole).
+
+        _CHAT_TEXT_MAX_BYTES = 32 * 1024
+
+        def _chat_or_503() -> WebChatTransport:
+            if self._chat is None:
+                raise HTTPException(503, "chat transport not initialised")
+            return self._chat
+
+        def _validated_text(body: dict, *, key: str = "text") -> str:
+            value = body.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise HTTPException(400, f"'{key}' must be a non-empty string")
+            if len(value.encode("utf-8")) > _CHAT_TEXT_MAX_BYTES:
+                raise HTTPException(
+                    413, f"'{key}' exceeds {_CHAT_TEXT_MAX_BYTES} bytes",
+                )
+            return value
+
+        def _validated_name(body: dict, *, key: str, optional: bool = False) -> str | None:
+            value = body.get(key)
+            if value is None or value == "":
+                if optional:
+                    return None
+                raise HTTPException(400, f"'{key}' is required")
+            if not isinstance(value, str):
+                raise HTTPException(400, f"'{key}' must be a string")
+            return value
+
+        @app.post(
+            "/api/v1/chat/send",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_chat_send(body: dict) -> JSONResponse:
+            chat = _chat_or_503()
+            text = _validated_text(body)
+            # Attachments are optional. Each entry is a {path, name, mime}
+            # dict the UI got back from POST /chat/attach. We format
+            # them into a hint block prepended to the user's message
+            # so the brain (which can read files via its existing
+            # tool surface) knows which paths to look at.
+            attachments_raw = body.get("attachments")
+            if attachments_raw is not None:
+                if not isinstance(attachments_raw, list):
+                    raise HTTPException(400, "'attachments' must be a list")
+                hint = _format_attachments_hint(attachments_raw)
+                if hint:
+                    text = f"{hint}\n\n{text}"
+            reply = await chat.send(text)
+            if reply is None:
+                raise HTTPException(401, "message rejected")
+            return JSONResponse({"reply": reply})
+
+        @app.get(
+            "/api/v1/chat/sessions",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_chat_sessions() -> JSONResponse:
+            chat = _chat_or_503()
+            infos = chat.list_sessions()
+            if infos is None:
+                raise HTTPException(401, "session list rejected")
+            return JSONResponse(
+                {
+                    "sessions": [
+                        {
+                            "name": s.name,
+                            "is_active": s.is_active,
+                            "created_at": s.created_at,
+                        }
+                        for s in infos
+                    ],
+                }
+            )
+
+        @app.post(
+            "/api/v1/chat/sessions/new",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_chat_sessions_new(body: dict) -> JSONResponse:
+            chat = _chat_or_503()
+            # Empty body is fine — handle_new auto-generates a name.
+            name = _validated_name(body, key="name", optional=True)
+            reply = await chat.new_session(name)
+            if reply is None:
+                raise HTTPException(401, "new session rejected")
+            return JSONResponse({"reply": reply})
+
+        @app.post(
+            "/api/v1/chat/sessions/switch",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_chat_sessions_switch(body: dict) -> JSONResponse:
+            chat = _chat_or_503()
+            name = _validated_name(body, key="name")
+            assert name is not None  # narrowing for mypy; required above
+            reply = await chat.switch_session(name)
+            if reply is None:
+                raise HTTPException(401, "switch rejected")
+            return JSONResponse({"reply": reply})
+
+        @app.post(
+            "/api/v1/chat/sessions/rename",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_chat_sessions_rename(body: dict) -> JSONResponse:
+            chat = _chat_or_503()
+            old = _validated_name(body, key="old")
+            new = _validated_name(body, key="new")
+            assert old is not None and new is not None
+            reply = await chat.rename_session(old, new)
+            if reply is None:
+                raise HTTPException(401, "rename rejected")
+            return JSONResponse({"reply": reply})
+
+        @app.post(
+            "/api/v1/chat/sessions/delete",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_chat_sessions_delete(body: dict) -> JSONResponse:
+            chat = _chat_or_503()
+            name = _validated_name(body, key="name")
+            assert name is not None
+            reply = await chat.delete_session(name)
+            if reply is None:
+                raise HTTPException(401, "delete rejected")
+            return JSONResponse({"reply": reply})
+
+        @app.post(
+            "/api/v1/chat/clear",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_chat_clear() -> JSONResponse:
+            chat = _chat_or_503()
+            reply = await chat.clear()
+            if reply is None:
+                raise HTTPException(401, "clear rejected")
+            return JSONResponse({"reply": reply})
+
+        # ----- chat attachments — phase 2 -----
+        #
+        # Two-step flow: UI uploads each file to /chat/attach,
+        # gets back a server-side path, then includes those paths
+        # in the next /chat/send body. Two-step rather than one
+        # multipart per send because:
+        #   1. Lets the user queue multiple files before sending,
+        #   2. Composer can show inline previews from the returned
+        #      paths without re-uploading,
+        #   3. Keeps /chat/send a JSON endpoint (cleaner SSE
+        #      upgrade path later).
+        #
+        # Files land in <workspace>/uploads/<active-session>/<ts>-<safe-name>.
+        # Per-session subdir gives the user a quick `rm -rf` path
+        # to wipe one conversation's attachments. Timestamp prefix
+        # avoids collisions when uploading the same filename twice.
+
+        _ATTACH_FILENAME_SAFE_RE = re.compile(r"[^a-zA-Z0-9._-]")
+
+        def _safe_filename(name: str | None) -> str:
+            """Reduce an uploaded filename to a safe basename. Strips
+            path components, dot-dot, and any character outside the
+            alnum + dot/underscore/dash set. Empty after sanitizing
+            falls back to ``upload`` so we always have a usable name."""
+            if not name:
+                return "upload"
+            base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            base = base.strip().lstrip(".")
+            cleaned = _ATTACH_FILENAME_SAFE_RE.sub("_", base)
+            return cleaned or "upload"
+
+        @app.post(
+            "/api/v1/chat/attach",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_chat_attach(
+            file: UploadFile = File(...),
+        ) -> JSONResponse:
+            if not yaml_config.chat_attachments_enabled():
+                raise HTTPException(503, "chat attachments disabled")
+
+            allowed = yaml_config.chat_attachments_allowed_mimes()
+            mime = (file.content_type or "").lower().strip()
+            if mime not in allowed:
+                raise HTTPException(
+                    415,
+                    f"mime {mime!r} not in allowlist (allowed: "
+                    f"{', '.join(sorted(allowed))})",
+                )
+
+            # Per-session subdir so deleting a session can also
+            # delete its uploads (phase 2.5 cleanup hook).
+            chat_obj = _chat_or_503()
+            sessions = chat_obj.list_sessions()
+            active_name = "_default"
+            if sessions:
+                active = next((s for s in sessions if s.is_active), None)
+                if active:
+                    active_name = _safe_filename(active.name)
+
+            uploads_root = self._workspace / "uploads" / active_name
+            uploads_root.mkdir(parents=True, exist_ok=True)
+
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            safe = _safe_filename(file.filename)
+            target = uploads_root / f"{ts}-{safe}"
+
+            # Stream-write with size cap. Same pattern as voice route
+            # so a malicious client can't exhaust memory by claiming
+            # a huge content-length.
+            max_bytes = yaml_config.chat_attachments_max_bytes()
+            written = 0
+            try:
+                with open(target, "wb") as out:
+                    while True:
+                        chunk = await file.read(64 * 1024)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > max_bytes:
+                            target.unlink(missing_ok=True)
+                            raise HTTPException(
+                                413, f"file exceeds {max_bytes} bytes",
+                            )
+                        out.write(chunk)
+            except HTTPException:
+                raise
+            except OSError as exc:
+                target.unlink(missing_ok=True)
+                log.exception("attachment write failed")
+                raise HTTPException(500, f"could not save upload: {exc}")
+
+            if written == 0:
+                target.unlink(missing_ok=True)
+                raise HTTPException(400, "empty file upload")
+
+            return JSONResponse({
+                "path": str(target),
+                "name": safe,
+                "size": written,
+                "mime": mime,
+            })
+
+        # ----- voice (STT + TTS) — phase 2 addon -----
+        #
+        # All three voice routes are auth-gated and report
+        # availability through ``/voice/info``. The UI calls
+        # ``/info`` once on load to decide whether to render the
+        # mic button and hook up TTS playback; both individual
+        # endpoints also 503 when voice is off so a stale UI
+        # doesn't get a misleading 200.
+        #
+        # Audio cap: 25 MiB. Roughly 30 minutes of 192kbps Opus or
+        # 4 minutes of 16-bit 16kHz WAV. Far above any reasonable
+        # voice memo, well below the kind of payload that suggests
+        # misuse.
+
+        _VOICE_AUDIO_MAX_BYTES = 25 * 1024 * 1024
+        _TTS_TEXT_MAX_BYTES = 16 * 1024
+
+        @app.get(
+            "/api/v1/chat/voice/info",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_voice_info() -> dict:
+            """One-shot capability probe. Lets the UI render the
+            mic button only when STT is actually wired and decide
+            whether to autoplay TTS on assistant replies."""
+            stt = stt_provider()
+            tts = tts_provider()
+            return {
+                "enabled": voice_enabled(),
+                "stt": {"provider": stt.name, "available": stt.name != "null"},
+                "tts": {
+                    "provider": tts.name,
+                    "available": tts.name != "null",
+                    "mime_type": tts.mime_type,
+                },
+            }
+
+        @app.post(
+            "/api/v1/chat/voice",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_chat_voice(
+            audio: UploadFile = File(...),
+        ) -> JSONResponse:
+            """STT round-trip: receive audio → transcribe → send the
+            transcription to the brain → return both the transcript
+            and the brain's reply. Single round-trip so the UI doesn't
+            have to chain two calls."""
+            chat = _chat_or_503()
+            stt = stt_provider()
+
+            # Persist the upload to a temp file because the STT provider
+            # accepts a Path (voxtype's pipeline shells out to ffmpeg
+            # which wants a real filesystem path). NamedTemporaryFile
+            # with delete=False so we control unlink order — the file
+            # has to outlive the ``await`` chain inside transcribe().
+            import os as _os
+            import tempfile as _tempfile
+            # Preserve the upload's extension hint so ffmpeg's auto-
+            # detection picks the right demuxer. ``.bin`` is a safe
+            # fallback when the browser didn't supply one.
+            suffix = ".bin"
+            if audio.filename and "." in audio.filename:
+                ext = audio.filename.rsplit(".", 1)[1].lower()
+                if ext.isalnum() and len(ext) <= 6:
+                    suffix = f".{ext}"
+
+            fd, tmp_path = _tempfile.mkstemp(suffix=suffix, prefix="vexis-voice-")
+            written = 0
+            try:
+                # Stream the upload to disk in chunks so we don't buffer
+                # the whole thing in memory before checking the size cap.
+                while True:
+                    chunk = await audio.read(64 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > _VOICE_AUDIO_MAX_BYTES:
+                        raise HTTPException(
+                            413,
+                            f"audio exceeds {_VOICE_AUDIO_MAX_BYTES} bytes",
+                        )
+                    _os.write(fd, chunk)
+                _os.close(fd)
+                fd = -1
+
+                if written == 0:
+                    raise HTTPException(400, "empty audio upload")
+
+                try:
+                    transcript = await stt.transcribe(Path(tmp_path))
+                except STTUnavailable as exc:
+                    raise HTTPException(503, str(exc))
+                except VoiceError as exc:
+                    # Empty transcription (silence, noise) → 422 so the
+                    # UI can surface "I didn't catch that, try again".
+                    raise HTTPException(422, str(exc))
+            finally:
+                if fd != -1:
+                    try:
+                        _os.close(fd)
+                    except OSError:
+                        pass
+                Path(tmp_path).unlink(missing_ok=True)
+
+            if not transcript.strip():
+                raise HTTPException(422, "empty transcription")
+
+            reply = await chat.send(transcript)
+            if reply is None:
+                raise HTTPException(401, "message rejected")
+            return JSONResponse({"transcript": transcript, "reply": reply})
+
+        # ----- voice settings (dashboard surface) -----
+        # Surfaces as the "Voice" tab. GET returns current config +
+        # discovered Piper voice models so the dashboard doesn't have
+        # to do filesystem walking client-side. POST accepts a partial
+        # update (any subset of {enabled, stt.provider, tts.provider,
+        # tts.voice_model_path, tts.binary}) and writes through the
+        # same atomic+comment-preserving path the Models tab uses.
+
+        @app.get(
+            "/api/v1/voice",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_voice() -> dict:
+            return await asyncio.to_thread(self._voice_payload)
+
+        @app.post(
+            "/api/v1/voice",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_voice(body: dict) -> dict:
+            return await asyncio.to_thread(self._voice_set, body)
+
+        @app.post(
+            "/api/v1/chat/tts",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_chat_tts(body: dict) -> Response:
+            """Synthesize ``text`` to audio bytes. The UI plays the
+            response through an HTMLAudioElement after each assistant
+            message when voice.enabled."""
+            text = _validated_text(body, key="text")
+            if len(text.encode("utf-8")) > _TTS_TEXT_MAX_BYTES:
+                raise HTTPException(
+                    413, f"text exceeds {_TTS_TEXT_MAX_BYTES} bytes",
+                )
+            tts = tts_provider()
+            try:
+                audio_bytes = await tts.synthesize(text)
+            except TTSUnavailable as exc:
+                raise HTTPException(503, str(exc))
+            except VoiceError as exc:
+                log.exception("TTS synthesis failed")
+                raise HTTPException(500, str(exc))
+            if not audio_bytes:
+                # Whitespace-only after trim — nothing to play. Use
+                # 204 so the UI doesn't try to attach an empty Blob
+                # to <audio>.
+                return Response(status_code=204)
+            return Response(content=audio_bytes, media_type=tts.mime_type)
+
         # ----- frontend bootstrap -----
 
         index_html = self._config.web_dist / "index.html"
@@ -2058,6 +2519,157 @@ class WebDashboard:
                 "null": [],
             },
         }
+
+    # ──────────────────────────────────────────────────────────
+    # Voice settings (dashboard surface — phase 3a)
+    # ──────────────────────────────────────────────────────────
+
+    def _voice_payload(self) -> dict:
+        """Snapshot for the Voice tab. Combines the current ``voice.*``
+        config with a filesystem walk for installed Piper models so
+        the dashboard can render a full picker without further round-
+        trips."""
+        from core.voice.discovery import find_piper_voices
+        from core.yaml_config import (
+            voice_enabled,
+            voice_stt_provider,
+            voice_tts_binary,
+            voice_tts_provider,
+            voice_tts_voice_model_path,
+        )
+        # Include the parent dir of any currently-configured model in
+        # the search paths so non-standard install locations still
+        # surface in the picker.
+        configured = voice_tts_voice_model_path()
+        configured_resolved: str | None = None
+        extra_paths = []
+        if configured:
+            try:
+                resolved = Path(configured).expanduser()
+                configured_resolved = str(resolved)
+                if resolved.parent.is_dir():
+                    extra_paths.append(resolved.parent)
+            except (OSError, ValueError):
+                pass
+        voices = find_piper_voices(extra_paths=extra_paths)
+        binary_raw = voice_tts_binary()
+        binary_resolved: str | None = None
+        if binary_raw:
+            try:
+                binary_resolved = str(Path(binary_raw).expanduser())
+            except (OSError, ValueError):
+                binary_resolved = binary_raw
+        return {
+            "enabled": voice_enabled(),
+            "stt": {
+                "provider": voice_stt_provider(),
+                # Hardcoded today; once we add more STT providers,
+                # this list expands. The UI uses it to populate the
+                # dropdown.
+                "available_providers": ["voxtype", "null"],
+            },
+            "tts": {
+                "provider": voice_tts_provider(),
+                "available_providers": ["piper", "null"],
+                # Resolved (tilde-expanded) so the dashboard's voice
+                # radio button can match against ``available_voices``
+                # entries (which always carry resolved absolute paths
+                # from the filesystem walk).
+                "voice_model_path": configured_resolved,
+                "binary": binary_resolved,
+            },
+            "available_voices": [
+                {
+                    "path": v.path,
+                    "name": v.name,
+                    "language": v.language,
+                    "size": v.size,
+                    "has_config": v.has_config,
+                }
+                for v in voices
+            ],
+        }
+
+    def _voice_set(self, payload: dict) -> dict:
+        """Partial update of the ``voice.*`` config keys. Accepts any
+        subset of:
+
+            {
+              "enabled": bool,
+              "stt": {"provider": str},
+              "tts": {
+                "provider": str,
+                "voice_model_path": str | null,
+                "binary": str | null,
+              },
+            }
+
+        Writes through the same atomic + comment-preserving path the
+        Models tab uses. Returns the post-write payload so the UI can
+        pick up resolved values without a follow-up GET.
+        """
+        from core.yaml_config import _read_raw
+        from core.yaml_config_writer import (
+            atomic_write_yaml,
+            backup_if_commented,
+        )
+        from core.paths import vexis_dir
+
+        if not isinstance(payload, dict):
+            raise HTTPException(400, "payload must be an object")
+
+        current = _read_raw()
+        # Defensive copy + ensure the section exists before merging.
+        proposed = dict(current)
+        voice_section = dict(proposed.get("voice") or {})
+
+        if "enabled" in payload:
+            if not isinstance(payload["enabled"], bool):
+                raise HTTPException(400, "enabled must be bool")
+            voice_section["enabled"] = payload["enabled"]
+
+        if "stt" in payload:
+            if not isinstance(payload["stt"], dict):
+                raise HTTPException(400, "stt must be an object")
+            stt = dict(voice_section.get("stt") or {})
+            if "provider" in payload["stt"]:
+                v = payload["stt"]["provider"]
+                if not isinstance(v, str) or not v.strip():
+                    raise HTTPException(400, "stt.provider must be a non-empty string")
+                stt["provider"] = v.strip()
+            voice_section["stt"] = stt
+
+        if "tts" in payload:
+            if not isinstance(payload["tts"], dict):
+                raise HTTPException(400, "tts must be an object")
+            tts = dict(voice_section.get("tts") or {})
+            for key in ("provider", "voice_model_path", "binary"):
+                if key not in payload["tts"]:
+                    continue
+                v = payload["tts"][key]
+                if v is None or (isinstance(v, str) and not v.strip()):
+                    # Empty/null means "unset this knob". Drop the key
+                    # from config so the helper falls back to its
+                    # default. Keeps the YAML uncluttered.
+                    tts.pop(key, None)
+                    continue
+                if not isinstance(v, str):
+                    raise HTTPException(400, f"tts.{key} must be a string or null")
+                tts[key] = v.strip()
+            voice_section["tts"] = tts
+
+        proposed["voice"] = voice_section
+
+        cfg_path = vexis_dir() / "config.yaml"
+        backup_path = (
+            backup_if_commented(cfg_path) if cfg_path.exists() else None
+        )
+        atomic_write_yaml(cfg_path, proposed)
+
+        result = self._voice_payload()
+        result["ok"] = True
+        result["backup_path"] = str(backup_path) if backup_path else None
+        return result
 
     @staticmethod
     def _proposed_set_subsystem(
