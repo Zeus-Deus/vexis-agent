@@ -47,7 +47,7 @@ anything, nothing changed.
 
 4. **Re-run the install script** to write opencode's MCP config:
    ```bash
-   ./scripts/install.sh
+   ./scripts/dev-setup.sh
    ```
    Idempotent — re-running the script doesn't churn existing files.
    This step writes `<workspace>/opencode.json` with vexis's MCP
@@ -206,7 +206,7 @@ storage, so they survive a brain switch unchanged.
 Same flow in reverse. Install claude-code if you uninstalled it,
 authenticate (`claude /login` or `ANTHROPIC_API_KEY` env), edit
 `~/.vexis/config.yaml` with `brain.kind: claude-code`, re-run
-`./scripts/install.sh`, restart vexis.
+`./scripts/dev-setup.sh`, restart vexis.
 
 The persistence story is symmetric — memory/skills/goals/schedules
 keep working; only the conversation session resets.
@@ -243,7 +243,7 @@ check the MCP config write happened by inspecting
   `which opencode` should print a path; if not, the
   `curl ... | bash` install step didn't add the install bin
   directory to PATH (typically `~/.local/bin`).
-- **MCP tools missing** — re-run `./scripts/install.sh`. The
+- **MCP tools missing** — re-run `./scripts/dev-setup.sh`. The
   install script's idempotence contract means it's always safe to
   re-run.
 

@@ -553,7 +553,7 @@ def test_claude_code_write_mcp_config_is_idempotent(
 ):
     """Day 6: re-running with the same servers produces a byte-
     identical file. Important for the install script's idempotence
-    contract — re-running ``scripts/install.sh`` mustn't churn the
+    contract — re-running ``scripts/dev-setup.sh`` mustn't churn the
     config."""
     spec = McpServerSpec(name="x", command="/bin/x", args=["a"])
     path1 = claude_brain.write_mcp_config([spec])

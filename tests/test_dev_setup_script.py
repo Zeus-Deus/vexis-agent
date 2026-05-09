@@ -1,7 +1,7 @@
-"""Tests for ``scripts/install.py``.
+"""Tests for ``scripts/dev-setup.py``.
 
 Covers the planning + apply paths against tmp workspaces. The
-shell wrapper ``scripts/install.sh`` is a thin conda-activate
+shell wrapper ``scripts/dev-setup.sh`` is a thin conda-activate
 delegator — its behaviour is implicit in the Python tests.
 
 What's verified
@@ -34,7 +34,7 @@ import pytest
 # Importing the script's machinery directly (it adds itself to
 # sys.path) lets us exercise the planning logic without a
 # subprocess shell hop.
-from scripts.install import (
+from scripts.dev_setup import (
     SymlinkAction,
     _install_dashboard_precommit_hook,
     brain_binary_for_kind,
@@ -369,9 +369,9 @@ def test_main_dry_run_returns_zero_when_plan_clean(
 ):
     """``--dry-run`` with a clean plan exits 0 and doesn't touch
     the filesystem."""
-    monkeypatch.setattr("scripts.install.repo_root", lambda: fake_repo)
+    monkeypatch.setattr("scripts.dev_setup.repo_root", lambda: fake_repo)
     monkeypatch.setattr(
-        "scripts.install.resolve_brain_kind", lambda: "claude-code",
+        "scripts.dev_setup.resolve_brain_kind", lambda: "claude-code",
     )
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     rc = main([
@@ -392,9 +392,9 @@ def test_main_dry_run_returns_one_when_brain_missing(
     """``--dry-run`` with a fatal planning error (brain binary
     missing) exits 1 — script callers can use this to gate
     install steps in a Makefile / CI."""
-    monkeypatch.setattr("scripts.install.repo_root", lambda: fake_repo)
+    monkeypatch.setattr("scripts.dev_setup.repo_root", lambda: fake_repo)
     monkeypatch.setattr(
-        "scripts.install.resolve_brain_kind", lambda: "opencode",
+        "scripts.dev_setup.resolve_brain_kind", lambda: "opencode",
     )
     monkeypatch.setattr("shutil.which", lambda name: None)
     rc = main([
@@ -410,9 +410,9 @@ def test_main_apply_invocation(
 ):
     """Without ``--dry-run`` main() actually applies — verify the
     end state matches the dry-run plan."""
-    monkeypatch.setattr("scripts.install.repo_root", lambda: fake_repo)
+    monkeypatch.setattr("scripts.dev_setup.repo_root", lambda: fake_repo)
     monkeypatch.setattr(
-        "scripts.install.resolve_brain_kind", lambda: "claude-code",
+        "scripts.dev_setup.resolve_brain_kind", lambda: "claude-code",
     )
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     rc = main([

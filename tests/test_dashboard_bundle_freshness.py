@@ -5,7 +5,7 @@ are newer than the compiled ``web/dist/assets/index-*.js``
 bundle, the daemon logs a banner WARNING so the user knows to
 run ``npm run build``. Belt-and-suspenders for the pre-commit
 hook (which auto-rebuilds on commit but isn't installed in
-fresh clones until ``scripts/install.py`` runs).
+fresh clones until ``scripts/dev-setup.py`` runs).
 """
 
 from __future__ import annotations

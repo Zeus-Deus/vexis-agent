@@ -24,7 +24,7 @@ Pass criteria for the shadow → live flip (v2 §4.3):
   G8 = 2/2    USER.md threshold respected
 
 Usage:
-    ./venv-python scripts/eval_learning.py [--out report.md]
+    python scripts/eval_learning.py [--out report.md]
 
 Cost: roughly 30-40 LLM calls (10 reviews + ~20 judges). The script
 prints a one-line summary of each scenario as it goes plus a final
@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Allow `./venv-python scripts/eval_learning.py` from the repo root.
+# Allow `python scripts/eval_learning.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vexis_agent.core.coherence_judge import (  # noqa: E402

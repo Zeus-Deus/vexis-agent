@@ -2,7 +2,7 @@
 # Pre-commit hook: rebuild + stage the dashboard bundle whenever
 # any tracked frontend source changes.
 #
-# Installed by ``scripts/install.py`` into ``.git/hooks/pre-commit``
+# Installed by ``scripts/dev-setup.py`` into ``.git/hooks/pre-commit``
 # (git hooks live outside the index and aren't tracked themselves —
 # the install step handles propagation across clones).
 #

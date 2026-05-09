@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# vexis-agent installer — bash wrapper around scripts/install.py.
+# vexis-agent installer — bash wrapper around scripts/dev_setup.py.
 #
 # Activates the conda env, then delegates to the Python installer
 # which holds all the actual logic (so tests/test_install_script.py
 # can exercise it without spawning subprocesses).
 #
 # Usage:
-#   ./scripts/install.sh [--dry-run] [--workspace PATH] [--quiet]
+#   ./scripts/dev-setup.sh [--dry-run] [--workspace PATH] [--quiet]
 #
 # Idempotent — re-running mints no churn on existing symlinks or
-# config files. See scripts/install.py docstring for the full
+# config files. See scripts/dev_setup.py docstring for the full
 # contract.
 
 set -euo pipefail
@@ -32,4 +32,4 @@ if [[ "${CONDA_DEFAULT_ENV:-}" != "vexis-agent_env" ]]; then
     fi
 fi
 
-exec python "$REPO_ROOT/scripts/install.py" "$@"
+exec python "$REPO_ROOT/scripts/dev_setup.py" "$@"

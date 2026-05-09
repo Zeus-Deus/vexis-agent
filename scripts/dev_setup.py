@@ -68,7 +68,7 @@ import sys
 from pathlib import Path
 
 # Add the repo root to sys.path so we can import core.* even when
-# the script is invoked directly as ``python scripts/install.py``.
+# the script is invoked directly as ``python scripts/dev_setup.py``.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -380,7 +380,7 @@ def _install_dashboard_precommit_hook(repo: Path) -> None:
         "# Chains the original pre-commit (preserved as\n"
         "# pre-commit.local during install) before the dashboard\n"
         "# rebuild. Edit scripts/pre-commit-dashboard-build to\n"
-        "# change the rebuild behavior; re-run scripts/install.py\n"
+        "# change the rebuild behavior; re-run scripts/dev_setup.py\n"
         "# to refresh this wrapper.\n"
         "set -euo pipefail\n"
         'HOOKS_DIR="$(dirname "$0")"\n'
