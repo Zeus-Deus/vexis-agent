@@ -145,24 +145,46 @@ def backup(
         "-o",
         help="Output zip path. Defaults to ~/.vexis/backups/vexis-<utc>.zip.",
     ),
+    include_brain_sessions: bool = typer.Option(
+        False,
+        "--include-brain-sessions",
+        help=(
+            "Also pack the brain's conversation history "
+            "(~/.claude/projects/<encoded-cwd>/ for claude-code or "
+            "~/.local/share/opencode/opencode.db for opencode). "
+            "Useful when migrating a long-lived install; can be large."
+        ),
+    ),
 ) -> None:
-    """Pack $VEXIS_HOME + $VEXIS_WORKSPACE into a zip.
+    """Pack the whole agent — config, secrets, memories, skills,
+    SOUL, RELATIONSHIPS, curator/learning state, goals — into a zip.
 
-    Excludes regenerable junk (caches, node_modules, browser profiles,
-    SQLite WAL sidecars). Restore the archive on a different machine
-    with ``vexis-agent backup-restore <path>`` after running
-    ``vexis-agent setup`` there.
+    Default backup includes everything that makes \"your agent\" your
+    agent on the vexis side: ~/.vexis/ + ~/vexis-workspace/.
+    ``--include-brain-sessions`` adds the brain's stored conversation
+    history (claude-code's projects dir or opencode's DB) so the
+    restored install picks up exactly where the source left off.
+
+    Excludes regenerable junk: caches, node_modules, browser
+    profiles, SQLite WAL sidecars, daemon.pid, .git history.
     """
     from pathlib import Path
 
     from vexis_agent.daemon.backup import run_backup
 
     out_path = Path(out).expanduser() if out else None
-    result = run_backup(out=out_path)
+    result = run_backup(
+        out=out_path,
+        include_brain_sessions=include_brain_sessions,
+    )
     typer.echo(f"Wrote {result.file_count} files to {result.archive}")
     typer.echo(f"  vexis-home:      {result.home_root}")
     if result.workspace_root:
         typer.echo(f"  vexis-workspace: {result.workspace_root}")
+    if result.brain_sessions_included:
+        typer.echo(
+            f"  brain-sessions:  {result.brain_session_files} files"
+        )
 
 
 @app.command()

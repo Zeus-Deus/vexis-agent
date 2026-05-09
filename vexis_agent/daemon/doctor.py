@@ -305,6 +305,70 @@ def check_workspace() -> CheckResult:
     return CheckResult("Workspace", Status.OK, str(workspace))
 
 
+def check_compositor() -> CheckResult:
+    """Detect the active Wayland compositor (or none). Used to scope
+    install hints in the doctor output: a Hyprland user gets
+    Hyprland-specific install commands; a sway user gets sway hints;
+    a non-Wayland user just gets "desktop control unavailable here."
+    """
+    session = os.environ.get("XDG_SESSION_TYPE", "")
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "")
+    hypr_signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if session != "wayland":
+        return CheckResult(
+            "Compositor",
+            Status.WARN,
+            f"non-Wayland session ({session or 'unset'})",
+            "vexis runs on Wayland only for desktop control. Telegram chat "
+            "still works on any session; tools needing screenshots / "
+            "typing / clicking will fail.",
+        )
+    if hypr_signature or "hyprland" in desktop.lower():
+        return CheckResult("Compositor", Status.OK, "Hyprland (Wayland)")
+    return CheckResult(
+        "Compositor",
+        Status.WARN,
+        f"Wayland compositor: {desktop or 'unknown'} (not Hyprland)",
+        "vexis is Hyprland-targeted. wtype/grim work on most Wayland "
+        "compositors; hyprctl is Hyprland-only — workspace/window "
+        "dispatches will be no-ops elsewhere.",
+    )
+
+
+def check_feature_tools() -> CheckResult:
+    """Per-feature dependency rollup. Surfaces which feature groups
+    are usable on this install and which need binaries the user
+    hasn't installed. WARN — daemon runs regardless."""
+    feature_groups: dict[str, tuple[str, ...]] = {
+        "voice notes": ("voxtype", "ffmpeg"),
+        "desktop control": ("hyprctl", "wtype", "ydotool", "grim"),
+        "shell helpers": ("jq",),
+    }
+    available: list[str] = []
+    degraded: list[str] = []
+    for feature, tools in feature_groups.items():
+        missing = [t for t in tools if shutil.which(t) is None]
+        if missing:
+            degraded.append(f"{feature} (missing: {', '.join(missing)})")
+        else:
+            available.append(feature)
+    if not degraded:
+        return CheckResult(
+            "Feature deps",
+            Status.OK,
+            f"all groups available ({len(available)})",
+        )
+    detail = "; ".join(degraded)
+    return CheckResult(
+        "Feature deps",
+        Status.WARN,
+        detail,
+        "Install the missing binaries to enable the feature, or ignore "
+        "if you don't need it. Telegram chat + brain dispatch don't "
+        "depend on any of these.",
+    )
+
+
 def check_dispatch_wrappers() -> CheckResult:
     """The vexis-* dispatch wrappers are exposed as console scripts
     after pipx install. If they're not on PATH, the brain prompt's
@@ -349,6 +413,8 @@ DEFAULT_CHECKS: list[Callable[[], CheckResult]] = [
     check_brain_cli,
     check_workspace,
     check_dispatch_wrappers,
+    check_compositor,
+    check_feature_tools,
     check_tailscale,
     check_systemctl,
     check_linger,

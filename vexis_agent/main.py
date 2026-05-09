@@ -196,38 +196,54 @@ async def _run() -> None:
             f"(brain.kind={kind} in ~/.vexis/config.yaml). {install_hint}"
         )
 
-    # Wayland-Hyprland actuator + tooling deps. vexis-agent is
-    # Hyprland-targeted; these are required for the desktop-control,
-    # screenshot, and dispatch tools. On non-Hyprland systems these
-    # tools won't work — we fail fast here rather than letting the
-    # MCP servers crash mid-call. Voice deps (voxtype, ffmpeg) live in
-    # this list because the Telegram transport accepts voice notes by
-    # default; users without voice should still see a clean error
-    # rather than a stack trace mid-message.
-    _REQUIRED_TOOLS: dict[str, str] = {
-        "voxtype":  "Install via your distro or pip; speech-to-text for voice notes.",
-        "ffmpeg":   "Install via your distro: pacman -S ffmpeg / apt install ffmpeg / dnf install ffmpeg.",
-        "grim":     "Wayland screenshot tool: pacman -S grim / apt install grim.",
-        "hyprctl":  "Hyprland's runtime CLI; ships with Hyprland itself.",
-        "jq":       "Shell JSON tool: pacman -S jq / apt install jq / dnf install jq.",
-        "ydotool":  "Wayland uinput injector. Arch: pacman -S ydotool. Make sure ydotool.service is enabled.",
-        "wtype":    "Wayland xdotool-equivalent for typing. pacman -S wtype.",
+    # Per-feature soft dependencies. The daemon used to hard-require
+    # all of these (Hyprland-only-or-die); Phase 5j demoted them to
+    # warnings so vexis runs anywhere — Telegram chat works without
+    # any of these — and the tools that actually need them surface
+    # the missing-binary error at invocation time.
+    #
+    # Each feature group declares which capability it powers so the
+    # startup banner is honest about what *will* and *won't* work
+    # on this install. Setup wizard + doctor mirror this taxonomy.
+    _FEATURE_TOOLS: dict[str, dict[str, str]] = {
+        "voice notes": {
+            "voxtype": "Speech-to-text wrapper. Install separately; absent → voice notes won't transcribe.",
+            "ffmpeg":  "Audio decoding. Install via your distro (pacman/apt/dnf).",
+        },
+        "desktop control (Hyprland/Wayland)": {
+            "hyprctl": "Ships with Hyprland; absent → window/workspace dispatches no-op.",
+            "wtype":   "Wayland typing (Hyprland/sway). Absent → vexis-type doesn't work.",
+            "ydotool": "Wayland uinput (mouse + keys). Absent → vexis-click/key/move don't work. Needs ydotool.service running.",
+            "grim":    "Wayland screenshots. Absent → screenshot tool returns an error.",
+        },
+        "shell helpers": {
+            "jq":      "JSON parsing for some dispatch wrappers.",
+        },
     }
-    for cmd, hint in _REQUIRED_TOOLS.items():
-        if shutil.which(cmd) is None:
-            raise RuntimeError(
-                f"`{cmd}` CLI not found on PATH. {hint}\n"
-                f"Run 'vexis-agent doctor' for the full readiness check."
-            )
-
-    for cmd in ("tailscale",):
-        if shutil.which(cmd) is None:
+    missing_features: list[str] = []
+    for feature, tools in _FEATURE_TOOLS.items():
+        missing = [cmd for cmd in tools if shutil.which(cmd) is None]
+        if missing:
+            missing_features.append(feature)
             log.warning(
-                "`%s` not found on PATH; live streaming + remote dashboard "
-                "URL unavailable. Daemon continues; install Tailscale and "
-                "run 'tailscale up' to enable.",
-                cmd,
+                "feature unavailable: %s — missing %s. The daemon runs; "
+                "tools that need these will return a clear error when "
+                "invoked. Run 'vexis-agent doctor' for install hints.",
+                feature, ", ".join(missing),
             )
+    if missing_features:
+        log.info(
+            "vexis-agent starting with %d feature group(s) degraded; "
+            "Telegram chat + brain dispatch still work.",
+            len(missing_features),
+        )
+
+    if shutil.which("tailscale") is None:
+        log.warning(
+            "tailscale not on PATH; live streaming + remote dashboard "
+            "URL unavailable. Daemon continues; install Tailscale and "
+            "run 'tailscale up' to enable."
+        )
 
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     socket = Path(runtime) / ".ydotool_socket"

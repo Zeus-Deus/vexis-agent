@@ -1,13 +1,28 @@
 """``vexis-agent backup`` / ``vexis-agent backup-restore`` — pack and
-restore the user's personal state.
+restore the user's personal agent state.
 
-Targets:
+What "the agent" is, packaged as:
+
   $VEXIS_HOME/                — config.yaml, .env, curator state,
-                                  learning state, goals.json, browser
-                                  profiles, dashboard token.
-  $VEXIS_WORKSPACE/             — gittable agent brain (CLAUDE.md,
-                                  SOUL.md, MEMORY.md, USER.md,
-                                  RELATIONSHIPS.md, memories/, skills/).
+                                  learning state, goals.json,
+                                  dashboard token, logs.
+  $VEXIS_WORKSPACE/             — the soul of the agent:
+                                    SOUL.md (personality)
+                                    CLAUDE.md (project instructions)
+                                    memories/MEMORY.md (situational notes)
+                                    memories/USER.md (durable preferences)
+                                    RELATIONSHIPS.md (third-party facts)
+                                    skills/**/SKILL.md (procedural lessons)
+
+  ~/.claude/projects/<encoded-cwd>/  (opt-in via include_brain_sessions)
+                                — claude-code's conversation history.
+                                  Vexis reads this for the curator;
+                                  including it gives the new install
+                                  the same conversational context.
+
+  ~/.local/share/opencode/opencode.db  (opt-in via include_brain_sessions)
+                                — opencode's conversation DB. Same
+                                  reason as above for opencode users.
 
 Excluded by design:
   - The wheel/source code (pipx upgrade or git pull restores it).
@@ -17,10 +32,11 @@ Excluded by design:
   - node_modules anywhere (npm install on destination).
   - SQLite WAL / SHM sidecars — torn pairs of (live db, stale sidecar)
     cause restore-time corruption; the .db itself is captured.
+  - browser-profiles/ — regenerable + can be huge.
   - Runtime PID files (daemon.pid).
 
 Pattern cribbed from hermes_cli/backup.py — kept much smaller because
-vexis's state surface is smaller and there's no SQLite to round-trip.
+vexis's state surface is smaller.
 """
 
 from __future__ import annotations
@@ -59,6 +75,8 @@ class BackupResult:
     file_count: int
     home_root: Path
     workspace_root: Optional[Path]
+    brain_sessions_included: bool = False
+    brain_session_files: int = 0
 
 
 def _should_skip(rel: Path) -> bool:
@@ -101,16 +119,47 @@ def _default_archive_path() -> Path:
     return parent / f"vexis-{stamp}.zip"
 
 
+def _brain_session_roots(workspace: Path) -> list[tuple[str, Path]]:
+    """Where the brain stores conversation history. Returns
+    (archive-prefix, path) pairs for everything that exists.
+
+    claude-code's projects dir is keyed by the workspace path with
+    slashes/dots replaced by hyphens — see vexis_agent.core.transcripts
+    for the canonical encoder. We preserve the encoded directory name
+    in the archive prefix so restore can put it back at the same path
+    (which works on the destination iff the user's workspace lives at
+    the same absolute path — typically ``~/vexis-workspace`` for both
+    source and destination).
+
+    opencode uses a single SQLite DB at a fixed path; that just lands
+    back in place wherever Path.home() points on the destination.
+    """
+    out: list[tuple[str, Path]] = []
+    encoded = str(workspace).replace("/", "-").replace(".", "-")
+    cc_root = Path.home() / ".claude" / "projects" / encoded
+    if cc_root.exists():
+        out.append((f"brain-sessions/claude-code/{encoded}", cc_root))
+    oc_db = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+    if oc_db.exists():
+        out.append(("brain-sessions/opencode/opencode.db", oc_db))
+    return out
+
+
 def run_backup(
     *,
     out: Optional[Path] = None,
     workspace: Optional[Path] = None,
     home: Optional[Path] = None,
+    include_brain_sessions: bool = False,
 ) -> BackupResult:
-    """Bundle $VEXIS_HOME and $VEXIS_WORKSPACE into a zip.
+    """Bundle $VEXIS_HOME, $VEXIS_WORKSPACE, and (optionally) the
+    brain's conversation history into a zip.
 
-    The archive is structured with two top-level prefixes (``vexis-home/``
-    and ``vexis-workspace/``) so restore can reliably target each.
+    The archive is structured with top-level prefixes
+    (``vexis-home/``, ``vexis-workspace/``, ``brain-sessions/``) so
+    restore can reliably target each. Brain sessions are opt-in:
+    they can be large (each turn is a JSONL file for claude-code) and
+    not all users want to roundtrip past conversations.
     """
     from vexis_agent.core.paths import vexis_dir
     from vexis_agent.setup_wizard import workspace_path as _ws_path
@@ -121,6 +170,7 @@ def run_backup(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     file_count = 0
+    brain_count = 0
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
         if home.exists():
             for p in _walk_for_backup(home):
@@ -132,12 +182,24 @@ def run_backup(
                 arcname = Path("vexis-workspace") / p.relative_to(workspace)
                 zf.write(p, arcname)
                 file_count += 1
+        if include_brain_sessions:
+            for prefix, src in _brain_session_roots(workspace):
+                if src.is_file():
+                    zf.write(src, prefix)
+                    brain_count += 1
+                else:
+                    for p in _walk_for_backup(src):
+                        arcname = Path(prefix) / p.relative_to(src)
+                        zf.write(p, arcname)
+                        brain_count += 1
 
     return BackupResult(
         archive=out_path,
-        file_count=file_count,
+        file_count=file_count + brain_count,
         home_root=home,
         workspace_root=workspace if workspace and workspace.exists() else None,
+        brain_sessions_included=include_brain_sessions,
+        brain_session_files=brain_count,
     )
 
 
@@ -148,6 +210,7 @@ class RestoreResult:
     workspace_files_restored: int
     home_dest: Path
     workspace_dest: Path
+    brain_sessions_restored: int = 0
 
 
 def run_restore(
@@ -177,6 +240,10 @@ def run_restore(
     home_count = 0
     ws_count = 0
 
+    brain_count = 0
+    cc_dest = Path.home() / ".claude" / "projects"
+    oc_db_dest = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+
     with zipfile.ZipFile(archive, "r") as zf:
         for member in zf.namelist():
             # Skip directory entries; zipfile creates them on demand.
@@ -190,6 +257,20 @@ def run_restore(
                 rel = member[len("vexis-workspace/") :]
                 dest_root = workspace
                 ws_count += 1
+            elif member.startswith("brain-sessions/claude-code/"):
+                rel = member[len("brain-sessions/claude-code/") :]
+                dest_root = cc_dest
+                brain_count += 1
+            elif member == "brain-sessions/opencode/opencode.db":
+                # Single-file destination — handled out-of-band.
+                oc_db_dest.parent.mkdir(parents=True, exist_ok=True)
+                if oc_db_dest.exists() and not overwrite:
+                    log.info("skipping existing %s (use overwrite=True)", oc_db_dest)
+                    continue
+                with zf.open(member) as src, open(oc_db_dest, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                brain_count += 1
+                continue
             else:
                 # Unknown prefix — skip rather than dump into home/cwd.
                 log.warning("skipping archive entry with unknown prefix: %s", member)
@@ -214,4 +295,5 @@ def run_restore(
         workspace_files_restored=ws_count,
         home_dest=home,
         workspace_dest=workspace,
+        brain_sessions_restored=brain_count,
     )

@@ -203,3 +203,92 @@ def test_default_archive_path_lives_under_vexis_home() -> None:
     assert p.parent.name == "backups"
     assert p.name.startswith("vexis-")
     assert p.suffix == ".zip"
+
+
+# ── brain-session inclusion (Phase 5j) ────────────────────────────
+
+
+def test_backup_excludes_brain_sessions_by_default(tmp_path, monkeypatch) -> None:
+    """Default backup leaves brain conversation history alone — that
+    can be huge and not every user wants to roundtrip it."""
+    home, ws = _build_fixture(tmp_path)
+    out = tmp_path / "out.zip"
+    result = bk.run_backup(out=out, home=home, workspace=ws)
+    assert result.brain_sessions_included is False
+    assert result.brain_session_files == 0
+    with zipfile.ZipFile(out, "r") as zf:
+        names = zf.namelist()
+    assert not any(n.startswith("brain-sessions/") for n in names)
+
+
+def test_backup_includes_claude_code_sessions_when_opted_in(
+    tmp_path, monkeypatch
+) -> None:
+    """With --include-brain-sessions, claude-code's projects/<encoded>
+    dir lands under brain-sessions/claude-code/ in the archive."""
+    home, ws = _build_fixture(tmp_path)
+    # Lay a fake claude-code projects dir for ws.
+    encoded = str(ws).replace("/", "-").replace(".", "-")
+    cc_dir = tmp_path / "fakehome" / ".claude" / "projects" / encoded
+    cc_dir.mkdir(parents=True)
+    (cc_dir / "session-1.jsonl").write_text('{"type":"user","msg":"hi"}\n')
+    (cc_dir / "session-2.jsonl").write_text('{"type":"user","msg":"yo"}\n')
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fakehome")
+
+    out = tmp_path / "out.zip"
+    result = bk.run_backup(
+        out=out, home=home, workspace=ws, include_brain_sessions=True
+    )
+    assert result.brain_sessions_included is True
+    assert result.brain_session_files == 2
+    with zipfile.ZipFile(out, "r") as zf:
+        names = zf.namelist()
+    # Encoded workspace path is preserved in the prefix so restore
+    # can put the session jsonls back at the right ~/.claude path.
+    assert f"brain-sessions/claude-code/{encoded}/session-1.jsonl" in names
+    assert f"brain-sessions/claude-code/{encoded}/session-2.jsonl" in names
+
+
+def test_backup_includes_opencode_db_when_opted_in(
+    tmp_path, monkeypatch
+) -> None:
+    home, ws = _build_fixture(tmp_path)
+    oc_db = tmp_path / "fakehome" / ".local" / "share" / "opencode" / "opencode.db"
+    oc_db.parent.mkdir(parents=True)
+    oc_db.write_bytes(b"SQLITEx00\xfake-db-bytes")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fakehome")
+
+    out = tmp_path / "out.zip"
+    result = bk.run_backup(
+        out=out, home=home, workspace=ws, include_brain_sessions=True
+    )
+    assert result.brain_sessions_included is True
+    assert result.brain_session_files == 1
+    with zipfile.ZipFile(out, "r") as zf:
+        assert "brain-sessions/opencode/opencode.db" in zf.namelist()
+
+
+def test_restore_replays_claude_code_sessions(tmp_path, monkeypatch) -> None:
+    """Round-trip: pack with --include-brain-sessions, restore against
+    a fresh ~/.claude/projects/ — sessions land back in place."""
+    home, ws = _build_fixture(tmp_path)
+    encoded = str(ws).replace("/", "-").replace(".", "-")
+    src_cc = tmp_path / "src-home" / ".claude" / "projects" / encoded
+    src_cc.mkdir(parents=True)
+    (src_cc / "s1.jsonl").write_text("session1")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "src-home")
+
+    archive = tmp_path / "a.zip"
+    bk.run_backup(out=archive, home=home, workspace=ws, include_brain_sessions=True)
+
+    # Switch HOME for restore — fresh machine.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "dest-home")
+    new_home = tmp_path / "dest-home" / ".vexis"
+    new_ws = tmp_path / "dest-home" / "vexis-workspace"
+    new_home.mkdir(parents=True)
+    new_ws.mkdir(parents=True)
+
+    result = bk.run_restore(archive, home=new_home, workspace=new_ws)
+    assert result.brain_sessions_restored == 1
+    restored = tmp_path / "dest-home" / ".claude" / "projects" / encoded / "s1.jsonl"
+    assert restored.read_text() == "session1"

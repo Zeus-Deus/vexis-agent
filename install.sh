@@ -267,11 +267,17 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
         warn "[dry-run] would run: pipx install --force '$REPO'"
         warn "[dry-run] would run: vexis-agent setup (unless --skip-setup)"
     fi
-    info "[dry-run] would print the soft-dependency advice + next steps"
-    exit 0
+    # Fall through to the soft-deps section so users see what their
+    # current setup is missing without having to actually install.
 fi
 
-if [[ "$ALREADY_INSTALLED" -eq 1 ]]; then
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    # Skip the actual install in dry-run; soft-deps advice still
+    # renders below so the user can see what's missing.
+    if [[ "$ALREADY_INSTALLED" -eq 1 ]]; then
+        SKIP_SETUP=1
+    fi
+elif [[ "$ALREADY_INSTALLED" -eq 1 ]]; then
     info "vexis-agent is already installed — updating to ${SOURCE_LABEL}."
     info "(Skipping the setup wizard; your config + workspace are preserved.)"
     # --force here both refreshes the venv at the new git ref AND
@@ -290,12 +296,14 @@ fi
 
 # ── soft-dependency advice ──────────────────────────────────────────
 section "Soft dependencies"
-info "The daemon needs a brain CLI and Hyprland/Wayland tools at runtime."
+info "The daemon only requires a brain CLI to run. Other tools enable"
+info "specific features — install only what you'll use."
 info "Run 'vexis-agent doctor' anytime for the full readiness check."
 
 CHECK_HEAD=" • "
 
-# Brain CLI: claude-code is the default; opencode is opt-in.
+# Brain CLI: required for daemon start. claude-code is the default;
+# opencode is opt-in via brain.kind in config.yaml.
 if command -v claude >/dev/null 2>&1; then
     ok "${CHECK_HEAD}claude (claude-code) on PATH"
 elif command -v opencode >/dev/null 2>&1; then
@@ -306,23 +314,71 @@ else
     info "    opencode:    curl -fsSL https://opencode.ai/install | bash"
 fi
 
-# Hyprland/Wayland actuator tools (REQUIRED for daemon start).
-MISSING_HARD=()
-for cmd in hyprctl wtype ydotool grim ffmpeg jq; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        MISSING_HARD+=("$cmd")
-    fi
-done
-if [[ ${#MISSING_HARD[@]} -eq 0 ]]; then
-    ok "${CHECK_HEAD}Hyprland/Wayland tools all present"
-else
-    warn "${CHECK_HEAD}missing required Wayland tools: ${MISSING_HARD[*]}"
-    info "    Arch:   sudo pacman -S ${MISSING_HARD[*]}"
-    info "    Debian: sudo apt install ${MISSING_HARD[*]}"
-    info "    Fedora: sudo dnf install ${MISSING_HARD[*]}"
+# Compositor detection — scopes the desktop-control advice to what
+# the user can actually use. Hyprland users get Hyprland-specific
+# tools; non-Hyprland users get a clear "those tools won't help here"
+# instead of a wrong-distro install command.
+COMPOSITOR="other"
+if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] || \
+   [[ "${XDG_CURRENT_DESKTOP:-}" == *Hyprland* ]] || \
+   [[ "${XDG_CURRENT_DESKTOP:-}" == *hyprland* ]]; then
+    COMPOSITOR="hyprland"
+elif [[ "${XDG_SESSION_TYPE:-}" != "wayland" ]]; then
+    COMPOSITOR="non-wayland"
 fi
 
-# Tailscale (SOFT — dashboard works on localhost without it, but the
+# Desktop-control feature group (per-tool optional). Daemon starts
+# without these; tools that need them (vexis-click etc.) just return
+# a clear "tool unavailable" error when invoked. We only nudge users
+# to install on Hyprland — telling a GNOME-X11 user to install
+# 'hyprctl' is wrong.
+if [[ "$COMPOSITOR" == "hyprland" ]]; then
+    DC_MISSING=()
+    for cmd in hyprctl wtype ydotool grim; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            DC_MISSING+=("$cmd")
+        fi
+    done
+    if [[ ${#DC_MISSING[@]} -eq 0 ]]; then
+        ok "${CHECK_HEAD}desktop control: Hyprland tools all present"
+    else
+        warn "${CHECK_HEAD}desktop control degraded: missing ${DC_MISSING[*]}"
+        info "    Arch:   sudo pacman -S ${DC_MISSING[*]}"
+        info "    Debian: sudo apt install ${DC_MISSING[*]}"
+        info "    Fedora: sudo dnf install ${DC_MISSING[*]}"
+    fi
+elif [[ "$COMPOSITOR" == "non-wayland" ]]; then
+    info "${CHECK_HEAD}desktop control: unavailable (needs Wayland)"
+    info "    The daemon still runs for Telegram chat + brain dispatch."
+    info "    Switch to Wayland (ideally Hyprland) to enable screenshots,"
+    info "    typing, clicking, and window control."
+else
+    info "${CHECK_HEAD}desktop control: partial on non-Hyprland Wayland"
+    info "    wtype + grim work on most Wayland compositors; hyprctl is"
+    info "    Hyprland-only (workspace/window dispatches will no-op)."
+fi
+
+# Voice feature group (optional — only matters if you'll send voice
+# notes via Telegram).
+VOICE_MISSING=()
+for cmd in voxtype ffmpeg; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        VOICE_MISSING+=("$cmd")
+    fi
+done
+if [[ ${#VOICE_MISSING[@]} -eq 0 ]]; then
+    ok "${CHECK_HEAD}voice notes: voxtype + ffmpeg present"
+else
+    info "${CHECK_HEAD}voice notes: optional (missing ${VOICE_MISSING[*]})"
+    info "    Voice transcription stays disabled until both are installed."
+fi
+
+# Shell helpers (jq) — minor, but used by the dispatch wrappers.
+if ! command -v jq >/dev/null 2>&1; then
+    info "${CHECK_HEAD}shell helpers: install jq for the dispatch wrappers (optional)"
+fi
+
+# Tailscale (SOFT — dashboard works on localhost without it; the
 # remote-from-phone story needs it).
 if command -v tailscale >/dev/null 2>&1; then
     if tailscale status >/dev/null 2>&1; then
@@ -332,21 +388,15 @@ if command -v tailscale >/dev/null 2>&1; then
         info "    Run: ${BOLD}tailscale up${RESET}"
     fi
 else
-    warn "${CHECK_HEAD}tailscale not installed (optional — dashboard will be localhost-only)"
-    info "    Install: https://tailscale.com/download"
-    info "    Then:    ${BOLD}tailscale up${RESET}"
-fi
-
-# voxtype (SOFT — voice transcription, only needed for voice notes).
-if ! command -v voxtype >/dev/null 2>&1; then
-    warn "${CHECK_HEAD}voxtype not installed (optional — voice notes won't transcribe)"
-    info "    The daemon currently REQUIRES voxtype at startup; install it"
-    info "    or disable the voice path in your transports."
+    info "${CHECK_HEAD}tailscale: optional (dashboard will be localhost-only)"
+    info "    Install: https://tailscale.com/download — then ${BOLD}tailscale up${RESET}"
 fi
 
 # ── auto-run setup wizard ───────────────────────────────────────────
 section "Setup"
-if [[ "$SKIP_SETUP" -eq 1 ]]; then
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    info "[dry-run] would launch 'vexis-agent setup' here (skipped if --skip-setup)."
+elif [[ "$SKIP_SETUP" -eq 1 ]]; then
     info "Skipping wizard (--skip-setup). Run 'vexis-agent setup' when you're ready."
 elif ! { : </dev/tty; } 2>/dev/null; then
     # Piped curl-bash with no TTY — stdin's the install script. Skip
