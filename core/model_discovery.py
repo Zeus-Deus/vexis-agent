@@ -703,11 +703,50 @@ def _parse_opencode_verbose(text: str) -> dict[str, dict]:
                 if isinstance(out_lim, int) and out_lim > 0:
                     max_tokens = out_lim
 
+            # opencode-specific extras the picker uses to badge each
+            # row. ``providerID`` is the canonical source for the
+            # provider; the prefix in ``full_id`` matches but we
+            # prefer the explicit field when present.
+            #
+            # Cost is per-million-tokens (so 0.8 means $0.80 per
+            # million input tokens). Both being 0 is the signal for
+            # "free" — covers opencode/Zen freebies as well as any
+            # other provider that exposes a free tier this way.
+            provider: str | None = None
+            provider_raw = meta.get("providerID")
+            if isinstance(provider_raw, str) and provider_raw.strip():
+                provider = provider_raw.strip()
+            elif "/" in full_id:
+                # Fallback to the prefix when providerID is missing.
+                provider = full_id.split("/", 1)[0]
+
+            cost = meta.get("cost")
+            cost_input: float | None = None
+            cost_output: float | None = None
+            free = False
+            if isinstance(cost, dict):
+                ci = cost.get("input")
+                co = cost.get("output")
+                if isinstance(ci, (int, float)):
+                    cost_input = float(ci)
+                if isinstance(co, (int, float)):
+                    cost_output = float(co)
+                # Free signal: both input and output are exactly 0.
+                # Some providers (cache-only freebies, oddities)
+                # might have 0 input but paid output — those aren't
+                # "free for use" and shouldn't carry the badge.
+                if cost_input == 0.0 and cost_output == 0.0:
+                    free = True
+
             out[full_id] = {
                 "reasoning_levels": sorted(reasoning_levels),
                 "display_name": display_name,
                 "max_input_tokens": max_input_tokens,
                 "max_tokens": max_tokens,
+                "provider": provider,
+                "free": free,
+                "cost_input_per_million": cost_input,
+                "cost_output_per_million": cost_output,
             }
             i = j
             continue

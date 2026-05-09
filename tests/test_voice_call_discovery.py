@@ -378,10 +378,15 @@ def test_picker_payload_uniform_shape_across_brains(
     # Filter rule: opencode IDs must contain "/".
     ids = [m["id"] for m in out]
     assert "bare-no-slash" not in ids
-    # Every entry must carry every field — uniform shape.
+    # Every entry must carry every field — uniform shape across brains.
+    # Adding a field here means the AvailableModel TypeScript interface
+    # AND every consumer site (CallModePicker render, search filter,
+    # cost formatter) needs the matching update.
     expected_keys = {
         "id", "display_name", "reasoning_levels",
         "max_input_tokens", "max_tokens",
+        "provider", "free",
+        "cost_input_per_million", "cost_output_per_million",
     }
     for entry in out:
         assert set(entry.keys()) == expected_keys, (
@@ -505,6 +510,86 @@ def test_opencode_parser_extracts_context_and_display_name() -> None:
     assert entry["max_tokens"] == 64_000
     # variants → reasoning levels (sorted)
     assert entry["reasoning_levels"] == ["fast", "thinking"]
+
+
+def test_opencode_parser_extracts_provider_and_free_badge() -> None:
+    """``providerID`` becomes the picker's provider tag. Free badge
+    fires when both cost.input and cost.output are 0 — covers
+    opencode/Zen freebies and any other 0-cost provider that uses
+    the same shape."""
+    from core.model_discovery import _parse_opencode_verbose
+    raw = """opencode/free-model
+{
+  "id": "free-model",
+  "providerID": "opencode",
+  "name": "Free Model",
+  "limit": {"context": 200000, "output": 64000},
+  "cost": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}},
+  "variants": {}
+}
+openrouter/anthropic/claude-3.5-haiku
+{
+  "id": "anthropic/claude-3.5-haiku",
+  "providerID": "openrouter",
+  "name": "Claude 3.5 Haiku",
+  "limit": {"context": 200000, "output": 8192},
+  "cost": {"input": 0.8, "output": 4, "cache": {"read": 0.08, "write": 1}},
+  "variants": {}
+}
+"""
+    parsed = _parse_opencode_verbose(raw)
+    free = parsed["opencode/free-model"]
+    paid = parsed["openrouter/anthropic/claude-3.5-haiku"]
+    # Provider sourced from providerID, not the prefix.
+    assert free["provider"] == "opencode"
+    assert paid["provider"] == "openrouter"
+    # Free badge.
+    assert free["free"] is True
+    assert paid["free"] is False
+    # Costs surfaced as floats per million tokens.
+    assert paid["cost_input_per_million"] == 0.8
+    assert paid["cost_output_per_million"] == 4.0
+    # Free model also reports its 0-cost (UI uses the badge, not
+    # the cost line, but the data is there).
+    assert free["cost_input_per_million"] == 0.0
+
+
+def test_opencode_parser_falls_back_to_id_prefix_when_provider_missing() -> None:
+    """Older opencode versions might omit ``providerID``. Fall back
+    to the prefix in the full id (everything before the first ``/``)
+    so the picker still gets a provider tag."""
+    from core.model_discovery import _parse_opencode_verbose
+    raw = """legacy-provider/model-x
+{
+  "id": "model-x",
+  "name": "Legacy",
+  "variants": {}
+}
+"""
+    parsed = _parse_opencode_verbose(raw)
+    entry = parsed["legacy-provider/model-x"]
+    assert entry["provider"] == "legacy-provider"
+    # Without cost, free is False (zero-cost is a positive signal,
+    # absence-of-cost-info is not).
+    assert entry["free"] is False
+
+
+def test_opencode_parser_partial_zero_cost_not_free() -> None:
+    """A model with input=0 but output>0 is NOT free — covers
+    weird cache-only freebies and prevents accidental "free" badges
+    on models that charge for output."""
+    from core.model_discovery import _parse_opencode_verbose
+    raw = """oddprovider/cache-only
+{
+  "id": "cache-only",
+  "providerID": "oddprovider",
+  "name": "Cache Only",
+  "cost": {"input": 0, "output": 1.5},
+  "variants": {}
+}
+"""
+    parsed = _parse_opencode_verbose(raw)
+    assert parsed["oddprovider/cache-only"]["free"] is False
 
 
 def test_opencode_parser_handles_missing_limits() -> None:

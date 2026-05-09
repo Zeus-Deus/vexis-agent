@@ -300,6 +300,126 @@ def test_sequential_voice_then_send_no_leak(
     assert r2m is None
 
 
+def test_default_mode_full_cycle(
+    client: TestClient, brain: BrainNull, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end Default-mode contract:
+
+      1. User picks a real model + reasoning, saves → config has the
+         keys.
+      2. User clicks 'Reset to default' → POST /api/v1/voice with
+         empty strings → config keys removed.
+      3. /api/v1/chat/voice/info returns empty strings (the wire-
+         format sentinel for 'no override').
+      4. The next /chat/voice call (no form fields, since the UI
+         reads empty from /info and omits the form fields) reaches
+         the brain with model=None and reasoning_level=None.
+
+    Pins the UI's 'Reset to default' flow against silent regressions
+    — it's load-bearing because the Default radio is the typical
+    state for most users.
+    """
+    # Patch BOTH paths the route layer touches: ``_config_path`` for
+    # reads (``voice_call_mode_*`` helpers) and ``vexis_dir`` for
+    # writes (``_voice_set`` builds the path as ``vexis_dir() /
+    # "config.yaml"``). Otherwise the writer scribbles into the real
+    # ~/.vexis/ during the test.
+    vexis_root = tmp_path / "vexis"
+    vexis_root.mkdir()
+    cfg = vexis_root / "config.yaml"
+    monkeypatch.setattr("core.yaml_config._config_path", lambda: cfg)
+    monkeypatch.setattr("core.paths.vexis_dir", lambda: vexis_root)
+
+    # 1. Set an override.
+    set_resp = client.post(
+        "/api/v1/voice",
+        headers=_auth(),
+        json={
+            "call_mode": {
+                "model": "claude-opus-4-7",
+                "reasoning_level": "high",
+            },
+        },
+    )
+    assert set_resp.status_code == 200
+    cfg_text = cfg.read_text()
+    assert "model: claude-opus-4-7" in cfg_text
+    assert "reasoning_level: high" in cfg_text
+
+    # 2. Reset both — empty strings = the UI's "Default" sentinel.
+    reset_resp = client.post(
+        "/api/v1/voice",
+        headers=_auth(),
+        json={
+            "call_mode": {"model": "", "reasoning_level": ""},
+        },
+    )
+    assert reset_resp.status_code == 200
+    cfg_text_after = cfg.read_text()
+    # Both keys gone — call_mode block dropped entirely when empty.
+    assert "model: claude-opus-4-7" not in cfg_text_after
+    assert "reasoning_level" not in cfg_text_after
+
+    # 3. /chat/voice/info reflects empty.
+    info_resp = client.get("/api/v1/chat/voice/info", headers=_auth())
+    assert info_resp.status_code == 200
+    info = info_resp.json()
+    assert info["call_mode"]["model"] == ""
+    assert info["call_mode"]["reasoning_level"] == ""
+
+    # 4. Voice call without form fields (matches what the UI sends
+    #    when modelOverride/reasoningOverride are empty strings —
+    #    api.chatVoice omits them entirely) → brain gets None.
+    voice_resp = client.post(
+        "/api/v1/chat/voice",
+        headers=_auth(),
+        files={"audio": ("v.wav", b"fake-audio", "audio/wav")},
+    )
+    assert voice_resp.status_code == 200
+    _msg, _chat_id, model, reasoning = brain.calls()[-1]
+    assert model is None, "Default mode leaked a non-None model to the brain"
+    assert reasoning is None, "Default mode leaked a non-None reasoning to the brain"
+
+
+def test_default_sentinel_string_is_normalised(
+    client: TestClient, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Belt-and-suspenders: sending the literal string 'default' (or
+    'DEFAULT', whitespace) instead of empty must also reset. This
+    matches what voice_call_mode_model() reads: empty / 'default' /
+    whitespace all collapse to None."""
+    vexis_root = tmp_path / "vexis"
+    vexis_root.mkdir()
+    cfg = vexis_root / "config.yaml"
+    monkeypatch.setattr("core.yaml_config._config_path", lambda: cfg)
+    monkeypatch.setattr("core.paths.vexis_dir", lambda: vexis_root)
+    # Pre-load with a real model.
+    cfg.write_text(
+        "voice:\n  call_mode:\n    model: claude-haiku-4-5\n",
+        encoding="utf-8",
+    )
+    for sentinel in ("", "default", "DEFAULT", "   ", "  default  "):
+        client.post(
+            "/api/v1/voice",
+            headers=_auth(),
+            json={"call_mode": {"model": sentinel}},
+        )
+        info = client.get(
+            "/api/v1/chat/voice/info", headers=_auth(),
+        ).json()
+        assert info["call_mode"]["model"] == "", (
+            f"sentinel {sentinel!r} not normalised to empty"
+        )
+        # Re-set so the next iteration has something to reset.
+        client.post(
+            "/api/v1/voice",
+            headers=_auth(),
+            json={"call_mode": {"model": "claude-opus-4-7"}},
+        )
+
+
 def test_sequential_voice_with_then_without(
     client: TestClient, brain: BrainNull,
 ) -> None:

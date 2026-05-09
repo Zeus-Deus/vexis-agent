@@ -670,6 +670,22 @@ export interface AvailableModel {
   // Max output tokens per turn (Anthropic's ``max_tokens``,
   // opencode's ``limit.output``).
   max_tokens: number | null;
+  // Provider tag for the model. claude-code defaults to "anthropic"
+  // (everything routes through their API). opencode pulls this from
+  // ``providerID`` in its verbose output — values seen in the wild:
+  // "opencode", "openrouter", "github-copilot", "venice",
+  // "minimax-coding-plan". Surfaced as a small badge in the picker.
+  provider: string | null;
+  // True when the model costs nothing per token (opencode's Zen
+  // free tier + any other 0-cost provider). Picker shows a "free"
+  // badge so the user knows they can use it without spending.
+  free: boolean;
+  // Per-million-token costs (opencode reports these; null for
+  // claude-code where the API doesn't expose per-model pricing).
+  // Surfaced as "$0.80/M in · $4/M out" in the picker metadata
+  // strip when present.
+  cost_input_per_million: number | null;
+  cost_output_per_million: number | null;
 }
 
 export interface VoiceSettings {

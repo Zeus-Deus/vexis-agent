@@ -2590,6 +2590,12 @@ class WebDashboard:
               "reasoning_levels": list[str],   # dynamic per-model
               "max_input_tokens": int | None,  # context window
               "max_tokens": int | None,        # max output tokens
+              "provider": str | None,          # "anthropic" / "openrouter"
+                                               #   / "github-copilot" / etc
+              "free": bool,                    # opencode reports cost.input
+                                               #   == cost.output == 0 → True
+              "cost_input_per_million":  float | None,  # opencode only;
+              "cost_output_per_million": float | None,  # null elsewhere
             }
 
         Every value comes from the brain's native discovery
@@ -2612,7 +2618,16 @@ class WebDashboard:
             discover_opencode_models,
         )
 
-        def _from_caps(mid: str, caps: dict) -> dict:
+        def _from_caps(
+            mid: str, caps: dict, *, default_provider: str | None,
+        ) -> dict:
+            """Project a capability entry into the picker wire format.
+
+            ``default_provider`` is what we fall back to when the
+            entry didn't ship a ``provider`` field — claude-code
+            doesn't have per-model provider info because everything
+            is anthropic, so we set it to ``"anthropic"`` by default.
+            """
             entry = caps.get(mid) or {}
             return {
                 "id": mid,
@@ -2620,6 +2635,10 @@ class WebDashboard:
                 "reasoning_levels": entry.get("reasoning_levels", []),
                 "max_input_tokens": entry.get("max_input_tokens"),
                 "max_tokens": entry.get("max_tokens"),
+                "provider": entry.get("provider") or default_provider,
+                "free": bool(entry.get("free", False)),
+                "cost_input_per_million": entry.get("cost_input_per_million"),
+                "cost_output_per_million": entry.get("cost_output_per_million"),
             }
 
         if active_brain == "claude-code":
@@ -2628,14 +2647,20 @@ class WebDashboard:
                 if m.startswith("claude-")
             )
             caps = discover_claude_code_capabilities()
-            return [_from_caps(mid, caps) for mid in ids]
+            return [
+                _from_caps(mid, caps, default_provider="anthropic")
+                for mid in ids
+            ]
         if active_brain == "opencode":
             ids = sorted(
                 m for m in discover_opencode_models()
                 if "/" in m
             )
             caps = discover_opencode_capabilities()
-            return [_from_caps(mid, caps) for mid in ids]
+            return [
+                _from_caps(mid, caps, default_provider=None)
+                for mid in ids
+            ]
         # null brain — no real model list to surface.
         return []
 

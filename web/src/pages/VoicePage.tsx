@@ -474,20 +474,34 @@ function CallModePicker({
 }) {
   const [query, setQuery] = useState("");
 
-  // Filter pipeline — case-insensitive substring match against
-  // both the canonical id and the display_name. Memoised so a
-  // 273-model opencode list doesn't refilter on every render.
-  // Default option is rendered separately above the search results
-  // so it's never hidden by an aggressive filter.
+  // Optional "free models only" filter — only useful for opencode
+  // where 34/237 models are free; surfaced as a small toggle next
+  // to the search bar when AT LEAST ONE free model exists in the
+  // current available list (claude-code never has any, so the
+  // toggle stays hidden there).
+  const [freeOnly, setFreeOnly] = useState(false);
+  const hasFreeModels = useMemo(
+    () => available.some((m) => m.free),
+    [available],
+  );
+
+  // Filter pipeline — case-insensitive substring match against id,
+  // display_name, AND provider so 'openrouter' or 'github-copilot'
+  // narrow the list naturally. Memoised so a 237-model opencode
+  // list doesn't refilter on every render. Default option is
+  // rendered separately above the results so it's never hidden by
+  // an aggressive filter or the freeOnly toggle.
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return available;
     return available.filter((m) => {
+      if (freeOnly && !m.free) return false;
+      if (!q) return true;
       if (m.id.toLowerCase().includes(q)) return true;
       if (m.display_name?.toLowerCase().includes(q)) return true;
+      if (m.provider?.toLowerCase().includes(q)) return true;
       return false;
     });
-  }, [available, query]);
+  }, [available, query, freeOnly]);
 
   return (
     <div className="space-y-3">
@@ -523,36 +537,54 @@ function CallModePicker({
         </div>
       </label>
 
-      {/* Search bar — only useful with more than a handful of
-          models, but renders unconditionally for a consistent
-          control surface across brains. */}
+      {/* Search bar + filter chips. Search matches id +
+          display_name + provider so typing 'openrouter' narrows
+          to that provider on opencode. */}
       {available.length > 0 && (
-        <div className="flex items-center gap-2">
-          <div className="flex-1 relative">
-            <input
-              type="search"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search models…"
-              className={[
-                "w-full bg-[var(--color-base)] border border-[var(--color-border-strong)]",
-                "rounded px-2.5 py-1.5 pl-7 text-xs text-[var(--color-fg)]",
-                "placeholder:text-[var(--color-fg-dim)]",
-                "focus:outline-none focus:border-[var(--color-accent)]",
-              ].join(" ")}
-            />
-            <span
-              aria-hidden
-              className="absolute left-2 top-1/2 -translate-y-1/2 text-[var(--color-fg-dim)] text-[11px]"
-            >
-              ⌕
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <div className="flex-1 relative">
+              <input
+                type="search"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search id, display name, or provider…"
+                className={[
+                  "w-full bg-[var(--color-base)] border border-[var(--color-border-strong)]",
+                  "rounded px-2.5 py-1.5 pl-7 text-xs text-[var(--color-fg)]",
+                  "placeholder:text-[var(--color-fg-dim)]",
+                  "focus:outline-none focus:border-[var(--color-accent)]",
+                ].join(" ")}
+              />
+              <span
+                aria-hidden
+                className="absolute left-2 top-1/2 -translate-y-1/2 text-[var(--color-fg-dim)] text-[11px]"
+              >
+                ⌕
+              </span>
+            </div>
+            <span className="text-[10px] text-[var(--color-fg-dim)] tabular-nums shrink-0">
+              {filtered.length === available.length
+                ? `${available.length} models`
+                : `${filtered.length} / ${available.length}`}
             </span>
           </div>
-          <span className="text-[10px] text-[var(--color-fg-dim)] tabular-nums shrink-0">
-            {filtered.length === available.length
-              ? `${available.length} models`
-              : `${filtered.length} / ${available.length}`}
-          </span>
+          {hasFreeModels && (
+            <label className="flex items-center gap-2 text-xs text-[var(--color-fg-2)] cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={freeOnly}
+                onChange={(e) => setFreeOnly(e.target.checked)}
+                className="accent-[var(--color-accent)]"
+              />
+              <span>
+                Free models only
+                <span className="text-[var(--color-fg-dim)] ml-1">
+                  ({available.filter((m) => m.free).length})
+                </span>
+              </span>
+            </label>
+          )}
         </div>
       )}
 
@@ -609,6 +641,19 @@ function CallModePicker({
   );
 }
 
+function formatCost(per_million: number | null | undefined): string | null {
+  if (per_million == null || !Number.isFinite(per_million)) return null;
+  if (per_million === 0) return "0";
+  // Two decimals for sub-dollar costs ("$0.80"), one decimal for
+  // larger ("$15.0"). Trim trailing zero on integers ("$5").
+  const fmt =
+    per_million < 1 ? per_million.toFixed(2) :
+    per_million < 10 ? per_million.toFixed(1) :
+    per_million.toFixed(0);
+  // Trim trailing ".0" so $5.0 becomes $5
+  return fmt.replace(/\.0$/, "");
+}
+
 function ModelRadio({
   model,
   selected,
@@ -632,6 +677,17 @@ function ModelRadio({
   if (model.reasoning_levels.length > 0) {
     meta.push(`reasoning: ${model.reasoning_levels.join("/")}`);
   }
+  // Cost line — only when at least one side is non-zero (free
+  // models get the "Free" badge instead, no need to also say
+  // "$0/M in"). opencode-only today.
+  const ci = formatCost(model.cost_input_per_million);
+  const co = formatCost(model.cost_output_per_million);
+  if (!model.free && (ci || co)) {
+    const parts: string[] = [];
+    if (ci) parts.push(`$${ci}/M in`);
+    if (co) parts.push(`$${co}/M out`);
+    meta.push(parts.join(" · "));
+  }
   return (
     <label
       className={[
@@ -653,22 +709,52 @@ function ModelRadio({
       <div className="flex-1 min-w-0">
         {/* Display name as the primary label when discovery
             provides one; otherwise the canonical id sits alone.
-            Keeps the row scannable without losing the actual id
-            (always shown as a smaller monospace subtitle). */}
-        {model.display_name ? (
-          <>
-            <div className="text-sm text-[var(--color-fg)] truncate">
-              {model.display_name}
-            </div>
-            <div className="text-[10px] text-[var(--color-fg-dim)] font-mono truncate">
-              {model.id}
-            </div>
-          </>
-        ) : (
-          <div className="text-sm text-[var(--color-fg)] font-mono truncate">
-            {model.id}
+            Provider + free badges align to the right of the
+            heading row. */}
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="flex-1 min-w-0">
+            {model.display_name ? (
+              <>
+                <div className="text-sm text-[var(--color-fg)] truncate">
+                  {model.display_name}
+                </div>
+                <div className="text-[10px] text-[var(--color-fg-dim)] font-mono truncate">
+                  {model.id}
+                </div>
+              </>
+            ) : (
+              <div className="text-sm text-[var(--color-fg)] font-mono truncate">
+                {model.id}
+              </div>
+            )}
           </div>
-        )}
+          <div className="flex items-center gap-1 shrink-0">
+            {model.free && (
+              <span
+                className={[
+                  "text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded",
+                  "bg-[var(--color-accent)] text-[var(--color-accent-fg)]",
+                  "font-semibold",
+                ].join(" ")}
+                title="No per-token cost on this provider"
+              >
+                Free
+              </span>
+            )}
+            {model.provider && (
+              <span
+                className={[
+                  "text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded",
+                  "bg-[var(--color-surface-2)] text-[var(--color-fg-2)]",
+                  "border border-[var(--color-border)]",
+                ].join(" ")}
+                title={`Routed via ${model.provider}`}
+              >
+                {model.provider}
+              </span>
+            )}
+          </div>
+        </div>
         {meta.length > 0 && (
           <div className="text-[10px] text-[var(--color-fg-dim)] mt-1 tabular-nums">
             {meta.join(" · ")}
