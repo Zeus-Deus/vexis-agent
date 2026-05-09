@@ -175,7 +175,10 @@ export function AttachmentPicker({
         title={inflight > 0 ? `Uploading ${inflight} (${pct}%)` : "Attach files"}
         className={[
           "shrink-0 rounded-md flex items-center justify-center",
-          "px-3 py-2.5 md:px-2.5 md:py-1.5",
+          // 44x44 square on mobile, tighter pill on desktop —
+          // matches MicButton and Send for a consistent
+          // composer-button row height.
+          "w-11 h-11 md:w-auto md:h-auto md:px-2.5 md:py-1.5",
           "transition-colors select-none",
           "border border-[var(--color-border-strong)]",
           "text-[var(--color-fg-2)] hover:text-[var(--color-fg)]",

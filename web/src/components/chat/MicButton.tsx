@@ -177,8 +177,10 @@ export function MicButton({
       title={recording ? `Recording ${elapsed}s` : "Hold to record"}
       className={[
         "shrink-0 rounded-md flex items-center justify-center",
-        // Match send-button sizing: comfortable touch target on mobile.
-        "px-3 py-2.5 md:px-2.5 md:py-1.5",
+        // Mobile: 44x44 square — matches send-button + touch-target
+        // floor. Desktop: tighter pill that sits flush with the text
+        // baseline.
+        "w-11 h-11 md:w-auto md:h-auto md:px-2.5 md:py-1.5",
         "transition-colors select-none",
         recording
           ? "bg-[var(--color-error)] text-[var(--color-fg)]"

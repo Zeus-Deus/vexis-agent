@@ -96,7 +96,12 @@ function Bubble({ message }: { message: ChatMessage }) {
     >
       <div
         className={[
-          "max-w-[85%] sm:max-w-[75%] rounded-lg px-4 py-3",
+          // Mobile: 90% to give long messages more reading width on
+          // narrow screens. Desktop: tighter so bubbles don't span
+          // edge-to-edge. ``min-w-0`` lets markdown children shrink
+          // properly (some content like long URLs / code flags
+          // would otherwise push the bubble wider than max-w).
+          "max-w-[90%] sm:max-w-[75%] min-w-0 rounded-lg px-4 py-3",
           isUser
             ? "bg-[var(--color-accent)] text-[var(--color-accent-fg)]"
             : "bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-fg)]",

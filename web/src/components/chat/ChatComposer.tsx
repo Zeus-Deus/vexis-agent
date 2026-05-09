@@ -132,7 +132,11 @@ export function ChatComposer({
         <AttachmentChips queue={attachmentQueue} onRemove={removeAttachment} />
         <div
           className={[
-            "flex items-end gap-2 rounded-lg border bg-[var(--color-surface)] px-3 py-2",
+            "flex items-end rounded-lg border bg-[var(--color-surface)]",
+            // Tighter padding + inter-button gap on mobile so the
+            // 4-button + textarea cluster fits a 375px viewport
+            // without crushing the textarea down to ~50px wide.
+            "gap-1 px-2 py-2 sm:gap-2 sm:px-3",
             "border-[var(--color-border)] focus-within:border-[var(--color-accent-2)]",
             "transition-colors",
           ].join(" ")}
@@ -175,7 +179,9 @@ export function ChatComposer({
               title="Voice call — hands-free conversation"
               className={[
                 "shrink-0 rounded-md flex items-center justify-center",
-                "px-3 py-2.5 md:px-2.5 md:py-1.5",
+                // 44x44 square on mobile, tighter pill on desktop —
+                // matches the rest of the composer button row.
+                "w-11 h-11 md:w-auto md:h-auto md:px-2.5 md:py-1.5",
                 "transition-colors select-none",
                 "border border-[var(--color-accent-2)]",
                 "text-[var(--color-accent)] hover:text-[var(--color-fg)]",
@@ -191,21 +197,30 @@ export function ChatComposer({
             onClick={submit}
             disabled={!draft.trim() || pending}
             className={[
-              "shrink-0 rounded-md text-xs uppercase tracking-wider",
-              // Generous touch target on mobile (~44px tall), tighter
-              // on desktop where a cursor doesn't need the padding.
-              "px-4 py-2.5 md:px-3 md:py-1.5",
-              "font-semibold transition-colors",
+              "shrink-0 rounded-md font-semibold transition-colors",
+              // Mobile: square 44x44 icon button (touch-target floor),
+              // arrow glyph instead of "SEND" text — the 50px the
+              // word would have eaten lets the textarea breathe.
+              // Desktop: keep the labeled pill button.
+              "w-11 h-11 flex items-center justify-center text-base",
+              "md:w-auto md:h-auto md:px-3 md:py-1.5 md:text-xs md:uppercase md:tracking-wider",
               "bg-[var(--color-accent)] text-[var(--color-accent-fg)]",
               "hover:bg-[var(--color-accent-2)] hover:text-[var(--color-fg)]",
               "disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-[var(--color-accent)]",
             ].join(" ")}
             aria-label="Send message"
           >
-            Send
+            {/* Up-arrow glyph on mobile (sends "up" into the
+                conversation), "Send" text on desktop. md:hidden /
+                hidden md:inline is the canonical Tailwind toggle. */}
+            <span aria-hidden className="md:hidden">↑</span>
+            <span className="hidden md:inline">Send</span>
           </button>
         </div>
-        <div className="mt-1.5 px-1 text-[10px] text-[var(--color-fg-dim)]">
+        {/* Keyboard hint is desktop-only — mobile keyboards don't
+            expose Shift+Enter and the line just steals 16px of
+            vertical space above the keyboard. */}
+        <div className="hidden md:block mt-1.5 px-1 text-[10px] text-[var(--color-fg-dim)]">
           Enter to send, Shift+Enter for newline.
         </div>
       </div>
