@@ -156,3 +156,74 @@ def test_run_all_returns_one_per_default_check() -> None:
     DEFAULT_CHECKS has entries. Catches accidental duplication / drops."""
     out = doc.run_all()
     assert len(out) == len(doc.DEFAULT_CHECKS)
+
+
+# ── Phase 5d additions ────────────────────────────────────────────
+
+
+def test_tailscale_warn_when_missing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    result = doc.check_tailscale()
+    assert result.status is doc.Status.WARN
+    assert "not installed" in result.detail
+
+
+def test_workspace_fail_when_missing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VEXIS_WORKSPACE", str(tmp_path / "no-such-ws"))
+    result = doc.check_workspace()
+    assert result.status is doc.Status.FAIL
+    assert "missing" in result.detail
+
+
+def test_workspace_warn_when_incomplete(tmp_path, monkeypatch) -> None:
+    """Workspace exists but missing expected subdirs / CLAUDE.md →
+    warning, not fail. The daemon still runs; the prompt just lacks
+    the workspace context."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.setenv("VEXIS_WORKSPACE", str(ws))
+    result = doc.check_workspace()
+    assert result.status is doc.Status.WARN
+
+
+def test_workspace_ok_when_complete(tmp_path, monkeypatch) -> None:
+    ws = tmp_path / "ws"
+    (ws / "memories").mkdir(parents=True)
+    (ws / "skills").mkdir(parents=True)
+    (ws / "CLAUDE.md").write_text("x")
+    monkeypatch.setenv("VEXIS_WORKSPACE", str(ws))
+    result = doc.check_workspace()
+    assert result.status is doc.Status.OK
+
+
+def test_dispatch_wrappers_warn_when_missing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    result = doc.check_dispatch_wrappers()
+    assert result.status is doc.Status.WARN
+    # All 11 wrappers should be reported missing in the detail.
+    for name in ("vexis-bg", "vexis-click", "vexis-stream"):
+        assert name in result.detail
+
+
+def test_dispatch_wrappers_ok_when_present(tmp_path, monkeypatch) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in (
+        "vexis-bg",
+        "vexis-browse",
+        "vexis-desktop",
+        "vexis-dispatch",
+        "vexis-click",
+        "vexis-key",
+        "vexis-type",
+        "vexis-stream",
+        "vexis-mem",
+        "vexis-skill",
+        "vexis-focus-wait",
+    ):
+        f = bin_dir / name
+        f.write_text("")
+        f.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    result = doc.check_dispatch_wrappers()
+    assert result.status is doc.Status.OK

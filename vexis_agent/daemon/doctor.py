@@ -3,10 +3,14 @@
 Sequence of independent checks. Each returns a CheckResult with status
 + remediation hint. The CLI prints a green ✓ / red ✗ line per check
 and exits 0 if all required checks pass, 1 otherwise. Optional checks
-(linger, service installed, telegram-token roundtrip) emit warnings
-but don't fail the run.
+(linger, service installed, telegram-token roundtrip, tailscale,
+workspace state) emit warnings but don't fail the run.
 
-Plan §6.5 listing.
+Phase 5d adds checks for the soft dependencies the daemon now treats
+as warn-and-continue: tailscale (dashboard reachability) and the
+workspace tree (CLAUDE.md, memories/, skills/). The wrapper-on-PATH
+check confirms pipx-installed users have the dispatch console scripts
+the brain prompt assumes.
 """
 
 from __future__ import annotations
@@ -230,6 +234,112 @@ def check_service_installed() -> CheckResult:
     )
 
 
+def check_tailscale() -> CheckResult:
+    """Tailscale is soft — dashboard works on localhost without it. We
+    surface the state so users know whether their phone can reach the
+    dashboard and whether the live-stream tools have a tunnel."""
+    if not shutil.which("tailscale"):
+        return CheckResult(
+            "Tailscale",
+            Status.WARN,
+            "not installed",
+            "Optional. Install from https://tailscale.com/download "
+            "and run 'tailscale up' to make the dashboard reachable "
+            "from your phone.",
+        )
+    try:
+        out = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return CheckResult(
+            "Tailscale",
+            Status.WARN,
+            f"status probe failed: {exc}",
+        )
+    if out.returncode != 0:
+        return CheckResult(
+            "Tailscale",
+            Status.WARN,
+            "not logged in",
+            "Run 'tailscale up' to log in. Without this the dashboard "
+            "is localhost-only.",
+        )
+    return CheckResult("Tailscale", Status.OK, "up + logged in")
+
+
+def check_workspace() -> CheckResult:
+    """Workspace tree exists and has the expected layout. The setup
+    wizard creates this; missing here means setup either wasn't run
+    or the user blew the directory away."""
+    raw = os.environ.get("VEXIS_WORKSPACE")
+    workspace = Path(raw).expanduser() if raw else Path.home() / "vexis-workspace"
+    if not workspace.exists():
+        return CheckResult(
+            "Workspace",
+            Status.FAIL,
+            f"{workspace} missing",
+            f"Run 'vexis-agent setup' to create {workspace} with the "
+            "expected memories/ + skills/ tree.",
+        )
+    missing = [
+        sub for sub in ("memories", "skills") if not (workspace / sub).is_dir()
+    ]
+    claude_md = workspace / "CLAUDE.md"
+    if missing or not claude_md.exists():
+        details = []
+        if missing:
+            details.append("missing dirs: " + ", ".join(missing))
+        if not claude_md.exists():
+            details.append("CLAUDE.md absent")
+        return CheckResult(
+            "Workspace",
+            Status.WARN,
+            "; ".join(details),
+            "Run 'vexis-agent setup' to refresh the workspace template.",
+        )
+    return CheckResult("Workspace", Status.OK, str(workspace))
+
+
+def check_dispatch_wrappers() -> CheckResult:
+    """The vexis-* dispatch wrappers are exposed as console scripts
+    after pipx install. If they're not on PATH, the brain prompt's
+    examples won't resolve — almost always means the wheel wasn't
+    installed (user is running from source without pip install -e .)
+    or PATH is mis-set."""
+    expected = (
+        "vexis-bg",
+        "vexis-browse",
+        "vexis-desktop",
+        "vexis-dispatch",
+        "vexis-click",
+        "vexis-key",
+        "vexis-type",
+        "vexis-stream",
+        "vexis-mem",
+        "vexis-skill",
+        "vexis-focus-wait",
+    )
+    missing = [name for name in expected if shutil.which(name) is None]
+    if not missing:
+        return CheckResult(
+            "Dispatch wrappers",
+            Status.OK,
+            f"{len(expected)} on PATH",
+        )
+    return CheckResult(
+        "Dispatch wrappers",
+        Status.WARN,
+        f"missing: {', '.join(missing)}",
+        "These ship as console scripts when vexis-agent is pipx-installed. "
+        "Check 'pipx list' or reinstall with 'pipx install --force'.",
+    )
+
+
 # Ordered list — the CLI iterates this. Tests use it too so the
 # wire-up doesn't drift.
 DEFAULT_CHECKS: list[Callable[[], CheckResult]] = [
@@ -237,6 +347,9 @@ DEFAULT_CHECKS: list[Callable[[], CheckResult]] = [
     check_config_yaml,
     check_secrets,
     check_brain_cli,
+    check_workspace,
+    check_dispatch_wrappers,
+    check_tailscale,
     check_systemctl,
     check_linger,
     check_service_installed,
