@@ -293,7 +293,7 @@ If you ended this pass with fewer than 3 consolidations and the
 candidate list has more than 10 skills, you stopped too early.
 Re-scan.
 
-Your toolset (invoke via Bash, all under ~/projects/vexis-agent/scripts/):
+Your toolset (invoke via Bash; the vexis-skill wrappers ship as console scripts on PATH):
   - vexis-skill list                       — read the current landscape
   - vexis-skill view <name>                — read a SKILL.md body
   - vexis-skill view <name> --file <path>  — read a supporting file

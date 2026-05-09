@@ -227,15 +227,17 @@ def test_peers_parses_all_peers_and_orders_online_first():
         result = tailscale.get_peers()
     assert result.error is None
     hostnames = [p.hostname for p in result.peers]
-    # iphone + peer2 online (alphabetical), peer1 offline last.
+    # peer2 + phone online (alphabetical), peer1 offline last.
     assert hostnames == [
-        "phone.example.ts.net",
         "peer2.example.ts.net",
+        "phone.example.ts.net",
         "peer1.example.ts.net",
     ]
-    iphone = result.peers[0]
-    assert iphone.last_seen is None  # zero-time scrubbed
-    assert iphone.online is True
+    peer2 = result.peers[0]
+    assert peer2.online is True
+    phone = result.peers[1]
+    assert phone.last_seen is None  # zero-time scrubbed
+    assert phone.online is True
     peer1 = result.peers[2]
     assert peer1.online is False
     assert peer1.last_seen == "2026-04-27T16:21:17Z"
