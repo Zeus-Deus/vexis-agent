@@ -292,6 +292,123 @@ def ensure_agents_md_symlink(ws: Path, brain_kind: str) -> tuple[Optional[Path],
     return link, "created"
 
 
+# ── MCP server detection + write ────────────────────────────────────
+
+
+def _omarchy_kb_spec() -> Optional[dict]:
+    """Detect omarchy-kb on PATH; return a minimal spec dict the
+    write helper consumes, or None if not found."""
+    if shutil.which("omarchy-kb") is None:
+        return None
+    return {
+        "name": "omarchy-kb",
+        "command": "omarchy-kb",
+        "args": [],
+        "env": {},
+    }
+
+
+# Registry of detect-and-wire MCP servers. Each entry is a callable
+# that returns a spec dict if the server is locally usable, else None.
+# Keep this list small; users with custom MCP servers should edit
+# their workspace's .mcp.json (claude-code) or opencode.json by hand.
+_MCP_DETECTORS: list[Callable[[], Optional[dict]]] = [_omarchy_kb_spec]
+
+
+def detect_mcp_servers() -> list[dict]:
+    """Return spec dicts for every MCP server whose binary is on
+    PATH today. Empty list is a valid result and means "no
+    auto-discovery hits — the workspace MCP config will be empty
+    unless the user adds entries by hand."""
+    out: list[dict] = []
+    for detector in _MCP_DETECTORS:
+        spec = detector()
+        if spec is not None:
+            out.append(spec)
+    return out
+
+
+def write_mcp_config(workspace: Path, brain_kind: str, specs: list[dict]) -> Optional[Path]:
+    """Translate spec dicts into McpServerSpec objects and call the
+    matching brain's writer. Returns the path written (None for the
+    null brain or if no writer applies)."""
+    if not specs and brain_kind == "null":
+        return None
+    # Lazy-import — keeps the wizard's startup graph small for
+    # `vexis-agent --help` and friends.
+    from vexis_agent.core.brain.base import McpServerSpec
+
+    typed: list = [
+        McpServerSpec(
+            name=s["name"],
+            command=s["command"],
+            args=list(s.get("args", [])),
+            env=dict(s.get("env", {})),
+        )
+        for s in specs
+    ]
+    if brain_kind == "claude-code":
+        return _write_claude_code_mcp(workspace, typed)
+    if brain_kind == "opencode":
+        return _write_opencode_mcp(workspace, typed)
+    return None
+
+
+def _write_claude_code_mcp(workspace: Path, servers: list) -> Path:
+    """Mirrors ClaudeCodeBrain.write_mcp_config without instantiating
+    the brain — the brain ctor wants a SessionStore + RunningTasks the
+    wizard has no business spinning up. Same atomic-write semantics.
+    """
+    import json
+
+    path = workspace / ".mcp.json"
+    servers_dict: dict = {}
+    for spec in servers:
+        entry: dict = {"command": spec.command, "args": list(spec.args)}
+        if spec.env:
+            entry["env"] = dict(spec.env)
+        servers_dict[spec.name] = entry
+    body = {"mcpServers": servers_dict}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def _write_opencode_mcp(workspace: Path, servers: list) -> Path:
+    """Namespace-merge into <workspace>/opencode.json with the
+    ``vexis-`` prefix. Preserves user-owned non-prefixed entries
+    (matches OpenCodeBrain.write_mcp_config's contract)."""
+    import json
+
+    prefix = "vexis-"
+    path = workspace / "opencode.json"
+    if path.exists():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8")) or {}
+        except (OSError, json.JSONDecodeError):
+            current = {}
+    else:
+        current = {}
+    mcp_block = current.get("mcp") or {}
+    # Drop any prior vexis-prefixed entries so we replace cleanly.
+    mcp_block = {k: v for k, v in mcp_block.items() if not k.startswith(prefix)}
+    for spec in servers:
+        argv = [spec.command, *list(spec.args)]
+        entry = {"type": "local", "command": argv, "enabled": True}
+        if spec.env:
+            entry["environment"] = dict(spec.env)
+        mcp_block[f"{prefix}{spec.name}"] = entry
+    if mcp_block:
+        current["mcp"] = mcp_block
+    elif "mcp" in current and not mcp_block:
+        del current["mcp"]
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
 # ── Tailscale soft check ───────────────────────────────────────────
 
 
@@ -351,6 +468,8 @@ class SetupResult:
     service_installed: bool = False
     brain_check: Optional[BrainCheck] = None
     tailscale_check: Optional[TailscaleCheck] = None
+    mcp_config_path: Optional[Path] = None
+    mcp_servers_wired: list = field(default_factory=list)
 
 
 PromptFn = Callable[[str, bool], str]
@@ -490,7 +609,32 @@ def run_setup(
             "Delete or rename it, then re-run 'vexis-agent setup'."
         )
 
-    # ── 5. Tailscale soft-check ───────────────────────────────────
+    # ── 5. MCP servers ────────────────────────────────────────────
+    section("MCP servers")
+    detected = detect_mcp_servers()
+    mcp_path: Optional[Path] = None
+    if detected:
+        names = [s["name"] for s in detected]
+        info(f"detected: {', '.join(names)}")
+        mcp_path = write_mcp_config(workspace, brain_kind, detected)
+        if mcp_path:
+            ok(f"wrote {mcp_path}")
+        else:
+            info("null brain — MCP config skipped")
+    else:
+        info(
+            "no MCP servers auto-detected. The brain runs fine without "
+            "any; add custom entries by editing the workspace MCP config "
+            "(<workspace>/.mcp.json for claude-code, "
+            "<workspace>/opencode.json for opencode)."
+        )
+        if shutil.which("omarchy-kb") is None:
+            info(
+                "Tip: install omarchy-kb if you want Omarchy/Hyprland "
+                "system knowledge in the brain."
+            )
+
+    # ── 6. Tailscale soft-check ───────────────────────────────────
     section("Tailscale (optional)")
     ts = check_tailscale()
     if ts.installed and ts.logged_in:
@@ -505,7 +649,7 @@ def run_setup(
             "'tailscale up' to log in."
         )
 
-    # ── 6. Optional: install systemd service ──────────────────────
+    # ── 7. Optional: install systemd service ──────────────────────
     section("Service")
     decision = install_service
     if decision is None:
@@ -532,6 +676,8 @@ def run_setup(
         service_installed=service_installed,
         brain_check=bc,
         tailscale_check=ts,
+        mcp_config_path=mcp_path,
+        mcp_servers_wired=[s["name"] for s in detected],
     )
 
 

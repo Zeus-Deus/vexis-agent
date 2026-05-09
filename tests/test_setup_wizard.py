@@ -347,6 +347,112 @@ def test_run_setup_skips_agents_md_for_claude_code(isolated_setup_env) -> None:
     assert not (result.workspace / "AGENTS.md").exists()
 
 
+# ── MCP detection + write ─────────────────────────────────────────
+
+
+def test_detect_mcp_servers_when_omarchy_kb_present(tmp_path, monkeypatch) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "omarchy-kb"
+    fake.write_text("")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    detected = sw.detect_mcp_servers()
+    names = [s["name"] for s in detected]
+    assert "omarchy-kb" in names
+
+
+def test_detect_mcp_servers_when_none(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    assert sw.detect_mcp_servers() == []
+
+
+def test_write_mcp_config_claude_code(tmp_path) -> None:
+    import json
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    specs = [{"name": "omarchy-kb", "command": "omarchy-kb", "args": []}]
+    path = sw.write_mcp_config(workspace, "claude-code", specs)
+    assert path == workspace / ".mcp.json"
+    body = json.loads(path.read_text(encoding="utf-8"))
+    assert "mcpServers" in body
+    assert body["mcpServers"]["omarchy-kb"]["command"] == "omarchy-kb"
+
+
+def test_write_mcp_config_opencode_namespace_prefix(tmp_path) -> None:
+    """opencode namespace-merges with the 'vexis-' prefix; non-prefixed
+    user entries must survive untouched."""
+    import json
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    # User-owned non-prefixed entry
+    (workspace / "opencode.json").write_text(
+        json.dumps(
+            {
+                "mcp": {
+                    "user-thing": {"type": "local", "command": ["x"], "enabled": True}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    specs = [{"name": "omarchy-kb", "command": "omarchy-kb", "args": []}]
+    path = sw.write_mcp_config(workspace, "opencode", specs)
+    body = json.loads(path.read_text(encoding="utf-8"))
+    assert "user-thing" in body["mcp"]  # preserved
+    assert "vexis-omarchy-kb" in body["mcp"]  # prefixed
+    assert body["mcp"]["vexis-omarchy-kb"]["command"] == ["omarchy-kb"]
+
+
+def test_write_mcp_config_null_brain_returns_none(tmp_path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    assert sw.write_mcp_config(workspace, "null", []) is None
+
+
+def test_run_setup_wires_mcp_when_detected(
+    isolated_setup_env, monkeypatch
+) -> None:
+    """End-to-end: drop a fake omarchy-kb on PATH, run setup, verify
+    the workspace .mcp.json mentions it."""
+    bin_dir = isolated_setup_env / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "omarchy-kb"
+    fake.write_text("")
+    fake.chmod(0o755)
+    # Need claude on PATH too so the brain check passes; both share PATH.
+    fake_claude = bin_dir / "claude"
+    fake_claude.write_text("")
+    fake_claude.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    result = sw.run_setup(
+        prompt=_canned_prompts({"token": "x", "user ID": "1"}),
+        install_service=False,
+        require_interactive=False,
+        print_banner=False,
+    )
+    assert result.mcp_servers_wired == ["omarchy-kb"]
+    assert result.mcp_config_path == result.workspace / ".mcp.json"
+    assert result.mcp_config_path.is_file()
+
+
+def test_run_setup_skips_mcp_when_nothing_detected(
+    isolated_setup_env, monkeypatch
+) -> None:
+    monkeypatch.setenv("PATH", str(isolated_setup_env / "no-mcp-here"))
+    result = sw.run_setup(
+        prompt=_canned_prompts({"token": "x", "user ID": "1"}),
+        install_service=False,
+        require_interactive=False,
+        print_banner=False,
+    )
+    assert result.mcp_servers_wired == []
+    assert result.mcp_config_path is None
+
+
 def test_format_summary_renders_archive_lines(tmp_path) -> None:
     result = sw.SetupResult(
         home=tmp_path,

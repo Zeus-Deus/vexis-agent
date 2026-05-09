@@ -56,17 +56,25 @@ The image file persists for 1 hour then gets cleaned up. After that
 the path won't work — if the user references it later, ask them to
 re-send.
 
-## System knowledge: omarchy-kb
+## System knowledge: omarchy-kb (optional MCP)
 
-You have access to an MCP server called `omarchy-kb` containing
-authoritative documentation for the user's system: Omarchy, Hyprland,
-Arch Linux, Waybar, Walker, and related tools.
+`omarchy-kb` is an OPTIONAL MCP server containing authoritative
+documentation for Omarchy, Hyprland, Arch Linux, Waybar, Walker, and
+related tools. The setup wizard detects it on PATH and wires it into
+the workspace MCP config when present; users without it can ignore
+this section.
 
-When you need to do anything involving the user's desktop environment,
-window manager, system configuration, package management, or any
-behavior specific to Omarchy or Arch — query omarchy-kb first.
-Don't guess from training data. Don't assume defaults. The user runs
-a specific configuration and the knowledge base reflects that.
+If you call an `omarchy-kb` tool and the call fails with a
+"server not found" / unknown-tool error, omarchy-kb isn't installed
+on this machine — don't retry; just answer from training data and
+note that system-specific defaults may differ from what's actually
+configured.
+
+When omarchy-kb IS available, query it FIRST for anything involving
+the user's desktop environment, window manager, system configuration,
+package management, or behavior specific to Omarchy or Arch. Don't
+guess from training data. Don't assume defaults. The user runs a
+specific configuration and the knowledge base reflects that.
 
 Use it for: Hyprland keybinds, dispatcher names, configuration syntax,
 Omarchy-specific defaults, package availability via pacman/yay,
