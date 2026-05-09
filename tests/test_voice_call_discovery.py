@@ -514,9 +514,12 @@ def test_opencode_parser_extracts_context_and_display_name() -> None:
 
 def test_opencode_parser_extracts_provider_and_free_badge() -> None:
     """``providerID`` becomes the picker's provider tag. Free badge
-    fires when both cost.input and cost.output are 0 — covers
-    opencode/Zen freebies and any other 0-cost provider that uses
-    the same shape."""
+    fires ONLY for opencode-provider models with both costs at 0 —
+    that's the Zen tier, universally free for any vexis user.
+    Other providers with 0-cost models (github-copilot freebies
+    that need a Copilot subscription, openrouter freebies that
+    bill against the user's own OpenRouter key) do NOT get the
+    badge because they're not universally free."""
     from core.model_discovery import _parse_opencode_verbose
     raw = """opencode/free-model
 {
@@ -552,6 +555,102 @@ openrouter/anthropic/claude-3.5-haiku
     # Free model also reports its 0-cost (UI uses the badge, not
     # the cost line, but the data is there).
     assert free["cost_input_per_million"] == 0.0
+
+
+def test_opencode_free_badge_only_on_opencode_provider() -> None:
+    """The badge is gated to ``providerID == "opencode"``. A
+    github-copilot model at 0/0 cost is NOT free because it
+    requires a Copilot subscription. An openrouter model at 0/0 is
+    NOT free because the user pays via their OpenRouter API key.
+    Both must NOT carry the badge.
+    """
+    from core.model_discovery import _parse_opencode_verbose
+    raw = """github-copilot/claude-haiku-4.5
+{
+  "id": "claude-haiku-4.5",
+  "providerID": "github-copilot",
+  "name": "Claude Haiku 4.5",
+  "cost": {"input": 0, "output": 0},
+  "variants": {}
+}
+openrouter/some-zero-cost-model
+{
+  "id": "some-zero-cost-model",
+  "providerID": "openrouter",
+  "name": "Zero Cost",
+  "cost": {"input": 0, "output": 0},
+  "variants": {}
+}
+opencode/big-pickle
+{
+  "id": "big-pickle",
+  "providerID": "opencode",
+  "name": "Big Pickle",
+  "cost": {"input": 0, "output": 0},
+  "variants": {}
+}
+"""
+    parsed = _parse_opencode_verbose(raw)
+    # Copilot freebie — no badge (requires subscription).
+    assert parsed["github-copilot/claude-haiku-4.5"]["free"] is False
+    # OpenRouter freebie — no badge (user has their own API key).
+    assert parsed["openrouter/some-zero-cost-model"]["free"] is False
+    # Opencode/Zen — yes badge (universally free).
+    assert parsed["opencode/big-pickle"]["free"] is True
+
+
+def test_opencode_picker_sorts_free_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Picker contract: free opencode models pinned to the top of
+    the list. Within free / non-free buckets the alphabetical id
+    order is preserved (sorted is stable). 237 models is too many
+    to scroll through, so floating the free tier saves a scroll."""
+    monkeypatch.setattr(
+        "core.model_discovery.discover_opencode_models",
+        lambda: {
+            "openrouter/zzz-model",
+            "opencode/aaa-free",
+            "github-copilot/foo",
+            "opencode/zzz-free",
+            "opencode/aaa-paid",  # hypothetical paid opencode
+        },
+    )
+    monkeypatch.setattr(
+        "core.model_discovery.discover_opencode_capabilities",
+        lambda: {
+            "opencode/aaa-free": {
+                "provider": "opencode", "free": True,
+                "reasoning_levels": [],
+            },
+            "opencode/zzz-free": {
+                "provider": "opencode", "free": True,
+                "reasoning_levels": [],
+            },
+            "opencode/aaa-paid": {
+                "provider": "opencode", "free": False,
+                "reasoning_levels": [],
+            },
+            "github-copilot/foo": {
+                "provider": "github-copilot", "free": False,
+                "reasoning_levels": [],
+            },
+            "openrouter/zzz-model": {
+                "provider": "openrouter", "free": False,
+                "reasoning_levels": [],
+            },
+        },
+    )
+    out = WebDashboard._voice_call_mode_available_models_static("opencode")
+    ids = [m["id"] for m in out]
+    # First two: free opencode entries, alphabetical within the bucket.
+    assert ids[:2] == ["opencode/aaa-free", "opencode/zzz-free"]
+    # Then paid, alphabetical across the rest.
+    assert ids[2:] == [
+        "github-copilot/foo",
+        "opencode/aaa-paid",
+        "openrouter/zzz-model",
+    ]
 
 
 def test_opencode_parser_falls_back_to_id_prefix_when_provider_missing() -> None:

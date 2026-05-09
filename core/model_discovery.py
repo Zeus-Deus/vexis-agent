@@ -731,11 +731,22 @@ def _parse_opencode_verbose(text: str) -> dict[str, dict]:
                     cost_input = float(ci)
                 if isinstance(co, (int, float)):
                     cost_output = float(co)
-                # Free signal: both input and output are exactly 0.
-                # Some providers (cache-only freebies, oddities)
-                # might have 0 input but paid output — those aren't
-                # "free for use" and shouldn't carry the badge.
-                if cost_input == 0.0 and cost_output == 0.0:
+                # Free badge means "universally free for any vexis
+                # user — no provider subscription, no API key on
+                # the user's account". That's the opencode/Zen
+                # tier specifically. github-copilot freebies need a
+                # Copilot subscription; openrouter "free" models
+                # bill against the user's own OpenRouter key. Both
+                # cost the user something at the account level even
+                # at $0/M tokens, so they don't get the badge.
+                # Source-of-truth: provider must be opencode AND
+                # both costs zero. Either condition alone isn't
+                # enough.
+                if (
+                    provider == "opencode"
+                    and cost_input == 0.0
+                    and cost_output == 0.0
+                ):
                     free = True
 
             out[full_id] = {

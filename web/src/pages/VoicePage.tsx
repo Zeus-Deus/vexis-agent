@@ -728,15 +728,24 @@ function ModelRadio({
               </div>
             )}
           </div>
-          <div className="flex items-center gap-1 shrink-0">
+          {/* Right-side badge column — vertically stacked so the
+              FREE badges across all rows align in a single visual
+              column down the right edge of the picker. Free is
+              pinned above the provider badge in the stack. Both
+              badges use the same width (min-w-[3.5rem]) so the
+              column is rectangular and reads cleanly at a glance.
+              On mobile the badges stay visible (shrink-0); the
+              text size is already small enough that a 375px
+              viewport handles it fine. */}
+          <div className="flex flex-col items-stretch gap-1 shrink-0 min-w-[3.5rem]">
             {model.free && (
               <span
                 className={[
                   "text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded",
                   "bg-[var(--color-accent)] text-[var(--color-accent-fg)]",
-                  "font-semibold",
+                  "font-semibold text-center",
                 ].join(" ")}
-                title="No per-token cost on this provider"
+                title="Universally free — no provider key or subscription required"
               >
                 Free
               </span>
@@ -746,7 +755,7 @@ function ModelRadio({
                 className={[
                   "text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded",
                   "bg-[var(--color-surface-2)] text-[var(--color-fg-2)]",
-                  "border border-[var(--color-border)]",
+                  "border border-[var(--color-border)] text-center truncate",
                 ].join(" ")}
                 title={`Routed via ${model.provider}`}
               >

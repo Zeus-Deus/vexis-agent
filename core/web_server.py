@@ -2657,10 +2657,17 @@ class WebDashboard:
                 if "/" in m
             )
             caps = discover_opencode_capabilities()
-            return [
+            entries = [
                 _from_caps(mid, caps, default_provider=None)
                 for mid in ids
             ]
+            # Free models pinned to the top of the picker — at 237
+            # entries the free tier is what most casual users will
+            # try first, and surfacing it requires zero scrolling.
+            # ``sorted`` is stable so within the free / non-free
+            # buckets the alphabetical id order from above is
+            # preserved.
+            return sorted(entries, key=lambda e: not e["free"])
         # null brain — no real model list to surface.
         return []
 
