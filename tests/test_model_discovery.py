@@ -966,7 +966,14 @@ def test_claude_code_capabilities_extracts_supported_effort_levels(
 ):
     """``capabilities.effort.{level}.supported = true`` lands in
     the per-model reasoning_levels list. Models with
-    ``effort.supported = false`` get an empty list."""
+    ``effort.supported = false`` get an empty list.
+
+    Note: this exercises the API-FALLBACK path (CLI probe stubbed
+    to empty). The CLI-canonical path is tested separately in
+    ``tests/test_voice_call_discovery.py`` — that's where the
+    ``xhigh`` regression is pinned. Here we want to confirm that
+    even when the CLI is unavailable, the API extraction still
+    works correctly per-model."""
     payload = _api_payload_with_capabilities(
         {
             "id": "claude-opus-4-7",
@@ -988,10 +995,16 @@ def test_claude_code_capabilities_extracts_supported_effort_levels(
     with patch(
         "urllib.request.urlopen",
         return_value=_fake_http_response(payload),
+    ), patch(
+        # Stub the CLI probe so this test exercises the
+        # API-fallback path (the test's original intent — predates
+        # the CLI source of truth).
+        "core.model_discovery._discover_claude_code_effort_levels_uncached",
+        return_value=[],
     ):
         caps = md.discover_claude_code_capabilities()
-    assert caps["claude-opus-4-7"]["reasoning_levels"] == [
-        "low", "medium", "high", "max",
+    assert sorted(caps["claude-opus-4-7"]["reasoning_levels"]) == [
+        "high", "low", "max", "medium",
     ]
     assert caps["claude-haiku-4-5-20251001"]["reasoning_levels"] == []
 
@@ -1142,6 +1155,12 @@ github-copilot/claude-opus-4.5
     with patch(
         "urllib.request.urlopen",
         return_value=_fake_http_response(api_payload),
+    ), patch(
+        # Stub CLI probe to empty — exercise the API-fallback path.
+        # The CLI-canonical path is tested elsewhere
+        # (tests/test_voice_call_discovery.py).
+        "core.model_discovery._discover_claude_code_effort_levels_uncached",
+        return_value=[],
     ):
         cc_levels = md.reasoning_levels_for(
             "claude-code", "claude-opus-4-7",

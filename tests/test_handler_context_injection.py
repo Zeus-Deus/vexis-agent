@@ -22,8 +22,17 @@ class FakeBrain:
         self.last_message: str | None = None
         self.calls: int = 0
 
-    async def respond(self, message: str, chat_id: int) -> str:
+    async def respond(
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ) -> str:
         self.last_message = message
+        self.last_model = model
+        self.last_reasoning_level = reasoning_level
         self.calls += 1
         return "ok"
 

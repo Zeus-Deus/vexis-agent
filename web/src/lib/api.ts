@@ -6,6 +6,15 @@ import type {
   ApproveOkResponse,
   ApproveSensitivePayload,
   BrowserState,
+  AttachmentRef,
+  ChatHistoryState,
+  ChatReply,
+  ChatSessionsState,
+  VoiceInfo,
+  VoiceReply,
+  VoiceSettings,
+  VoiceSettingsResponse,
+  VoiceSettingsUpdate,
   CuratorRunDetail,
   CuratorState,
   GoalRecord,
@@ -46,6 +55,12 @@ export class TokenInvalidError extends ApiError {
 interface FetchOptions {
   method?: "GET" | "POST";
   body?: unknown;
+  // AbortSignal lets callers cancel an in-flight request when the
+  // component unmounts or the user navigates away. The fetch
+  // implementation already supports this natively — we just plumb
+  // it through. ``AbortError`` propagates back so callers can
+  // distinguish "user cancelled" from "network failed".
+  signal?: AbortSignal;
 }
 
 async function call<T>(
@@ -59,6 +74,7 @@ async function call<T>(
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
+    signal: opts.signal,
   };
   if (opts.body !== undefined) init.body = JSON.stringify(opts.body);
 
@@ -77,6 +93,37 @@ async function call<T>(
     throw new ApiError(resp.status, detail || resp.statusText);
   }
   return resp.json() as Promise<T>;
+}
+
+/** Wire-stable error categories from the SSE ``error`` event.
+ *  Backend producer: ``core.handler._ERR_CODE_*`` constants.
+ *  When adding a new code, also extend ``mapErrorCode`` in
+ *  ChatPage so the user sees a specific recovery UX rather than
+ *  the generic "Something went wrong" fallback.
+ *
+ *  - ``brain_error``     transient — retry button
+ *  - ``brain_timeout``   long turn — retry won't help, suggest a
+ *                         shorter prompt or different model
+ *  - ``session_lost``    auto-recovers; UI shows a soft note
+ *  - ``cancelled``       Stop button — silent
+ *  - ``rejected``        auth gate; UI flips to auth-fail
+ *  - ``unknown``         generic — at least admit something broke
+ */
+export type ErrorCode =
+  | "brain_error"
+  | "brain_timeout"
+  | "session_lost"
+  | "cancelled"
+  | "rejected"
+  | "unknown";
+
+const _ERROR_CODES: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
+  "brain_error", "brain_timeout", "session_lost",
+  "cancelled", "rejected", "unknown",
+]);
+
+function isErrorCode(value: unknown): value is ErrorCode {
+  return typeof value === "string" && _ERROR_CODES.has(value as ErrorCode);
 }
 
 export const api = {
@@ -205,6 +252,329 @@ export const api = {
       `/relationships/candidates/${encodeURIComponent(slug)}/resolve_qualifier`,
       { method: "POST", body },
     ),
+  // ----- chat -----
+  // The reply field carries either the brain's response (chat.send) or
+  // a control message ("Switched to demo", "Conversation cleared.").
+  // The UI renders both as a normal assistant bubble.
+  chatSend: (token: string, text: string, signal?: AbortSignal) =>
+    call<ChatReply>(token, "/chat/send", {
+      method: "POST",
+      body: { text },
+      signal,
+    }),
+  /**
+   * Streaming variant — POSTs to /chat/stream, parses the SSE
+   * response with manual ReadableStream + TextDecoder. EventSource
+   * is GET-only so we can't use it; the fetch + ReadableStream
+   * combo is the standard browser pattern for SSE-over-POST.
+   *
+   * Calls back per chunk as text arrives, then once with the full
+   * concatenated reply when the brain emits its ``done`` event.
+   * On error: invokes ``onError`` and stops. AbortController on
+   * the caller side cancels the read mid-stream cleanly.
+   */
+  chatSendStream: async (
+    token: string,
+    payload: {
+      text: string;
+      attachments?: AttachmentRef[];
+      model?: string;
+      reasoning_level?: string;
+    },
+    handlers: {
+      onChunk: (text: string) => void;
+      onDone: (full: string) => void;
+      // ``message`` is the user-facing string (may be empty for
+      // silent codes like ``cancelled``). ``code`` discriminates
+      // error categories so the UI can pick a specific recovery
+      // affordance — retry button on transient brain errors,
+      // auth-fail flow on ``rejected``, silent dismiss on
+      // ``cancelled``. New codes default to "unknown" on the
+      // wire; tests / older callers tolerate that.
+      onError: (
+        message: string,
+        opts?: { code?: ErrorCode },
+      ) => void;
+      // Tool-use status updates streamed inline with text deltas.
+      // Optional — surface omitted by callers that don't render
+      // tool status (e.g. tests, voice path). When present the
+      // callback fires per tool_use event the brain emits during
+      // the turn, in the order they fire.
+      onTool?: (event: { name: string; target: string | null }) => void;
+      signal?: AbortSignal;
+    },
+  ): Promise<void> => {
+    let resp: Response;
+    try {
+      resp = await fetch("/api/v1/chat/stream", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: handlers.signal,
+      });
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      handlers.onError(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    if (resp.status === 401) {
+      throw new TokenInvalidError();
+    }
+    if (!resp.ok || !resp.body) {
+      let detail = resp.statusText;
+      try { detail = (await resp.json()).detail ?? detail; } catch {}
+      handlers.onError(detail);
+      return;
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    // SSE frames are separated by ``\n\n``. We accumulate raw bytes
+    // in ``buffer`` until we see a frame terminator, parse the
+    // ``data: ...`` line, and feed the JSON payload to the handlers.
+    // Partial frames at the read boundary stay in ``buffer`` until
+    // the next read fills them in.
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let sepIdx;
+        while ((sepIdx = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, sepIdx);
+          buffer = buffer.slice(sepIdx + 2);
+          // Each frame may contain multiple lines; we only care
+          // about ``data: `` lines (per SSE spec there's also
+          // ``event: ``, ``id: ``, ``retry: `` — we don't use them).
+          for (const line of frame.split("\n")) {
+            if (!line.startsWith("data: ")) continue;
+            const json = line.slice(6);
+            try {
+              const evt = JSON.parse(json);
+              if (evt.type === "chunk" && typeof evt.text === "string") {
+                handlers.onChunk(evt.text);
+              } else if (evt.type === "tool" && typeof evt.name === "string") {
+                // Tool-use status. ``target`` is null for tools
+                // without a clear filename/command (Task, MCP).
+                // We tolerate missing onTool — older clients /
+                // tests just ignore the frame.
+                handlers.onTool?.({
+                  name: evt.name,
+                  target: typeof evt.target === "string" ? evt.target : null,
+                });
+              } else if (evt.type === "done" && typeof evt.reply === "string") {
+                handlers.onDone(evt.reply);
+              } else if (evt.type === "error") {
+                // ``code`` is wire-stable; defaults to "unknown" on
+                // older servers / unrecognised values so the UI
+                // always has something to dispatch on.
+                const code = isErrorCode(evt.code) ? evt.code : "unknown";
+                handlers.onError(
+                  typeof evt.message === "string" ? evt.message : "",
+                  { code },
+                );
+              }
+            } catch {
+              // Malformed frame — skip rather than crash the loop.
+            }
+          }
+        }
+      }
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      handlers.onError(e instanceof Error ? e.message : String(e));
+    }
+  },
+  chatSessions: (token: string, signal?: AbortSignal) =>
+    call<ChatSessionsState>(token, "/chat/sessions", { signal }),
+  // History backfill. Lazy-loaded on first switch into a session
+  // per page-load so the conversation pane shows prior turns
+  // instead of a blank canvas.
+  chatHistory: (
+    token: string, name: string, opts: { limit?: number; signal?: AbortSignal } = {},
+  ) =>
+    call<ChatHistoryState>(
+      token,
+      `/chat/sessions/${encodeURIComponent(name)}/history?limit=${opts.limit ?? 50}`,
+      { signal: opts.signal },
+    ),
+  chatNewSession: (token: string, name?: string) =>
+    call<ChatReply>(token, "/chat/sessions/new", {
+      method: "POST",
+      body: name ? { name } : {},
+    }),
+  chatSwitchSession: (token: string, name: string) =>
+    call<ChatReply>(token, "/chat/sessions/switch", {
+      method: "POST",
+      body: { name },
+    }),
+  chatRenameSession: (token: string, oldName: string, newName: string) =>
+    call<ChatReply>(token, "/chat/sessions/rename", {
+      method: "POST",
+      body: { old: oldName, new: newName },
+    }),
+  chatDeleteSession: (token: string, name: string) =>
+    call<ChatReply>(token, "/chat/sessions/delete", {
+      method: "POST",
+      body: { name },
+    }),
+  chatClear: (token: string) =>
+    call<ChatReply>(token, "/chat/clear", { method: "POST" }),
+  /**
+   * Cancel any in-flight brain turn for the web chat. Used by the
+   * Stop button and by session-switch / unmount cleanup so a long
+   * stream doesn't keep burning tokens on a reply the user will
+   * never see.
+   *
+   * Always best-effort: errors are swallowed because cancel-on-
+   * unmount is a fire-and-forget signal — there's no UI to
+   * surface a failure to. The local AbortController on the
+   * streaming fetch already closes the SSE pipe regardless.
+   */
+  chatCancel: async (token: string): Promise<{ cancelled: boolean }> => {
+    try {
+      return await call<{ cancelled: boolean }>(
+        token, "/chat/cancel", { method: "POST" },
+      );
+    } catch {
+      return { cancelled: false };
+    }
+  },
+  // ----- voice -----
+  voiceInfo: (token: string, signal?: AbortSignal) =>
+    call<VoiceInfo>(token, "/chat/voice/info", { signal }),
+  // Voice settings (dashboard Voice tab — full config + model picker)
+  voiceSettings: (token: string, signal?: AbortSignal) =>
+    call<VoiceSettings>(token, "/voice", { signal }),
+  voiceSettingsSet: (token: string, body: VoiceSettingsUpdate) =>
+    call<VoiceSettingsResponse>(token, "/voice", { method: "POST", body }),
+  // STT: multipart upload of an audio Blob → {transcript, reply}.
+  // Bypasses ``call`` because that helper sets Content-Type to
+  // application/json — the browser handles multipart boundary
+  // generation only when fetch sees a FormData body and we DON'T
+  // override Content-Type.
+  chatVoice: async (
+    token: string,
+    audio: Blob,
+    opts: { model?: string; reasoning_level?: string } = {},
+  ): Promise<VoiceReply> => {
+    const fd = new FormData();
+    // Hint extension via the second arg so the server's tempfile
+    // suffix-detection picks the right ffmpeg demuxer. Browsers
+    // typically produce webm or ogg from MediaRecorder; we send
+    // whatever the Blob's MIME suggests.
+    const ext = audio.type.includes("ogg") ? "ogg" :
+                audio.type.includes("webm") ? "webm" :
+                audio.type.includes("wav") ? "wav" : "bin";
+    fd.append("audio", audio, `voice.${ext}`);
+    // Per-turn overrides (voice call mode). Omitted entirely when
+    // unset so the server's ``Form(default=None)`` falls through to
+    // brain defaults — preserves current behaviour for any caller
+    // that doesn't pass these.
+    if (opts.model) fd.append("model", opts.model);
+    if (opts.reasoning_level) {
+      fd.append("reasoning_level", opts.reasoning_level);
+    }
+    const resp = await fetch("/api/v1/chat/voice", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: fd,
+    });
+    if (resp.status === 401) throw new TokenInvalidError();
+    if (!resp.ok) {
+      let detail = resp.statusText;
+      try { detail = (await resp.json()).detail ?? detail; } catch {}
+      throw new ApiError(resp.status, detail);
+    }
+    return resp.json() as Promise<VoiceReply>;
+  },
+  // ----- attachments -----
+  // Upload a single file. Caller passes the same File they got from
+  // <input type=file> / drag-drop / paste — the Blob streams to the
+  // server without buffering into memory (fetch + FormData uses the
+  // File reference directly). Optional ``signal`` for cancellation
+  // if the user removes the chip mid-upload or navigates away.
+  // Optional ``onProgress`` reports bytes-uploaded; piped through an
+  // XMLHttpRequest because fetch's Streams API for upload progress
+  // isn't widely supported yet (Safari especially).
+  chatAttach: (
+    token: string,
+    file: File,
+    opts: {
+      signal?: AbortSignal;
+      onProgress?: (loaded: number, total: number) => void;
+    } = {},
+  ): Promise<AttachmentRef> => {
+    return new Promise<AttachmentRef>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/v1/chat/attach", true);
+      xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+      xhr.upload.onprogress = (ev) => {
+        if (ev.lengthComputable && opts.onProgress) {
+          opts.onProgress(ev.loaded, ev.total);
+        }
+      };
+      xhr.onload = () => {
+        if (xhr.status === 401) { reject(new TokenInvalidError()); return; }
+        if (xhr.status < 200 || xhr.status >= 300) {
+          let detail = xhr.statusText;
+          try { detail = JSON.parse(xhr.responseText).detail ?? detail; } catch {}
+          reject(new ApiError(xhr.status, detail));
+          return;
+        }
+        try { resolve(JSON.parse(xhr.responseText) as AttachmentRef); }
+        catch (e) { reject(e instanceof Error ? e : new Error(String(e))); }
+      };
+      xhr.onerror = () => reject(new ApiError(0, "network error"));
+      xhr.onabort = () => reject(new DOMException("aborted", "AbortError"));
+      if (opts.signal) {
+        if (opts.signal.aborted) {
+          xhr.abort();
+          reject(new DOMException("aborted", "AbortError"));
+          return;
+        }
+        opts.signal.addEventListener("abort", () => xhr.abort(), { once: true });
+      }
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      xhr.send(fd);
+    });
+  },
+  // /chat/send variant that accepts attachments. Wraps the regular
+  // chatSend helper so the JSON shape stays in one place.
+  chatSendWithAttachments: (
+    token: string,
+    text: string,
+    attachments: AttachmentRef[],
+  ) =>
+    call<ChatReply>(token, "/chat/send", {
+      method: "POST",
+      body: { text, attachments },
+    }),
+  // TTS: text → audio Blob. Returns a Blob the UI feeds straight
+  // into <audio src=URL.createObjectURL(...)>. 204 = empty input,
+  // surface as null so the caller skips playback cleanly.
+  chatTts: async (token: string, text: string): Promise<Blob | null> => {
+    const resp = await fetch("/api/v1/chat/tts", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ text }),
+    });
+    if (resp.status === 401) throw new TokenInvalidError();
+    if (resp.status === 204) return null;
+    if (!resp.ok) {
+      let detail = resp.statusText;
+      try { detail = (await resp.json()).detail ?? detail; } catch {}
+      throw new ApiError(resp.status, detail);
+    }
+    return resp.blob();
+  },
 };
 
 // ApproveError surfaces the typed 409 / 422 / 4xx body from the

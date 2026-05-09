@@ -873,3 +873,201 @@ def brain_kind() -> str:
         )
         return "claude-code"
     return cleaned
+
+
+# ──────────────────────────────────────────────────────────────────
+# Voice (STT / TTS addon — phase 2)
+#
+# Off by default. ``voice.enabled: true`` opts in; the chat UI's
+# /api/v1/chat/voice and /api/v1/chat/tts endpoints stay 503 until
+# this flag is true. Provider keys are free-form strings (validated
+# at provider-construction time, not here) so adding a new provider
+# is a one-file change in core/voice/ + a registry case in
+# core/voice/__init__.py — no schema change here.
+# ──────────────────────────────────────────────────────────────────
+
+
+def voice_enabled() -> bool:
+    """True iff ``voice.enabled: true`` in ~/.vexis/config.yaml.
+
+    Both endpoints (STT and TTS) are gated on this single flag —
+    if a user wants only one of the two, they set the other side's
+    provider to ``null`` while leaving ``voice.enabled: true``.
+    """
+    raw = _section("voice").get("enabled", False)
+    return bool(raw)
+
+
+def voice_stt_provider() -> str:
+    """STT provider name. Default ``voxtype`` (the existing tool).
+
+    Unknown values fall back to ``null`` with a warning logged at
+    construction time in :mod:`core.voice`. We don't validate here
+    so plugin-style providers can register without code changes
+    in this file.
+    """
+    raw = _section("voice").get("stt", {})
+    if not isinstance(raw, dict):
+        return "voxtype"
+    name = raw.get("provider", "voxtype")
+    return name.strip() if isinstance(name, str) and name.strip() else "voxtype"
+
+
+def voice_tts_provider() -> str:
+    """TTS provider name. Default ``null`` — TTS requires the user
+    to install Piper and download a voice model, neither of which
+    we want to assume happened just because they enabled voice."""
+    raw = _section("voice").get("tts", {})
+    if not isinstance(raw, dict):
+        return "null"
+    name = raw.get("provider", "null")
+    return name.strip() if isinstance(name, str) and name.strip() else "null"
+
+
+def voice_tts_voice_model_path() -> str | None:
+    """Path to the Piper voice model (.onnx). None when unset —
+    the Piper provider raises TTSUnavailable with an install hint
+    in that case.
+
+    Conventionally ``~/.local/share/piper-voices/<voice>.onnx`` but
+    we don't enforce a location. Tilde expansion happens at the
+    construction site (core/voice/__init__.py) so the returned
+    string here is whatever the user typed.
+    """
+    raw = _section("voice").get("tts", {})
+    if not isinstance(raw, dict):
+        return None
+    path = raw.get("voice_model_path")
+    return path if isinstance(path, str) and path.strip() else None
+
+
+def voice_call_mode_model() -> str | None:
+    """Per-turn model override for voice call mode. ``None`` (the
+    default — unset, or sentinel string ``default``) means "use the
+    brain's account default" — same as Telegram and the text-chat tab.
+
+    The dashboard's Voice tab is the canonical writer; users can also
+    edit this manually:
+
+        voice:
+          call_mode:
+            model: claude-haiku-4-5    # any model id Claude Code accepts
+            reasoning_level: medium    # only when the model supports it
+
+    Reset by deleting the key (or setting to ``default``).
+    """
+    section = _section("voice").get("call_mode", {})
+    if not isinstance(section, dict):
+        return None
+    raw = section.get("model")
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned or cleaned.lower() == "default":
+        return None
+    return cleaned
+
+
+def voice_call_mode_reasoning_level() -> str | None:
+    """Per-turn reasoning effort for voice call mode. ``None`` means
+    "no flag — let the model use its baked-in default reasoning".
+    Only meaningful when the chosen model supports reasoning levels;
+    the dashboard validates this client-side via the capability map
+    served on /api/v1/voice. Same null/empty/``default`` sentinels
+    as :func:`voice_call_mode_model` for consistency.
+    """
+    section = _section("voice").get("call_mode", {})
+    if not isinstance(section, dict):
+        return None
+    raw = section.get("reasoning_level")
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned or cleaned.lower() == "default":
+        return None
+    return cleaned
+
+
+def voice_tts_binary() -> str | None:
+    """Optional absolute path to the piper binary. None falls back
+    to ``shutil.which("piper")`` from the daemon's PATH.
+
+    Why this exists: there's a *different* program also called
+    ``piper`` ( ``piper-tools`` for gaming mice on some distros)
+    that lives at ``/usr/bin/piper``. If PATH resolution picks the
+    wrong one, synthesis explodes with a baffling
+    ``ModuleNotFoundError: gi``. Letting the user pin an absolute
+    path side-steps the collision — recommended setting on Arch.
+    """
+    raw = _section("voice").get("tts", {})
+    if not isinstance(raw, dict):
+        return None
+    binary = raw.get("binary")
+    return binary if isinstance(binary, str) and binary.strip() else None
+
+
+# ──────────────────────────────────────────────────────────────────
+# Chat attachments (file/image upload — phase 2)
+#
+# Lives under ``chat.attachments.*`` so the rest of ``chat.*`` stays
+# free for future chat-only knobs (history retention, etc.). Default
+# allowlist covers the formats claude-code can already read; extending
+# it is a one-line config change.
+# ──────────────────────────────────────────────────────────────────
+
+
+_DEFAULT_ATTACHMENT_MIMES: frozenset[str] = frozenset({
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "application/pdf",
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "application/json",
+})
+
+_DEFAULT_ATTACHMENT_MAX_MB: int = 25
+
+
+def chat_attachments_enabled() -> bool:
+    """True iff ``chat.attachments.enabled`` is true. Default true.
+
+    The dial exists so a paranoid deployment can disable file
+    uploads entirely without touching code — the route returns
+    503 in that case."""
+    section = _section("chat").get("attachments", {})
+    if not isinstance(section, dict):
+        return True
+    raw = section.get("enabled", True)
+    return bool(raw)
+
+
+def chat_attachments_max_bytes() -> int:
+    """Per-file size cap in bytes. Default 25 MB."""
+    section = _section("chat").get("attachments", {})
+    if not isinstance(section, dict):
+        return _DEFAULT_ATTACHMENT_MAX_MB * 1024 * 1024
+    mb = _int_or_default(
+        section.get("max_mb"), _DEFAULT_ATTACHMENT_MAX_MB, minimum=1,
+    )
+    return mb * 1024 * 1024
+
+
+def chat_attachments_allowed_mimes() -> frozenset[str]:
+    """Mime allowlist. Defaults cover formats claude-code reads
+    natively; users can extend by setting ``chat.attachments.allowed_mimes``
+    to a YAML list of strings.
+
+    Returns a frozenset for O(1) membership checks. Empty config
+    list falls back to the default — empty allowlist would brick
+    all uploads, which is never the user's intent."""
+    section = _section("chat").get("attachments", {})
+    if not isinstance(section, dict):
+        return _DEFAULT_ATTACHMENT_MIMES
+    raw = section.get("allowed_mimes")
+    if not isinstance(raw, list):
+        return _DEFAULT_ATTACHMENT_MIMES
+    cleaned = {s.strip() for s in raw if isinstance(s, str) and s.strip()}
+    return frozenset(cleaned) if cleaned else _DEFAULT_ATTACHMENT_MIMES

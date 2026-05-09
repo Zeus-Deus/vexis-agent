@@ -10,8 +10,11 @@ import { LearningPage } from "./pages/LearningPage";
 import { TailscalePage } from "./pages/TailscalePage";
 import { GoalsPage } from "./pages/GoalsPage";
 import { ModelsPage } from "./pages/ModelsPage";
+import { ChatPage } from "./pages/ChatPage";
+import { VoicePage } from "./pages/VoicePage";
 
 type TabId =
+  | "chat"
   | "memory"
   | "skills"
   | "curator"
@@ -20,9 +23,14 @@ type TabId =
   | "learning"
   | "goals"
   | "models"
+  | "voice"
   | "tailscale";
 
 const TABS: TabDef[] = [
+  // Chat is first — it's the primary surface; the rest is observation
+  // and configuration. Keep this in lockstep with TabId / HASH_TO_TAB
+  // and the Footer's nav summary.
+  { id: "chat", label: "Chat", glyph: "✦" },
   { id: "memory", label: "Memory", glyph: "§" },
   { id: "skills", label: "Skills", glyph: "◇" },
   { id: "curator", label: "Curator", glyph: "◆" },
@@ -31,10 +39,12 @@ const TABS: TabDef[] = [
   { id: "learning", label: "Learning", glyph: "▲" },
   { id: "goals", label: "Goals", glyph: "⊙" },
   { id: "models", label: "Models", glyph: "⊕" },
+  { id: "voice", label: "Voice", glyph: "◉" },
   { id: "tailscale", label: "Tailscale", glyph: "◈" },
 ];
 
 const HASH_TO_TAB: Record<string, TabId> = {
+  "#chat": "chat",
   "#memory": "memory",
   "#skills": "skills",
   "#curator": "curator",
@@ -43,17 +53,29 @@ const HASH_TO_TAB: Record<string, TabId> = {
   "#learning": "learning",
   "#goals": "goals",
   "#models": "models",
+  "#voice": "voice",
   "#tailscale": "tailscale",
 };
 
 function readTabFromHash(): TabId {
   const fromHash = HASH_TO_TAB[window.location.hash];
-  return fromHash ?? "memory";
+  return fromHash ?? "chat";
+}
+
+// /talk is the chrome-less, full-bleed PWA target. The dashboard
+// catch-all (web_server.py) serves index.html for any unknown path
+// so we just sniff pathname here. Trailing slash and ``/talk/foo``
+// both count as "talk mode" because deep-linking inside chat doesn't
+// exist yet (and if it ever does, this still routes correctly).
+function isTalkRoute(): boolean {
+  const path = window.location.pathname;
+  return path === "/talk" || path.startsWith("/talk/");
 }
 
 export function App() {
   const [token, setToken] = useState<string | null>(() => bootstrapToken());
   const [tab, setTab] = useState<TabId>(() => readTabFromHash());
+  const [talkMode] = useState<boolean>(() => isTalkRoute());
 
   const handleTabChange = useCallback((id: string) => {
     setTab(id as TabId);
@@ -75,6 +97,18 @@ export function App() {
     return <NoTokenScreen />;
   }
 
+  // /talk: chrome-less, full-viewport ChatPage. Same component
+  // instance the dashboard tab renders — nothing duplicated. The
+  // ``fullscreen`` flag makes ChatPage size to the dvh rather than
+  // a calc-based dashboard slot.
+  if (talkMode) {
+    return (
+      <div className="min-h-dvh flex flex-col bg-[var(--color-base)]">
+        <ChatPage token={token} onAuthFail={handleAuthFail} fullscreen />
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen flex flex-col">
       <TopBar />
@@ -85,6 +119,9 @@ export function App() {
         trailing={<HostLine />}
       />
       <main className="flex-1 max-w-[1400px] w-full mx-auto px-3 sm:px-5 py-6 sm:py-8">
+        {tab === "chat" && (
+          <ChatPage token={token} onAuthFail={handleAuthFail} />
+        )}
         {tab === "memory" && (
           <MemoryPage token={token} onAuthFail={handleAuthFail} />
         )}
@@ -108,6 +145,9 @@ export function App() {
         )}
         {tab === "models" && (
           <ModelsPage token={token} onAuthFail={handleAuthFail} />
+        )}
+        {tab === "voice" && (
+          <VoicePage token={token} onAuthFail={handleAuthFail} />
         )}
         {tab === "tailscale" && (
           <TailscalePage token={token} onAuthFail={handleAuthFail} />
@@ -170,7 +210,7 @@ function Footer() {
             phones. The tab nav above is the source of truth for
             what pages exist. */}
         <span className="ml-auto hidden md:inline">
-          mem · skills · curator · status · browser · learning · goals · models · tailscale
+          chat · mem · skills · curator · status · browser · learning · goals · models · voice · tailscale
         </span>
       </div>
     </footer>

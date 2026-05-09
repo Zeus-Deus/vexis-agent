@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import signal
 from pathlib import Path
 
@@ -573,3 +574,270 @@ def test_brain_deletes_status_file_on_cancel(
 
     asyncio.run(scenario())
     assert not (patch_runtime_dir / "status-74.json").exists()
+
+
+# ──────────────────────────────────────────────────────────────────
+# Orphaned session-lock recovery (post-cancel "Session ID already
+# in use" bug).
+#
+# When ``claude -p --resume <uuid>`` is SIGKILLed, claude-code
+# leaves a ``~/.claude/tasks/<uuid>/.lock`` file behind. The next
+# spawn against the same UUID exits 1 with::
+#
+#     Error: Session ID <uuid> is already in use.
+#
+# Fix: ``_scrub_orphaned_session_lock`` runs before each spawn in
+# both :meth:`respond` and :meth:`astream`. These tests pin the
+# helper's behavior + the spawn-site integration.
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def patch_claude_home(monkeypatch, tmp_path):
+    """Redirect ``Path.home()`` in claude_code.py to a tmpdir so
+    the JSONL existence check (used to decide --session-id vs
+    --resume) reads from a sandbox, not the real ``~/.claude``.
+    Yields the fake home so tests can pre-seed transcript files."""
+    fake_home = tmp_path / "fake-home"
+    (fake_home / ".claude" / "projects").mkdir(parents=True)
+    real_path_cls = brain_module.Path
+
+    class _PatchedPath(type(brain_module.Path())):
+        @classmethod
+        def home(cls):
+            return fake_home
+
+    monkeypatch.setattr(brain_module, "Path", _PatchedPath)
+    yield fake_home
+    monkeypatch.setattr(brain_module, "Path", real_path_cls)
+
+
+def _seed_jsonl(home: Path, workspace: Path, session_id: str) -> Path:
+    """Pre-create ``<home>/.claude/projects/<encoded-cwd>/<uuid>.jsonl``
+    matching claude-code's on-disk layout. Returns the path so
+    tests can verify it stayed put / got read."""
+    encoded = "-" + str(workspace).strip("/").replace("/", "-")
+    proj = home / ".claude" / "projects" / encoded
+    proj.mkdir(parents=True, exist_ok=True)
+    jsonl = proj / f"{session_id}.jsonl"
+    jsonl.write_text('{"role":"system"}\n', encoding="utf-8")
+    return jsonl
+
+
+def test_session_jsonl_exists_returns_true_when_present(
+    patch_claude_home, tmp_path,
+):
+    """Disk check returns True when the transcript file is on
+    disk — what claude-code uses to decide 'in use'."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    uuid = "11111111-2222-3333-4444-555555555555"
+    _seed_jsonl(patch_claude_home, workspace, uuid)
+    assert brain_module._session_jsonl_exists(workspace, uuid) is True
+
+
+def test_session_jsonl_exists_returns_false_when_absent(
+    patch_claude_home, tmp_path,
+):
+    """No transcript = fresh session — caller will use
+    ``--session-id`` to pin the UUID for the first time."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    uuid = "22222222-2222-3333-4444-555555555555"
+    assert brain_module._session_jsonl_exists(workspace, uuid) is False
+
+
+def test_session_jsonl_exists_idempotent_when_projects_dir_missing(
+    patch_claude_home, tmp_path,
+):
+    """First-ever-claude-run case: the projects dir doesn't even
+    exist yet. Helper must return False without raising."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    # Remove the projects dir entirely.
+    import shutil as _shutil
+    _shutil.rmtree(patch_claude_home / ".claude" / "projects")
+    uuid = "33333333-2222-3333-4444-555555555555"
+    assert brain_module._session_jsonl_exists(workspace, uuid) is False
+
+
+def test_session_jsonl_exists_uses_correct_workspace_encoding(
+    patch_claude_home, tmp_path,
+):
+    """Workspace path encoding: ``/foo/bar`` → ``-foo-bar``. Test
+    that the encoding matches what claude actually uses on disk —
+    a mismatch would make us always say 'doesn't exist' and the
+    fix would silently be a no-op."""
+    workspace = tmp_path / "deep" / "nested" / "workspace"
+    workspace.mkdir(parents=True)
+    uuid = "44444444-2222-3333-4444-555555555555"
+    seeded = _seed_jsonl(patch_claude_home, workspace, uuid)
+    # The seeded path is the truth; check our helper finds it.
+    assert seeded.exists()
+    assert brain_module._session_jsonl_exists(workspace, uuid) is True
+
+
+class _FakeUninitializedSession(FakeSession):
+    """Session whose in-memory flag says NOT initialized — even
+    though the transcript may already exist on disk. Reproduces
+    the post-cancel scenario where ``mark_initialized`` was
+    never called because the cancelled turn raised before
+    reaching the success path."""
+    def __init__(self, uid: str = "00000000-0000-0000-0000-000000000001") -> None:
+        super().__init__(uid)
+        self._initialized = False
+
+
+def test_respond_uses_resume_when_jsonl_exists_despite_uninitialized(
+    monkeypatch, tmp_path, patch_killpg, patch_claude_home,
+):
+    """The actual fix: even if ``is_initialized()`` returns False
+    (cancel-mid-turn left the in-memory flag stale), the disk
+    check sees the JSONL and we use ``--resume``. Without this,
+    claude exits 1 with 'Session ID already in use'."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    uuid = "00000000-0000-0000-0000-000000000001"
+    # Pre-seed the transcript as if the previous (cancelled)
+    # turn already wrote partial content.
+    _seed_jsonl(patch_claude_home, workspace, uuid)
+
+    # Capture argv that goes to subprocess so we can assert which
+    # session flag the brain chose.
+    captured_argv: list[list[str]] = []
+
+    proc = FakeProc(
+        pid=300, mode="ok",
+        stdout=_stream_json_result("recovered after cancel"),
+    )
+    patch_killpg[300] = proc
+
+    async def _fake_spawn(*argv, **_kwargs) -> FakeProc:
+        captured_argv.append(list(argv))
+        return proc
+
+    monkeypatch.setattr(
+        brain_module.asyncio, "create_subprocess_exec", _fake_spawn,
+    )
+
+    reg = RunningTasks()
+    brain = ClaudeCodeBrain(
+        workspace=workspace,
+        session=_FakeUninitializedSession(uid=uuid),
+        running_tasks=reg,
+    )
+
+    async def scenario() -> str:
+        return await brain.respond("hello again", chat_id=80)
+
+    reply = asyncio.run(scenario())
+    assert reply == "recovered after cancel"
+
+    # The decisive assertion: argv contains --resume (not
+    # --session-id) because the JSONL existed on disk.
+    assert len(captured_argv) == 1
+    argv = captured_argv[0]
+    assert "--resume" in argv, (
+        f"expected --resume on post-cancel respawn, got argv={argv}. "
+        "claude-code rejects --session-id when the JSONL exists."
+    )
+    assert "--session-id" not in argv, (
+        "must not pass --session-id when the JSONL already exists "
+        "— claude exits 1 with 'Session ID already in use'"
+    )
+
+
+def test_astream_uses_resume_when_jsonl_exists_despite_uninitialized(
+    monkeypatch, tmp_path, patch_killpg, patch_claude_home,
+):
+    """Same fix on the streaming path — the *hottest* path for
+    the bug because the web chat's Stop button fires here."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    uuid = "00000000-0000-0000-0000-000000000001"
+    _seed_jsonl(patch_claude_home, workspace, uuid)
+
+    captured_argv: list[list[str]] = []
+
+    proc = FakeProc(
+        pid=301, mode="ok",
+        stdout=_stream_json_result("streamed after cancel"),
+    )
+    patch_killpg[301] = proc
+
+    async def _fake_spawn(*argv, **_kwargs) -> FakeProc:
+        captured_argv.append(list(argv))
+        return proc
+
+    monkeypatch.setattr(
+        brain_module.asyncio, "create_subprocess_exec", _fake_spawn,
+    )
+
+    reg = RunningTasks()
+    brain = ClaudeCodeBrain(
+        workspace=workspace,
+        session=_FakeUninitializedSession(uid=uuid),
+        running_tasks=reg,
+    )
+
+    async def scenario() -> list[str]:
+        out: list[str] = []
+        async for chunk in brain.astream("hi", chat_id=81):
+            out.append(chunk)
+        return out
+
+    chunks = asyncio.run(scenario())
+    assert "".join(chunks) == "streamed after cancel"
+    argv = captured_argv[0]
+    assert "--resume" in argv, (
+        f"astream must use --resume when JSONL exists; got {argv}"
+    )
+    assert "--session-id" not in argv
+
+
+def test_respond_uses_session_id_when_no_jsonl(
+    monkeypatch, tmp_path, patch_killpg, patch_claude_home,
+):
+    """Regression guard: the very first turn (no JSONL on disk,
+    flag still False) MUST use ``--session-id`` to pin the UUID.
+    Switching unconditionally to ``--resume`` would make claude
+    error with 'No conversation found' on first send."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    uuid = "00000000-0000-0000-0000-000000000001"
+    # No JSONL seeded — fresh session.
+
+    captured_argv: list[list[str]] = []
+
+    proc = FakeProc(
+        pid=302, mode="ok",
+        stdout=_stream_json_result("first turn ok"),
+    )
+    patch_killpg[302] = proc
+
+    async def _fake_spawn(*argv, **_kwargs) -> FakeProc:
+        captured_argv.append(list(argv))
+        return proc
+
+    monkeypatch.setattr(
+        brain_module.asyncio, "create_subprocess_exec", _fake_spawn,
+    )
+
+    reg = RunningTasks()
+    brain = ClaudeCodeBrain(
+        workspace=workspace,
+        session=_FakeUninitializedSession(uid=uuid),
+        running_tasks=reg,
+    )
+
+    async def scenario() -> str:
+        return await brain.respond("first message", chat_id=82)
+
+    reply = asyncio.run(scenario())
+    assert reply == "first turn ok"
+    argv = captured_argv[0]
+    assert "--session-id" in argv, (
+        "first turn must use --session-id to pin the UUID; "
+        f"got argv={argv}"
+    )
+    assert "--resume" not in argv

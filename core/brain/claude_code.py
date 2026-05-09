@@ -34,7 +34,7 @@ import re
 import shutil
 import signal
 import subprocess
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 from core.brain.base import (
@@ -93,6 +93,50 @@ BRAIN_TIMEOUT_SECONDS = 1800
 # around 4 MB base64); cheap because we only ever hold one line in
 # the buffer at a time.
 _BRAIN_STREAM_LIMIT_BYTES = 32 * 1024 * 1024
+
+
+def _session_jsonl_exists(workspace: Path, session_id: str) -> bool:
+    """True when claude-code already has a transcript on disk for
+    this session UUID — i.e. when ``--session-id <uuid>`` would be
+    rejected with "Session ID is already in use".
+
+    claude stores transcripts at::
+
+        ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+
+    where encoded-cwd is the workspace path with ``/`` replaced by
+    ``-`` and a leading ``-`` (verified against claude-code 2.1.138
+    by inspecting the live projects directory).
+
+    This is the ONLY signal claude uses to decide whether a session
+    UUID is "in use" — it's a pure file-existence check, not a
+    process-lock or sessions-database lookup. Disassembled from
+    the binary's ``Hf$(H)`` function::
+
+        function Hf$(H) {
+          let $ = WQ() ?? mf(q6()),
+              q = Ff.join($, `${H}.jsonl`);
+          try { return statSync(q), true; }
+          catch { return false; }
+        }
+
+    The bug we're working around: vexis's first-turn-vs-subsequent
+    branch in :meth:`respond` / :meth:`astream` picks ``--session-id``
+    when ``SessionStore.is_initialized()`` is False. ``mark_initialized``
+    only gets called at the *end* of a successful turn, so a turn
+    that's cancelled mid-stream (Stop button, /cancel) leaves the
+    in-memory flag at False even though claude has already written
+    a partial transcript JSONL. The next turn re-spawns with
+    ``--session-id`` against a UUID whose JSONL exists, and
+    claude exits 1 with "Session ID is already in use".
+
+    This helper is the disk-state authority that breaks that race:
+    if the JSONL exists, use ``--resume`` regardless of what
+    ``is_initialized()`` says. Idempotent and side-effect-free.
+    """
+    encoded = "-" + str(workspace).strip("/").replace("/", "-")
+    jsonl = Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
+    return jsonl.is_file()
 
 # Day 2 model UX: claude-code prints the bad-model diagnostic to
 # STDOUT (not stderr) and exits 1. Verified empirically:
@@ -322,11 +366,35 @@ class ClaudeCodeBrain(Brain):
         self._system_prompt_cache[session_uuid] = prompt
         return prompt
 
-    async def respond(self, message: str, chat_id: int) -> str:
-        log.info("Brain.respond starting for chat %d", chat_id)
+    async def respond(
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ) -> str:
+        log.info(
+            "Brain.respond starting for chat %d%s%s",
+            chat_id,
+            f" (model override: {model})" if model else "",
+            f" (reasoning: {reasoning_level})" if reasoning_level else "",
+        )
         session_id = self._session.get()
-        # First call pins the UUID with --session-id; subsequent calls resume it.
-        if self._session.is_initialized():
+        # First call pins the UUID with --session-id; subsequent
+        # calls resume it. The decision is grounded in DISK state
+        # (does the transcript JSONL exist?) rather than the in-
+        # memory ``is_initialized`` flag, because a turn cancelled
+        # mid-stream (Stop button / /cancel / SIGKILL) writes a
+        # partial transcript without ever flipping the flag —
+        # hitting ``--session-id`` on the next turn would surface
+        # claude's "Session ID already in use" check. The disk
+        # check is what claude itself uses to decide; aligning
+        # vexis with that closes the race entirely.
+        if (
+            self._session.is_initialized()
+            or _session_jsonl_exists(self._workspace, session_id)
+        ):
             session_flag = ["--resume", session_id]
         else:
             session_flag = ["--session-id", session_id]
@@ -354,6 +422,19 @@ class ClaudeCodeBrain(Brain):
         # for each tool use and the call would hang. Step 6.5 will add a
         # PreToolUse hook that consults core.safety for hard enforcement.
         argv += ["--permission-mode", "bypassPermissions"]
+        # Per-turn model override (voice call mode is the only caller
+        # today; see ``voice.call_mode.model`` in ~/.vexis/config.yaml).
+        # ``None`` keeps the canonical "no --model flag, use account
+        # default" behavior — Telegram and text-chat tab path through
+        # here unchanged.
+        if model:
+            argv += ["--model", model]
+        # Per-turn reasoning effort. ``--effort`` is the same flag
+        # spawn_aux uses; mapping is identical so the user can pick
+        # any level the discovery surface reports for the model
+        # they chose. ``None`` means no flag.
+        if reasoning_level:
+            argv += ["--effort", reasoning_level]
         log.debug(
             "Spawning claude -p (%s=%s, cwd=%s)",
             session_flag[0],
@@ -471,6 +552,263 @@ class ClaudeCodeBrain(Brain):
                 log.info("Vexis ran without confirm: %s", reason)
         log.info("Brain.respond completed for chat %d", chat_id)
         return response
+
+    async def astream(
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ) -> AsyncIterator[str]:
+        """Native streaming. Spawns ``claude --print`` with
+        ``--include-partial-messages`` so stream-json emits
+        ``content_block_delta`` events as the model generates each
+        chunk; yields the ``text_delta.text`` from each. Falls back
+        to yielding the buffered final text only if the partial-
+        message stream is empty (no tokens delivered — should never
+        happen on success but defensive against API quirks).
+
+        Same per-turn override semantics as :meth:`respond`. Same
+        cancellation, timeout, session-lost, and error mapping —
+        the spawn/kill machinery is identical, only the event-loop
+        differs.
+
+        Tool-use events still update the StatusFile so /status
+        works exactly like the buffered path. The ``result`` event
+        (if any) is captured to verify against the concatenated
+        deltas; mismatch is logged but not fatal.
+        """
+        log.info(
+            "Brain.astream starting for chat %d%s%s",
+            chat_id,
+            f" (model override: {model})" if model else "",
+            f" (reasoning: {reasoning_level})" if reasoning_level else "",
+        )
+        session_id = self._session.get()
+        # Same disk-state-authority --session-id-vs-resume decision
+        # as :meth:`respond`. The streaming path is the *hottest*
+        # path for the post-cancel bug because the web chat's Stop
+        # button fires here; without this check, every Stop →
+        # resend produces "Session ID already in use" even though
+        # the in-memory ``is_initialized`` flag is still False.
+        if (
+            self._session.is_initialized()
+            or _session_jsonl_exists(self._workspace, session_id)
+        ):
+            session_flag = ["--resume", session_id]
+        else:
+            session_flag = ["--session-id", session_id]
+
+        system_prompt = self._system_prompt_for(session_id)
+
+        argv = [
+            "claude",
+            "-p",
+            message,
+            *session_flag,
+            "--append-system-prompt",
+            system_prompt,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            # The streaming-only addition: makes claude emit
+            # ``content_block_delta`` events with ``text_delta.text``
+            # for each chunk the model generates, instead of buffering
+            # the whole reply into a single ``assistant`` event.
+            "--include-partial-messages",
+        ]
+        if DISALLOWED_TOOLS:
+            argv += ["--disallowedTools", *DISALLOWED_TOOLS]
+        argv += ["--permission-mode", "bypassPermissions"]
+        if model:
+            argv += ["--model", model]
+        if reasoning_level:
+            argv += ["--effort", reasoning_level]
+        log.debug(
+            "Spawning claude -p (stream %s=%s, cwd=%s)",
+            session_flag[0],
+            session_id,
+            self._workspace,
+        )
+
+        reservation = await self._running_tasks.reserve(chat_id)
+        env = {**os.environ, "VEXIS_CHAT_ID": str(chat_id)}
+
+        status_file = StatusFile(chat_id)
+        status_file.start()
+
+        # Concatenated deltas (for cross-check against the result
+        # event) and the result-event text (used as fallback if no
+        # deltas arrived for some reason).
+        accumulated = ""
+        result_text = ""
+        stderr_bytes = b""
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(self._workspace),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+                env=env,
+                limit=_BRAIN_STREAM_LIMIT_BYTES,
+            )
+            log.info("Brain (stream) spawned PID %d for chat %d", proc.pid, chat_id)
+
+            attached = await self._running_tasks.attach(reservation, proc)
+            if not attached:
+                log.info(
+                    "Brain raising BrainCancelled for chat %d "
+                    "(cancel during reservation window)",
+                    chat_id,
+                )
+                await self._kill_group(proc)
+                raise BrainCancelled("brain subprocess cancelled via /cancel")
+
+            # Drain stderr in the background so a verbose stderr
+            # doesn't fill the OS pipe buffer and stall the brain.
+            stderr_task = asyncio.create_task(proc.stderr.read())
+
+            stream = proc.stdout
+            if stream is None:
+                raise BrainError("claude -p produced no stdout pipe")
+
+            # Per-line stream-json parse. Each yield is a tight
+            # async event (the caller's SSE loop forwards it
+            # immediately to the browser).
+            stream_started_at = asyncio.get_event_loop().time()
+            while True:
+                # Bound the per-line read by the overall brain
+                # timeout so a hung subprocess doesn't deadlock the
+                # iterator. The remainder of BRAIN_TIMEOUT_SECONDS
+                # decreases as the stream progresses.
+                elapsed = asyncio.get_event_loop().time() - stream_started_at
+                remaining = max(1.0, BRAIN_TIMEOUT_SECONDS - elapsed)
+                try:
+                    line = await asyncio.wait_for(
+                        stream.readline(), timeout=remaining,
+                    )
+                except asyncio.TimeoutError as exc:
+                    await self._kill_group(proc)
+                    await asyncio.gather(stderr_task, return_exceptions=True)
+                    raise BrainTimeoutError(
+                        f"claude -p stream timed out after {BRAIN_TIMEOUT_SECONDS}s"
+                    ) from exc
+                if not line:
+                    break
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                kind = event.get("type")
+                if kind == "stream_event":
+                    inner = event.get("event") or {}
+                    if not isinstance(inner, dict):
+                        continue
+                    if inner.get("type") == "content_block_delta":
+                        delta = inner.get("delta") or {}
+                        if (
+                            isinstance(delta, dict)
+                            and delta.get("type") == "text_delta"
+                        ):
+                            text = delta.get("text")
+                            if isinstance(text, str) and text:
+                                accumulated += text
+                                yield text
+                elif kind == "assistant":
+                    # Tool-use tracking. Two consumers:
+                    #   1. StatusFile (per-chat tmpfs JSON) — read by
+                    #      Telegram /status. Unchanged.
+                    #   2. The chat UI streaming bubble — yielded as
+                    #      a tool event dict so the user sees inline
+                    #      "Reading src/foo.py" lines while the brain
+                    #      is grinding through tools. Without this
+                    #      the bubble is just a pulse for 30+s during
+                    #      heavy tool turns and feels frozen.
+                    content = event.get("message", {}).get("content") or []
+                    if isinstance(content, list):
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            if block.get("type") != "tool_use":
+                                continue
+                            name = block.get("name") or "Tool"
+                            target = extract_tool_target(
+                                name, block.get("input") or {},
+                            )
+                            status_file.record_tool(name, target)
+                            # Tool event → chat UI. Distinct from
+                            # text deltas; consumers must distinguish
+                            # via ``isinstance``. Documented contract
+                            # on Brain.astream.
+                            yield {
+                                "type": "tool",
+                                "name": name,
+                                "target": target,
+                            }
+                elif kind == "result":
+                    rt = event.get("result")
+                    if isinstance(rt, str):
+                        result_text = rt
+
+            await proc.wait()
+            try:
+                stderr_bytes = await stderr_task
+            except Exception:
+                stderr_bytes = b""
+
+            if self._running_tasks.was_cancelled(chat_id):
+                log.info(
+                    "Brain.astream raising BrainCancelled for chat %d",
+                    chat_id,
+                )
+                raise BrainCancelled("brain subprocess cancelled via /cancel")
+
+            if proc.returncode != 0:
+                err = stderr_bytes.decode(errors="replace").strip()
+                if self._session.is_initialized() and "No conversation found" in err:
+                    old_uuid = self._session.get()
+                    new_uuid = self._session.rotate()
+                    log.warning(
+                        "Claude Code lost session %s; rotated to %s",
+                        old_uuid, new_uuid,
+                    )
+                    raise SessionLost(
+                        "Claude Code session was lost. Rotated to new session.",
+                    )
+                raise BrainError(
+                    f"claude -p exited {proc.returncode}: {err or '(no stderr)'}",
+                )
+        finally:
+            status_file.delete()
+            await self._running_tasks.unregister(chat_id)
+
+        if not self._session.is_initialized():
+            self._session.mark_initialized()
+
+        # Defensive: if no deltas streamed (unusual but observed in
+        # very-short replies on some backends) fall back to the
+        # result-event text so the caller's bubble isn't empty.
+        if not accumulated and result_text:
+            yield result_text
+            accumulated = result_text
+
+        # Cross-check (logged only — never raises). Useful for
+        # spotting silent stream-json schema drift.
+        result_clean = result_text.strip()
+        accumulated_clean = accumulated.strip()
+        if result_clean and accumulated_clean and result_clean != accumulated_clean:
+            log.debug(
+                "Brain.astream: result/delta mismatch for chat %d "
+                "(result=%d chars, deltas=%d chars)",
+                chat_id, len(result_clean), len(accumulated_clean),
+            )
+
+        log.info("Brain.astream completed for chat %d", chat_id)
 
     @staticmethod
     async def _kill_group(proc: asyncio.subprocess.Process) -> None:

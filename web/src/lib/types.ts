@@ -560,3 +560,197 @@ export interface ModelDiscoveryRefreshResponse {
   ok: true;
   available_models: Record<string, string[]>;
 }
+
+// ----- chat -----
+
+export interface ChatSession {
+  name: string;
+  is_active: boolean;
+  // ISO-8601 UTC. Format with Intl.DateTimeFormat at render time.
+  created_at: string;
+  // First-user-message snippet (truncated to ~80 chars on the
+  // server). Rendered under the session name in the sidebar so
+  // the user can find conversations by content. Null/missing for
+  // sessions whose transcript can't be read or hasn't been
+  // populated yet (just-created session). UI must tolerate both
+  // null and undefined — older clients won't send the field at all.
+  preview?: string | null;
+}
+
+export interface ChatSessionsState {
+  sessions: ChatSession[];
+}
+
+export interface ChatReply {
+  // The brain's response (or a handler-emitted control reply for
+  // session ops, e.g. "Switched to <name>" / "⚠️ Couldn't resume…").
+  // Already trimmed; markdown is safe to render.
+  reply: string;
+}
+
+export interface ChatHistoryMessage {
+  // "user" | "assistant" — same vocabulary the in-memory ChatMessage
+  // type uses so backfilled history can populate the buffer without
+  // a translation step.
+  role: string;
+  content: string;
+  // Unix milliseconds. JS ``new Date(ts)`` handles it.
+  ts: number;
+}
+
+export interface ChatHistoryState {
+  messages: ChatHistoryMessage[];
+}
+
+// ----- voice -----
+
+export interface VoiceCapability {
+  provider: string;        // "voxtype" | "piper" | "null" | future
+  available: boolean;      // false when provider is "null"
+  mime_type?: string;      // TTS only — what audio/* the bytes are
+}
+
+export interface VoiceInfo {
+  enabled: boolean;        // mirrors voice.enabled in ~/.vexis/config.yaml
+  stt: VoiceCapability;
+  tts: VoiceCapability;
+  // Per-turn model override for voice call mode. Empty string =
+  // "use the brain's account default" (current behavior — same as
+  // Telegram and the text-chat tab). Any other value is a model id
+  // forwarded to /chat/voice as a multipart ``model`` form field.
+  call_mode: {
+    model: string;
+    reasoning_level: string;
+  };
+}
+
+export interface VoiceReply {
+  // STT round-trip result. Both fields are present together — the
+  // server returns the transcript so the UI can render it as a
+  // user bubble, AND the brain's reply so the UI doesn't have to
+  // chain a second /chat/send call.
+  transcript: string;
+  reply: string;
+}
+
+// ----- attachments -----
+
+export interface AttachmentRef {
+  // Server-side path under <workspace>/uploads/<session>/. The
+  // brain reads files from this path directly.
+  path: string;
+  // Sanitized filename (extension preserved). Used for display
+  // and for re-sending to the server in /chat/send body.
+  name: string;
+  // Bytes written to disk. Useful for showing "1.2 MB" next to
+  // the chip without round-tripping the actual file.
+  size: number;
+  // Server-validated mime — same as what the upload sent, but
+  // verified against the allowlist server-side.
+  mime: string;
+}
+
+// Used by the composer to render queued attachments before send.
+// Adds a client-only ``previewUrl`` (blob: URL) so we can show the
+// thumbnail without re-fetching from the server.
+export interface QueuedAttachment extends AttachmentRef {
+  previewUrl?: string;
+}
+
+// ----- voice settings (dashboard tab) -----
+
+export interface PiperVoice {
+  path: string;
+  name: string;
+  language: string;
+  size: number;
+  has_config: boolean;
+}
+
+export interface AvailableModel {
+  // Native model id as the active brain reports it. Surfaced to the
+  // picker without any transformation so future models appear
+  // automatically.
+  //   - claude-code: "claude-opus-4-7" / "claude-haiku-4-5-20251001"
+  //   - opencode:    "anthropic/claude-sonnet-4-7" / "openrouter/..."
+  id: string;
+  // Friendly name from the API (Anthropic's ``display_name``,
+  // opencode's ``name``). Null when discovery doesn't carry one —
+  // UI falls back to the id.
+  display_name: string | null;
+  // Empty list = no reasoning controls for this model. Non-empty
+  // list = the user can pick one (e.g. "low", "medium", "high",
+  // "max") in the reasoning sub-picker. Dynamic over the discovery
+  // response — Anthropic adding a new level (``xhigh``, ``ultra``)
+  // surfaces here automatically.
+  reasoning_levels: string[];
+  // Context window in tokens (Anthropic's ``max_input_tokens``,
+  // opencode's ``limit.context``). Null when discovery doesn't
+  // expose it.
+  max_input_tokens: number | null;
+  // Max output tokens per turn (Anthropic's ``max_tokens``,
+  // opencode's ``limit.output``).
+  max_tokens: number | null;
+  // Provider tag for the model. claude-code defaults to "anthropic"
+  // (everything routes through their API). opencode pulls this from
+  // ``providerID`` in its verbose output — values seen in the wild:
+  // "opencode", "openrouter", "github-copilot", "venice",
+  // "minimax-coding-plan". Surfaced as a small badge in the picker.
+  provider: string | null;
+  // True when the model costs nothing per token (opencode's Zen
+  // free tier + any other 0-cost provider). Picker shows a "free"
+  // badge so the user knows they can use it without spending.
+  free: boolean;
+  // Per-million-token costs (opencode reports these; null for
+  // claude-code where the API doesn't expose per-model pricing).
+  // Surfaced as "$0.80/M in · $4/M out" in the picker metadata
+  // strip when present.
+  cost_input_per_million: number | null;
+  cost_output_per_million: number | null;
+}
+
+export interface VoiceSettings {
+  enabled: boolean;
+  stt: {
+    provider: string;
+    available_providers: string[];
+  };
+  tts: {
+    provider: string;
+    available_providers: string[];
+    voice_model_path: string | null;
+    binary: string | null;
+  };
+  available_voices: PiperVoice[];
+  call_mode: {
+    // Empty string = "use brain default". Same sentinel the radio
+    // list uses so the wire format and UI state line up.
+    model: string;
+    // Empty string = "no --effort flag, model default reasoning".
+    // Only meaningful when ``model`` corresponds to an entry in
+    // ``available_models`` whose ``reasoning_levels`` is non-empty.
+    reasoning_level: string;
+    available_models: AvailableModel[];
+  };
+}
+
+export interface VoiceSettingsUpdate {
+  enabled?: boolean;
+  stt?: { provider?: string };
+  tts?: {
+    provider?: string;
+    voice_model_path?: string | null;
+    binary?: string | null;
+  };
+  call_mode?: {
+    // null / "" / "default" all mean "reset to brain default" on the
+    // server side; UI sends "" for clarity.
+    model?: string | null;
+    reasoning_level?: string | null;
+  };
+}
+
+export interface VoiceSettingsResponse extends VoiceSettings {
+  ok: true;
+  backup_path: string | null;
+}

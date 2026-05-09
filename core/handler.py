@@ -30,6 +30,34 @@ _BRAIN_TIMEOUT = (
 _EMPTY_RESPONSE = "(empty response)"
 _CLEAR_OK = "Conversation cleared."
 
+# ── Streaming error taxonomy ─────────────────────────────────────
+# The chat UI distinguishes error categories so it can render
+# specific recovery affordances (e.g. an inline "Retry" button on
+# transient brain errors but not on auth failures). The codes are
+# wire-stable strings that travel through the SSE ``error`` event.
+# Adding a new code = update the frontend's ``mapErrorCode`` helper.
+
+# Brain returned a non-zero exit / unparseable output. Often
+# transient (rate limit, bad provider response). Retry button OK.
+_ERR_CODE_BRAIN_ERROR = "brain_error"
+# Brain hung past the configured timeout. Retry won't help unless
+# the user shortens the prompt or switches model.
+_ERR_CODE_BRAIN_TIMEOUT = "brain_timeout"
+# Underlying claude/opencode session vanished — usually because
+# the brain rotated UUIDs. UI auto-recovers on the next send.
+_ERR_CODE_SESSION_LOST = "session_lost"
+# User-initiated cancel via Stop button. UI swallows silently —
+# no toast, no retry button. Empty message; the code is what
+# distinguishes it from genuine errors.
+_ERR_CODE_CANCELLED = "cancelled"
+# Caller-side allow-list rejection. UI surfaces as an auth wall;
+# the message is None (don't leak which user was rejected).
+_ERR_CODE_REJECTED = "rejected"
+# Catch-all for the SSE generator's outermost ``except``. Logs
+# already have the traceback; user gets a generic "stream
+# interrupted" so we never render uncaught Python on the page.
+_ERR_CODE_UNKNOWN = "unknown"
+
 
 class MessageHandler:
     def __init__(
@@ -61,7 +89,31 @@ class MessageHandler:
         self._dispatched_turn_index: dict[str, int] = {}
         self._cursor_lock = asyncio.Lock()
 
-    async def handle(self, user_id: int, chat_id: int, text: str) -> str | None:
+    @property
+    def brain(self) -> Brain:
+        """Expose the bound brain to peers (web transport, learning
+        curator) that need to call transcript-readback methods like
+        ``iter_messages``. Read-only intentionally — the brain is
+        bound at handler construction and never reassigned."""
+        return self._brain
+
+    async def handle(
+        self,
+        user_id: int,
+        chat_id: int,
+        text: str,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ) -> str | None:
+        """Foreground turn entrypoint. ``model`` and ``reasoning_level``
+        are optional per-turn overrides forwarded straight to
+        ``Brain.respond``. ``None`` (the default) on either preserves
+        the existing Telegram + text-chat path bit-for-bit. Voice call
+        mode is the only caller passing non-None values today, sourced
+        from ``voice.call_mode.{model,reasoning_level}`` in
+        ``~/.vexis/config.yaml``.
+        """
         if not is_allowed(user_id, self._allowed_user_id):
             log.warning("Rejected message from user_id=%s", user_id)
             return None
@@ -69,7 +121,10 @@ class MessageHandler:
         message = await self._inject_context(chat_id, text)
 
         try:
-            reply = await self._brain.respond(message, chat_id)
+            reply = await self._brain.respond(
+                message, chat_id,
+                model=model, reasoning_level=reasoning_level,
+            )
         except BrainCancelled:
             # /cancel handler already replied; nothing more to send.
             return None
@@ -83,6 +138,102 @@ class MessageHandler:
             return _BRAIN_ERROR
 
         return reply.strip() or _EMPTY_RESPONSE
+
+    async def stream(
+        self,
+        user_id: int,
+        chat_id: int,
+        text: str,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ):
+        """Streaming variant of :meth:`handle`. Yields incremental
+        text chunks as the brain generates them, plus a sentinel
+        ``("done", full_text)`` at the end so callers can persist
+        the final reply.
+
+        On any failure (rejection, brain error, timeout, session
+        lost) yields ``("error", message_or_None)`` and stops. The
+        SSE route maps these to ``data: {type:..., ...}`` frames.
+
+        Why a sentinel-tagged generator instead of two separate
+        methods (chunks + final): keeps the contract single-pass.
+        Callers don't have to coordinate two iterators or worry
+        about the brain finishing between them. ``yield`` shape:
+
+            ("chunk", str)         — incremental text
+            ("tool",  dict)        — tool-use event (Phase A)
+            ("done",  str)         — full reply, fired exactly once
+                                     after the last chunk
+            ("error", dict | None) — error event. Dict payload is
+                                     ``{"code": str, "message": str}``
+                                     where ``code`` is one of the
+                                     ``_ERR_CODE_*`` constants. The
+                                     SSE route maps each code to a
+                                     specific user-facing recovery
+                                     affordance (retry button,
+                                     auto-recovery toast, etc.).
+                                     ``None`` is the caller-side
+                                     allow-list reject (route
+                                     responds with 401).
+        """
+        if not is_allowed(user_id, self._allowed_user_id):
+            log.warning("Rejected streaming message from user_id=%s", user_id)
+            yield ("error", None)
+            return
+
+        message = await self._inject_context(chat_id, text)
+
+        full = ""
+        try:
+            async for event in self._brain.astream(
+                message, chat_id,
+                model=model, reasoning_level=reasoning_level,
+            ):
+                # Brain.astream yields a discriminated union (see
+                # base.Brain.astream docstring): str = text delta,
+                # dict = tool-use event. Tool events are forwarded
+                # untouched — the caller (chat UI SSE route) renders
+                # them as inline "Reading src/foo.py" status lines.
+                if isinstance(event, dict):
+                    yield ("tool", event)
+                    continue
+                # Text deltas: accumulate for the final ``done`` event
+                # so the UI can swap streamed-content for a canonical
+                # full-reply copy without parse-drift risk.
+                if event:
+                    full += event
+                    yield ("chunk", event)
+        except BrainCancelled:
+            # User-initiated cancel — UI swallows silently, no toast.
+            yield ("error", {
+                "code": _ERR_CODE_CANCELLED,
+                "message": "",
+            })
+            return
+        except BrainTimeoutError:
+            log.warning("Brain stream timed out for chat_id=%s", chat_id)
+            yield ("error", {
+                "code": _ERR_CODE_BRAIN_TIMEOUT,
+                "message": _BRAIN_TIMEOUT,
+            })
+            return
+        except SessionLost:
+            yield ("error", {
+                "code": _ERR_CODE_SESSION_LOST,
+                "message": _SESSION_LOST,
+            })
+            return
+        except Exception:
+            log.exception("Brain stream failed")
+            yield ("error", {
+                "code": _ERR_CODE_BRAIN_ERROR,
+                "message": _BRAIN_ERROR,
+            })
+            return
+
+        yield ("done", full.strip() or _EMPTY_RESPONSE)
 
     async def _inject_context(self, chat_id: int, text: str) -> str:
         """Prepend any pending system notes to the user's message.
@@ -136,6 +287,62 @@ class MessageHandler:
             log.warning("Rejected /sessions from user_id=%s", user_id)
             return None
         return _format_sessions(self._sessions.list())
+
+    def handle_history(
+        self, user_id: int, name: str, limit: int = 50,
+    ) -> list[dict] | None:
+        """Return the last ``limit`` conversational turns of the
+        named session as a list of plain dicts:
+            [{"role": "user"|"assistant", "content": str, "ts": int}, ...]
+
+        ``ts`` is unix milliseconds (matches what the chat UI's
+        in-memory buffer uses). Returns:
+          - ``None`` when ``user_id`` fails the allow-list (route
+            translates to 401)
+          - empty list when the session exists but has no messages
+            (pristine session that's never been written to) OR the
+            session name doesn't exist (caller can either 404 or
+            treat as empty — the route currently 404s by checking
+            sessions_for first)
+          - list of messages otherwise
+
+        Reads via ``brain.iter_messages(uuid)`` — both brains
+        implement that ABC method (claude-code reads JSONL via
+        ``core.transcripts``; opencode reads SQLite directly).
+        Skips tool_call-only assistant messages with empty text
+        because they don't render meaningfully in chat bubbles.
+        """
+        if not is_allowed(user_id, self._allowed_user_id):
+            log.warning("Rejected history-for from user_id=%s", user_id)
+            return None
+        if limit <= 0:
+            return []
+        # Resolve name → uuid via SessionStore. Avoids exposing
+        # ``brain.iter_messages`` to the dashboard which speaks in
+        # names, not uuids.
+        sessions = self._sessions.list()
+        target = next((s for s in sessions if s.name == name), None)
+        if target is None:
+            return []
+        # Drain the iterator into a list so we can ``[-limit:]``.
+        # Tool-call-only messages (assistant turns where the model
+        # only emitted tool_use blocks, no text) get filtered: their
+        # text is empty so they'd render as blank bubbles.
+        messages: list[dict] = []
+        for tm in self._brain.iter_messages(target.uuid):
+            if not tm.text:
+                continue
+            messages.append(
+                {
+                    "role": tm.role,
+                    "content": tm.text,
+                    # Unix milliseconds — what JS's ``Date`` constructor
+                    # consumes, matches the in-memory ChatMessage shape
+                    # the UI already uses.
+                    "ts": int(tm.timestamp.timestamp() * 1000),
+                }
+            )
+        return messages[-limit:] if len(messages) > limit else messages
 
     def sessions_for(self, user_id: int) -> list[SessionInfo] | None:
         if not is_allowed(user_id, self._allowed_user_id):

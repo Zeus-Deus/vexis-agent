@@ -31,7 +31,7 @@ zero subprocess dependencies. The cross-brain contract test
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Union
@@ -309,9 +309,84 @@ class Brain(ABC):
 
     # ─── foreground turn ─────────────────────────────────────────
 
+    async def astream(
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ) -> AsyncIterator[str | dict]:
+        """Streaming variant of :meth:`respond`. Yields incremental
+        text chunks as the model generates them.
+
+        **Yield types** (callers must accept both):
+
+        - ``str`` — a text delta (``content_block_delta.text_delta``
+          on claude-code; whatever the brain produces incrementally).
+          Concatenate these to reconstruct the assistant's reply.
+        - ``dict`` — a tool-use event with shape
+          ``{"type": "tool", "name": str, "target": str | None}``.
+          Surfaced to the chat UI as inline "Reading src/foo.py" /
+          "Running git status" lines so the user sees the brain
+          working through its tools instead of staring at a pulse
+          for 30+ seconds. Tool events do NOT contribute to the
+          assistant's text reply — they're a separate UX channel.
+
+        Default implementation here delegates to ``respond`` and
+        yields the full reply once at the end — non-streaming brains
+        still satisfy the contract (no tool events, just a single
+        text yield). Implementations that natively stream (claude-code
+        via ``--include-partial-messages``, future opencode) override
+        this to yield per-delta plus tool events as they fire.
+
+        Same per-turn override semantics as ``respond``: ``model``
+        and ``reasoning_level`` flow through identically. Telegram
+        and the text-chat tab don't call this — the streaming SSE
+        route on the dashboard is the only caller today. Same
+        exception surface: BrainTimeout, BrainCancelled, SessionLost,
+        BrainError.
+
+        Marked NOT-abstract so concrete brains are free to inherit
+        the default fallback. Brains that override it MUST yield at
+        least one text chunk on success (empty reply → yield "") so
+        downstream callers can rely on that for the "done" signal.
+        """
+        reply = await self.respond(
+            message, chat_id,
+            model=model, reasoning_level=reasoning_level,
+        )
+        yield reply
+
     @abstractmethod
-    async def respond(self, message: str, chat_id: int) -> str:
+    async def respond(
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ) -> str:
         """Run one foreground turn. Returns the assistant's final text.
+
+        ``model`` is an optional per-turn override. ``None`` (the
+        default) means "use the brain's account default" — the
+        canonical foreground behaviour, preserved bit-for-bit so
+        Telegram and the text-chat tab keep their existing semantics.
+        When set, the brain spawns its CLI with ``--model <id>`` for
+        this turn only. Used by voice call mode (``voice.call_mode.model``
+        config knob) so the call surface can run a faster model
+        without shifting every other foreground turn.
+
+        ``reasoning_level`` is the matching per-turn reasoning override
+        (``low``/``medium``/``high``/``max`` for claude-code, where it
+        translates to ``--effort``; ``low``/``medium``/``high`` for
+        opencode where it becomes ``--variant``). ``None`` means
+        "no flag — let the model use its default". Should only be set
+        when the chosen ``model`` actually supports reasoning levels;
+        the dashboard validates this upstream by reading capabilities
+        from ``core.model_discovery``. Same per-turn isolation as
+        ``model`` — Telegram and text-chat always pass ``None``.
 
         Side effects: writes to the per-chat ``StatusFile`` for
         ``/status``, registers the running subprocess with

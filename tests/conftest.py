@@ -38,6 +38,46 @@ from core.sessions import SessionStore
 
 
 @pytest.fixture(autouse=True)
+def _isolate_vexis_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Belt-and-suspenders: every test gets a private ``~/.vexis/``.
+
+    Why this exists: a test (test_voice_call_model_isolation.py)
+    initially patched only ``yaml_config._config_path`` for reads
+    and forgot ``paths.vexis_dir`` for writes. The route's
+    ``_voice_set`` writer used the unpatched ``vexis_dir()``, scribbled
+    over the user's real ``~/.vexis/config.yaml`` once during a
+    failing run, and wiped non-voice sections (the writer reads-
+    then-rewrites the whole file).
+
+    This fixture redirects ``core.paths.vexis_dir`` to a tmp path
+    for every test by default. Tests that genuinely need to write
+    to a specific location can override with their own monkeypatch
+    after this fires (later patches win); the production code
+    runs against the real path because the daemon entrypoint
+    doesn't go through pytest. Cost is one ``mkdir`` per test —
+    cheap.
+
+    The matching read-side patch on ``yaml_config._config_path``
+    keeps the read/write paths consistent so a test reading config
+    sees what the same test wrote, not the user's real file.
+    """
+    private_root = tmp_path / "_vexis_isolated"
+    private_root.mkdir(parents=True, exist_ok=True)
+    # Only patch ``core.paths.vexis_dir`` — that's the binding the
+    # writer (``_voice_set``) uses via the function-local
+    # ``from core.paths import vexis_dir``. Do NOT also patch
+    # ``core.yaml_config._config_path`` here: existing tests in
+    # ``test_yaml_config_models.py`` patch their own
+    # ``core.yaml_config.vexis_dir`` and a competing autouse
+    # ``_config_path`` patch would shadow theirs and break read
+    # consistency. yaml_config's own ``_config_path`` already calls
+    # vexis_dir() under the hood, so a single vexis_dir patch keeps
+    # both read and write going to the same place.
+    monkeypatch.setattr("core.paths.vexis_dir", lambda: private_root)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_opencode_db(tmp_path: Path):
     """Phase C Day 4 safety: opencode's transcript reader queries
     ``~/.local/share/opencode/opencode.db`` by default. Tests must
