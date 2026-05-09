@@ -67,17 +67,33 @@ def run() -> None:
 
 
 @app.command()
-def setup() -> None:
-    """Interactive first-run setup. (Phase 4 — not implemented yet.)
+def setup(
+    reset: bool = typer.Option(
+        False,
+        "--reset",
+        help="Archive existing config.yaml + .env to *.bak.<utc> and re-run.",
+    ),
+) -> None:
+    """Interactive first-run setup.
 
-    Will write ``~/.vexis/config.yaml`` and ``~/.vexis/.env`` from
-    shipped templates, prompt for Telegram token + allowed user ID,
-    and optionally install the systemd user unit.
+    Creates ``$VEXIS_HOME/config.yaml`` and ``$VEXIS_HOME/.env`` (mode
+    0600) from shipped templates if absent, prompts for the Telegram
+    bot token + allowed user ID, and offers to install the systemd
+    user unit. Existing curator/learning/goal state is left untouched
+    — the wizard never deletes data.
     """
-    raise NotImplementedError(
-        "vexis-agent setup is implemented in Phase 4 of the packaging plan. "
-        "For now, copy ~/.vexis/config.yaml and ~/.vexis/.env by hand."
+    from vexis_agent.setup_wizard import (
+        SetupAborted,
+        format_summary,
+        run_setup,
     )
+
+    try:
+        result = run_setup(reset=reset)
+    except SetupAborted as exc:
+        typer.echo(f"vexis-agent setup: {exc}", err=True)
+        raise typer.Exit(1)
+    typer.echo(format_summary(result))
 
 
 @app.command()

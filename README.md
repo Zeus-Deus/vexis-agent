@@ -3,67 +3,99 @@
 Standalone Python daemon that bridges Telegram to an agent CLI,
 letting you control an Omarchy (Hyprland/Wayland) desktop from your
 phone. It is a transport layer in front of an agent CLI (claude-code
-by default; opencode optional), not a new agent — Telegram in, MCP
-tools out, agent CLI in the middle.
+by default; opencode optional) — Telegram in, MCP tools out, agent
+CLI in the middle.
 
 ## Install
 
-1. **Install a brain.** Pick one (you can switch later):
+### One-liner (curl-bash)
 
-   - **claude-code** (recommended default) —
-     <https://docs.anthropic.com/claude/claude-code>
-   - **opencode** (alternative; supports 30+ providers including
-     Anthropic OAuth, ChatGPT Plus, GitHub Copilot, plus API keys) —
-     ```bash
-     curl -fsSL https://opencode.ai/install | bash
-     ```
+Linux only (Arch, Debian/Ubuntu, Fedora, openSUSE supported out of
+the box).
 
-   Authenticate the brain you installed:
-   - claude-code: `claude /login` (Pro/Max subscription) or set
-     `ANTHROPIC_API_KEY` in your env.
-   - opencode: `opencode providers login` (interactive provider
-     picker; the legacy `opencode auth login` alias still works).
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zeus-Deus/vexis-agent/main/install.sh | bash
+vexis-agent setup
+systemctl --user enable --now vexis-agent.service
+```
 
-2. **Clone vexis**:
-   ```bash
-   git clone https://github.com/Zeus-Deus/vexis-agent.git
-   cd vexis-agent
-   ```
+The installer:
 
-3. **Set up a Python venv**:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -e .
-   ```
-   (All dependencies live inside this env. Never install to global
-   Python.)
+- Refuses to run as root (vexis-agent is single-user by design).
+- Installs `pipx` if missing, using your distro's package manager.
+- Runs `pipx install --force git+https://github.com/Zeus-Deus/vexis-agent.git`.
+- Prints the next-step hints; does NOT auto-run `vexis-agent setup`.
 
-4. **Configure secrets**:
-   ```bash
-   cp .env.example .env
-   # then edit .env and fill in TELEGRAM_BOT_TOKEN,
-   # TELEGRAM_ALLOWED_USER_ID, and ANTHROPIC_API_KEY (or other
-   # provider keys if you're on opencode).
-   ```
+Pass `--dry-run` (when piped: `bash -s -- --dry-run`) to preview
+without changes. Set `VEXIS_CHANNEL=dev` to install from the
+`develop` branch instead of `main`.
 
-5. **Run the install script**:
-   ```bash
-   ./scripts/install.sh
-   ```
-   This:
-   - Symlinks `AGENTS.md → CLAUDE.md` so both brains see the same
-     project instructions.
-   - Verifies your chosen brain is on PATH (prints an install hint
-     if not).
-   - Writes the brain's MCP config: `<workspace>/.mcp.json` for
-     claude-code, `<workspace>/opencode.json` (with the `vexis-`
-     namespace prefix preserving any non-prefixed entries you've
-     added by hand) for opencode.
+### Manual install
 
-   Idempotent — safe to re-run after switching brains or updating
-   vexis. Pass `--dry-run` to preview without touching the
-   filesystem.
+If you'd rather inspect the source first, or don't trust the
+curl-bash flow:
+
+```bash
+pipx install git+https://github.com/Zeus-Deus/vexis-agent.git
+vexis-agent setup
+```
+
+`vexis-agent setup` is interactive: it writes `~/.vexis/config.yaml`
+(from a shipped template) and `~/.vexis/.env` (mode 0600), prompts
+for your Telegram bot token and numeric user ID, and offers to
+install the systemd user unit.
+
+### Brain prerequisites
+
+Pick one (you can switch later via `~/.vexis/config.yaml`):
+
+- **claude-code** (default) — <https://docs.anthropic.com/claude/claude-code>
+- **opencode** (alternative; 30+ providers including Anthropic OAuth,
+  ChatGPT Plus, GitHub Copilot, plus API keys) —
+  ```bash
+  curl -fsSL https://opencode.ai/install | bash
+  ```
+
+Authenticate:
+
+- claude-code: `claude /login` (Pro/Max subscription) or set
+  `ANTHROPIC_API_KEY` in your shell.
+- opencode: `opencode providers login`.
+
+Run `vexis-agent doctor` to confirm the brain CLI is on PATH and
+all secrets are reachable.
+
+## Operating
+
+```bash
+vexis-agent run                       # foreground daemon
+vexis-agent service install           # write the systemd user unit
+systemctl --user enable --now vexis-agent.service
+vexis-agent service status            # systemctl --user status …
+vexis-agent service logs --follow     # journalctl -u … -f
+vexis-agent service restart           # after edits to ~/.vexis/config.yaml
+vexis-agent update                    # pipx upgrade (or git pull for editable installs)
+vexis-agent doctor                    # diagnose install + config
+```
+
+`update` never touches `~/.vexis/` or `~/vexis-workspace/` — your
+state is preserved across upgrades. After a successful update it
+prints a hint pointing at `vexis-agent service restart`; it never
+restarts the daemon for you.
+
+## Migrating a running deployment
+
+To move vexis-agent from your dev box to a home server (or any
+fresh machine):
+
+1. Run the curl-bash installer on the destination.
+2. `vexis-agent setup` — interactive prompts.
+3. `scp` your gittable agent state from the source machine:
+   `SOUL.md`, `MEMORY.md`, `USER.md`, `RELATIONSHIPS.md`, and
+   `skills/` go into `~/vexis-workspace/`.
+4. `vexis-agent service install`, then enable + start.
+5. From then on, `vexis-agent update` whenever the dev machine
+   pushes new features.
 
 ## Choosing your brain
 
@@ -86,36 +118,60 @@ walk through the [dogfood checklist](docs/dogfood-checklist.md) —
 `/cancel`, `/goal`, `/schedule`, daemon restart, bad auth, bad
 install, plus two non-negotiable race-condition checks.
 
-## Running
+## Development setup
 
-The daemon expects to run under conda. From the repo root:
+For contributors (and the maintainer's own machine). Conda is one
+option; venv / uv / poetry all work — pick whatever you like.
 
 ```bash
-conda activate vexis-agent_env
-python main.py
+git clone https://github.com/Zeus-Deus/vexis-agent.git
+cd vexis-agent
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
 ```
 
-For systemd / autostart setups, see the dispatch scripts in
-`scripts/` (`vexis-bg`, `vexis-stream`, `vexis-dashboard`, etc.).
+Or with conda (if that's already your workflow):
+
+```bash
+conda create -n vexis-agent_env python=3.11
+conda activate vexis-agent_env
+pip install -e '.[dev]'
+```
+
+Run the test suite:
+
+```bash
+pytest
+```
+
+The legacy entry-point `python main.py` no longer exists post-Phase-2;
+use `vexis-agent run` (or `python -m vexis_agent.cli run`) instead.
+The dispatch wrappers in `scripts/` (`vexis-bg`, `vexis-stream`, …)
+still work for ad-hoc tooling.
 
 ## Project structure
 
-- `core/` — main loop, brain abstraction, learning curator, goals,
-  schedules, sessions, config.
-- `core/brain/` — `Brain` ABC + concrete implementations
-  (`claude_code.py`, `opencode.py`, `null.py` for tests).
-- `transports/` — messaging adapters. Default: `telegram.py`.
-- `tools/` — MCP servers (desktop-control, voxtype, livestream,
-  etc.).
-- `scripts/` — dispatch helpers + `install.sh` / `install.py`.
+- `vexis_agent/` — installable package; the wheel that pipx ships.
+  - `cli.py` — Typer entry, source of `vexis-agent` console script.
+  - `main.py` — daemon entry.
+  - `core/` — main loop, brain ABC + adapters, learning curator,
+    goals, schedules, sessions, config.
+  - `transports/` — messaging adapters. Default: `telegram.py`.
+  - `tools/` — MCP servers (desktop-control, voxtype, livestream, …).
+  - `daemon/` — systemd unit rendering, update detection, doctor.
+  - `data/` — shipped templates the setup wizard installs.
+- `web/` — dashboard frontend (Vite/React; built with `npm run build`).
+- `scripts/` — dev helpers + dispatch wrappers (`vexis-bg`,
+  `vexis-dispatch`, …).
 - `tests/` — pytest suite, parametrised over all three brain
   implementations for the cross-brain contract.
-- `docs/` — user-facing reference (this README, brain-by-brain
-  guide, migration, dogfood checklist).
+- `docs/` — user-facing reference.
 
 ## Status
 
-Phase C of the brain abstraction landing — opencode is opt-in and
-functionally complete pending the Day 8 dogfood-gated flag posture
-decision. claude-code remains the default and is unchanged from
-pre-Phase-C behaviour.
+Packaging effort landed on the `packaging-effort` branch. Everything
+above (curl-bash install, Typer CLI, systemd lifecycle, doctor,
+update) is implemented and dogfooded on the maintainer's dev box.
+The repo is single-user by design; no plans for PyPI / AUR / Docker
+until the curl-bash flow is battle-tested in production.

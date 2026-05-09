@@ -47,7 +47,7 @@ include = ["vexis_agent*"]
 exclude = ["tests*", "scripts*", ".plans*", "docs*", "web*"]
 
 [tool.setuptools.package-data]
-vexis_agent = ["**/*.yaml", "**/*.json"]
+vexis_agent = ["**/*.yaml", "**/*.json", "data/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
