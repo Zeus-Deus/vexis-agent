@@ -165,6 +165,55 @@ def backup(
         typer.echo(f"  vexis-workspace: {result.workspace_root}")
 
 
+@app.command()
+def uninstall(
+    purge_state: bool = typer.Option(
+        False,
+        "--purge-state",
+        help=(
+            "Also delete $VEXIS_HOME (config, curator/learning state, "
+            "goals.json, dashboard token, .env). DESTRUCTIVE."
+        ),
+    ),
+    purge_workspace: bool = typer.Option(
+        False,
+        "--purge-workspace",
+        help=(
+            "Also delete $VEXIS_WORKSPACE (CLAUDE.md, SOUL.md, MEMORY.md, "
+            "USER.md, RELATIONSHIPS.md, memories/, skills/). DESTRUCTIVE."
+        ),
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompts. Use with care.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the uninstall plan and exit without doing anything.",
+    ),
+) -> None:
+    """Remove vexis-agent. Layered: service / package / state.
+
+    Without ``--purge-state``, your ``~/.vexis/`` survives — re-installing
+    later picks up where you left off. ``--purge-workspace`` is even more
+    destructive (deletes memories + skills); only pass it when you're
+    sure you want to start fresh.
+
+    Always prompts before destructive steps unless ``--yes``.
+    """
+    from vexis_agent.daemon.uninstall import build_plan, run_uninstall
+
+    plan = build_plan(purge_state=purge_state, purge_workspace=purge_workspace)
+    typer.echo(plan.describe())
+    if dry_run:
+        return
+    rc = run_uninstall(plan, confirm=not yes)
+    raise typer.Exit(rc)
+
+
 @app.command("backup-restore")
 def backup_restore(
     archive: str = typer.Argument(..., help="Path to a vexis backup zip."),
