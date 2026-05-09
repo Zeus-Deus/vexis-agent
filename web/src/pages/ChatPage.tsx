@@ -60,10 +60,25 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
   // voice affordances so the UI doesn't flash mic-then-no-mic.
   const [voiceInfo, setVoiceInfo] = useState<VoiceInfo | null>(null);
   // User-toggleable TTS mute. Persisted to localStorage so the
-  // preference survives reloads. Default: TTS plays when available.
+  // preference survives reloads. **Muted by default** — opt-in
+  // for spoken replies because:
+  //   - first-time mobile users via Tailscale may be in a public
+  //     space; surprise audio is jarring
+  //   - autoplay policies on iOS Safari can drop the first reply
+  //     audio anyway, so it's better to surface the toggle and let
+  //     the user explicitly enable
+  //   - voice call mode is a separate explicit opt-in (the 📞
+  //     button) and plays its own TTS inside the modal regardless
+  //     of this flag — that's where the "I want to hear replies"
+  //     intent lives most naturally
+  // Storage key writes "0" on opt-in, "1" on mute. Anything else
+  // (unset / corrupted / first-load) coerces to muted.
   const [ttsMuted, setTtsMuted] = useState<boolean>(() => {
-    try { return localStorage.getItem("vexis-tts-muted") === "1"; }
-    catch { return false; }
+    try {
+      const v = localStorage.getItem("vexis-tts-muted");
+      // Only an explicit "0" means the user opted in.
+      return v !== "0";
+    } catch { return true; }
   });
   // Tracks the in-flight TTS audio element so a new reply can stop
   // the previous playback (avoids overlapping audio when replies
