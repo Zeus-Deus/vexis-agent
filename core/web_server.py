@@ -1429,6 +1429,33 @@ class WebDashboard:
                 },
             )
 
+        @app.post(
+            "/api/v1/chat/cancel",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_chat_cancel() -> JSONResponse:
+            """Stop any in-flight brain turn for the web chat.
+
+            The user-facing 'Stop' button calls this; so do
+            session-switch and page-unmount cleanup paths so
+            switching sessions mid-stream doesn't keep burning
+            tokens on a reply you'll never see. Routes to the same
+            RunningTasks.cancel that Telegram's /cancel uses.
+
+            Returns ``{cancelled: bool}`` — true means something
+            was actually killed, false means there was nothing in
+            flight (a no-op cancel is fine; the stop button might
+            be tapped during the gap between SSE 'done' frames).
+            """
+            chat = _chat_or_503()
+            if self._running_tasks is None:
+                # Construction-time hadn't wired running_tasks (test
+                # fixtures). Treat as 'nothing to cancel' rather than
+                # 500 — caller proceeds.
+                return JSONResponse({"cancelled": False})
+            cancelled = await chat.cancel(self._running_tasks)
+            return JSONResponse({"cancelled": cancelled})
+
         @app.get(
             "/api/v1/chat/sessions/{name}/history",
             dependencies=[Depends(_require_auth)],

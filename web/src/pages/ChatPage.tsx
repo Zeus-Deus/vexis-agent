@@ -7,6 +7,7 @@ import {
   type ChatMessage,
 } from "../components/chat/ChatMessages";
 import { ChatComposer } from "../components/chat/ChatComposer";
+import type { AttachmentPickerHandle } from "../components/chat/AttachmentPicker";
 
 // Lazy-load voice call mode + its dependencies (vad-web,
 // onnxruntime-web, the Silero ONNX model wasm). These add ~900 KB
@@ -91,6 +92,30 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
   // composer. Clears after a successful send.
   const [attachmentQueue, setAttachmentQueue] = useState<QueuedAttachment[]>([]);
 
+  // Active stream's AbortController + the session it belongs to.
+  // ``activeStreamRef`` is the source of truth that the Stop
+  // button + session-switch / unmount cleanup all read from. Tied
+  // to a session name so a fast switch-and-resume doesn't
+  // accidentally cancel a stream that just-started for the new
+  // session.
+  const activeStreamRef = useRef<{
+    controller: AbortController;
+    sessionName: string;
+  } | null>(null);
+  // ``streaming`` mirrors the ref into React state so the Stop
+  // button can render conditionally. The ref alone wouldn't
+  // trigger re-renders.
+  const [streaming, setStreaming] = useState(false);
+
+  // Forwarded to AttachmentPicker so drag-drop / paste handlers
+  // on the conversation pane can route uploads through the same
+  // optimistic-chip + progress flow as the paperclip button.
+  const attachmentPickerRef = useRef<AttachmentPickerHandle | null>(null);
+  // Visual feedback while a drag is hovering the conversation
+  // pane. Phones don't fire drag events so this is desktop-only;
+  // we just gate the highlight on the boolean.
+  const [dragHover, setDragHover] = useState(false);
+
   // Voice call mode — opens a full-screen overlay with VAD-driven
   // hands-free conversation. The component owns its own mic +
   // playback; we just track open/closed and forward each turn back
@@ -131,6 +156,38 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
       });
     },
     [],
+  );
+
+  /** Abort the active stream + tell the daemon to kill the brain
+   *  subprocess. Safe to call when nothing's in flight. */
+  const cancelStream = useCallback(
+    async (reason: "user-stop" | "switch" | "unmount" = "user-stop") => {
+      const active = activeStreamRef.current;
+      if (!active) return;
+      activeStreamRef.current = null;
+      setStreaming(false);
+      try { active.controller.abort(); } catch {}
+      // Server-side cancel — best-effort. Without this the brain
+      // subprocess keeps running until it finishes naturally,
+      // burning tokens on a reply nobody will see. ``chatCancel``
+      // swallows its own errors so this won't throw.
+      void api.chatCancel(token);
+      // ``unmount`` skips state mutations because the component
+      // is going away anyway and React would warn about state-
+      // updates-on-unmounted.
+      if (reason === "unmount") return;
+      // For switch / user-stop, leave whatever already-streamed
+      // content is in the bubble. Drop the bubble entirely if it
+      // never received any chunks (would render as empty).
+      setMessages(active.sessionName, (prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.role === "assistant" && last.content === "") {
+          return prev.slice(0, -1);
+        }
+        return prev;
+      });
+    },
+    [token, setMessages],
   );
 
   const refreshSessions = useCallback(
@@ -225,6 +282,34 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [refreshSessions]);
+
+  // Cancel any in-flight stream when:
+  //   1. The active session changes (user switched mid-stream
+  //      — the abandoned bubble shouldn't keep growing in a
+  //      hidden buffer, AND we shouldn't keep paying brain
+  //      tokens for a reply the user navigated away from).
+  //   2. The component unmounts (page reload, route change,
+  //      auth-fail re-mount).
+  // The ref tracks ``sessionName`` so we only cancel when the
+  // ACTIVE name diverges from the streaming-bubble's name.
+  useEffect(() => {
+    const active = activeStreamRef.current;
+    if (active && active.sessionName !== activeName) {
+      void cancelStream("switch");
+    }
+  }, [activeName, cancelStream]);
+  useEffect(() => {
+    return () => {
+      // Unmount: same path. Voids all state updates since the
+      // component is going away anyway.
+      const active = activeStreamRef.current;
+      if (active) {
+        try { active.controller.abort(); } catch {}
+        void api.chatCancel(token);
+        activeStreamRef.current = null;
+      }
+    };
+  }, [token]);
 
   // Voice-capability probe. One-shot on mount — the result drives
   // whether the mic button renders and whether TTS playback fires.
@@ -336,6 +421,18 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
       setPendingSend(true);
       setAttachmentQueue([]);
 
+      // Track this stream's AbortController so the Stop button +
+      // session-switch / unmount cleanup can kill it. Cleared in
+      // the ``finally`` below regardless of how the stream ends —
+      // success, error, or user-stop — so a subsequent send always
+      // starts from a known empty state.
+      const controller = new AbortController();
+      activeStreamRef.current = {
+        controller,
+        sessionName: activeName,
+      };
+      setStreaming(true);
+
       try {
         await api.chatSendStream(
           token,
@@ -347,6 +444,7 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
                 : undefined,
           },
           {
+            signal: controller.signal,
             onChunk: (chunk) => {
               // Find the assistant bubble we placed and append the
               // chunk to its content. ``assistantTs`` stays unique
@@ -404,6 +502,15 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
           },
         );
       } catch (exc: unknown) {
+        // AbortError is raised by fetch when our AbortController
+        // fires — that's the user-stop / switch / unmount path,
+        // which has already been handled by ``cancelStream``. Drop
+        // the throw silently so we don't paint a scary "⚠️ The
+        // operation was aborted" system row over a deliberate
+        // cancel.
+        if (exc instanceof DOMException && exc.name === "AbortError") {
+          return;
+        }
         if (exc instanceof ApiError && exc.status === 401) {
           onAuthFail();
           return;
@@ -415,10 +522,82 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
         ]);
       } finally {
         setPendingSend(false);
+        // Only clear the activeStreamRef if it still points at THIS
+        // controller — a fast cancel-then-resend could have already
+        // overwritten it with a new entry by the time this finally
+        // runs (cancelStream nulls the ref synchronously).
+        if (activeStreamRef.current?.controller === controller) {
+          activeStreamRef.current = null;
+        }
+        setStreaming(false);
       }
     },
     [activeName, token, onAuthFail, setMessages, speakReply],
   );
+
+  /** Edit-and-resend the last user message. Drops everything from
+   *  the last user bubble onward (including the assistant's reply),
+   *  then routes the new text through the same streaming send path.
+   *  Append-only — we don't rewind the brain's session JSONL, the
+   *  brain just sees a new user turn after this. Simpler than
+   *  ChatGPT's branch model but works for the user-visible UI. */
+  const handleEditLastUser = useCallback(
+    (newText: string, attachments: QueuedAttachment[]) => {
+      if (!activeName) return;
+      // Truncate the visible buffer to BEFORE the last user message
+      // — we'll re-send via handleSend which appends a fresh user
+      // bubble with the new text. Walk from the end so we drop the
+      // most recent user (and everything that came after).
+      setMessages(activeName, (prev) => {
+        for (let i = prev.length - 1; i >= 0; i--) {
+          if (prev[i].role === "user") {
+            return prev.slice(0, i);
+          }
+        }
+        return prev;
+      });
+      // Re-send with the edited text. ``handleSend`` is async but
+      // we don't need to await — it owns its own pending/streaming
+      // state.
+      void handleSend(newText, attachments);
+    },
+    [activeName, setMessages, handleSend],
+  );
+
+  /** Re-run the last turn. Drops the assistant bubble, then
+   *  re-sends the previous user message verbatim. Same append-only
+   *  contract as edit. */
+  const handleRegenerateLastAssistant = useCallback(() => {
+    if (!activeName) return;
+    const buf = buffers[activeName] ?? [];
+    // Find the last assistant index AND the user message that
+    // preceded it. If either is missing, no-op (regenerate
+    // shouldn't run on a blank conversation).
+    let lastAssistantIdx = -1;
+    for (let i = buf.length - 1; i >= 0; i--) {
+      if (buf[i].role === "assistant" && buf[i].content.length > 0) {
+        lastAssistantIdx = i;
+        break;
+      }
+    }
+    if (lastAssistantIdx === -1) return;
+    let lastUserIdx = -1;
+    for (let i = lastAssistantIdx - 1; i >= 0; i--) {
+      if (buf[i].role === "user") {
+        lastUserIdx = i;
+        break;
+      }
+    }
+    if (lastUserIdx === -1) return;
+    const userMsg = buf[lastUserIdx];
+    // Truncate to BEFORE the last user bubble — handleSend will
+    // re-append a fresh user bubble with the same text. We drop the
+    // old user bubble too rather than just the assistant so the
+    // conversation reads cleanly (one user/assistant pair, not a
+    // duplicated user followed by a new assistant).
+    setMessages(activeName, (prev) => prev.slice(0, lastUserIdx));
+    void handleSend(userMsg.content, userMsg.attachments ?? []);
+  }, [activeName, buffers, setMessages, handleSend]);
 
   // Voice capture: STT + brain turn in one round-trip. The server
   // returns both the transcript and the brain's reply, which we
@@ -545,6 +724,130 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
     [token, onAuthFail, refreshSessions],
   );
 
+  /** Filter a list of File objects to ones the server will accept.
+   *  Mirrors the picker's ACCEPT list — keeping a copy here so a
+   *  drag of an unsupported type (e.g. a video) surfaces a clean
+   *  "not supported" toast instead of a 415 from the upload route.
+   *  Server-side validation in
+   *  ``core/web_server.py:_attach_route`` is still the authority. */
+  const filterAcceptable = useCallback(
+    (files: File[]): { ok: File[]; rejected: string[] } => {
+      const accept = new Set([
+        "image/png", "image/jpeg", "image/webp", "image/gif",
+        "application/pdf", "text/plain", "text/markdown", "text/csv",
+        "application/json",
+      ]);
+      const ok: File[] = [];
+      const rejected: string[] = [];
+      for (const f of files) {
+        // Some pasted images come through with an empty type when
+        // the OS pasteboard didn't tag them — accept anything that
+        // claims to be an image.
+        if (accept.has(f.type) || f.type.startsWith("image/")) {
+          ok.push(f);
+        } else {
+          rejected.push(f.name || `(${f.type || "unknown"})`);
+        }
+      }
+      return { ok, rejected };
+    },
+    [],
+  );
+
+  /** Hand a batch of files to the AttachmentPicker's exposed
+   *  uploadFiles handle. Used by both drag-drop and paste. */
+  const uploadFiles = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) return;
+      const { ok, rejected } = filterAcceptable(files);
+      if (rejected.length > 0) {
+        setError(
+          `Skipped ${rejected.length} unsupported file${rejected.length > 1 ? "s" : ""}: ${rejected.join(", ")}`,
+        );
+      }
+      if (ok.length === 0) return;
+      const handle = attachmentPickerRef.current;
+      if (!handle) return;
+      await handle.uploadFiles(ok);
+    },
+    [filterAcceptable],
+  );
+
+  // Drag-and-drop on the conversation pane. We attach to the entire
+  // chat container (sidebar excluded) so the user has a generous
+  // hit area — anywhere over the messages list or composer wrapper
+  // counts as "drop here". Browser default behaviour on a drop is
+  // to navigate to the file URL; preventDefault on every event in
+  // the chain stops that.
+  const onDragEnter = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      // Only react when files are being dragged — text drags
+      // (e.g. dragging a selection) shouldn't trigger the upload UI.
+      if (!Array.from(e.dataTransfer.types).includes("Files")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setDragHover(true);
+    },
+    [],
+  );
+  const onDragOver = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (!Array.from(e.dataTransfer.types).includes("Files")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      // dropEffect "copy" gives the browser the right cursor.
+      e.dataTransfer.dropEffect = "copy";
+    },
+    [],
+  );
+  const onDragLeave = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      // Only flip hover off when we leave the chat container — not
+      // every child boundary the cursor crosses.
+      if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+      setDragHover(false);
+    },
+    [],
+  );
+  const onDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setDragHover(false);
+      void uploadFiles(files);
+    },
+    [uploadFiles],
+  );
+
+  // Paste handler — trapped on the document so it works regardless
+  // of which composer-internal element has focus. Most common case:
+  // the user takes a screenshot (Cmd+Shift+4 on macOS, PrtSc on
+  // Linux) and pastes into the chat. We pull only image-typed
+  // entries from clipboard.items; ignoring text/* lets a paste of
+  // mixed clipboard content (image + html) still work as expected.
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const files: File[] = [];
+      for (const item of Array.from(items)) {
+        if (item.kind === "file") {
+          const f = item.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+      if (files.length === 0) return;
+      // Prevent the default paste which would otherwise embed the
+      // image into the textarea as base64 (some browsers do this).
+      e.preventDefault();
+      void uploadFiles(files);
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  }, [uploadFiles]);
+
   const handleDelete = useCallback(
     async (name: string) => {
       setPendingName(name);
@@ -596,7 +899,13 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
         onRename={handleRename}
         onDelete={handleDelete}
       />
-      <div className="flex-1 flex flex-col min-w-0">
+      <div
+        className="flex-1 flex flex-col min-w-0 relative"
+        onDragEnter={onDragEnter}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+      >
         {/* Mobile-only header: hamburger to open the drawer + the
             active session name as the visual orienting cue. Above md
             the sidebar is always visible so this row is hidden. */}
@@ -698,10 +1007,17 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
             {error}
           </div>
         )}
-        <ChatMessages messages={messages} pending={pendingSend} />
+        <ChatMessages
+          messages={messages}
+          pending={pendingSend}
+          onEditLastUser={handleEditLastUser}
+          onRegenerateLastAssistant={handleRegenerateLastAssistant}
+        />
         <ChatComposer
           token={token}
           pending={pendingSend}
+          streaming={streaming}
+          onStop={() => void cancelStream("user-stop")}
           onSend={handleSend}
           sttAvailable={voiceInfo?.stt.available ?? false}
           onVoiceCapture={handleVoiceCapture}
@@ -717,7 +1033,26 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
           attachmentQueue={attachmentQueue}
           setAttachmentQueue={setAttachmentQueue}
           onAttachmentError={(m) => setError(m)}
+          attachmentPickerRef={attachmentPickerRef}
         />
+        {/* Drag-hover overlay — full-pane translucent state with a
+            "drop image here" affordance. Pointer-events:none so the
+            drop event still reaches the underlying container.
+            Hidden on mobile (no drag events fire from a tap). */}
+        {dragHover && (
+          <div
+            aria-hidden
+            className={[
+              "hidden md:flex absolute inset-0 z-20 pointer-events-none",
+              "items-center justify-center",
+              "bg-[var(--color-accent)]/10 border-2 border-dashed",
+              "border-[var(--color-accent)]",
+              "text-[var(--color-accent)] text-sm font-semibold tracking-wide",
+            ].join(" ")}
+          >
+            Drop to attach
+          </div>
+        )}
       </div>
       {callOpen && (
         <Suspense fallback={null}>

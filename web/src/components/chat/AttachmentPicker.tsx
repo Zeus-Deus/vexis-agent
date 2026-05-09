@@ -1,6 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState,
+} from "react";
 import { api, ApiError } from "../../lib/api";
 import type { QueuedAttachment } from "../../lib/types";
+
+/** Handle exposed by ``AttachmentPicker`` via ``ref``. Lets the
+ *  parent (ChatPage) trigger an upload from drag-drop / paste
+ *  without re-implementing the optimistic-chip + progress flow. */
+export interface AttachmentPickerHandle {
+  /** Upload a list of File objects sequentially — same flow the
+   *  paperclip button uses. Returns when all uploads finish or
+   *  fail; errors are surfaced through the ``onError`` callback
+   *  rather than thrown so a single bad file doesn't cancel the
+   *  rest of the batch. */
+  uploadFiles: (files: File[]) => Promise<void>;
+}
 
 interface AttachmentPickerProps {
   token: string;
@@ -40,13 +54,16 @@ interface UploadState {
   abort: AbortController;
 }
 
-export function AttachmentPicker({
+export const AttachmentPicker = forwardRef<
+  AttachmentPickerHandle,
+  AttachmentPickerProps
+>(function AttachmentPicker({
   token,
   disabled,
   queue,
   onChange,
   onError,
-}: AttachmentPickerProps) {
+}, ref) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   // Map keyed by client-generated id (we mint one per File) so the
   // chip can correlate progress events to its row even before the
@@ -145,6 +162,24 @@ export function AttachmentPicker({
     [uploadOne],
   );
 
+  // Expose ``uploadFiles`` so ChatPage's drag-drop / paste handlers
+  // can route into the same optimistic-chip + progress flow as the
+  // paperclip-picked path. Recreated on every uploadOne re-bind so
+  // the closure inside captures the latest queue (uploadOne already
+  // depends on ``queue``).
+  useImperativeHandle(
+    ref,
+    () => ({
+      uploadFiles: async (files: File[]) => {
+        for (const file of files) {
+          // eslint-disable-next-line no-await-in-loop
+          await uploadOne(file);
+        }
+      },
+    }),
+    [uploadOne],
+  );
+
   // Active uploads — surfaced as a small "uploading X" indicator
   // alongside the paperclip. We don't render per-chip progress in
   // this minimal phase; can layer that in if the use case needs it.
@@ -194,7 +229,7 @@ export function AttachmentPicker({
       </button>
     </>
   );
-}
+});
 
 /**
  * Render the queued-attachment chips above the textarea. Kept as a

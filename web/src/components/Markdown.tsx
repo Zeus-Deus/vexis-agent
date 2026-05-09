@@ -1,9 +1,72 @@
+import { useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 interface MarkdownProps {
   source: string;
   className?: string;
+}
+
+/** Wraps a fenced ``<pre>`` code block in a relatively-positioned
+ *  shell with a Copy button overlay. The button reads
+ *  ``pre.textContent`` at click time so we don't have to walk
+ *  ReactMarkdown's nested children tree to flatten the source —
+ *  the DOM already has the right text. ``aria-live`` on the label
+ *  span announces the "Copied" flip for screen readers.
+ *
+ *  Why a separate component (not inline JSX in ``components.pre``):
+ *  hooks. The copy state + revert timer need ``useRef`` /
+ *  ``useState``, which can't sit inside a ReactMarkdown component
+ *  override that's redefined per render — would leak timers. */
+function CodeBlockWithCopy(
+  { children, ...rest }: React.HTMLAttributes<HTMLPreElement>,
+) {
+  const preRef = useRef<HTMLPreElement | null>(null);
+  const [copied, setCopied] = useState(false);
+  const onCopy = async () => {
+    const text = preRef.current?.textContent ?? "";
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Browsers without clipboard API (rare) — fail silently.
+      // Per-bubble copy button has the same posture; consistency
+      // matters more than a one-off error path here.
+    }
+  };
+  return (
+    <div className="relative group not-prose">
+      <pre ref={preRef} {...rest}>
+        {children}
+      </pre>
+      <button
+        type="button"
+        onClick={onCopy}
+        data-testid="codeblock-copy"
+        aria-label={copied ? "Copied to clipboard" : "Copy code"}
+        title={copied ? "Copied" : "Copy"}
+        className={[
+          // Tucked top-right, only visible on hover/focus on
+          // desktop — mobile shows it always (no hover state).
+          // ``opacity-0 group-hover:opacity-100`` handles the
+          // hover; ``focus-within`` keeps it visible while the
+          // button itself has focus (keyboard nav).
+          "absolute top-1.5 right-1.5 z-10",
+          "px-2 py-0.5 text-[10px] uppercase tracking-wider",
+          "rounded border transition-all",
+          "bg-[var(--color-surface)] border-[var(--color-border-strong)]",
+          "text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]",
+          "hover:bg-[var(--color-base)]",
+          "md:opacity-0 md:group-hover:opacity-100 md:focus:opacity-100",
+          copied ? "text-[var(--color-accent)]" : "",
+        ].join(" ")}
+      >
+        {copied ? "Copied" : "Copy"}
+      </button>
+    </div>
+  );
 }
 
 // Markdown renderer with a dialed-in dark style. Used for SKILL.md
@@ -56,7 +119,18 @@ export function Markdown({ source, className }: MarkdownProps) {
         .filter(Boolean)
         .join(" ")}
     >
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{source}</ReactMarkdown>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          // Override fenced code blocks (``<pre>``) to add the copy
+          // affordance. Inline code (``<code>`` not inside ``<pre>``)
+          // stays untouched — copy buttons on inline code would be
+          // visual noise.
+          pre: CodeBlockWithCopy,
+        }}
+      >
+        {source}
+      </ReactMarkdown>
     </div>
   );
 }

@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { Ref } from "react";
 import { MicButton } from "./MicButton";
 import {
   AttachmentChips,
   AttachmentPicker,
+  type AttachmentPickerHandle,
 } from "./AttachmentPicker";
 import type { QueuedAttachment } from "../../lib/types";
 
@@ -14,6 +16,16 @@ interface ChatComposerProps {
   // Send is blocked but the textarea stays editable so the user
   // can queue their next message during the wait.
   pending: boolean;
+  // True while an SSE stream is open and assistant tokens are
+  // still arriving. Drives the Send→Stop button swap. Distinct
+  // from ``pending`` because the buffered (non-streaming) voice
+  // round-trip flips ``pending`` without ever flipping
+  // ``streaming`` — only the SSE chat path has a stream to stop.
+  streaming: boolean;
+  // Called when the user clicks the Stop button. Parent aborts
+  // the in-flight fetch and POSTs /chat/cancel so the brain
+  // subprocess actually quits (not just the SSE pipe).
+  onStop: () => void;
   // Called with the user's text + the queued attachments. Parent
   // is responsible for clearing the queue after a successful send
   // (passes a fresh empty array via ``attachments`` next render).
@@ -38,6 +50,11 @@ interface ChatComposerProps {
   attachmentQueue: QueuedAttachment[];
   setAttachmentQueue: (next: QueuedAttachment[]) => void;
   onAttachmentError: (message: string) => void;
+  // Ref forwarded to the underlying AttachmentPicker so the page's
+  // drag-drop / paste handlers can route into the same upload flow
+  // as the paperclip button. ``null`` is allowed because tests +
+  // legacy call sites that don't need drag-drop just omit it.
+  attachmentPickerRef?: Ref<AttachmentPickerHandle>;
 }
 
 // Soft cap on the textarea height so a giant paste doesn't push the
@@ -48,6 +65,8 @@ const MAX_HEIGHT_PX = 240;
 export function ChatComposer({
   token,
   pending,
+  streaming,
+  onStop,
   onSend,
   sttAvailable,
   onVoiceCapture,
@@ -57,6 +76,7 @@ export function ChatComposer({
   attachmentQueue,
   setAttachmentQueue,
   onAttachmentError,
+  attachmentPickerRef,
 }: ChatComposerProps) {
   const [draft, setDraft] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -142,6 +162,7 @@ export function ChatComposer({
           ].join(" ")}
         >
           <AttachmentPicker
+            ref={attachmentPickerRef}
             token={token}
             disabled={pending}
             queue={attachmentQueue}
@@ -192,30 +213,59 @@ export function ChatComposer({
               <span aria-hidden className="text-base leading-none">📞</span>
             </button>
           )}
-          <button
-            type="button"
-            onClick={submit}
-            disabled={!draft.trim() || pending}
-            className={[
-              "shrink-0 rounded-md font-semibold transition-colors",
-              // Mobile: square 44x44 icon button (touch-target floor),
-              // arrow glyph instead of "SEND" text — the 50px the
-              // word would have eaten lets the textarea breathe.
-              // Desktop: keep the labeled pill button.
-              "w-11 h-11 flex items-center justify-center text-base",
-              "md:w-auto md:h-auto md:px-3 md:py-1.5 md:text-xs md:uppercase md:tracking-wider",
-              "bg-[var(--color-accent)] text-[var(--color-accent-fg)]",
-              "hover:bg-[var(--color-accent-2)] hover:text-[var(--color-fg)]",
-              "disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-[var(--color-accent)]",
-            ].join(" ")}
-            aria-label="Send message"
-          >
-            {/* Up-arrow glyph on mobile (sends "up" into the
-                conversation), "Send" text on desktop. md:hidden /
-                hidden md:inline is the canonical Tailwind toggle. */}
-            <span aria-hidden className="md:hidden">↑</span>
-            <span className="hidden md:inline">Send</span>
-          </button>
+          {streaming ? (
+            // Stop button — replaces Send while assistant tokens
+            // are streaming in. Distinct red-ish accent so it
+            // reads as a destructive action; the square glyph is
+            // the de-facto "stop" pictogram (matches ChatGPT,
+            // Claude.ai, Cursor). data-testid keeps the
+            // ChatComposer test surface stable across Send/Stop
+            // swaps without coupling tests to localised aria
+            // labels.
+            <button
+              type="button"
+              onClick={onStop}
+              data-testid="composer-stop"
+              aria-label="Stop generating"
+              title="Stop generating"
+              className={[
+                "shrink-0 rounded-md font-semibold transition-colors",
+                "w-11 h-11 flex items-center justify-center text-base",
+                "md:w-auto md:h-auto md:px-3 md:py-1.5 md:text-xs md:uppercase md:tracking-wider",
+                "bg-[var(--color-error)] text-[var(--color-base)]",
+                "hover:opacity-90",
+              ].join(" ")}
+            >
+              <span aria-hidden className="md:hidden">■</span>
+              <span className="hidden md:inline">Stop</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={submit}
+              data-testid="composer-send"
+              disabled={!draft.trim() || pending}
+              className={[
+                "shrink-0 rounded-md font-semibold transition-colors",
+                // Mobile: square 44x44 icon button (touch-target
+                // floor), arrow glyph instead of "SEND" text — the
+                // 50px the word would have eaten lets the textarea
+                // breathe. Desktop: keep the labeled pill.
+                "w-11 h-11 flex items-center justify-center text-base",
+                "md:w-auto md:h-auto md:px-3 md:py-1.5 md:text-xs md:uppercase md:tracking-wider",
+                "bg-[var(--color-accent)] text-[var(--color-accent-fg)]",
+                "hover:bg-[var(--color-accent-2)] hover:text-[var(--color-fg)]",
+                "disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-[var(--color-accent)]",
+              ].join(" ")}
+              aria-label="Send message"
+            >
+              {/* Up-arrow glyph on mobile (sends "up" into the
+                  conversation), "Send" text on desktop. md:hidden /
+                  hidden md:inline is the canonical Tailwind toggle. */}
+              <span aria-hidden className="md:hidden">↑</span>
+              <span className="hidden md:inline">Send</span>
+            </button>
+          )}
         </div>
         {/* Keyboard hint is desktop-only — mobile keyboards don't
             expose Shift+Enter and the line just steals 16px of

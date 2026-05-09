@@ -147,3 +147,214 @@ describe("ChatMessages — copy button", () => {
     });
   });
 });
+
+
+// ──────────────────────────────────────────────────────────────────
+// Edit + Regenerate (Phase 4)
+// ──────────────────────────────────────────────────────────────────
+
+
+describe("ChatMessages — Edit last user message", () => {
+  it("renders an Edit button only on the LAST user bubble", () => {
+    render(
+      <ChatMessages
+        messages={[
+          userMsg("first user msg"),
+          assistantMsg("first reply"),
+          userMsg("second user msg"),
+          assistantMsg("second reply"),
+        ]}
+        pending={false}
+        onEditLastUser={vi.fn()}
+      />,
+    );
+    // Only one Edit button — on the second (last) user bubble.
+    const editButtons = screen.getAllByTestId("bubble-edit");
+    expect(editButtons).toHaveLength(1);
+  });
+
+  it("does NOT render Edit when onEditLastUser is undefined", () => {
+    render(
+      <ChatMessages
+        messages={[userMsg("only msg"), assistantMsg("reply")]}
+        pending={false}
+        // onEditLastUser omitted on purpose — caller hasn't wired
+        // edit yet, the affordance shouldn't appear.
+      />,
+    );
+    expect(screen.queryByTestId("bubble-edit")).toBeNull();
+  });
+
+  it("does NOT render Edit while ``pending`` is true", () => {
+    // Edit during a streaming reply would race with the in-flight
+    // turn. Hide the button until the reply finishes.
+    render(
+      <ChatMessages
+        messages={[userMsg("hi"), assistantMsg("typing…")]}
+        pending={true}
+        onEditLastUser={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId("bubble-edit")).toBeNull();
+  });
+
+  it("clicking Edit swaps the bubble into a textarea pre-filled with the original", () => {
+    render(
+      <ChatMessages
+        messages={[userMsg("original text"), assistantMsg("reply")]}
+        pending={false}
+        onEditLastUser={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("bubble-edit"));
+    const ta = screen.getByTestId("bubble-edit-textarea") as HTMLTextAreaElement;
+    expect(ta.value).toBe("original text");
+  });
+
+  it("Save fires onEditLastUser with the trimmed new text + original attachments", () => {
+    const onEdit = vi.fn();
+    const userWithAttachments: ChatMessage = {
+      role: "user",
+      content: "what's this?",
+      ts: 1700000000000,
+      attachments: [
+        { path: "/tmp/cat.png", name: "cat.png", size: 100, mime: "image/png" },
+      ],
+    };
+    render(
+      <ChatMessages
+        messages={[userWithAttachments, assistantMsg("a cat")]}
+        pending={false}
+        onEditLastUser={onEdit}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("bubble-edit"));
+    const ta = screen.getByTestId("bubble-edit-textarea") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "  what kind of cat? " } });
+    fireEvent.click(screen.getByTestId("bubble-edit-save"));
+    expect(onEdit).toHaveBeenCalledTimes(1);
+    expect(onEdit).toHaveBeenCalledWith(
+      "what kind of cat?",
+      userWithAttachments.attachments,
+    );
+  });
+
+  it("Cancel reverts to the read-only bubble without calling onEditLastUser", () => {
+    const onEdit = vi.fn();
+    render(
+      <ChatMessages
+        messages={[userMsg("don't change"), assistantMsg("ok")]}
+        pending={false}
+        onEditLastUser={onEdit}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("bubble-edit"));
+    const ta = screen.getByTestId("bubble-edit-textarea") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "modified but cancelled" } });
+    fireEvent.click(screen.getByTestId("bubble-edit-cancel"));
+    expect(onEdit).not.toHaveBeenCalled();
+    // Bubble back in read-only mode — the textarea is gone.
+    expect(screen.queryByTestId("bubble-edit-textarea")).toBeNull();
+  });
+
+  it("Enter submits, Escape cancels in the edit textarea", () => {
+    const onEdit = vi.fn();
+    render(
+      <ChatMessages
+        messages={[userMsg("seed"), assistantMsg("reply")]}
+        pending={false}
+        onEditLastUser={onEdit}
+      />,
+    );
+    // Submit via Enter.
+    fireEvent.click(screen.getByTestId("bubble-edit"));
+    let ta = screen.getByTestId("bubble-edit-textarea") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "edited via enter" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onEdit).toHaveBeenCalledWith("edited via enter", []);
+
+    // Cancel via Escape on a fresh edit session.
+    fireEvent.click(screen.getByTestId("bubble-edit"));
+    ta = screen.getByTestId("bubble-edit-textarea") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "abandoned" } });
+    fireEvent.keyDown(ta, { key: "Escape" });
+    // onEdit count unchanged from the first submission.
+    expect(onEdit).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("bubble-edit-textarea")).toBeNull();
+  });
+
+  it("Save with the unchanged text exits edit mode without firing onEditLastUser", () => {
+    // No-op edit — burning a brain turn on the identical message
+    // would surprise the user. Re-enter read-only mode silently.
+    const onEdit = vi.fn();
+    render(
+      <ChatMessages
+        messages={[userMsg("same"), assistantMsg("ok")]}
+        pending={false}
+        onEditLastUser={onEdit}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("bubble-edit"));
+    fireEvent.click(screen.getByTestId("bubble-edit-save"));
+    expect(onEdit).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("bubble-edit-textarea")).toBeNull();
+  });
+});
+
+
+describe("ChatMessages — Regenerate last assistant", () => {
+  it("renders a Regenerate button only on the LAST non-empty assistant bubble", () => {
+    render(
+      <ChatMessages
+        messages={[
+          userMsg("u1"), assistantMsg("a1"),
+          userMsg("u2"), assistantMsg("a2"),
+        ]}
+        pending={false}
+        onRegenerateLastAssistant={vi.fn()}
+      />,
+    );
+    const buttons = screen.getAllByTestId("bubble-regenerate");
+    expect(buttons).toHaveLength(1);
+  });
+
+  it("Regenerate is suppressed on an in-flight (empty content) assistant bubble", () => {
+    // While streaming, the empty placeholder bubble shouldn't get
+    // a Regenerate button — there's nothing to regenerate yet.
+    render(
+      <ChatMessages
+        messages={[
+          userMsg("hello"),
+          { role: "assistant", content: "", ts: 1700000001000 },
+        ]}
+        pending={true}
+        onRegenerateLastAssistant={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId("bubble-regenerate")).toBeNull();
+  });
+
+  it("clicking Regenerate fires the callback exactly once", () => {
+    const onRegen = vi.fn();
+    render(
+      <ChatMessages
+        messages={[userMsg("hi"), assistantMsg("first reply")]}
+        pending={false}
+        onRegenerateLastAssistant={onRegen}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("bubble-regenerate"));
+    expect(onRegen).toHaveBeenCalledTimes(1);
+  });
+
+  it("Regenerate is hidden while pending is true", () => {
+    render(
+      <ChatMessages
+        messages={[userMsg("hi"), assistantMsg("complete reply")]}
+        pending={true}
+        onRegenerateLastAssistant={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId("bubble-regenerate")).toBeNull();
+  });
+});

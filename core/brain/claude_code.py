@@ -94,6 +94,50 @@ BRAIN_TIMEOUT_SECONDS = 1800
 # the buffer at a time.
 _BRAIN_STREAM_LIMIT_BYTES = 32 * 1024 * 1024
 
+
+def _session_jsonl_exists(workspace: Path, session_id: str) -> bool:
+    """True when claude-code already has a transcript on disk for
+    this session UUID — i.e. when ``--session-id <uuid>`` would be
+    rejected with "Session ID is already in use".
+
+    claude stores transcripts at::
+
+        ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+
+    where encoded-cwd is the workspace path with ``/`` replaced by
+    ``-`` and a leading ``-`` (verified against claude-code 2.1.138
+    by inspecting the live projects directory).
+
+    This is the ONLY signal claude uses to decide whether a session
+    UUID is "in use" — it's a pure file-existence check, not a
+    process-lock or sessions-database lookup. Disassembled from
+    the binary's ``Hf$(H)`` function::
+
+        function Hf$(H) {
+          let $ = WQ() ?? mf(q6()),
+              q = Ff.join($, `${H}.jsonl`);
+          try { return statSync(q), true; }
+          catch { return false; }
+        }
+
+    The bug we're working around: vexis's first-turn-vs-subsequent
+    branch in :meth:`respond` / :meth:`astream` picks ``--session-id``
+    when ``SessionStore.is_initialized()`` is False. ``mark_initialized``
+    only gets called at the *end* of a successful turn, so a turn
+    that's cancelled mid-stream (Stop button, /cancel) leaves the
+    in-memory flag at False even though claude has already written
+    a partial transcript JSONL. The next turn re-spawns with
+    ``--session-id`` against a UUID whose JSONL exists, and
+    claude exits 1 with "Session ID is already in use".
+
+    This helper is the disk-state authority that breaks that race:
+    if the JSONL exists, use ``--resume`` regardless of what
+    ``is_initialized()`` says. Idempotent and side-effect-free.
+    """
+    encoded = "-" + str(workspace).strip("/").replace("/", "-")
+    jsonl = Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
+    return jsonl.is_file()
+
 # Day 2 model UX: claude-code prints the bad-model diagnostic to
 # STDOUT (not stderr) and exits 1. Verified empirically:
 #   $ claude --model definitely-not-a-real-model -p "hi"
@@ -337,8 +381,20 @@ class ClaudeCodeBrain(Brain):
             f" (reasoning: {reasoning_level})" if reasoning_level else "",
         )
         session_id = self._session.get()
-        # First call pins the UUID with --session-id; subsequent calls resume it.
-        if self._session.is_initialized():
+        # First call pins the UUID with --session-id; subsequent
+        # calls resume it. The decision is grounded in DISK state
+        # (does the transcript JSONL exist?) rather than the in-
+        # memory ``is_initialized`` flag, because a turn cancelled
+        # mid-stream (Stop button / /cancel / SIGKILL) writes a
+        # partial transcript without ever flipping the flag —
+        # hitting ``--session-id`` on the next turn would surface
+        # claude's "Session ID already in use" check. The disk
+        # check is what claude itself uses to decide; aligning
+        # vexis with that closes the race entirely.
+        if (
+            self._session.is_initialized()
+            or _session_jsonl_exists(self._workspace, session_id)
+        ):
             session_flag = ["--resume", session_id]
         else:
             session_flag = ["--session-id", session_id]
@@ -530,7 +586,16 @@ class ClaudeCodeBrain(Brain):
             f" (reasoning: {reasoning_level})" if reasoning_level else "",
         )
         session_id = self._session.get()
-        if self._session.is_initialized():
+        # Same disk-state-authority --session-id-vs-resume decision
+        # as :meth:`respond`. The streaming path is the *hottest*
+        # path for the post-cancel bug because the web chat's Stop
+        # button fires here; without this check, every Stop →
+        # resend produces "Session ID already in use" even though
+        # the in-memory ``is_initialized`` flag is still False.
+        if (
+            self._session.is_initialized()
+            or _session_jsonl_exists(self._workspace, session_id)
+        ):
             session_flag = ["--resume", session_id]
         else:
             session_flag = ["--session-id", session_id]

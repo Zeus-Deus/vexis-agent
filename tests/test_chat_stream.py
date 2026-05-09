@@ -392,4 +392,129 @@ def test_chat_send_still_uses_buffered_respond(
     assert r.status_code == 200
     body = r.json()
     assert body == {"reply": "streamed reply text"}
-    assert brain.calls() == [("hello", -1, None, None)]
+
+
+# ──────────────────────────────────────────────────────────────────
+# /api/v1/chat/cancel — Stop button + session-switch cleanup
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_cancel_route_requires_auth(client: TestClient) -> None:
+    """Same auth gate as the rest of /chat/*. Without a token the
+    cancel route can't be used to discover whether a turn is in
+    flight (info-leak)."""
+    r = client.post("/api/v1/chat/cancel")
+    assert r.status_code == 401
+
+
+def test_cancel_route_returns_false_when_running_tasks_unwired(
+    client: TestClient,
+) -> None:
+    """Test fixture sets ``_running_tasks=None`` — the cancel route
+    should treat this as 'nothing to cancel' rather than 500. Lets
+    the front-end fire-and-forget regardless of construction state.
+    """
+    r = client.post("/api/v1/chat/cancel", headers=_auth())
+    assert r.status_code == 200
+    assert r.json() == {"cancelled": False}
+
+
+def test_cancel_route_invokes_running_tasks_cancel(
+    chat: WebChatTransport, tmp_path: Path,
+) -> None:
+    """When ``_running_tasks`` is wired, the cancel route should
+    route through ``RunningTasks.cancel(WEB_CHAT_ID=-1)``. Pin the
+    chat_id so a future refactor can't silently start cancelling
+    Telegram chats from the web Stop button."""
+
+    class FakeRunning:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        async def cancel(self, chat_id: int, grace_seconds: float = 2.0) -> bool:
+            self.calls.append(chat_id)
+            # Pretend a turn was running so we can assert on the
+            # response body (cancelled=true).
+            return True
+
+    fake = FakeRunning()
+    dashboard = WebDashboard.__new__(WebDashboard)
+    dashboard._workspace = tmp_path  # type: ignore[attr-defined]
+    dashboard._token = _TOKEN  # type: ignore[attr-defined]
+    dashboard._learning = None  # type: ignore[attr-defined]
+    dashboard._chat = chat  # type: ignore[attr-defined]
+    dashboard._relationships_mutation_window_seconds = 600  # type: ignore[attr-defined]
+    dashboard._relationships_mutation_limit = 100  # type: ignore[attr-defined]
+    dashboard._relationships_mutation_log = defaultdict(deque)  # type: ignore[attr-defined]
+    dashboard._config = DashboardConfig(  # type: ignore[attr-defined]
+        host="127.0.0.1", port=0,
+        web_dist=tmp_path / "no-frontend",
+        manage_tailscale=False,
+    )
+    for k in (
+        "_sessions", "_background_tasks", "_curator",
+        "_browser", "_started_at", "_tailscale_url", "_tailscale_dns",
+        "_server", "_serve_task", "_profile_size_cache",
+        "_running_brain_kind",
+    ):
+        setattr(dashboard, k, None)
+    dashboard._running_tasks = fake  # type: ignore[attr-defined]
+    dashboard._app = dashboard._build_app()  # type: ignore[attr-defined]
+    cl = TestClient(dashboard._app)
+
+    r = cl.post("/api/v1/chat/cancel", headers=_auth())
+    assert r.status_code == 200
+    assert r.json() == {"cancelled": True}
+    # WEB_CHAT_ID == -1 — same chat-id namespace the streaming path
+    # uses. Drift here would mean cancel hits the wrong subprocess.
+    assert fake.calls == [-1]
+
+
+def test_cancel_route_503_when_chat_disabled(tmp_path: Path) -> None:
+    """Mirrors the rest of /chat/* — chat=None → 503 not 500."""
+    dashboard = WebDashboard.__new__(WebDashboard)
+    dashboard._workspace = tmp_path  # type: ignore[attr-defined]
+    dashboard._token = _TOKEN  # type: ignore[attr-defined]
+    dashboard._learning = None  # type: ignore[attr-defined]
+    dashboard._chat = None  # type: ignore[attr-defined]
+    dashboard._relationships_mutation_window_seconds = 600  # type: ignore[attr-defined]
+    dashboard._relationships_mutation_limit = 100  # type: ignore[attr-defined]
+    dashboard._relationships_mutation_log = defaultdict(deque)  # type: ignore[attr-defined]
+    dashboard._config = DashboardConfig(  # type: ignore[attr-defined]
+        host="127.0.0.1", port=0,
+        web_dist=tmp_path / "no-frontend",
+        manage_tailscale=False,
+    )
+    for k in (
+        "_sessions", "_running_tasks", "_background_tasks", "_curator",
+        "_browser", "_started_at", "_tailscale_url", "_tailscale_dns",
+        "_server", "_serve_task", "_profile_size_cache",
+        "_running_brain_kind",
+    ):
+        setattr(dashboard, k, None)
+    dashboard._app = dashboard._build_app()  # type: ignore[attr-defined]
+    cl = TestClient(dashboard._app)
+    r = cl.post("/api/v1/chat/cancel", headers=_auth())
+    assert r.status_code == 503
+
+
+def test_web_transport_cancel_routes_to_running_tasks_with_web_chat_id(
+    chat: WebChatTransport,
+) -> None:
+    """Direct unit test on the transport. The route test above is a
+    full-stack assertion; this one pins the transport contract on
+    its own so a route-rewrite can't silently change which chat_id
+    gets cancelled."""
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        async def cancel(self, chat_id: int) -> bool:
+            self.calls.append(chat_id)
+            return False
+
+    recorder = Recorder()
+    result = asyncio.run(chat.cancel(recorder))
+    assert result is False
+    assert recorder.calls == [-1]

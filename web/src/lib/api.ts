@@ -362,6 +362,26 @@ export const api = {
     }),
   chatClear: (token: string) =>
     call<ChatReply>(token, "/chat/clear", { method: "POST" }),
+  /**
+   * Cancel any in-flight brain turn for the web chat. Used by the
+   * Stop button and by session-switch / unmount cleanup so a long
+   * stream doesn't keep burning tokens on a reply the user will
+   * never see.
+   *
+   * Always best-effort: errors are swallowed because cancel-on-
+   * unmount is a fire-and-forget signal — there's no UI to
+   * surface a failure to. The local AbortController on the
+   * streaming fetch already closes the SSE pipe regardless.
+   */
+  chatCancel: async (token: string): Promise<{ cancelled: boolean }> => {
+    try {
+      return await call<{ cancelled: boolean }>(
+        token, "/chat/cancel", { method: "POST" },
+      );
+    } catch {
+      return { cancelled: false };
+    }
+  },
   // ----- voice -----
   voiceInfo: (token: string, signal?: AbortSignal) =>
     call<VoiceInfo>(token, "/chat/voice/info", { signal }),

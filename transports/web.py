@@ -98,6 +98,17 @@ class WebChatTransport:
     async def clear(self) -> str | None:
         return await self._handler.handle_clear(self._user_id)
 
+    async def cancel(self, running_tasks) -> bool:
+        """Cancel any in-flight brain turn for the web chat.
+
+        Routes through ``RunningTasks.cancel(WEB_CHAT_ID)`` — same
+        kill-the-subprocess path Telegram's ``/cancel`` slash uses.
+        Returns True iff something was actually cancelled (a turn
+        was running). False when there's nothing in flight (still a
+        valid call — the stop button might double-fire).
+        """
+        return await running_tasks.cancel(WEB_CHAT_ID)
+
     async def stream(
         self,
         text: str,
