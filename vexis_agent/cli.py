@@ -137,6 +137,66 @@ def update(
     raise typer.Exit(run_update(channel=channel))
 
 
+@app.command()
+def backup(
+    out: str = typer.Option(
+        "",
+        "--out",
+        "-o",
+        help="Output zip path. Defaults to ~/.vexis/backups/vexis-<utc>.zip.",
+    ),
+) -> None:
+    """Pack $VEXIS_HOME + $VEXIS_WORKSPACE into a zip.
+
+    Excludes regenerable junk (caches, node_modules, browser profiles,
+    SQLite WAL sidecars). Restore the archive on a different machine
+    with ``vexis-agent backup-restore <path>`` after running
+    ``vexis-agent setup`` there.
+    """
+    from pathlib import Path
+
+    from vexis_agent.daemon.backup import run_backup
+
+    out_path = Path(out).expanduser() if out else None
+    result = run_backup(out=out_path)
+    typer.echo(f"Wrote {result.file_count} files to {result.archive}")
+    typer.echo(f"  vexis-home:      {result.home_root}")
+    if result.workspace_root:
+        typer.echo(f"  vexis-workspace: {result.workspace_root}")
+
+
+@app.command("backup-restore")
+def backup_restore(
+    archive: str = typer.Argument(..., help="Path to a vexis backup zip."),
+    overwrite: bool = typer.Option(
+        False,
+        "--overwrite",
+        help="Overwrite existing files (default: skip).",
+    ),
+) -> None:
+    """Restore a backup zip into $VEXIS_HOME + $VEXIS_WORKSPACE.
+
+    Run ``vexis-agent setup`` first on a fresh machine; then point
+    this at the backup zip to bring memories, skills, config, and
+    secrets across. Existing files are skipped unless ``--overwrite``
+    is passed.
+    """
+    from pathlib import Path
+
+    from vexis_agent.daemon.backup import run_restore
+
+    result = run_restore(Path(archive).expanduser(), overwrite=overwrite)
+    typer.echo(
+        f"Restored {result.home_files_restored} home file(s) → {result.home_dest}"
+    )
+    typer.echo(
+        f"Restored {result.workspace_files_restored} workspace file(s) "
+        f"→ {result.workspace_dest}"
+    )
+    if not overwrite:
+        typer.echo("(existing files skipped — pass --overwrite to replace them)")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # `service` sub-app: thin shells around vexis_agent.daemon.systemd.
 # ──────────────────────────────────────────────────────────────────────
