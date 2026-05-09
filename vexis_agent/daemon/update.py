@@ -5,6 +5,15 @@ or system pip) and dispatches the right reinstall recipe. Refuses to
 touch user state (``~/.vexis/``, ``~/vexis-workspace/``) — decision D7
 in the packaging plan: code dir ≠ data dir.
 
+Phase 5f hardens the path against bad-luck disconnects:
+  * Pre-update snapshot — a quick backup of ``~/.vexis/`` lands at
+    ``~/.vexis/backups/pre-update-<utc>.zip`` before any install
+    work runs. Failed updates rollback via ``vexis-agent backup-restore``.
+  * Output mirrored to ``~/.vexis/logs/update.log`` so a dropped
+    terminal doesn't lose visibility into a long pip/git run.
+  * SIGHUP ignored for the duration so closing the SSH session
+    doesn't kill the update mid-flight.
+
 Detection heuristic:
 
   pipx     : ``sys.executable`` lives under
@@ -29,12 +38,15 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import vexis_agent
 
@@ -151,7 +163,120 @@ def pipx_venv_root() -> Path | None:
     return info.pipx_venv
 
 
-def run_update(channel: str = "stable", *, info: InstallInfo | None = None) -> int:
+@contextmanager
+def _hangup_protection() -> Iterator[None]:
+    """Ignore SIGHUP for the duration so a closed terminal doesn't
+    kill the update mid-flight. POSIX-only; the signal disposition
+    is preserved across exec(), which means pip/git children inherit
+    the protection.
+
+    Restores the previous handler on exit even on exception. Same
+    pattern hermes uses (hermes_cli.main._install_hangup_protection).
+    """
+    if not hasattr(signal, "SIGHUP"):  # pragma: no cover — Windows
+        yield
+        return
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+
+@contextmanager
+def _mirror_to_log(log_path: Path) -> Iterator[None]:
+    """Tee stdout + stderr through a log file in $VEXIS_HOME/logs so
+    a dropped terminal doesn't lose visibility. The original streams
+    are restored on context exit.
+
+    Best-effort: if log_path can't be opened (permission, full disk),
+    we skip the mirror and just log a warning — better to update
+    without a log than to refuse to update over a logging issue.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        log_fp = open(log_path, "a", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        log.warning("could not open update log %s: %s", log_path, exc)
+        yield
+        return
+
+    class _Tee:
+        def __init__(self, primary, secondary):
+            self._primary = primary
+            self._secondary = secondary
+
+        def write(self, data):
+            try:
+                self._secondary.write(data)
+            except (OSError, ValueError):
+                pass
+            return self._primary.write(data)
+
+        def flush(self):
+            try:
+                self._secondary.flush()
+            except (OSError, ValueError):
+                pass
+            self._primary.flush()
+
+        def __getattr__(self, name):  # passthrough for isatty etc.
+            return getattr(self._primary, name)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    log_fp.write(f"\n──── vexis-agent update {stamp} ────\n")
+    log_fp.flush()
+
+    orig_out, orig_err = sys.stdout, sys.stderr
+    sys.stdout = _Tee(orig_out, log_fp)
+    sys.stderr = _Tee(orig_err, log_fp)
+    try:
+        yield
+    finally:
+        sys.stdout = orig_out
+        sys.stderr = orig_err
+        try:
+            log_fp.close()
+        except OSError:
+            pass
+
+
+def _pre_update_snapshot() -> Optional[Path]:
+    """Pack a pre-update zip of $VEXIS_HOME so a botched update is
+    recoverable. Returns the archive path, or None if backup raised
+    (we don't block updates on snapshot failure)."""
+    from vexis_agent.core.paths import vexis_dir
+    from vexis_agent.daemon.backup import run_backup
+
+    home = vexis_dir()
+    archive = home / "backups" / (
+        f"pre-update-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.zip"
+    )
+    try:
+        result = run_backup(out=archive, home=home, workspace=None)
+    except Exception as exc:  # pragma: no cover — defensive
+        log.warning("pre-update snapshot failed: %s", exc)
+        return None
+    print(
+        f"Pre-update snapshot: {result.archive} "
+        f"({result.file_count} files)"
+    )
+    return result.archive
+
+
+def _update_log_path() -> Path:
+    """``$VEXIS_HOME/logs/update.log`` — mirrors the update transcript."""
+    from vexis_agent.core.paths import vexis_dir
+
+    return vexis_dir() / "logs" / "update.log"
+
+
+def run_update(
+    channel: str = "stable",
+    *,
+    info: InstallInfo | None = None,
+    snapshot: bool = True,
+) -> int:
     """Run the update appropriate for this install. Returns an exit
     code (0 = success, 1 = failure / unsupported install).
 
@@ -159,17 +284,27 @@ def run_update(channel: str = "stable", *, info: InstallInfo | None = None) -> i
     branch (only meaningful for pipx installs that read from git).
     Editable installs already have a working tree — channel is a no-op.
 
+    Side-effects (Phase 5f):
+      * Pre-update zip of $VEXIS_HOME at $VEXIS_HOME/backups/
+        pre-update-<utc>.zip (skip with snapshot=False).
+      * Output mirrored to $VEXIS_HOME/logs/update.log.
+      * SIGHUP ignored for the duration.
+
     Never restarts the service: the caller (or the user) decides when
     that's safe. Plan §6.4 invariant.
     """
     if info is None:
         info = detect_install_type()
 
-    if info.kind is InstallType.PIPX:
-        return _update_pipx(channel)
-    if info.kind is InstallType.EDITABLE:
-        return _update_editable(info.source_root)  # type: ignore[arg-type]
-    return _update_unknown()
+    with _hangup_protection(), _mirror_to_log(_update_log_path()):
+        if snapshot:
+            _pre_update_snapshot()
+
+        if info.kind is InstallType.PIPX:
+            return _update_pipx(channel)
+        if info.kind is InstallType.EDITABLE:
+            return _update_editable(info.source_root)  # type: ignore[arg-type]
+        return _update_unknown()
 
 
 def _update_pipx(channel: str) -> int:

@@ -89,6 +89,60 @@ def test_run_update_editable_refuses_when_no_git(tmp_path, capsys) -> None:
         python_path=Path("/usr/bin/python3"),
         source_root=repo,
     )
-    code = upd.run_update(info=info)
+    code = upd.run_update(info=info, snapshot=False)
     assert code == 1
     assert "no longer has a .git" in capsys.readouterr().out
+
+
+# ── Phase 5f: hangup protection + mirrored log + snapshot ─────────
+
+
+def test_pre_update_snapshot_writes_archive(tmp_path, monkeypatch) -> None:
+    """Snapshot lands at $VEXIS_HOME/backups/pre-update-<utc>.zip and
+    contains the seed config we drop into VEXIS_HOME."""
+    home = tmp_path / "v"
+    home.mkdir()
+    (home / "config.yaml").write_text("brain:\n  kind: claude-code\n")
+    monkeypatch.setattr(
+        "vexis_agent.core.paths.vexis_dir", lambda: home
+    )
+
+    archive = upd._pre_update_snapshot()
+    assert archive is not None
+    assert archive.exists()
+    assert archive.parent == home / "backups"
+    assert archive.name.startswith("pre-update-")
+
+
+def test_run_update_unknown_writes_log_file(tmp_path, monkeypatch, capsys) -> None:
+    """The mirrored-log context wraps the update; even when the
+    install-type is UNKNOWN and run_update bails, the log file
+    should exist with at least the timestamped header."""
+    home = tmp_path / "v"
+    home.mkdir()
+    monkeypatch.setattr(
+        "vexis_agent.core.paths.vexis_dir", lambda: home
+    )
+    info = upd.InstallInfo(
+        kind=upd.InstallType.UNKNOWN,
+        python_path=Path("/usr/bin/python3"),
+    )
+    upd.run_update(info=info, snapshot=False)
+    log_path = home / "logs" / "update.log"
+    assert log_path.exists()
+    body = log_path.read_text(encoding="utf-8")
+    assert "vexis-agent update" in body  # the header banner
+
+
+def test_hangup_protection_restores_handler() -> None:
+    """The context manager must restore the previous SIGHUP handler
+    when it exits — leaving SIG_IGN around forever would surprise
+    long-running parents."""
+    import signal as _signal
+
+    before = _signal.getsignal(_signal.SIGHUP)
+    with upd._hangup_protection():
+        # Inside the context: SIGHUP is ignored.
+        assert _signal.getsignal(_signal.SIGHUP) == _signal.SIG_IGN
+    # After: handler restored to whatever it was.
+    assert _signal.getsignal(_signal.SIGHUP) == before
