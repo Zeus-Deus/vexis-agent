@@ -106,9 +106,10 @@ def test_install_sh_dry_run_without_pipx(tmp_path) -> None:
     assert "would run: pipx install --force" in out
 
 
-def test_install_sh_default_pulls_from_main(tmp_path) -> None:
-    """No VEXIS_VERSION set → install from latest main."""
-    env = _empty_path_env(tmp_path)
+def test_install_sh_default_falls_back_to_main_without_git(tmp_path) -> None:
+    """When git isn't on PATH the resolver can't probe remote tags;
+    fall back to main rather than refusing to install."""
+    env = _empty_path_env(tmp_path)  # git intentionally absent
     result = subprocess.run(
         ["bash", str(INSTALL_SH), "--dry-run"],
         env=env,
@@ -117,8 +118,8 @@ def test_install_sh_default_pulls_from_main(tmp_path) -> None:
         check=True,
     )
     out = result.stdout + result.stderr
-    assert "latest main" in out
     assert "@main" in out
+    assert "latest main" in out
 
 
 def test_install_sh_version_pin_uses_tag(tmp_path) -> None:

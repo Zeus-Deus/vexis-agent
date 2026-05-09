@@ -134,18 +134,53 @@ if [[ "${XDG_SESSION_TYPE:-}" != "wayland" ]]; then
 fi
 
 # ── version resolution ──────────────────────────────────────────────
-# Default install is "latest commit on main" — the maintainer keeps
-# main always-working via feature branches. Users who want to pin to
-# a known-good release set VEXIS_VERSION=<tag> (e.g. v0.2.0). Power
-# users can override the whole git URL via VEXIS_REPO.
+# Default install picks the latest semver tag (e.g. v0.2.0) so
+# end-users only ever land on code the maintainer has explicitly
+# released. If the repo has no tags yet (early-development), fall
+# back to the main branch tip. VEXIS_VERSION pins to a specific tag
+# or commit; VEXIS_REPO overrides the whole git URL.
 section "Source"
+GH_REPO="https://github.com/Zeus-Deus/vexis-agent.git"
+
+resolve_default_version() {
+    # If git's missing, we can't probe remote tags — fall back to
+    # main. pipx install will pull git in transitively but that's
+    # too late to discover the latest tag here.
+    if ! command -v git >/dev/null 2>&1; then
+        echo "main"
+        return
+    fi
+    # Pull the latest semver tag from the remote without cloning.
+    # `git ls-remote --tags --refs --sort=-v:refname` lists tags
+    # newest-first; head -1 picks the freshest. Strip the refs/tags/
+    # prefix and the trailing ^{} that some annotated tags emit.
+    local latest
+    latest="$(
+        git ls-remote --tags --refs --sort=-v:refname "$GH_REPO" 2>/dev/null \
+            | awk '{ print $2 }' \
+            | sed 's|^refs/tags/||; s|\^{}$||' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' \
+            | head -1
+    )"
+    if [[ -n "$latest" ]]; then
+        echo "$latest"
+    else
+        echo "main"
+    fi
+}
+
 VERSION="${VEXIS_VERSION:-}"
 if [[ -n "$VERSION" ]]; then
-    REPO_DEFAULT="git+https://github.com/Zeus-Deus/vexis-agent.git@${VERSION}"
+    REPO_DEFAULT="git+${GH_REPO}@${VERSION}"
     SOURCE_LABEL="pinned to ${VERSION}"
 else
-    REPO_DEFAULT="git+https://github.com/Zeus-Deus/vexis-agent.git@main"
-    SOURCE_LABEL="latest main"
+    RESOLVED="$(resolve_default_version)"
+    REPO_DEFAULT="git+${GH_REPO}@${RESOLVED}"
+    if [[ "$RESOLVED" == "main" ]]; then
+        SOURCE_LABEL="latest main (no release tags yet)"
+    else
+        SOURCE_LABEL="latest release: ${RESOLVED}"
+    fi
 fi
 REPO="${VEXIS_REPO:-$REPO_DEFAULT}"
 
