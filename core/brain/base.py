@@ -316,16 +316,29 @@ class Brain(ABC):
         *,
         model: str | None = None,
         reasoning_level: str | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | dict]:
         """Streaming variant of :meth:`respond`. Yields incremental
         text chunks as the model generates them.
 
+        **Yield types** (callers must accept both):
+
+        - ``str`` — a text delta (``content_block_delta.text_delta``
+          on claude-code; whatever the brain produces incrementally).
+          Concatenate these to reconstruct the assistant's reply.
+        - ``dict`` — a tool-use event with shape
+          ``{"type": "tool", "name": str, "target": str | None}``.
+          Surfaced to the chat UI as inline "Reading src/foo.py" /
+          "Running git status" lines so the user sees the brain
+          working through its tools instead of staring at a pulse
+          for 30+ seconds. Tool events do NOT contribute to the
+          assistant's text reply — they're a separate UX channel.
+
         Default implementation here delegates to ``respond`` and
         yields the full reply once at the end — non-streaming brains
-        still satisfy the contract, just without the live-feel UX.
-        Implementations that natively stream (claude-code via
-        ``--include-partial-messages``, future opencode) override
-        this to yield per-delta.
+        still satisfy the contract (no tool events, just a single
+        text yield). Implementations that natively stream (claude-code
+        via ``--include-partial-messages``, future opencode) override
+        this to yield per-delta plus tool events as they fire.
 
         Same per-turn override semantics as ``respond``: ``model``
         and ``reasoning_level`` flow through identically. Telegram
@@ -336,7 +349,7 @@ class Brain(ABC):
 
         Marked NOT-abstract so concrete brains are free to inherit
         the default fallback. Brains that override it MUST yield at
-        least one chunk on success (empty reply → yield "") so
+        least one text chunk on success (empty reply → yield "") so
         downstream callers can rely on that for the "done" signal.
         """
         reply = await self.respond(

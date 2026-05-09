@@ -568,6 +568,13 @@ export interface ChatSession {
   is_active: boolean;
   // ISO-8601 UTC. Format with Intl.DateTimeFormat at render time.
   created_at: string;
+  // First-user-message snippet (truncated to ~80 chars on the
+  // server). Rendered under the session name in the sidebar so
+  // the user can find conversations by content. Null/missing for
+  // sessions whose transcript can't be read or hasn't been
+  // populated yet (just-created session). UI must tolerate both
+  // null and undefined — older clients won't send the field at all.
+  preview?: string | null;
 }
 
 export interface ChatSessionsState {

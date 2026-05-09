@@ -95,6 +95,37 @@ async function call<T>(
   return resp.json() as Promise<T>;
 }
 
+/** Wire-stable error categories from the SSE ``error`` event.
+ *  Backend producer: ``core.handler._ERR_CODE_*`` constants.
+ *  When adding a new code, also extend ``mapErrorCode`` in
+ *  ChatPage so the user sees a specific recovery UX rather than
+ *  the generic "Something went wrong" fallback.
+ *
+ *  - ``brain_error``     transient — retry button
+ *  - ``brain_timeout``   long turn — retry won't help, suggest a
+ *                         shorter prompt or different model
+ *  - ``session_lost``    auto-recovers; UI shows a soft note
+ *  - ``cancelled``       Stop button — silent
+ *  - ``rejected``        auth gate; UI flips to auth-fail
+ *  - ``unknown``         generic — at least admit something broke
+ */
+export type ErrorCode =
+  | "brain_error"
+  | "brain_timeout"
+  | "session_lost"
+  | "cancelled"
+  | "rejected"
+  | "unknown";
+
+const _ERROR_CODES: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
+  "brain_error", "brain_timeout", "session_lost",
+  "cancelled", "rejected", "unknown",
+]);
+
+function isErrorCode(value: unknown): value is ErrorCode {
+  return typeof value === "string" && _ERROR_CODES.has(value as ErrorCode);
+}
+
 export const api = {
   memory: (token: string) => call<MemoryState>(token, "/memory"),
   skills: (token: string) => call<SkillsState>(token, "/skills"),
@@ -253,7 +284,23 @@ export const api = {
     handlers: {
       onChunk: (text: string) => void;
       onDone: (full: string) => void;
-      onError: (message: string) => void;
+      // ``message`` is the user-facing string (may be empty for
+      // silent codes like ``cancelled``). ``code`` discriminates
+      // error categories so the UI can pick a specific recovery
+      // affordance — retry button on transient brain errors,
+      // auth-fail flow on ``rejected``, silent dismiss on
+      // ``cancelled``. New codes default to "unknown" on the
+      // wire; tests / older callers tolerate that.
+      onError: (
+        message: string,
+        opts?: { code?: ErrorCode },
+      ) => void;
+      // Tool-use status updates streamed inline with text deltas.
+      // Optional — surface omitted by callers that don't render
+      // tool status (e.g. tests, voice path). When present the
+      // callback fires per tool_use event the brain emits during
+      // the turn, in the order they fire.
+      onTool?: (event: { name: string; target: string | null }) => void;
       signal?: AbortSignal;
     },
   ): Promise<void> => {
@@ -309,11 +356,25 @@ export const api = {
               const evt = JSON.parse(json);
               if (evt.type === "chunk" && typeof evt.text === "string") {
                 handlers.onChunk(evt.text);
+              } else if (evt.type === "tool" && typeof evt.name === "string") {
+                // Tool-use status. ``target`` is null for tools
+                // without a clear filename/command (Task, MCP).
+                // We tolerate missing onTool — older clients /
+                // tests just ignore the frame.
+                handlers.onTool?.({
+                  name: evt.name,
+                  target: typeof evt.target === "string" ? evt.target : null,
+                });
               } else if (evt.type === "done" && typeof evt.reply === "string") {
                 handlers.onDone(evt.reply);
               } else if (evt.type === "error") {
+                // ``code`` is wire-stable; defaults to "unknown" on
+                // older servers / unrecognised values so the UI
+                // always has something to dispatch on.
+                const code = isErrorCode(evt.code) ? evt.code : "unknown";
                 handlers.onError(
                   typeof evt.message === "string" ? evt.message : "",
+                  { code },
                 );
               }
             } catch {

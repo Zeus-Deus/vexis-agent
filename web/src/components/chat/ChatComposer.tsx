@@ -55,6 +55,20 @@ interface ChatComposerProps {
   // as the paperclip button. ``null`` is allowed because tests +
   // legacy call sites that don't need drag-drop just omit it.
   attachmentPickerRef?: Ref<AttachmentPickerHandle>;
+  // (Phase D) Persistence key for the composer draft. When set,
+  // every keystroke is written to ``localStorage[draftKey]`` and
+  // the initial draft loads from there on mount. Lets a tab close
+  // / accidental reload not eat a half-typed long message.
+  // Pass ``null`` (or omit) on transient surfaces (voice modal,
+  // tests) where draft persistence would be more confusing than
+  // helpful.
+  draftKey?: string | null;
+  // (Phase D) Last user message in the active session. ↑ in the
+  // empty composer recalls this into the textarea for editing
+  // before resending — same muscle-memory shortcut as a terminal
+  // shell, ChatGPT, Claude.ai. Undefined / null = no recall
+  // (e.g. fresh session).
+  lastUserMessage?: string | null;
 }
 
 // Soft cap on the textarea height so a giant paste doesn't push the
@@ -77,9 +91,55 @@ export function ChatComposer({
   setAttachmentQueue,
   onAttachmentError,
   attachmentPickerRef,
+  draftKey,
+  lastUserMessage,
 }: ChatComposerProps) {
-  const [draft, setDraft] = useState("");
+  // Hydrate the draft from localStorage when ``draftKey`` is set.
+  // The lazy initializer keeps the localStorage read out of the
+  // hot render path. Falsy keys (undefined, null, "") fall back
+  // to the empty draft — e.g. when ``activeName`` is "" before
+  // the sessions list arrives.
+  const [draft, setDraft] = useState<string>(() => {
+    if (!draftKey) return "";
+    try {
+      return localStorage.getItem(draftKey) ?? "";
+    } catch {
+      return "";
+    }
+  });
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Switch the draft buffer when ``draftKey`` changes (session
+  // switch). Also fires on first mount if draftKey arrives later
+  // than the initial render — the initializer above runs only
+  // once. We deliberately read fresh every time so a switch back
+  // to a session shows whatever draft was most recently typed.
+  useEffect(() => {
+    if (!draftKey) {
+      setDraft("");
+      return;
+    }
+    try {
+      setDraft(localStorage.getItem(draftKey) ?? "");
+    } catch {
+      setDraft("");
+    }
+  }, [draftKey]);
+
+  // Persist on every keystroke. Cheap (single string write) and
+  // stays inside the render cycle so a tab close mid-edit catches
+  // the latest. We don't debounce — localStorage writes are
+  // synchronous and fast enough for a single key per stroke.
+  useEffect(() => {
+    if (!draftKey) return;
+    try {
+      if (draft) localStorage.setItem(draftKey, draft);
+      else localStorage.removeItem(draftKey);
+    } catch {
+      // Quota exceeded / private mode — silently drop. Drafts
+      // are nice-to-have, not essential.
+    }
+  }, [draft, draftKey]);
 
   const removeAttachment = useCallback(
     (path: string) => {
@@ -121,19 +181,83 @@ export function ChatComposer({
     // image would render as broken alt text.
   }, [draft, pending, onSend, attachmentQueue]);
 
-  // Enter sends, Shift+Enter newline. Matches Telegram, ChatGPT,
-  // Claude.ai. Mobile keyboards still get a newline button via
-  // the IME's Shift+Enter equivalent (most send a return key event
-  // without shift, which we deliberately treat as send — long-form
-  // edits happen on desktop).
+  // Keybindings (in priority order):
+  //   - Enter (no shift)               → submit
+  //   - Cmd/Ctrl+Enter                  → submit (alt for users who
+  //                                       prefer Shift+Enter as the
+  //                                       newline default and want
+  //                                       a chord they can't trip)
+  //   - ↑ in an empty composer          → recall the last user msg
+  //                                       so editing-and-resending a
+  //                                       previous prompt doesn't
+  //                                       require copy-paste
+  //   - Esc                             → blur the composer (kills
+  //                                       the IME / mobile keyboard,
+  //                                       lets the user scroll the
+  //                                       conversation cleanly)
+  // Mobile keyboards still get a newline button via the IME's
+  // Shift+Enter equivalent (most send a return key event without
+  // shift, which we deliberately treat as send — long-form edits
+  // happen on desktop).
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+      // ↑ recall — only when the textarea is empty AND the cursor
+      // is at the very start (defensive: a user on a multi-line
+      // draft pressing ↑ to navigate the textarea shouldn't trip
+      // the recall). Cursor-at-start covers both "empty draft"
+      // and "draft starts at 0,0" for the same code path.
+      if (
+        e.key === "ArrowUp"
+        && !e.shiftKey
+        && !e.metaKey
+        && !e.ctrlKey
+        && !e.altKey
+        && !e.nativeEvent.isComposing
+        && lastUserMessage
+        && (draft === "" || (
+          e.currentTarget.selectionStart === 0
+          && e.currentTarget.selectionEnd === 0
+        ))
+      ) {
+        e.preventDefault();
+        setDraft(lastUserMessage);
+        // Move the cursor to the end of the recalled text so the
+        // user can start editing immediately. Defer one tick so
+        // the new value is committed first.
+        setTimeout(() => {
+          const el = textareaRef.current;
+          if (el) el.setSelectionRange(el.value.length, el.value.length);
+        }, 0);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.currentTarget.blur();
+        return;
+      }
+      if (
+        e.key === "Enter"
+        && !e.shiftKey
+        && !e.nativeEvent.isComposing
+      ) {
+        e.preventDefault();
+        submit();
+        return;
+      }
+      // Cmd/Ctrl+Enter is the safety-gated submit. We deliberately
+      // accept shift here so a user who's holding shift to insert
+      // newlines can still use the chord without fighting their
+      // own modifier.
+      if (
+        e.key === "Enter"
+        && (e.metaKey || e.ctrlKey)
+        && !e.nativeEvent.isComposing
+      ) {
         e.preventDefault();
         submit();
       }
     },
-    [submit],
+    [submit, lastUserMessage, draft],
   );
 
   return (

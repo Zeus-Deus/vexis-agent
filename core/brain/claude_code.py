@@ -720,9 +720,15 @@ class ClaudeCodeBrain(Brain):
                                 accumulated += text
                                 yield text
                 elif kind == "assistant":
-                    # Tool-use tracking — same as the buffered path
-                    # so /status sees in-flight tools regardless of
-                    # which entrypoint the caller used.
+                    # Tool-use tracking. Two consumers:
+                    #   1. StatusFile (per-chat tmpfs JSON) — read by
+                    #      Telegram /status. Unchanged.
+                    #   2. The chat UI streaming bubble — yielded as
+                    #      a tool event dict so the user sees inline
+                    #      "Reading src/foo.py" lines while the brain
+                    #      is grinding through tools. Without this
+                    #      the bubble is just a pulse for 30+s during
+                    #      heavy tool turns and feels frozen.
                     content = event.get("message", {}).get("content") or []
                     if isinstance(content, list):
                         for block in content:
@@ -735,6 +741,15 @@ class ClaudeCodeBrain(Brain):
                                 name, block.get("input") or {},
                             )
                             status_file.record_tool(name, target)
+                            # Tool event → chat UI. Distinct from
+                            # text deltas; consumers must distinguish
+                            # via ``isinstance``. Documented contract
+                            # on Brain.astream.
+                            yield {
+                                "type": "tool",
+                                "name": name,
+                                "target": target,
+                            }
                 elif kind == "result":
                     rt = event.get("result")
                     if isinstance(rt, str):

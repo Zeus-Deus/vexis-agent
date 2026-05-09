@@ -1,6 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { Markdown } from "../Markdown";
 import type { QueuedAttachment } from "../../lib/types";
+
+/** One tool-use event surfaced from the brain during streaming.
+ *  Rendered as an inline "Reading src/foo.py" line in the assistant
+ *  bubble so the user can see the brain working through tools
+ *  instead of staring at a pulse. ``target`` is null for tools
+ *  without a clear filename/command (Task, MCP servers). */
+export interface ToolUseEvent {
+  name: string;
+  target: string | null;
+  ts: number;
+}
 
 export interface ChatMessage {
   // ``user`` is what you typed; ``assistant`` is the brain's reply or
@@ -19,6 +30,25 @@ export interface ChatMessage {
   // are forensic-only after send (the brain has already received the
   // server paths in the message body).
   attachments?: QueuedAttachment[];
+  // Tool events the brain fired during this assistant turn. Rendered
+  // ABOVE the text content in the bubble. Persists after streaming
+  // ends so the user can scroll back and see what the brain did
+  // (matches Claude.ai / ChatGPT inline-tool-block behaviour).
+  // History-backfill messages don't carry these — only fresh
+  // streaming turns. Always undefined on user/system bubbles.
+  tools?: ToolUseEvent[];
+  // (system-role only) Wire-stable error category from the SSE
+  // ``error`` event. Drives the recovery affordance on the row
+  // (Retry button on ``brain_error`` / ``brain_timeout`` /
+  // ``unknown``; silent dismiss on ``cancelled``; auth-fail
+  // redirect on ``rejected``). Absent on plain notes.
+  errorCode?: string;
+  // (system-role only) Original user payload that triggered the
+  // failed turn. Set iff Retry should be offered. The retry click
+  // re-sends via the same ``handleSend`` path so the user gets a
+  // fresh user bubble + a fresh streaming turn — matches what
+  // typing the message again would do.
+  retryPayload?: { text: string; attachments: QueuedAttachment[] };
 }
 
 interface ChatMessagesProps {
@@ -43,6 +73,11 @@ interface ChatMessagesProps {
   // bubble, then re-sends the last user message's content +
   // attachments. Same append-only contract as edit.
   onRegenerateLastAssistant?: () => void;
+  // Retry a failed turn — invoked from the inline Retry button on
+  // a system-role error message. The error message itself carries
+  // the original ``retryPayload``; this callback re-sends it
+  // verbatim through ``handleSend``. Disabled while ``pending``.
+  onRetryFailed?: (text: string, attachments: QueuedAttachment[]) => void;
 }
 
 export function ChatMessages({
@@ -50,6 +85,7 @@ export function ChatMessages({
   pending,
   onEditLastUser,
   onRegenerateLastAssistant,
+  onRetryFailed,
 }: ChatMessagesProps) {
   const endRef = useRef<HTMLDivElement | null>(null);
 
@@ -129,6 +165,19 @@ export function ChatMessages({
                 ? onRegenerateLastAssistant
                 : undefined
             }
+            onRetry={
+              // Retry button appears on system bubbles whose
+              // ``retryPayload`` is set AND we're not already
+              // mid-stream (parent disables onRetry while pending
+              // by passing undefined).
+              !pending && onRetryFailed && m.retryPayload
+                ? () =>
+                    onRetryFailed(
+                      m.retryPayload!.text,
+                      m.retryPayload!.attachments,
+                    )
+                : undefined
+            }
           />
         ))}
         {pending && !tailIsStreaming && <PendingBubble />}
@@ -138,13 +187,7 @@ export function ChatMessages({
   );
 }
 
-function Bubble({
-  message,
-  isLastUser,
-  isLastAssistant,
-  onEdit,
-  onRegenerate,
-}: {
+type BubbleProps = {
   message: ChatMessage;
   isLastUser: boolean;
   isLastAssistant: boolean;
@@ -153,7 +196,17 @@ function Bubble({
     attachments: QueuedAttachment[],
   ) => void;
   onRegenerate?: () => void;
-}) {
+  onRetry?: () => void;
+};
+
+function BubbleImpl({
+  message,
+  isLastUser,
+  isLastAssistant,
+  onEdit,
+  onRegenerate,
+  onRetry,
+}: BubbleProps) {
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
   // Edit-in-place state for the last user bubble. Lives on the
@@ -164,9 +217,48 @@ function Bubble({
   const [draft, setDraft] = useState(message.content);
 
   if (isSystem) {
+    // System messages now come in two flavours:
+    //   (1) plain notes ("Conversation cleared.") — same dim
+    //       centered text we shipped originally.
+    //   (2) error rows with an optional Retry button — drives
+    //       transient-failure recovery without forcing the user
+    //       to re-type their prompt.
+    const isError = message.errorCode && message.errorCode !== "cancelled";
+    if (!isError) {
+      return (
+        <div className="text-center text-xs text-[var(--color-fg-dim)] py-1">
+          {message.content}
+        </div>
+      );
+    }
     return (
-      <div className="text-center text-xs text-[var(--color-fg-dim)] py-1">
-        {message.content}
+      <div className="flex justify-center">
+        <div
+          data-testid="error-bubble"
+          className={[
+            "max-w-md flex flex-col items-center gap-2 px-4 py-3 rounded-md",
+            "border border-[var(--color-error)]/40 bg-[var(--color-error)]/5",
+            "text-xs text-[var(--color-fg-2)] text-center",
+          ].join(" ")}
+        >
+          <div className="text-[var(--color-fg)]">{message.content}</div>
+          {onRetry && (
+            <button
+              type="button"
+              onClick={onRetry}
+              data-testid="error-retry"
+              aria-label="Retry sending"
+              className={[
+                "px-2.5 py-1 rounded text-[11px] uppercase tracking-wider",
+                "bg-[var(--color-accent)] text-[var(--color-accent-fg)]",
+                "hover:bg-[var(--color-accent-2)] hover:text-[var(--color-fg)]",
+                "transition-colors",
+              ].join(" ")}
+            >
+              ↻ Retry
+            </button>
+          )}
+        </div>
       </div>
     );
   }
@@ -237,6 +329,13 @@ function Bubble({
               {message.attachments && message.attachments.length > 0 && (
                 <BubbleAttachments attachments={message.attachments} isUser={isUser} />
               )}
+              {/* Tool-use status — rendered ABOVE the text content
+                  on assistant bubbles so the user can see what the
+                  brain is doing while it works. Persists after
+                  streaming so scrolling back shows the sequence. */}
+              {!isUser && message.tools && message.tools.length > 0 && (
+                <ToolUseList events={message.tools} streaming={!message.content} />
+              )}
               {message.content ? (
                 isUser ? (
                   <div className="whitespace-pre-wrap text-sm leading-relaxed">
@@ -248,11 +347,12 @@ function Bubble({
               ) : (
                 // Empty-content state on assistant bubbles:
                 // streaming in progress but no tokens have landed
-                // yet. Render the pulse inline so the user sees the
-                // bubble is alive and a reply is on the way. User
-                // bubbles never have empty content (the composer
-                // blocks empty sends).
-                !isUser && <InlinePulse />
+                // yet. Suppress the pulse if a tool event was
+                // already streamed — the tool-row gives the user
+                // the same "alive" signal without redundant noise.
+                !isUser && (!message.tools || message.tools.length === 0) && (
+                  <InlinePulse />
+                )
               )}
             </>
           )}
@@ -296,6 +396,25 @@ function Bubble({
     </div>
   );
 }
+
+/** Memoised wrapper. Without memo, every SSE chunk on the
+ *  streaming bubble re-renders ALL bubbles in the conversation
+ *  (because messages.map sends a fresh ChatMessage[] reference
+ *  each time and Bubble receives unstable props). On a 100-message
+ *  conversation that's 100 ReactMarkdown renders per chunk —
+ *  noticeable lag on phones. With memo, only the streaming
+ *  bubble re-renders per chunk; everyone else short-circuits.
+ *
+ *  Default shallow compare is fine because:
+ *    - ``message`` identity is stable across renders for non-
+ *      streaming bubbles (we replace messages by index, not in
+ *      place; the streaming bubble gets a new object per chunk
+ *      because of the spread in ``setMessages``).
+ *    - ``isLastUser`` / ``isLastAssistant`` are booleans.
+ *    - ``onEdit`` / ``onRegenerate`` / ``onRetry`` are stable
+ *      because ChatMessages computes them per-bubble and the
+ *      parent only re-renders this when its own state changes. */
+const Bubble = memo(BubbleImpl);
 
 /** Compact action button used for Edit / Regenerate. Same visual
  *  treatment as CopyButton so the action row reads as a single
@@ -500,6 +619,12 @@ function BubbleAttachments({
   attachments: QueuedAttachment[];
   isUser: boolean;
 }) {
+  // Lightbox state — single open image at a time. Lifted to the
+  // attachments component (not page-level) because ScreenReader
+  // expectations attach the dialog role inline with the image
+  // strip; a global modal layer would also work but adds an extra
+  // portal that the rest of the chat surface doesn't need.
+  const [lightbox, setLightbox] = useState<QueuedAttachment | null>(null);
   return (
     <div
       className={[
@@ -511,13 +636,26 @@ function BubbleAttachments({
         const isImage = a.mime.startsWith("image/");
         if (isImage && a.previewUrl) {
           return (
-            <img
+            <button
               key={a.path}
-              src={a.previewUrl}
-              alt={a.name}
-              className="max-w-full sm:max-w-xs max-h-64 rounded object-contain"
-              loading="lazy"
-            />
+              type="button"
+              data-testid="attachment-image"
+              onClick={() => setLightbox(a)}
+              aria-label={`Open ${a.name} full size`}
+              className={[
+                "p-0 border-0 bg-transparent rounded",
+                "cursor-zoom-in transition-opacity",
+                "hover:opacity-90 focus:outline-none",
+                "focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]",
+              ].join(" ")}
+            >
+              <img
+                src={a.previewUrl}
+                alt={a.name}
+                className="max-w-full sm:max-w-xs max-h-64 rounded object-contain"
+                loading="lazy"
+              />
+            </button>
           );
         }
         return (
@@ -535,8 +673,174 @@ function BubbleAttachments({
           </div>
         );
       })}
+      {lightbox && (
+        <ImageLightbox
+          attachment={lightbox}
+          onClose={() => setLightbox(null)}
+        />
+      )}
     </div>
   );
+}
+
+/** Full-screen overlay for an attached image. Esc + backdrop
+ *  click both close. Body scroll is locked while open so a
+ *  long conversation doesn't scroll under the modal. Tab focus
+ *  is moved to the close button on mount so screen-reader
+ *  users can dismiss without hunting. */
+function ImageLightbox({
+  attachment,
+  onClose,
+}: {
+  attachment: QueuedAttachment;
+  onClose: () => void;
+}) {
+  const closeRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    closeRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    // Lock body scroll. Restore on unmount so the dismissal
+    // returns control to the conversation cleanly.
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [onClose]);
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={attachment.name}
+      data-testid="attachment-lightbox"
+      onClick={onClose}
+      className={[
+        "fixed inset-0 z-50 flex items-center justify-center p-4",
+        "bg-black/85 backdrop-blur-sm",
+      ].join(" ")}
+    >
+      <img
+        // Click on the image itself is swallowed so a careful tap
+        // on the photo doesn't dismiss; only the backdrop / close
+        // button do.
+        onClick={(e) => e.stopPropagation()}
+        src={attachment.previewUrl}
+        alt={attachment.name}
+        className="max-w-full max-h-full object-contain rounded"
+      />
+      <button
+        ref={closeRef}
+        type="button"
+        onClick={onClose}
+        aria-label="Close image"
+        data-testid="lightbox-close"
+        className={[
+          "absolute top-4 right-4 w-10 h-10 rounded-full",
+          "flex items-center justify-center",
+          "bg-[var(--color-surface)] border border-[var(--color-border-strong)]",
+          "text-[var(--color-fg)] hover:bg-[var(--color-base)]",
+          "transition-colors text-lg",
+        ].join(" ")}
+      >
+        ✕
+      </button>
+    </div>
+  );
+}
+
+/** Inline tool-use status row on the assistant bubble. Each event
+ *  shows up as a small dim line: "→ Reading src/foo.py" /
+ *  "→ Running git status". The LAST event during streaming gets a
+ *  pulse to indicate "this one's still in flight"; earlier rows
+ *  are static (already finished). After the stream ends, no row
+ *  pulses — they all read as historical receipts.
+ *
+ *  Why not collapse to a single "X tools used" summary: the user
+ *  cares which file/command specifically. ChatGPT collapses; we
+ *  aim for Claude.ai's expanded inline view because it's more
+ *  trustable. Cheap to render — typical turn has < 10 tool events. */
+function ToolUseList({
+  events,
+  streaming,
+}: {
+  events: ToolUseEvent[];
+  streaming: boolean;
+}) {
+  return (
+    <div
+      className={[
+        // Subtle indent + dim color so it reads as scaffolding,
+        // not as content. Sits in the bubble's content rhythm via
+        // the same mb-2 the attachments row uses.
+        "flex flex-col gap-1 mb-2",
+        "text-[11px] leading-snug",
+        "text-[var(--color-fg-dim)] font-data",
+      ].join(" ")}
+      data-testid="tool-use-list"
+    >
+      {events.map((evt, i) => {
+        const isLast = i === events.length - 1;
+        const isPulsing = streaming && isLast;
+        return (
+          <div
+            key={`${evt.ts}-${i}`}
+            className="flex items-baseline gap-1.5 min-w-0"
+            data-testid="tool-use-row"
+          >
+            <span aria-hidden className="shrink-0 opacity-60">→</span>
+            <span className="shrink-0 text-[var(--color-fg-2)]">
+              {humanToolLabel(evt.name)}
+            </span>
+            {evt.target && (
+              <span
+                className="truncate text-[var(--color-fg-dim)]"
+                title={evt.target}
+              >
+                {evt.target}
+              </span>
+            )}
+            {isPulsing && (
+              <span
+                aria-hidden
+                className={[
+                  "shrink-0 ml-auto w-1 h-1 rounded-full",
+                  "bg-[var(--color-accent)] animate-pulse",
+                ].join(" ")}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Map raw tool name → user-facing verb. Keeps the inline status
+ *  reading like "Reading <file>" instead of "Read <file>" (which
+ *  reads as a noun in some fonts). Fallback: the tool name
+ *  verbatim — covers MCP servers + Task without a special case. */
+function humanToolLabel(name: string): string {
+  switch (name) {
+    case "Read": return "Reading";
+    case "Edit": return "Editing";
+    case "MultiEdit": return "Editing";
+    case "Write": return "Writing";
+    case "NotebookEdit": return "Editing";
+    case "Bash": return "Running";
+    case "Glob": return "Finding";
+    case "Grep": return "Searching";
+    case "WebFetch": return "Fetching";
+    case "WebSearch": return "Searching";
+    case "Task": return "Delegating";
+    default: return name;
+  }
 }
 
 function InlinePulse() {

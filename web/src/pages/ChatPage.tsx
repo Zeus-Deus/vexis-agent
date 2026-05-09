@@ -264,6 +264,31 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
     return () => ctrl.abort();
   }, [activeName, token, buffers, onAuthFail, setMessages]);
 
+  // Cmd/Ctrl+K — start a new chat. Page-level listener so the
+  // shortcut works regardless of which input has focus. We
+  // deliberately swallow it inside text inputs too: every chat
+  // app the user expects this shortcut from (ChatGPT, Claude.ai,
+  // Linear) does the same. Esc on the document is intentionally
+  // NOT bound — that's per-input scope (composer blur, edit
+  // cancel) so we don't fight focus/selection state.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        if (pendingName === null) {
+          void handleNew();
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // ``handleNew`` is declared further down; the linter rule
+    // would warn about hoisting but TypeScript is happy because
+    // useCallback returns the latest reference and React commits
+    // the effect after all callback declarations have settled.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingName]);
+
   // Refresh sessions when the tab becomes visible again — phones
   // suspend background tabs aggressively, and a backgrounded chat
   // can be minutes-stale by the time the user comes back. Cheap
@@ -445,6 +470,28 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
           },
           {
             signal: controller.signal,
+            onTool: (toolEvt) => {
+              // Append a tool event to the streaming bubble's
+              // ``tools`` array. Renders as an inline "Reading
+              // src/foo.py" row above the text content.
+              setMessages(activeName, (prev) =>
+                prev.map((m) =>
+                  m.ts === assistantTs && m.role === "assistant"
+                    ? {
+                        ...m,
+                        tools: [
+                          ...(m.tools ?? []),
+                          {
+                            name: toolEvt.name,
+                            target: toolEvt.target,
+                            ts: Date.now(),
+                          },
+                        ],
+                      }
+                    : m,
+                ),
+              );
+            },
             onChunk: (chunk) => {
               // Find the assistant bubble we placed and append the
               // chunk to its content. ``assistantTs`` stays unique
@@ -476,26 +523,43 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
               // voice.tts is enabled and not muted.
               void speakReply(full);
             },
-            onError: (msg) => {
+            onError: (msg, opts) => {
+              const code = opts?.code ?? "unknown";
               // Remove the empty assistant bubble (or leave its
-              // partial content if anything streamed) and append
-              // a system note describing the failure. Empty msg
-              // means cancel — drop the placeholder silently.
+              // partial content if anything streamed). Then either
+              // dismiss silently (cancel), redirect to auth-fail
+              // (rejected), or append a recoverable error row with
+              // a Retry button (everything else).
               setMessages(activeName, (prev) => {
                 const out = prev.filter((m) => {
                   if (m.ts !== assistantTs) return true;
-                  // Keep the bubble if it has any streamed content;
-                  // drop it if it was empty (no tokens before the
-                  // error fired).
                   return m.content.length > 0;
                 });
-                if (msg) {
-                  out.push({
-                    role: "system",
-                    content: `⚠️ ${msg}`,
-                    ts: Date.now(),
-                  });
+                // ``cancelled`` and empty-msg paths swallow silently
+                // — the user pressed Stop / switched session / a
+                // pre-existing handler already cleared the bubble.
+                if (code === "cancelled" || !msg) return out;
+                if (code === "rejected") {
+                  // Auth-list reject. Same surface the rest of the
+                  // app uses for 401 — sends user back through the
+                  // /dashboard token flow. Don't render a stale
+                  // error bubble that the user can't act on.
+                  onAuthFail();
+                  return out;
                 }
+                // ``brain_timeout`` / ``brain_error`` /
+                // ``session_lost`` / ``unknown``: render the error
+                // bubble with a Retry button. ``session_lost``
+                // technically self-recovers on the next turn so
+                // the retry just sends again, which is exactly
+                // what the user wants.
+                out.push({
+                  role: "system",
+                  content: msg,
+                  ts: Date.now(),
+                  errorCode: code,
+                  retryPayload: { text, attachments },
+                });
                 return out;
               });
             },
@@ -562,6 +626,38 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
       void handleSend(newText, attachments);
     },
     [activeName, setMessages, handleSend],
+  );
+
+  /** Retry a failed turn from the inline Retry button on the
+   *  error bubble. Drops the error row + any partial assistant
+   *  content, then re-sends the original prompt through the same
+   *  ``handleSend`` path. Same append-only contract as edit /
+   *  regenerate — no rewinding the brain's transcript. */
+  const handleRetryFailed = useCallback(
+    (text: string, attachments: QueuedAttachment[]) => {
+      if (!activeName) return;
+      // Drop the most recent error system message (and any partial
+      // assistant content that preceded it) so the retry doesn't
+      // double up the visible error history. Keeping the original
+      // user bubble in place — the retry is conceptually "send
+      // this same prompt again", not "edit and resend".
+      setMessages(activeName, (prev) => {
+        // Walk from the end stripping any trailing error system
+        // rows. Stop at the first non-error-system message.
+        const out = [...prev];
+        while (out.length > 0) {
+          const tail = out[out.length - 1];
+          if (tail.role === "system" && tail.errorCode) {
+            out.pop();
+            continue;
+          }
+          break;
+        }
+        return out;
+      });
+      void handleSend(text, attachments);
+    },
+    [activeName, setMessages],
   );
 
   /** Re-run the last turn. Drops the assistant bubble, then
@@ -1012,6 +1108,7 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
           pending={pendingSend}
           onEditLastUser={handleEditLastUser}
           onRegenerateLastAssistant={handleRegenerateLastAssistant}
+          onRetryFailed={handleRetryFailed}
         />
         <ChatComposer
           token={token}
@@ -1034,6 +1131,25 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
           setAttachmentQueue={setAttachmentQueue}
           onAttachmentError={(m) => setError(m)}
           attachmentPickerRef={attachmentPickerRef}
+          draftKey={
+            // Per-session draft key — keeps each session's
+            // half-typed message separate. Falsy when no session
+            // is active so the composer doesn't write to a "" key.
+            activeName ? `vexis-draft:${activeName}` : null
+          }
+          lastUserMessage={
+            // Most recent user-role content from the active
+            // buffer, surfaced for ↑-recall in the composer. Walk
+            // from the end so the latest user turn wins even when
+            // assistant/system rows were appended after it.
+            (() => {
+              for (let i = messages.length - 1; i >= 0; i--) {
+                const m = messages[i];
+                if (m.role === "user" && m.content) return m.content;
+              }
+              return null;
+            })()
+          }
         />
         {/* Drag-hover overlay — full-pane translucent state with a
             "drop image here" affordance. Pointer-events:none so the

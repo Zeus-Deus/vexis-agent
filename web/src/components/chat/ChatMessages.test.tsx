@@ -302,6 +302,252 @@ describe("ChatMessages — Edit last user message", () => {
 });
 
 
+describe("ChatMessages — Image lightbox (Phase D)", () => {
+  function imgMsg(): ChatMessage {
+    return {
+      role: "user",
+      content: "look at this",
+      ts: 1700000000000,
+      attachments: [
+        {
+          path: "/tmp/cat.png",
+          name: "cat.png",
+          size: 1024,
+          mime: "image/png",
+          previewUrl: "blob:fake",
+        },
+      ],
+    };
+  }
+
+  it("does NOT render the lightbox by default", () => {
+    render(<ChatMessages messages={[imgMsg()]} pending={false} />);
+    expect(screen.queryByTestId("attachment-lightbox")).toBeNull();
+  });
+
+  it("clicking the inline image opens the lightbox", () => {
+    render(<ChatMessages messages={[imgMsg()]} pending={false} />);
+    fireEvent.click(screen.getByTestId("attachment-image"));
+    expect(screen.getByTestId("attachment-lightbox")).toBeTruthy();
+  });
+
+  it("clicking the close button dismisses the lightbox", () => {
+    render(<ChatMessages messages={[imgMsg()]} pending={false} />);
+    fireEvent.click(screen.getByTestId("attachment-image"));
+    expect(screen.getByTestId("attachment-lightbox")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("lightbox-close"));
+    expect(screen.queryByTestId("attachment-lightbox")).toBeNull();
+  });
+
+  it("Esc dismisses the lightbox", () => {
+    render(<ChatMessages messages={[imgMsg()]} pending={false} />);
+    fireEvent.click(screen.getByTestId("attachment-image"));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("attachment-lightbox")).toBeNull();
+  });
+
+  it("clicking the backdrop dismisses; clicking the image does NOT", () => {
+    render(<ChatMessages messages={[imgMsg()]} pending={false} />);
+    fireEvent.click(screen.getByTestId("attachment-image"));
+    const dialog = screen.getByTestId("attachment-lightbox");
+    // The image inside the dialog stops propagation — click on it
+    // shouldn't dismiss.
+    const innerImg = dialog.querySelector("img");
+    fireEvent.click(innerImg!);
+    expect(screen.getByTestId("attachment-lightbox")).toBeTruthy();
+    // Backdrop click closes.
+    fireEvent.click(dialog);
+    expect(screen.queryByTestId("attachment-lightbox")).toBeNull();
+  });
+});
+
+
+describe("ChatMessages — Error bubble + Retry", () => {
+  function errMsg(
+    overrides: Partial<ChatMessage> = {},
+  ): ChatMessage {
+    return {
+      role: "system",
+      content: "⚠️ Brain timed out",
+      ts: 1700000000000,
+      errorCode: "brain_timeout",
+      retryPayload: { text: "the original prompt", attachments: [] },
+      ...overrides,
+    };
+  }
+
+  it("renders an error bubble with a Retry button when retryPayload is set", () => {
+    render(
+      <ChatMessages
+        messages={[
+          { role: "user", content: "the original prompt", ts: 1 },
+          errMsg(),
+        ]}
+        pending={false}
+        onRetryFailed={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId("error-bubble")).toBeTruthy();
+    expect(screen.getByTestId("error-retry")).toBeTruthy();
+  });
+
+  it("clicking Retry fires onRetryFailed with the original payload", () => {
+    const onRetry = vi.fn();
+    render(
+      <ChatMessages
+        messages={[
+          { role: "user", content: "the original prompt", ts: 1 },
+          errMsg(),
+        ]}
+        pending={false}
+        onRetryFailed={onRetry}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("error-retry"));
+    expect(onRetry).toHaveBeenCalledWith("the original prompt", []);
+  });
+
+  it("hides Retry while pending (don't queue a second turn)", () => {
+    render(
+      <ChatMessages
+        messages={[errMsg()]}
+        pending={true}
+        onRetryFailed={vi.fn()}
+      />,
+    );
+    // Bubble still visible, but the button is suppressed.
+    expect(screen.getByTestId("error-bubble")).toBeTruthy();
+    expect(screen.queryByTestId("error-retry")).toBeNull();
+  });
+
+  it("plain system note (no errorCode) renders as a centered dim line", () => {
+    render(
+      <ChatMessages
+        messages={[
+          { role: "system", content: "Conversation cleared.", ts: 1 },
+        ]}
+        pending={false}
+        onRetryFailed={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId("error-bubble")).toBeNull();
+    expect(screen.getByText("Conversation cleared.")).toBeTruthy();
+  });
+
+  it("cancelled-code system messages don't render as an error bubble", () => {
+    // ``cancelled`` is the user-pressed-Stop path. The frontend
+    // shouldn't have placed it in the buffer at all (handleSend
+    // drops it), but if a stale row sneaks through, it must NOT
+    // render a Retry button — the user already chose to stop.
+    render(
+      <ChatMessages
+        messages={[
+          {
+            role: "system",
+            content: "",
+            ts: 1,
+            errorCode: "cancelled",
+          },
+        ]}
+        pending={false}
+        onRetryFailed={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId("error-bubble")).toBeNull();
+    expect(screen.queryByTestId("error-retry")).toBeNull();
+  });
+});
+
+
+describe("ChatMessages — Tool-use inline status", () => {
+  it("renders one row per tool event in order", () => {
+    const msg: ChatMessage = {
+      role: "assistant",
+      content: "reply text",
+      ts: 1700000001000,
+      tools: [
+        { name: "Read", target: "src/foo.py", ts: 1 },
+        { name: "Bash", target: "git status", ts: 2 },
+        { name: "Edit", target: "src/foo.py", ts: 3 },
+      ],
+    };
+    render(<ChatMessages messages={[msg]} pending={false} />);
+    const rows = screen.getAllByTestId("tool-use-row");
+    expect(rows).toHaveLength(3);
+    expect(rows[0].textContent).toContain("Reading");
+    expect(rows[0].textContent).toContain("src/foo.py");
+    expect(rows[1].textContent).toContain("Running");
+    expect(rows[1].textContent).toContain("git status");
+    expect(rows[2].textContent).toContain("Editing");
+  });
+
+  it("renders ONLY on assistant bubbles (not user/system)", () => {
+    // Defensive: even if a caller mistakenly attaches tools to a
+    // user message, the bubble must not render the tool row.
+    // We're checking that the renderer drops the row defensively
+    // even if a caller mistakenly attaches tools to a user role.
+    // Tools are typed optional on every role, so no @ts-expect-error
+    // is needed — the test still verifies the runtime guard.
+    const userWithTools: ChatMessage = {
+      role: "user",
+      content: "hi",
+      ts: 1,
+      tools: [{ name: "Read", target: "x", ts: 0 }],
+    };
+    render(<ChatMessages messages={[userWithTools]} pending={false} />);
+    expect(screen.queryByTestId("tool-use-list")).toBeNull();
+  });
+
+  it("suppresses the inline pulse when tools have streamed", () => {
+    // A streaming bubble normally shows a 3-dot pulse during the
+    // empty-content window. Once a tool event has streamed, the
+    // tool row's own indicator is the "alive" signal — the pulse
+    // would be redundant.
+    const msg: ChatMessage = {
+      role: "assistant",
+      content: "",
+      ts: 1700000001000,
+      tools: [{ name: "Read", target: "src/foo.py", ts: 1 }],
+    };
+    const { container } = render(
+      <ChatMessages messages={[msg]} pending={true} />,
+    );
+    expect(screen.getByTestId("tool-use-list")).toBeTruthy();
+    // The standalone PendingBubble pulse (three dots in a row) is
+    // not rendered because the tail bubble itself is streaming.
+    // The InlinePulse inside the bubble is also suppressed.
+    expect(container.querySelectorAll(".animate-pulse").length).toBeLessThanOrEqual(1);
+  });
+
+  it("falls back to the raw tool name when no humanised label exists", () => {
+    // MCP servers and arbitrary Task names — must render verbatim
+    // rather than as "undefined" or empty string.
+    const msg: ChatMessage = {
+      role: "assistant",
+      content: "ok",
+      ts: 1,
+      tools: [{ name: "mcp__codemux__browser_open", target: "https://x", ts: 0 }],
+    };
+    render(<ChatMessages messages={[msg]} pending={false} />);
+    const rows = screen.getAllByTestId("tool-use-row");
+    expect(rows[0].textContent).toContain("mcp__codemux__browser_open");
+  });
+
+  it("does not crash when target is null", () => {
+    const msg: ChatMessage = {
+      role: "assistant",
+      content: "delegated",
+      ts: 1,
+      tools: [{ name: "Task", target: null, ts: 0 }],
+    };
+    render(<ChatMessages messages={[msg]} pending={false} />);
+    const row = screen.getByTestId("tool-use-row");
+    // Label still rendered ("Delegating") but no target span.
+    expect(row.textContent).toContain("Delegating");
+  });
+});
+
+
 describe("ChatMessages — Regenerate last assistant", () => {
   it("renders a Regenerate button only on the LAST non-empty assistant bubble", () => {
     render(

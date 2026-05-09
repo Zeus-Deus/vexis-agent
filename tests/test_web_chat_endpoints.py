@@ -88,12 +88,21 @@ class _StubChat:
 
 
 class _FakeSessionInfo:
-    """Duck-typed WebSessionInfo. The route only reads three fields."""
+    """Duck-typed WebSessionInfo. The route now reads four fields:
+    name, is_active, created_at, and preview (added Phase B for the
+    sidebar's first-user-message snippets)."""
 
-    def __init__(self, name: str, is_active: bool, created_at: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        is_active: bool,
+        created_at: str,
+        preview: str | None = None,
+    ) -> None:
         self.name = name
         self.is_active = is_active
         self.created_at = created_at
+        self.preview = preview
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -287,11 +296,13 @@ def test_sessions_list_round_trip(
                 "name": "work",
                 "is_active": True,
                 "created_at": "2026-05-08T10:00:00+00:00",
+                "preview": None,
             },
             {
                 "name": "side",
                 "is_active": False,
                 "created_at": "2026-05-07T14:30:00+00:00",
+                "preview": None,
             },
         ]
     }

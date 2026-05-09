@@ -42,6 +42,24 @@ log = logging.getLogger(__name__)
 WEB_CHAT_ID: int = -1
 
 
+# Preview-snippet length. 80 chars fits comfortably under a session
+# row name on a 256px-wide sidebar without horizontal scroll, and
+# carries enough leading context that the user can recognise the
+# topic at a glance ("write a script to…", "help me debug…").
+_PREVIEW_MAX_CHARS: int = 80
+
+
+def _truncate_preview(text: str) -> str:
+    """Collapse multi-line / extra-whitespace text into a single
+    line, cap at ``_PREVIEW_MAX_CHARS`` with an ellipsis when
+    truncated. Stripped before measuring so leading newlines or
+    indentation don't burn budget."""
+    cleaned = " ".join(text.split())  # collapse all whitespace runs
+    if len(cleaned) <= _PREVIEW_MAX_CHARS:
+        return cleaned
+    return cleaned[: _PREVIEW_MAX_CHARS - 1].rstrip() + "…"
+
+
 @dataclass(frozen=True, slots=True)
 class WebSessionInfo:
     """Wire-format session record for the chat UI.
@@ -51,11 +69,19 @@ class WebSessionInfo:
     the ``initialized`` flag (UI doesn't differentiate yet). ISO-8601
     UTC timestamp so the browser can format with ``Intl.DateTimeFormat``
     in the user's locale without hauling a date library through the API.
+
+    ``preview`` is a short snippet of the session's first user message
+    (truncated to ~80 chars), shown under the session name in the
+    sidebar so the user can find conversations by content rather than
+    scrolling through a list of date-stamped names. ``None`` when the
+    session is empty or its transcript can't be read (e.g. fresh
+    just-created session, brain backend unavailable).
     """
 
     name: str
     is_active: bool
     created_at: str  # ISO-8601 UTC
+    preview: str | None = None
 
 
 class WebChatTransport:
@@ -68,6 +94,13 @@ class WebChatTransport:
     def __init__(self, handler: MessageHandler, allowed_user_id: int) -> None:
         self._handler = handler
         self._user_id = allowed_user_id
+        # Cache of session_uuid → first-user-message preview snippet.
+        # The first user turn is append-only on the brain side (claude
+        # writes it once at session init and never rewrites earlier
+        # turns), so a cached preview never goes stale. We don't bound
+        # the cache because session count is single-user and grows
+        # slowly; if it gets to 10k+ entries we can revisit.
+        self._preview_cache: dict[str, str | None] = {}
 
     # ---------- conversation ----------
 
@@ -153,17 +186,66 @@ class WebChatTransport:
         """Snapshot the session list in wire format. Returns ``None``
         only when the handler rejects the user_id (shouldn't happen
         behind the auth gate, but we forward the signal rather than
-        masking it)."""
+        masking it).
+
+        Each entry includes a ``preview`` snippet sourced from the
+        session's first user message — lets the sidebar render
+        searchable previews under each date-stamped name. Previews
+        are cached by session UUID; first call cold-reads the
+        transcript (cheap on tmpfs; first line of a JSONL), subsequent
+        calls hit the in-process cache.
+        """
         infos = self._handler.sessions_for(self._user_id)
         if infos is None:
             return None
-        # SessionInfo already carries is_active (sessions.py:25), so
-        # we don't need a second lookup against the SessionStore.
         return [
             WebSessionInfo(
                 name=info.name,
                 is_active=info.is_active,
                 created_at=info.created_at.isoformat(),
+                preview=self._preview_for(info.uuid),
             )
             for info in infos
         ]
+
+    def _preview_for(self, session_uuid: str) -> str | None:
+        """Return the first-user-message preview snippet for the
+        given session, computing+caching on first hit.
+
+        Reads at most a handful of messages until it finds a
+        user-role turn — defensive against transcripts that lead
+        with a system or assistant message (shouldn't happen for
+        vexis-spawned sessions but cheap insurance). Returns
+        ``None`` when the brain has no transcript reader, the
+        session is empty, or anything in the read path raises —
+        the sidebar gracefully renders just the name in that case.
+        """
+        cached = self._preview_cache.get(session_uuid)
+        if cached is not None or session_uuid in self._preview_cache:
+            return cached
+        snippet: str | None = None
+        try:
+            brain = self._handler.brain
+            # Walk a small prefix of messages so a malformed early
+            # turn doesn't shadow a perfectly good user message a
+            # few entries in. Cap at 5 to bound worst-case cost.
+            for i, msg in enumerate(brain.iter_messages(session_uuid)):
+                if i > 5:
+                    break
+                role = getattr(msg, "role", None)
+                text = getattr(msg, "text", None)
+                if role == "user" and isinstance(text, str) and text.strip():
+                    snippet = _truncate_preview(text)
+                    break
+        except Exception:
+            # Any read failure (missing transcript, malformed JSONL,
+            # opencode SQLite locked, brain not initialized) → no
+            # preview. Don't surface as an error to the user —
+            # the session row stays usable without one.
+            log.debug(
+                "preview lookup failed for session %s",
+                session_uuid, exc_info=True,
+            )
+            snippet = None
+        self._preview_cache[session_uuid] = snippet
+        return snippet

@@ -27,7 +27,7 @@ from core.brain.null import BrainNull
 from core.handler import MessageHandler
 from core.sessions import SessionStore
 from core.web_server import DashboardConfig, WebDashboard
-from transports.web import WebChatTransport
+from transports.web import WebChatTransport, _truncate_preview
 
 
 _TOKEN = "test-token-stream-cafef00d"
@@ -226,6 +226,236 @@ def test_handler_stream_done_carries_full_concatenated_reply(
     dones = [e[1] for e in events if e[0] == "done"]
     assert chunks == ["hel", "lo ", "world"]
     assert dones == ["hello world"]
+
+
+def test_handler_stream_forwards_tool_events(tmp_path: Path) -> None:
+    """Brain.astream yields a discriminated union — str (text delta)
+    or dict (tool-use event). MessageHandler.stream must forward
+    dict events as ``("tool", payload)`` so the SSE route can emit
+    them, without mixing them into the final text reply.
+
+    Pin: tool dicts must NOT contribute to the ``done`` payload
+    (would corrupt the assistant's transcript copy)."""
+
+    class ToolyBrain(BrainNull):
+        async def astream(
+            self, message: str, chat_id: int, *,
+            model=None, reasoning_level=None,
+        ) -> AsyncIterator[str | dict]:
+            yield "Looking… "
+            yield {"type": "tool", "name": "Read", "target": "src/foo.py"}
+            yield "found it. "
+            yield {"type": "tool", "name": "Bash", "target": "git status"}
+            yield "Done."
+
+    brain = ToolyBrain(responses=[])
+    sessions = SessionStore.__new__(SessionStore)
+    sessions._state_path = tmp_path / "sessions.json"  # type: ignore[attr-defined]
+    sessions._active = "test"  # type: ignore[attr-defined]
+    sessions._sessions = {  # type: ignore[attr-defined]
+        "test": {
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "initialized": True,
+            "created_at": "2026-05-09T00:00:00+00:00",
+        },
+    }
+    handler = MessageHandler(
+        brain=brain, sessions=sessions,
+        allowed_user_id=_ALLOWED_USER_ID, notifier=None,
+    )
+
+    async def run() -> list:
+        out: list = []
+        async for evt in handler.stream(_ALLOWED_USER_ID, 1, "x"):
+            out.append(evt)
+        return out
+
+    events = asyncio.run(run())
+    # Order matters: text + tool events interleave as the brain
+    # emits them, then a single ``done`` at the end.
+    assert events == [
+        ("chunk", "Looking… "),
+        ("tool", {"type": "tool", "name": "Read", "target": "src/foo.py"}),
+        ("chunk", "found it. "),
+        ("tool", {"type": "tool", "name": "Bash", "target": "git status"}),
+        ("chunk", "Done."),
+        ("done", "Looking… found it. Done."),
+    ]
+
+
+def test_stream_route_emits_tool_frames(
+    tmp_path: Path, brain: BrainNull,
+) -> None:
+    """SSE wire format: tool events become ``data: {"type":"tool",...}``
+    frames, distinct from chunk/done/error. Pin the wire shape so
+    the frontend's parser doesn't need to be rewritten when a new
+    tool is added on the brain side."""
+
+    class ToolyBrain(BrainNull):
+        async def astream(
+            self, message: str, chat_id: int, *,
+            model=None, reasoning_level=None,
+        ) -> AsyncIterator[str | dict]:
+            yield {"type": "tool", "name": "Read", "target": "/etc/hostname"}
+            yield "hello"
+
+    sessions = SessionStore.__new__(SessionStore)
+    sessions._state_path = tmp_path / "sessions.json"  # type: ignore[attr-defined]
+    sessions._active = "test"  # type: ignore[attr-defined]
+    sessions._sessions = {  # type: ignore[attr-defined]
+        "test": {
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "initialized": True,
+            "created_at": "2026-05-09T00:00:00+00:00",
+        },
+    }
+    handler = MessageHandler(
+        brain=ToolyBrain(responses=[]), sessions=sessions,
+        allowed_user_id=_ALLOWED_USER_ID, notifier=None,
+    )
+    chat_obj = WebChatTransport(handler=handler, allowed_user_id=_ALLOWED_USER_ID)
+
+    dashboard = WebDashboard.__new__(WebDashboard)
+    dashboard._workspace = tmp_path  # type: ignore[attr-defined]
+    dashboard._token = _TOKEN  # type: ignore[attr-defined]
+    dashboard._learning = None  # type: ignore[attr-defined]
+    dashboard._chat = chat_obj  # type: ignore[attr-defined]
+    dashboard._relationships_mutation_window_seconds = 600  # type: ignore[attr-defined]
+    dashboard._relationships_mutation_limit = 100  # type: ignore[attr-defined]
+    dashboard._relationships_mutation_log = defaultdict(deque)  # type: ignore[attr-defined]
+    dashboard._config = DashboardConfig(  # type: ignore[attr-defined]
+        host="127.0.0.1", port=0,
+        web_dist=tmp_path / "no-frontend",
+        manage_tailscale=False,
+    )
+    for k in (
+        "_sessions", "_running_tasks", "_background_tasks", "_curator",
+        "_browser", "_started_at", "_tailscale_url", "_tailscale_dns",
+        "_server", "_serve_task", "_profile_size_cache",
+        "_running_brain_kind",
+    ):
+        setattr(dashboard, k, None)
+    dashboard._app = dashboard._build_app()  # type: ignore[attr-defined]
+    cl = TestClient(dashboard._app)
+
+    r = cl.post(
+        "/api/v1/chat/stream",
+        headers=_auth(),
+        json={"text": "hi"},
+    )
+    assert r.status_code == 200
+    events = _parse_sse(r.text)
+    assert events == [
+        {"type": "tool", "name": "Read", "target": "/etc/hostname"},
+        {"type": "chunk", "text": "hello"},
+        {"type": "done", "reply": "hello"},
+    ]
+
+
+def test_handler_stream_emits_dict_error_with_code(tmp_path: Path) -> None:
+    """Phase C: error events carry a discriminator code so the
+    chat UI can pick a per-error recovery affordance. Pin the
+    BrainTimeoutError → ``brain_timeout`` mapping; same shape
+    expected for BrainError / SessionLost / generic Exception."""
+    from core.brain.base import BrainTimeoutError
+
+    class TimeyBrain(BrainNull):
+        async def astream(
+            self, message: str, chat_id: int, *,
+            model=None, reasoning_level=None,
+        ) -> AsyncIterator[str]:
+            yield "starting…"
+            raise BrainTimeoutError("simulated timeout")
+
+    brain = TimeyBrain(responses=[])
+    sessions = SessionStore.__new__(SessionStore)
+    sessions._state_path = tmp_path / "sessions.json"  # type: ignore[attr-defined]
+    sessions._active = "test"  # type: ignore[attr-defined]
+    sessions._sessions = {  # type: ignore[attr-defined]
+        "test": {
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "initialized": True,
+            "created_at": "2026-05-09T00:00:00+00:00",
+        },
+    }
+    handler = MessageHandler(
+        brain=brain, sessions=sessions,
+        allowed_user_id=_ALLOWED_USER_ID, notifier=None,
+    )
+
+    async def run() -> list:
+        out: list = []
+        async for evt in handler.stream(_ALLOWED_USER_ID, 1, "hi"):
+            out.append(evt)
+        return out
+
+    events = asyncio.run(run())
+    # First a chunk, then a single error with structured payload.
+    assert events[0] == ("chunk", "starting…")
+    assert len(events) == 2
+    kind, payload = events[1]
+    assert kind == "error"
+    assert isinstance(payload, dict)
+    assert payload["code"] == "brain_timeout"
+    assert "ceiling" in payload["message"]  # the user-facing string
+
+
+def test_stream_route_error_frame_includes_code(tmp_path: Path) -> None:
+    """End-to-end: SSE route serializes the dict error payload as
+    ``data: {"type":"error","code":"...","message":"..."}``."""
+    from core.brain.base import BrainError
+
+    class CrashBrain(BrainNull):
+        async def astream(
+            self, message: str, chat_id: int, *,
+            model=None, reasoning_level=None,
+        ) -> AsyncIterator[str]:
+            raise BrainError("crashed for the test")
+
+    sessions = SessionStore.__new__(SessionStore)
+    sessions._state_path = tmp_path / "sessions.json"  # type: ignore[attr-defined]
+    sessions._active = "test"  # type: ignore[attr-defined]
+    sessions._sessions = {  # type: ignore[attr-defined]
+        "test": {
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "initialized": True,
+            "created_at": "2026-05-09T00:00:00+00:00",
+        },
+    }
+    handler = MessageHandler(
+        brain=CrashBrain(responses=[]), sessions=sessions,
+        allowed_user_id=_ALLOWED_USER_ID, notifier=None,
+    )
+    chat_obj = WebChatTransport(handler=handler, allowed_user_id=_ALLOWED_USER_ID)
+    dashboard = WebDashboard.__new__(WebDashboard)
+    dashboard._workspace = tmp_path  # type: ignore[attr-defined]
+    dashboard._token = _TOKEN  # type: ignore[attr-defined]
+    dashboard._learning = None  # type: ignore[attr-defined]
+    dashboard._chat = chat_obj  # type: ignore[attr-defined]
+    dashboard._relationships_mutation_window_seconds = 600  # type: ignore[attr-defined]
+    dashboard._relationships_mutation_limit = 100  # type: ignore[attr-defined]
+    dashboard._relationships_mutation_log = defaultdict(deque)  # type: ignore[attr-defined]
+    dashboard._config = DashboardConfig(  # type: ignore[attr-defined]
+        host="127.0.0.1", port=0,
+        web_dist=tmp_path / "no-frontend",
+        manage_tailscale=False,
+    )
+    for k in (
+        "_sessions", "_running_tasks", "_background_tasks", "_curator",
+        "_browser", "_started_at", "_tailscale_url", "_tailscale_dns",
+        "_server", "_serve_task", "_profile_size_cache",
+        "_running_brain_kind",
+    ):
+        setattr(dashboard, k, None)
+    dashboard._app = dashboard._build_app()  # type: ignore[attr-defined]
+    cl = TestClient(dashboard._app)
+
+    r = cl.post("/api/v1/chat/stream", headers=_auth(), json={"text": "hi"})
+    assert r.status_code == 200
+    events = _parse_sse(r.text)
+    err = next(e for e in events if e.get("type") == "error")
+    assert err["code"] == "brain_error"
+    assert "Something broke" in err["message"]
 
 
 def test_handler_stream_rejects_disallowed_user(
@@ -518,3 +748,183 @@ def test_web_transport_cancel_routes_to_running_tasks_with_web_chat_id(
     result = asyncio.run(chat.cancel(recorder))
     assert result is False
     assert recorder.calls == [-1]
+
+
+# ──────────────────────────────────────────────────────────────────
+# Sidebar previews (Phase B): WebChatTransport.list_sessions
+# attaches a snippet of each session's first user message.
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_truncate_preview_short_text_unchanged() -> None:
+    """Short user messages survive intact — the helper is a no-op
+    when the text is already under the cap. Pin so we don't add
+    a forced ellipsis later."""
+    assert _truncate_preview("hello world") == "hello world"
+
+
+def test_truncate_preview_long_text_capped_with_ellipsis() -> None:
+    """Long messages get truncated to the cap with a trailing ellipsis.
+    Pin the exact truncated length so a future cap change is visible
+    in this test rather than silently rolling out."""
+    text = "a" * 200
+    out = _truncate_preview(text)
+    assert len(out) <= 80
+    assert out.endswith("…")
+
+
+def test_truncate_preview_collapses_whitespace() -> None:
+    """Multi-line / extra-spaces input gets normalized to one line.
+    A multi-line preview would visually break the sidebar's
+    line-clamp layout and confuse the rendered length."""
+    text = "first line\n\n\nsecond   line\twith\ttabs"
+    out = _truncate_preview(text)
+    assert "\n" not in out
+    assert "  " not in out  # no run of multiple spaces
+    assert "first line" in out
+    assert "second line" in out
+
+
+class _PreviewBrain(BrainNull):
+    """Minimal stand-in: returns a fake transcript with one user
+    message via ``iter_messages``. Lets the transport's preview
+    logic exercise without hitting disk."""
+
+    def __init__(self, first_user_text: str = "test prompt") -> None:
+        super().__init__(responses=[])
+        self._first_user_text = first_user_text
+        self.iter_calls: list[str] = []
+
+    def iter_messages(self, session_id: str):  # type: ignore[override]
+        self.iter_calls.append(session_id)
+        # Yield a system message first to verify the transport
+        # walks past non-user messages to find a user turn.
+
+        class _M:
+            def __init__(self, role: str, text: str) -> None:
+                self.role = role
+                self.text = text
+
+        yield _M("assistant", "hi sir, how can I help?")
+        yield _M("user", self._first_user_text)
+        yield _M("assistant", "...")
+
+
+def test_list_sessions_attaches_preview_from_first_user_message(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: list_sessions calls into the brain's transcript
+    reader, finds the first user-role message, attaches a truncated
+    preview to each WebSessionInfo. Sidebar sees the snippet."""
+    brain = _PreviewBrain(first_user_text="explain monads in haskell")
+    sessions = SessionStore.__new__(SessionStore)
+    sessions._state_path = tmp_path / "sessions.json"  # type: ignore[attr-defined]
+    sessions._active = "work"  # type: ignore[attr-defined]
+    sessions._sessions = {  # type: ignore[attr-defined]
+        "work": {
+            "uuid": "11111111-2222-3333-4444-555555555555",
+            "initialized": True,
+            "created_at": "2026-05-08T10:00:00+00:00",
+        },
+    }
+    handler = MessageHandler(
+        brain=brain, sessions=sessions,
+        allowed_user_id=_ALLOWED_USER_ID, notifier=None,
+    )
+    chat = WebChatTransport(handler=handler, allowed_user_id=_ALLOWED_USER_ID)
+
+    infos = chat.list_sessions()
+    assert infos is not None
+    assert len(infos) == 1
+    assert infos[0].preview == "explain monads in haskell"
+
+
+def test_list_sessions_preview_cache_avoids_rereading(tmp_path: Path) -> None:
+    """Cache invariant: a second list_sessions call must NOT
+    re-read the brain's transcript. First-user-message is append-
+    only on the brain side (claude writes once at session init),
+    so the cache stays valid forever."""
+    brain = _PreviewBrain()
+    sessions = SessionStore.__new__(SessionStore)
+    sessions._state_path = tmp_path / "sessions.json"  # type: ignore[attr-defined]
+    sessions._active = "work"  # type: ignore[attr-defined]
+    sessions._sessions = {  # type: ignore[attr-defined]
+        "work": {
+            "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "initialized": True,
+            "created_at": "2026-05-08T10:00:00+00:00",
+        },
+    }
+    handler = MessageHandler(
+        brain=brain, sessions=sessions,
+        allowed_user_id=_ALLOWED_USER_ID, notifier=None,
+    )
+    chat = WebChatTransport(handler=handler, allowed_user_id=_ALLOWED_USER_ID)
+
+    chat.list_sessions()
+    chat.list_sessions()
+    chat.list_sessions()
+    # Brain.iter_messages called exactly once for that uuid.
+    assert brain.iter_calls.count(
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    ) == 1
+
+
+def test_list_sessions_preview_none_when_brain_raises(tmp_path: Path) -> None:
+    """Robustness: a brain that fails on iter_messages (missing
+    transcript, locked DB) must not crash the sidebar list call.
+    Preview becomes None; the row still renders with name + date."""
+
+    class _FaultyBrain(BrainNull):
+        def iter_messages(self, session_id: str):  # type: ignore[override]
+            raise RuntimeError("transcript unreadable")
+
+    brain = _FaultyBrain(responses=[])
+    sessions = SessionStore.__new__(SessionStore)
+    sessions._state_path = tmp_path / "sessions.json"  # type: ignore[attr-defined]
+    sessions._active = "work"  # type: ignore[attr-defined]
+    sessions._sessions = {  # type: ignore[attr-defined]
+        "work": {
+            "uuid": "ffffffff-1111-2222-3333-444444444444",
+            "initialized": True,
+            "created_at": "2026-05-08T10:00:00+00:00",
+        },
+    }
+    handler = MessageHandler(
+        brain=brain, sessions=sessions,
+        allowed_user_id=_ALLOWED_USER_ID, notifier=None,
+    )
+    chat = WebChatTransport(handler=handler, allowed_user_id=_ALLOWED_USER_ID)
+    infos = chat.list_sessions()
+    assert infos is not None
+    assert infos[0].preview is None
+
+
+def test_list_sessions_preview_skips_non_user_messages(tmp_path: Path) -> None:
+    """Defensive: transcripts may lead with a system or assistant
+    message (curator/judge sessions, or anything weird). The
+    transport must walk past those to find the first ACTUAL user
+    turn — using the first message regardless of role would show
+    bogus previews like `hi sir, how can I help?` from the
+    assistant side."""
+    # The _PreviewBrain fixture above leads with an assistant
+    # message; verify the user message is what's surfaced.
+    brain = _PreviewBrain(first_user_text="this is the user turn")
+    sessions = SessionStore.__new__(SessionStore)
+    sessions._state_path = tmp_path / "sessions.json"  # type: ignore[attr-defined]
+    sessions._active = "work"  # type: ignore[attr-defined]
+    sessions._sessions = {  # type: ignore[attr-defined]
+        "work": {
+            "uuid": "11111111-1111-1111-1111-111111111111",
+            "initialized": True,
+            "created_at": "2026-05-08T10:00:00+00:00",
+        },
+    }
+    handler = MessageHandler(
+        brain=brain, sessions=sessions,
+        allowed_user_id=_ALLOWED_USER_ID, notifier=None,
+    )
+    chat = WebChatTransport(handler=handler, allowed_user_id=_ALLOWED_USER_ID)
+    infos = chat.list_sessions()
+    assert infos is not None
+    assert infos[0].preview == "this is the user turn"

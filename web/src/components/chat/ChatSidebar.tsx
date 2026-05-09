@@ -120,20 +120,24 @@ function ChatSidebarImpl({
             No sessions yet.
           </div>
         ) : (
-          <ul className="space-y-0.5">
-            {sessions.map((s) => (
-              <SessionRow
-                key={s.name}
-                session={s}
-                pending={pendingName === s.name}
-                disabled={pendingName !== null && pendingName !== s.name}
-                onSwitch={wrap(() => onSwitch(s.name))}
-                onRename={wrap((next) => onRename(s.name, next))}
-                onDelete={wrap(() => onDelete(s.name))}
-                canDelete={sessions.length > 1}
-              />
-            ))}
-          </ul>
+          // Grouped by recency (Today / Yesterday / Last 7 days /
+          // Older) so navigating ~60+ sessions doesn't require
+          // mentally subtracting dates. Group keys come from a
+          // pure helper so the test surface for "is this in
+          // Today?" stays small and deterministic.
+          groupSessions(sessions).map(({ label, items }) => (
+            <SessionGroup
+              key={label}
+              label={label}
+              sessions={items}
+              pendingName={pendingName}
+              onSwitch={onSwitch}
+              onRename={onRename}
+              onDelete={onDelete}
+              wrap={wrap}
+              canDelete={sessions.length > 1}
+            />
+          ))
         )}
       </nav>
 
@@ -221,38 +225,45 @@ function SessionRow({
   };
 
   return (
-    <li>
-      <div
-        // Behaves like a button when the row is selectable, like a
-        // plain container when it's the active session (no further
-        // selection happens). ``role`` and ``tabIndex`` reflect that.
-        role={rowDisabled ? undefined : "button"}
-        tabIndex={rowDisabled ? -1 : 0}
-        onClick={rowOnActivate}
-        onKeyDown={(e) => {
-          if (rowDisabled) return;
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            rowOnActivate();
-          }
-        }}
-        aria-label={
-          session.is_active
-            ? `${session.name} (active)`
-            : `Switch to ${session.name}`
+    <div
+      // Behaves like a button when the row is selectable, like a
+      // plain container when it's the active session (no further
+      // selection happens). ``role`` and ``tabIndex`` reflect that.
+      // Note: the surrounding <li> now lives in SessionGroup so
+      // the content-visibility hint can attach to the list item
+      // itself — leaving the <li> here would double up the
+      // element tree.
+      role={rowDisabled ? undefined : "button"}
+      tabIndex={rowDisabled ? -1 : 0}
+      onClick={rowOnActivate}
+      onKeyDown={(e) => {
+        if (rowDisabled) return;
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          rowOnActivate();
         }
-        title={`${session.name} · ${created}`}
-        className={[
-          "group rounded-md px-2 py-1.5",
-          session.is_active
-            ? "bg-[var(--color-surface-2)] border-l-2 border-[var(--color-accent)] pl-1.5"
-            : "hover:bg-[var(--color-surface-2)] cursor-pointer",
-          disabled ? "opacity-40 cursor-not-allowed" : "",
-          // Focus ring for keyboard users; subtle accent outline so it
-          // doesn't fight the active-session amber border-l-2.
-          "focus:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent)]",
-        ].join(" ")}
-      >
+      }}
+      aria-label={
+        session.is_active
+          ? `${session.name} (active)`
+          : `Switch to ${session.name}`
+      }
+      title={
+        session.preview
+          ? `${session.name}\n${session.preview}\n${created}`
+          : `${session.name} · ${created}`
+      }
+      className={[
+        "group rounded-md px-2 py-1.5",
+        session.is_active
+          ? "bg-[var(--color-surface-2)] border-l-2 border-[var(--color-accent)] pl-1.5"
+          : "hover:bg-[var(--color-surface-2)] cursor-pointer",
+        disabled ? "opacity-40 cursor-not-allowed" : "",
+        // Focus ring for keyboard users; subtle accent outline so it
+        // doesn't fight the active-session amber border-l-2.
+        "focus:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent)]",
+      ].join(" ")}
+    >
         <div className="flex items-center gap-2">
           {editing ? (
             <input
@@ -346,13 +357,28 @@ function SessionRow({
             </div>
           )}
         </div>
+        {/* Preview snippet (first user message). Two-line clamp so
+            longer prompts render as "first line… cut off here…"
+            without growing the row to a full paragraph. Hidden
+            during inline-edit because it's not relevant while the
+            user is renaming. */}
+        {!editing && session.preview && (
+          <div
+            className={[
+              "text-[10.5px] leading-snug text-[var(--color-fg-dim)]",
+              "mt-0.5 line-clamp-2 break-words",
+            ].join(" ")}
+            data-testid="session-preview"
+          >
+            {session.preview}
+          </div>
+        )}
         {created && !editing && (
           <div className="text-[10px] text-[var(--color-fg-dim)] mt-0.5 pl-0">
             {created}
           </div>
         )}
       </div>
-    </li>
   );
 }
 
@@ -364,6 +390,133 @@ function SessionRow({
 // and uses ``useCallback`` for handlers — the prop identities are
 // stable across renders that don't actually concern the sidebar.
 export const ChatSidebar = memo(ChatSidebarImpl);
+
+
+/** Bucketed sessions for sidebar grouping. Order matters — groups
+ *  render top-to-bottom in declaration order, mirroring "newest
+ *  first" navigation hierarchy used by ChatGPT / Claude.ai. */
+type GroupLabel = "Today" | "Yesterday" | "Previous 7 days" | "Older";
+
+const _GROUP_ORDER: GroupLabel[] = [
+  "Today", "Yesterday", "Previous 7 days", "Older",
+];
+
+/** Pure classifier so the grouping logic is straightforward to
+ *  unit test. Returns the bucket label for ``createdAt`` relative
+ *  to ``now``. Day boundaries use the user's LOCAL time zone (not
+ *  UTC) so a session created at 11pm yesterday doesn't show up as
+ *  "Today" the next morning across timezone math. */
+export function classifySession(
+  createdAt: string,
+  now: Date = new Date(),
+): GroupLabel {
+  const created = new Date(createdAt);
+  if (Number.isNaN(created.getTime())) return "Older";
+  // Midnight (local) of "today" — anything created on or after
+  // this is "Today".
+  const todayStart = new Date(
+    now.getFullYear(), now.getMonth(), now.getDate(),
+  );
+  if (created >= todayStart) return "Today";
+  // Midnight of the day before today. created∈[yesterdayStart, todayStart) → "Yesterday".
+  const yesterdayStart = new Date(todayStart);
+  yesterdayStart.setDate(yesterdayStart.getDate() - 1);
+  if (created >= yesterdayStart) return "Yesterday";
+  // Midnight 7 days before today. created∈[sevenDaysAgo, yesterdayStart) → "Previous 7 days".
+  // Strict < yesterdayStart is implicit from the prior branch.
+  const sevenDaysAgo = new Date(todayStart);
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+  if (created >= sevenDaysAgo) return "Previous 7 days";
+  return "Older";
+}
+
+/** Group + sort sessions for the sidebar. Returns groups in
+ *  recency order (Today first); empty groups are omitted so
+ *  short session histories don't render four headers with three
+ *  empty buckets. Within a group, sessions keep their input
+ *  order (caller already sorts newest-first). */
+export function groupSessions(
+  sessions: ChatSession[],
+  now: Date = new Date(),
+): { label: GroupLabel; items: ChatSession[] }[] {
+  const buckets: Record<GroupLabel, ChatSession[]> = {
+    "Today": [],
+    "Yesterday": [],
+    "Previous 7 days": [],
+    "Older": [],
+  };
+  for (const s of sessions) {
+    buckets[classifySession(s.created_at, now)].push(s);
+  }
+  return _GROUP_ORDER
+    .filter((label) => buckets[label].length > 0)
+    .map((label) => ({ label, items: buckets[label] }));
+}
+
+/** One date-grouped section in the sidebar. Renders a small
+ *  uppercase header followed by the rows. ``content-visibility:
+ *  auto`` lets the browser skip layout/paint for off-screen rows
+ *  — free virtualization for sessions further down a long list,
+ *  no library dependency. */
+function SessionGroup({
+  label,
+  sessions,
+  pendingName,
+  onSwitch,
+  onRename,
+  onDelete,
+  wrap,
+  canDelete,
+}: {
+  label: string;
+  sessions: ChatSession[];
+  pendingName: string | null;
+  onSwitch: (name: string) => void;
+  onRename: (oldName: string, newName: string) => void;
+  onDelete: (name: string) => void;
+  wrap: <A extends unknown[]>(fn: (...args: A) => void) => (...args: A) => void;
+  canDelete: boolean;
+}) {
+  return (
+    <div className="mb-2" data-testid={`group-${label}`}>
+      <div
+        className={[
+          "px-2 py-1 text-[10px] uppercase tracking-wider font-semibold",
+          "text-[var(--color-fg-dim)] sticky top-0 z-10",
+          "bg-[var(--color-surface)]",
+        ].join(" ")}
+      >
+        {label}
+      </div>
+      <ul className="space-y-0.5">
+        {sessions.map((s) => (
+          // ``content-visibility: auto`` + a contain-intrinsic-size
+          // hint lets the browser skip layout/paint for rows
+          // outside the viewport. Free perf win when the list
+          // gets long. The hint matches the row's actual rendered
+          // height (~52px) so the scrollbar geometry stays sane.
+          <li
+            key={s.name}
+            style={{
+              contentVisibility: "auto",
+              containIntrinsicSize: "0 52px",
+            }}
+          >
+            <SessionRow
+              session={s}
+              pending={pendingName === s.name}
+              disabled={pendingName !== null && pendingName !== s.name}
+              onSwitch={wrap(() => onSwitch(s.name))}
+              onRename={wrap((next) => onRename(s.name, next))}
+              onDelete={wrap(() => onDelete(s.name))}
+              canDelete={canDelete}
+            />
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 function IconButton({
   children,

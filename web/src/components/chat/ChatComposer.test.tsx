@@ -35,6 +35,8 @@ function defaultProps(overrides: Partial<React.ComponentProps<typeof ChatCompose
     attachmentQueue: [],
     setAttachmentQueue: vi.fn(),
     onAttachmentError: vi.fn(),
+    draftKey: null,
+    lastUserMessage: null,
     ...overrides,
   };
 }
@@ -84,5 +86,109 @@ describe("ChatComposer Send/Stop swap", () => {
     expect(stop.disabled).toBe(false);
     fireEvent.click(stop);
     expect(onStop).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe("ChatComposer keyboard shortcuts (Phase D)", () => {
+  it("↑ in empty composer recalls the last user message", () => {
+    render(
+      <ChatComposer
+        {...defaultProps({ lastUserMessage: "previously asked about X" })}
+      />,
+    );
+    const ta = screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement;
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta.value).toBe("previously asked about X");
+  });
+
+  it("↑ does NOT recall when the composer already has text", () => {
+    render(
+      <ChatComposer
+        {...defaultProps({ lastUserMessage: "previously asked" })}
+      />,
+    );
+    const ta = screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "current draft" } });
+    // Place cursor in the middle of the draft so the recall guard
+    // (cursor at 0,0) doesn't trigger.
+    ta.setSelectionRange(5, 5);
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta.value).toBe("current draft");
+  });
+
+  it("Cmd+Enter submits even with text", () => {
+    const onSend = vi.fn();
+    render(<ChatComposer {...defaultProps({ onSend })} />);
+    const ta = screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "test" } });
+    fireEvent.keyDown(ta, { key: "Enter", metaKey: true });
+    expect(onSend).toHaveBeenCalledWith("test", []);
+  });
+
+  it("Esc blurs the composer", () => {
+    render(<ChatComposer {...defaultProps()} />);
+    const ta = screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement;
+    ta.focus();
+    expect(document.activeElement).toBe(ta);
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(document.activeElement).not.toBe(ta);
+  });
+});
+
+
+describe("ChatComposer draft persistence (Phase D)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("loads the draft from localStorage on mount when draftKey is set", () => {
+    localStorage.setItem("vexis-draft:work", "half-typed message");
+    render(
+      <ChatComposer {...defaultProps({ draftKey: "vexis-draft:work" })} />,
+    );
+    const ta = screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement;
+    expect(ta.value).toBe("half-typed message");
+  });
+
+  it("persists every keystroke to localStorage", () => {
+    render(
+      <ChatComposer {...defaultProps({ draftKey: "vexis-draft:work" })} />,
+    );
+    const ta = screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "drafting…" } });
+    expect(localStorage.getItem("vexis-draft:work")).toBe("drafting…");
+  });
+
+  it("clears localStorage when the draft becomes empty", () => {
+    localStorage.setItem("vexis-draft:work", "old");
+    render(
+      <ChatComposer {...defaultProps({ draftKey: "vexis-draft:work" })} />,
+    );
+    const ta = screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "" } });
+    expect(localStorage.getItem("vexis-draft:work")).toBeNull();
+  });
+
+  it("switches drafts when draftKey changes (session switch)", () => {
+    localStorage.setItem("vexis-draft:work", "work draft");
+    localStorage.setItem("vexis-draft:side", "side draft");
+    const { rerender } = render(
+      <ChatComposer {...defaultProps({ draftKey: "vexis-draft:work" })} />,
+    );
+    let ta = screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement;
+    expect(ta.value).toBe("work draft");
+    rerender(
+      <ChatComposer {...defaultProps({ draftKey: "vexis-draft:side" })} />,
+    );
+    ta = screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement;
+    expect(ta.value).toBe("side draft");
+  });
+
+  it("draftKey=null disables persistence (and starts empty)", () => {
+    localStorage.setItem("vexis-draft:work", "should not be loaded");
+    render(<ChatComposer {...defaultProps({ draftKey: null })} />);
+    const ta = screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement;
+    expect(ta.value).toBe("");
   });
 });

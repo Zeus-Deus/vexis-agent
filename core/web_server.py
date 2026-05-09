@@ -1328,6 +1328,10 @@ class WebDashboard:
                             "name": s.name,
                             "is_active": s.is_active,
                             "created_at": s.created_at,
+                            # Preview snippet (first user message,
+                            # truncated). May be null for sessions
+                            # whose transcript is unreadable.
+                            "preview": s.preview,
                         }
                         for s in infos
                     ],
@@ -1394,25 +1398,48 @@ class WebDashboard:
                                 {"type": "chunk", "text": payload}
                             )
                             yield f"data: {data}\n\n"
+                        elif kind == "tool":
+                            # Tool-use event from the brain. ``payload``
+                            # is a dict ``{"type":"tool","name","target"}``;
+                            # we forward shape-as-is so the client can
+                            # render an inline status line. ``target``
+                            # may be None for tools without a clear
+                            # filename/command (Task, MCP servers, etc.).
+                            data = json.dumps(payload)
+                            yield f"data: {data}\n\n"
                         elif kind == "done":
                             data = json.dumps(
                                 {"type": "done", "reply": payload}
                             )
                             yield f"data: {data}\n\n"
                         elif kind == "error":
-                            # Empty ``payload`` means the handler
-                            # suppressed the message (cancel), no
-                            # error string to surface — still tell
-                            # the UI so it can clean up the bubble.
-                            msg = payload or ""
+                            # Phase C: payload is now a dict
+                            # ``{"code": ..., "message": ...}`` so
+                            # the UI can pick a per-code recovery
+                            # affordance (retry button, auth-fail
+                            # redirect, silent-cancel handling).
+                            # ``None`` from the handler means the
+                            # allow-list rejected the user; we surface
+                            # ``rejected`` so the UI can fall back to
+                            # the auth-fail flow without a stale
+                            # message bubble.
+                            code = "rejected"
+                            msg = ""
+                            if isinstance(payload, dict):
+                                code = str(payload.get("code") or "unknown")
+                                msg = str(payload.get("message") or "")
                             data = json.dumps(
-                                {"type": "error", "message": msg}
+                                {"type": "error", "code": code, "message": msg}
                             )
                             yield f"data: {data}\n\n"
                 except Exception:
                     log.exception("/chat/stream generator raised")
                     data = json.dumps(
-                        {"type": "error", "message": "stream interrupted"},
+                        {
+                            "type": "error",
+                            "code": "unknown",
+                            "message": "stream interrupted",
+                        },
                     )
                     yield f"data: {data}\n\n"
 
