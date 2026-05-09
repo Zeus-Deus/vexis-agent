@@ -9,7 +9,8 @@
 #   curl -fsSL ... | bash -s -- --skip-setup
 #
 # Env knobs:
-#   VEXIS_CHANNEL=stable|dev   default stable (main branch).
+#   VEXIS_VERSION=<tag-or-sha> pin to a specific git tag or commit
+#                              (e.g. v0.2.0). Default empty = latest main.
 #   VEXIS_REPO=git+...         override the source URL (forks, mirrors, ...).
 #   NO_COLOR=1                 disable ANSI colors (per https://no-color.org/).
 #
@@ -99,7 +100,8 @@ Flags:
   -h, --help    Show this help.
 
 Environment:
-  VEXIS_CHANNEL  stable (default, main branch) or dev (develop branch).
+  VEXIS_VERSION  Pin to a git tag or commit (e.g. v0.2.0).
+                 Default empty = latest commit on main.
   VEXIS_REPO     Override the install source (default: GitHub main).
   NO_COLOR       Disable ANSI colors.
 EOF
@@ -131,22 +133,23 @@ if [[ "${XDG_SESSION_TYPE:-}" != "wayland" ]]; then
     info "vexis-agent is Hyprland/Wayland-targeted; X11 won't work."
 fi
 
-# ── version + channel resolution ────────────────────────────────────
-section "Channel"
-CHANNEL="${VEXIS_CHANNEL:-stable}"
-case "$CHANNEL" in
-    stable) BRANCH="main" ;;
-    dev)    BRANCH="develop" ;;
-    *)
-        err "Unknown VEXIS_CHANNEL='$CHANNEL' (valid: stable, dev)."
-        exit 64
-        ;;
-esac
-
-REPO_DEFAULT="git+https://github.com/Zeus-Deus/vexis-agent.git@${BRANCH}"
+# ── version resolution ──────────────────────────────────────────────
+# Default install is "latest commit on main" — the maintainer keeps
+# main always-working via feature branches. Users who want to pin to
+# a known-good release set VEXIS_VERSION=<tag> (e.g. v0.2.0). Power
+# users can override the whole git URL via VEXIS_REPO.
+section "Source"
+VERSION="${VEXIS_VERSION:-}"
+if [[ -n "$VERSION" ]]; then
+    REPO_DEFAULT="git+https://github.com/Zeus-Deus/vexis-agent.git@${VERSION}"
+    SOURCE_LABEL="pinned to ${VERSION}"
+else
+    REPO_DEFAULT="git+https://github.com/Zeus-Deus/vexis-agent.git@main"
+    SOURCE_LABEL="latest main"
+fi
 REPO="${VEXIS_REPO:-$REPO_DEFAULT}"
 
-ok "channel: ${CHANNEL} (branch=${BRANCH})"
+ok "${SOURCE_LABEL}"
 info "source:  ${REPO}"
 if [[ "$DRY_RUN" -eq 1 ]]; then
     warn "DRY-RUN mode — no changes will be made"

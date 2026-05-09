@@ -489,6 +489,59 @@ def _default_confirm(message: str) -> bool:
     return raw in {"y", "yes"}
 
 
+# Choice prompts: a callable that takes (message, options, default_idx)
+# and returns the chosen index. Tests inject canned answers; the
+# default reads stdin and accepts a 1-based numeric pick (or empty
+# for the default).
+ChoiceFn = Callable[[str, list[str], int], int]
+
+
+def _default_choice(message: str, options: list[str], default_idx: int) -> int:
+    """Numbered-list prompt. Empty input → default; out-of-range or
+    non-numeric → re-prompt up to a few times then bail to default."""
+    sys.stdout.write(f"{message}\n")
+    for i, opt in enumerate(options):
+        marker = "*" if i == default_idx else " "
+        sys.stdout.write(f"   {marker} {i + 1}) {opt}\n")
+    for _ in range(3):
+        sys.stdout.write(f"    [{default_idx + 1}]: ")
+        sys.stdout.flush()
+        raw = sys.stdin.readline().strip()
+        if not raw:
+            return default_idx
+        try:
+            picked = int(raw)
+        except ValueError:
+            sys.stdout.write(f"      not a number — pick 1..{len(options)}\n")
+            continue
+        if 1 <= picked <= len(options):
+            return picked - 1
+        sys.stdout.write(f"      out of range — pick 1..{len(options)}\n")
+    return default_idx
+
+
+def _set_brain_kind(config_path: Path, kind: str) -> None:
+    """Rewrite the ``brain.kind`` line in an existing config.yaml.
+
+    The shipped template already has ``kind: claude-code`` — we just
+    swap the value if the user picked something else. Avoids pulling
+    in a full YAML rewriter for one line; the schema's stable enough
+    that a regex is safe here.
+    """
+    import re
+
+    text = config_path.read_text(encoding="utf-8")
+    new_text = re.sub(
+        r"^(\s*kind:\s*).*$",
+        rf"\1{kind}",
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if new_text != text:
+        config_path.write_text(new_text, encoding="utf-8")
+
+
 def _read_brain_kind(home: Path) -> str:
     """Best-effort read of brain.kind from the just-written
     config.yaml. Mirrors yaml_config.brain_kind() but doesn't import
@@ -515,11 +568,18 @@ def run_setup(
     install_service: Optional[bool] = None,
     prompt: PromptFn = _default_prompt,
     confirm: Optional[Callable[[str], bool]] = None,
+    choice: Optional[ChoiceFn] = None,
+    brain_kind_override: Optional[str] = None,
     require_interactive: bool = True,
     print_banner: bool = True,
 ) -> SetupResult:
-    """Drive the wizard. Returns a SetupResult."""
+    """Drive the wizard. Returns a SetupResult.
+
+    ``brain_kind_override`` skips the interactive brain picker — used
+    by tests + by automation that wants to pin the kind via env.
+    """
     confirm_fn = confirm if confirm is not None else _default_confirm
+    choice_fn = choice if choice is not None else _default_choice
 
     if require_interactive:
         require_tty()
@@ -568,10 +628,31 @@ def run_setup(
             "(daemon refuses to start without it)"
         )
 
-    # ── 3. Brain CLI check ────────────────────────────────────────
+    # ── 3. Brain CLI: pick + check ────────────────────────────────
     section("Brain CLI")
-    brain_kind = _read_brain_kind(home)
-    info(f"configured brain.kind: {brain_kind}")
+    current = _read_brain_kind(home)
+    if brain_kind_override is not None:
+        brain_kind = brain_kind_override
+    else:
+        brain_options = ["claude-code", "opencode", "null"]
+        labels = [
+            "claude-code  — official Anthropic CLI (default)",
+            "opencode     — 30+ providers including OAuth, OpenAI, Copilot",
+            "null         — test fake; no real brain (advanced)",
+        ]
+        try:
+            default_idx = brain_options.index(current)
+        except ValueError:
+            default_idx = 0
+        picked_idx = choice_fn(
+            "  Which brain should vexis-agent use?", labels, default_idx
+        )
+        brain_kind = brain_options[picked_idx]
+    if brain_kind != current:
+        _set_brain_kind(config_path, brain_kind)
+        ok(f"set brain.kind = {brain_kind} (was {current})")
+    else:
+        info(f"brain.kind: {brain_kind}")
     bc = check_brain_cli(brain_kind)
     if bc.found:
         if bc.binary:

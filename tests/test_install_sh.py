@@ -52,7 +52,7 @@ def test_install_sh_help_lists_dry_run_and_env_vars() -> None:
         check=True,
     )
     assert "--dry-run" in result.stdout
-    assert "VEXIS_CHANNEL" in result.stdout
+    assert "VEXIS_VERSION" in result.stdout
     assert "VEXIS_REPO" in result.stdout
 
 
@@ -106,22 +106,9 @@ def test_install_sh_dry_run_without_pipx(tmp_path) -> None:
     assert "would run: pipx install --force" in out
 
 
-def test_install_sh_rejects_unknown_channel(tmp_path) -> None:
+def test_install_sh_default_pulls_from_main(tmp_path) -> None:
+    """No VEXIS_VERSION set → install from latest main."""
     env = _empty_path_env(tmp_path)
-    env["VEXIS_CHANNEL"] = "totally-bogus"
-    result = subprocess.run(
-        ["bash", str(INSTALL_SH), "--dry-run"],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode != 0, "bad VEXIS_CHANNEL should exit non-zero"
-    assert "VEXIS_CHANNEL" in result.stderr
-
-
-def test_install_sh_dev_channel_uses_develop_branch(tmp_path) -> None:
-    env = _empty_path_env(tmp_path)
-    env["VEXIS_CHANNEL"] = "dev"
     result = subprocess.run(
         ["bash", str(INSTALL_SH), "--dry-run"],
         env=env,
@@ -130,7 +117,24 @@ def test_install_sh_dev_channel_uses_develop_branch(tmp_path) -> None:
         check=True,
     )
     out = result.stdout + result.stderr
-    assert "branch=develop" in out
+    assert "latest main" in out
+    assert "@main" in out
+
+
+def test_install_sh_version_pin_uses_tag(tmp_path) -> None:
+    """VEXIS_VERSION=v1.2.3 → install from that git ref."""
+    env = _empty_path_env(tmp_path)
+    env["VEXIS_VERSION"] = "v1.2.3"
+    result = subprocess.run(
+        ["bash", str(INSTALL_SH), "--dry-run"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    out = result.stdout + result.stderr
+    assert "pinned to v1.2.3" in out
+    assert "@v1.2.3" in out
 
 
 def test_install_sh_rejects_unknown_arg(tmp_path) -> None:
@@ -171,7 +175,7 @@ def test_install_sh_dry_run_includes_banner_and_section_headers(tmp_path) -> Non
     assert "vexis-agent installer" in out
     # Section markers
     assert "◆ Platform" in out
-    assert "◆ Channel" in out
+    assert "◆ Source" in out
     assert "◆ pipx" in out
 
 

@@ -162,6 +162,7 @@ def test_run_setup_writes_config_and_dotenv(isolated_setup_env) -> None:
         install_service=False,
         require_interactive=False,
         print_banner=False,
+        brain_kind_override="claude-code",
     )
     assert result.config_path.read_text(encoding="utf-8").startswith(
         "# vexis-agent — example configuration."
@@ -189,6 +190,7 @@ def test_run_setup_reset_archives_existing(isolated_setup_env) -> None:
         reset=True,
         require_interactive=False,
         print_banner=False,
+        brain_kind_override="claude-code",
     )
     assert result.archived_config is not None
     assert result.archived_dotenv is not None
@@ -212,6 +214,7 @@ def test_run_setup_install_service_calls_install(monkeypatch, isolated_setup_env
         install_service=True,
         require_interactive=False,
         print_banner=False,
+        brain_kind_override="claude-code",
     )
     assert "kwargs" in called
     assert result.service_installed is True
@@ -318,17 +321,14 @@ def test_check_tailscale_when_missing(tmp_path, monkeypatch) -> None:
 
 
 def test_run_setup_creates_workspace_for_opencode(isolated_setup_env, monkeypatch) -> None:
-    """When brain.kind=opencode, the wizard should write the AGENTS.md
-    symlink. Force the kind by writing config.yaml before run_setup."""
-    home = isolated_setup_env / "v"
-    home.mkdir()
-    (home / "config.yaml").write_text("brain:\n  kind: opencode\n")
-
+    """When the user picks opencode (or it's overridden), the wizard
+    should write the AGENTS.md symlink for opencode discovery."""
     result = sw.run_setup(
         prompt=_canned_prompts({"token": "x", "user ID": "1"}),
         install_service=False,
         require_interactive=False,
         print_banner=False,
+        brain_kind_override="opencode",
     )
     assert result.agents_md_status == "created"
     link = result.workspace / "AGENTS.md"
@@ -342,6 +342,7 @@ def test_run_setup_skips_agents_md_for_claude_code(isolated_setup_env) -> None:
         install_service=False,
         require_interactive=False,
         print_banner=False,
+        brain_kind_override="claude-code",
     )
     assert result.agents_md_status == "skipped_not_opencode"
     assert not (result.workspace / "AGENTS.md").exists()
@@ -433,10 +434,78 @@ def test_run_setup_wires_mcp_when_detected(
         install_service=False,
         require_interactive=False,
         print_banner=False,
+        brain_kind_override="claude-code",
     )
     assert result.mcp_servers_wired == ["omarchy-kb"]
     assert result.mcp_config_path == result.workspace / ".mcp.json"
     assert result.mcp_config_path.is_file()
+
+
+def test_set_brain_kind_rewrites_existing_value(tmp_path) -> None:
+    """The shipped template ships kind: claude-code; if the user
+    picks opencode in the picker, _set_brain_kind has to swap that
+    line in place without disturbing surrounding YAML."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "brain:\n"
+        "  kind: claude-code\n"
+        "  # comment that must survive\n"
+        "memory:\n"
+        "  memory_char_limit: 2200\n",
+        encoding="utf-8",
+    )
+    sw._set_brain_kind(cfg, "opencode")
+    body = cfg.read_text(encoding="utf-8")
+    assert "kind: opencode" in body
+    assert "kind: claude-code" not in body
+    assert "comment that must survive" in body
+    assert "memory_char_limit: 2200" in body
+
+
+def test_run_setup_brain_picker_writes_chosen_kind(
+    isolated_setup_env, monkeypatch
+) -> None:
+    """Inject a choice fn that picks index 1 (opencode); verify
+    config.yaml gets rewritten and the wizard treats the rest of
+    the run as opencode (AGENTS.md symlink etc.)."""
+    answers = {"Telegram bot token": "abc", "Allowed Telegram user ID": "1"}
+
+    def picked_opencode(message, options, default_idx):
+        # 0=claude-code, 1=opencode, 2=null
+        return 1
+
+    result = sw.run_setup(
+        prompt=_canned_prompts(answers),
+        choice=picked_opencode,
+        install_service=False,
+        require_interactive=False,
+        print_banner=False,
+    )
+    body = result.config_path.read_text(encoding="utf-8")
+    assert "kind: opencode" in body
+    # Opencode flow → AGENTS.md symlink lands.
+    assert result.agents_md_status == "created"
+
+
+def test_run_setup_brain_picker_default_keeps_template_kind(
+    isolated_setup_env, monkeypatch
+) -> None:
+    """Empty input / default selection must keep the template's
+    kind unchanged — re-running setup shouldn't churn config.yaml."""
+    answers = {"Telegram bot token": "abc", "Allowed Telegram user ID": "1"}
+
+    def picked_default(message, options, default_idx):
+        return default_idx
+
+    result = sw.run_setup(
+        prompt=_canned_prompts(answers),
+        choice=picked_default,
+        install_service=False,
+        require_interactive=False,
+        print_banner=False,
+    )
+    body = result.config_path.read_text(encoding="utf-8")
+    assert "kind: claude-code" in body
 
 
 def test_run_setup_skips_mcp_when_nothing_detected(
@@ -448,6 +517,7 @@ def test_run_setup_skips_mcp_when_nothing_detected(
         install_service=False,
         require_interactive=False,
         print_banner=False,
+        brain_kind_override="claude-code",
     )
     assert result.mcp_servers_wired == []
     assert result.mcp_config_path is None
