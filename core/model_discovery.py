@@ -399,19 +399,31 @@ def refresh_claude_code_models() -> set[str]:
 _EFFORT_META_KEYS = frozenset({"supported"})
 
 
-def _extract_claude_code_reasoning_levels(model_entry: dict) -> list[str]:
-    """Pull supported reasoning levels from a /v1/models entry.
+def _extract_claude_code_reasoning_levels(
+    model_entry: dict,
+    cli_levels: list[str] | None = None,
+) -> list[str]:
+    """Resolve the reasoning-level list for one model.
 
-    Returns an empty list when the model doesn't support reasoning
-    at all (``capabilities.effort.supported`` is False, or the
-    capabilities block is absent entirely). Picker uses the empty
-    list as the signal to skip the reasoning step for that model.
+    Two-source strategy:
 
-    Dynamic over the API response: any key under ``effort`` whose
-    value is a dict with ``supported: true`` and that isn't a meta
-    key (``supported`` itself) becomes a level. New levels Anthropic
-    adds — ``xhigh``, ``ultra``, anything — flow through without
-    requiring this constant to be updated.
+      1. Per-model gate from the API: ``capabilities.effort.supported``
+         tells us *whether* this model accepts reasoning at all.
+         haiku-style models have ``supported: false`` → empty list →
+         picker hides the reasoning sub-step.
+
+      2. Level vocabulary from ``cli_levels`` when provided. The
+         claude CLI is the canonical source for valid level names —
+         ``/v1/models`` is incomplete (e.g. ships low/medium/high/max
+         but not xhigh, even though ``claude --effort xhigh`` works).
+         Caller should pass the cached
+         :func:`discover_claude_code_effort_levels` result here.
+         When ``cli_levels`` is None or empty (CLI probe failed),
+         we fall back to the API-listed levels so the picker
+         degrades gracefully rather than going empty.
+
+    No hardcoded level list in this function — both sources are
+    discovered live.
     """
     if not isinstance(model_entry, dict):
         return []
@@ -421,6 +433,12 @@ def _extract_claude_code_reasoning_levels(model_entry: dict) -> list[str]:
     effort = caps.get("effort")
     if not isinstance(effort, dict) or not effort.get("supported"):
         return []
+
+    # CLI vocabulary is the source of truth when available.
+    if cli_levels:
+        return list(cli_levels)
+
+    # Fallback: walk the API's effort.* keys dynamically.
     out: list[str] = []
     for level, sub in effort.items():
         if level in _EFFORT_META_KEYS:
@@ -428,6 +446,81 @@ def _extract_claude_code_reasoning_levels(model_entry: dict) -> list[str]:
         if isinstance(sub, dict) and sub.get("supported"):
             out.append(level)
     return out
+
+
+# Pattern for parsing the ``--effort`` line in ``claude --help``.
+# The CLI prints this on a single (possibly wrapped) line:
+#
+#   --effort <level>   Effort level for the current session (low, medium, high, xhigh, max)
+#
+# We anchor on ``--effort <level>`` to avoid catching unrelated
+# parens elsewhere in the help text. ``re.S`` keeps the match
+# robust to line wrapping that separates the flag from the
+# parenthesised list.
+_CLAUDE_CODE_EFFORT_HELP_RE = re.compile(
+    r"--effort\s+<level>.*?\(([^)]+)\)", re.S,
+)
+
+
+def _parse_claude_code_effort_help(help_text: str) -> list[str]:
+    """Extract the canonical ``--effort`` level list from
+    ``claude --help`` output. Pure parser — no I/O — so tests can
+    drive synthetic help text without spawning the binary.
+
+    Returns an empty list when the schema doesn't match. Caller
+    treats empty as "couldn't discover via CLI; fall through to
+    whatever the API listed".
+    """
+    m = _CLAUDE_CODE_EFFORT_HELP_RE.search(help_text)
+    if not m:
+        return []
+    raw = m.group(1)
+    levels = [v.strip() for v in raw.split(",")]
+    return [v for v in levels if v]
+
+
+def _discover_claude_code_effort_levels_uncached() -> list[str]:
+    """Source-of-truth probe for valid ``--effort`` levels.
+
+    The CLI accept-set is canonical because it's what we actually
+    spawn — pass a level the CLI rejects and the subprocess errors.
+    Anthropic's ``/v1/models`` endpoint is *incomplete* relative to
+    the CLI: at the time of writing it advertises low/medium/high/max
+    but the CLI also accepts ``xhigh`` (verified directly:
+    ``claude --effort xhigh -p "hi"`` returns successfully on
+    reasoning-capable models). Trusting only the API would silently
+    drop xhigh from the picker — exactly the regression the user
+    flagged.
+
+    We probe the CLI's help once per cache window (5 min). On any
+    failure (binary not on PATH, output schema changed, parse
+    miss) return an empty list — callers fall back to the API's
+    per-model level list. No hardcoded fallback in this layer:
+    the absence of a CLI probe does not mean a fixed level set
+    is correct.
+    """
+    try:
+        proc = subprocess.run(
+            ["claude", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=_CLAUDE_CODE_DISCOVERY_TIMEOUT_SECONDS,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    if proc.returncode != 0:
+        return []
+    return _parse_claude_code_effort_help(proc.stdout)
+
+
+def discover_claude_code_effort_levels() -> list[str]:
+    """Cached canonical ``--effort`` level list. Empty when the
+    CLI couldn't be probed; callers should fall back to API-listed
+    per-model levels in that case."""
+    return _cached(
+        "claude-code-effort",
+        _discover_claude_code_effort_levels_uncached,
+    )
 
 
 def _extract_claude_code_context_info(model_entry: dict) -> dict[str, object]:
@@ -481,6 +574,13 @@ def _discover_claude_code_capabilities_uncached() -> dict[str, dict]:
             return {}
     except json.JSONDecodeError:
         return {}
+    # Fetch the CLI-canonical effort levels once per discovery
+    # cycle. The same list applies to every reasoning-capable
+    # model — claude-code's CLI doesn't differentiate by model.
+    # An empty list here means CLI probe failed; the per-model
+    # extraction falls back to API-listed levels.
+    cli_levels = discover_claude_code_effort_levels()
+
     out: dict[str, dict] = {}
     for entry in data:
         if not isinstance(entry, dict):
@@ -490,7 +590,9 @@ def _discover_claude_code_capabilities_uncached() -> dict[str, dict]:
             continue
         info = _extract_claude_code_context_info(entry)
         out[model_id] = {
-            "reasoning_levels": _extract_claude_code_reasoning_levels(entry),
+            "reasoning_levels": _extract_claude_code_reasoning_levels(
+                entry, cli_levels=cli_levels,
+            ),
             "display_name": info["display_name"],
             "max_input_tokens": info["max_input_tokens"],
             "max_tokens": info["max_tokens"],

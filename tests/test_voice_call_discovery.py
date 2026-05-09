@@ -23,11 +23,14 @@ expects.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from core.model_discovery import (
     _extract_claude_code_context_info,
     _extract_claude_code_reasoning_levels,
+    _parse_claude_code_effort_help,
 )
 from core.web_server import WebDashboard
 
@@ -37,26 +40,77 @@ from core.web_server import WebDashboard
 # ──────────────────────────────────────────────────────────────────
 
 
-def test_reasoning_levels_picks_up_arbitrary_keys() -> None:
-    """The extraction must NOT depend on a hardcoded list of level
-    names. Synthesise a payload with levels Anthropic doesn't ship
-    today and confirm they survive."""
+def test_reasoning_levels_uses_cli_list_when_provided() -> None:
+    """When the CLI canonical list is passed in (the production
+    path), it wins over the API. This is the exact case where
+    ``/v1/models`` ships low/medium/high/max but ``claude --help``
+    advertises xhigh too — picker must show xhigh."""
     entry = {
-        "id": "future-model",
         "capabilities": {
             "effort": {
                 "supported": True,
                 "low": {"supported": True},
                 "medium": {"supported": True},
-                "xhigh": {"supported": True},   # not currently shipped
-                "ultra": {"supported": True},   # not currently shipped
-                "ludicrous": {"supported": False},  # ignored — supported=False
+                "high": {"supported": True},
+                "max": {"supported": True},
             },
         },
     }
-    levels = _extract_claude_code_reasoning_levels(entry)
-    # Order isn't specified — sort for stable assertion.
-    assert sorted(levels) == ["low", "medium", "ultra", "xhigh"]
+    cli = ["low", "medium", "high", "xhigh", "max"]
+    assert _extract_claude_code_reasoning_levels(entry, cli_levels=cli) == cli
+
+
+def test_reasoning_levels_falls_back_to_api_when_no_cli() -> None:
+    """When CLI probe failed (empty list), API-listed levels are
+    the fallback — picker degrades gracefully rather than going
+    empty for reasoning-capable models."""
+    entry = {
+        "capabilities": {
+            "effort": {
+                "supported": True,
+                "low": {"supported": True},
+                "medium": {"supported": True},
+                "high": {"supported": True},
+                "max": {"supported": True},
+            },
+        },
+    }
+    levels = _extract_claude_code_reasoning_levels(entry, cli_levels=[])
+    assert sorted(levels) == ["high", "low", "max", "medium"]
+
+
+def test_reasoning_levels_falls_back_picks_up_arbitrary_api_keys() -> None:
+    """In the fallback (API-only) path, extraction is still dynamic
+    over effort.keys(). New API levels surface without code change."""
+    entry = {
+        "capabilities": {
+            "effort": {
+                "supported": True,
+                "low": {"supported": True},
+                "ultra": {"supported": True},   # not in any hardcoded list
+                "ludicrous": {"supported": False},  # ignored
+            },
+        },
+    }
+    levels = _extract_claude_code_reasoning_levels(entry, cli_levels=None)
+    assert sorted(levels) == ["low", "ultra"]
+
+
+def test_reasoning_levels_cli_does_not_override_unsupported_models() -> None:
+    """Even when the CLI advertises levels, models with
+    ``effort.supported: false`` (haiku-style) must return an empty
+    list — the API gate is per-model and CLI levels are a
+    universal vocabulary, not a per-model assertion."""
+    haiku_like = {
+        "capabilities": {
+            "effort": {
+                "supported": False,
+                "low": {"supported": False},
+            },
+        },
+    }
+    cli = ["low", "medium", "high", "xhigh", "max"]
+    assert _extract_claude_code_reasoning_levels(haiku_like, cli_levels=cli) == []
 
 
 def test_reasoning_levels_excludes_meta_keys() -> None:
@@ -101,6 +155,79 @@ def test_reasoning_levels_robust_to_missing_fields() -> None:
     # Wrong type at the entry level
     assert _extract_claude_code_reasoning_levels("garbage") == []
     assert _extract_claude_code_reasoning_levels(None) == []
+
+
+# ──────────────────────────────────────────────────────────────────
+# CLI help parser — canonical source of truth for effort levels
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_cli_parser_extracts_real_help_shape() -> None:
+    """The shape ``claude --help`` actually outputs today (2026-05).
+    Pinned here so a CLI schema change surfaces as a test failure
+    rather than an empty picker."""
+    help_text = (
+        "  --effort <level>                      "
+        "Effort level for the current session "
+        "(low, medium, high, xhigh, max)\n"
+        "  --some-other-flag                     irrelevant\n"
+    )
+    assert _parse_claude_code_effort_help(help_text) == [
+        "low", "medium", "high", "xhigh", "max",
+    ]
+
+
+def test_cli_parser_handles_line_wrap() -> None:
+    """``argparse`` wraps long help lines; the parser uses re.S so
+    the parenthesised list survives across a newline."""
+    help_text = (
+        "--effort <level>                                  Effort level\n"
+        "                                                  for the\n"
+        "                                                  current\n"
+        "                                                  session\n"
+        "                                                  (low, medium, high, xhigh, max)\n"
+    )
+    assert _parse_claude_code_effort_help(help_text) == [
+        "low", "medium", "high", "xhigh", "max",
+    ]
+
+
+def test_cli_parser_picks_up_future_levels() -> None:
+    """If a future CLI release adds ``ultra`` to the accept-set,
+    the parser must surface it without code change. This is the
+    contract — CLI is canonical, no hardcoded fallback list."""
+    help_text = (
+        "  --effort <level>   Effort level (low, medium, high, xhigh, ultra, max, ludicrous)\n"
+    )
+    assert _parse_claude_code_effort_help(help_text) == [
+        "low", "medium", "high", "xhigh", "ultra", "max", "ludicrous",
+    ]
+
+
+def test_cli_parser_returns_empty_when_no_match() -> None:
+    """No ``--effort`` line in help → empty list. Caller falls
+    through to API-extracted levels rather than crashing."""
+    help_text = "Usage: claude [options]\n  --model <name>   pick model\n"
+    assert _parse_claude_code_effort_help(help_text) == []
+
+
+def test_cli_parser_returns_empty_for_malformed() -> None:
+    """No parens, no list → empty. Defensive against schema drift."""
+    assert _parse_claude_code_effort_help(
+        "--effort <level>   Effort level for the session\n",
+    ) == []
+    assert _parse_claude_code_effort_help("") == []
+
+
+def test_cli_parser_strips_whitespace_around_levels() -> None:
+    """Levels separated by ``,`` may have arbitrary whitespace —
+    must round-trip clean strings."""
+    help_text = (
+        "--effort <level>   Effort level (  low ,  medium  ,high   , xhigh, max  )\n"
+    )
+    assert _parse_claude_code_effort_help(help_text) == [
+        "low", "medium", "high", "xhigh", "max",
+    ]
 
 
 def test_reasoning_levels_skips_non_dict_level_payloads() -> None:
@@ -260,6 +387,68 @@ def test_picker_payload_uniform_shape_across_brains(
         assert set(entry.keys()) == expected_keys, (
             f"opencode picker entry {entry['id']} missing fields"
         )
+
+
+def test_picker_xhigh_surfaces_when_cli_advertises_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The user-flagged regression: ``xhigh`` must appear in the
+    picker for reasoning-capable models even when ``/v1/models``
+    only lists low/medium/high/max. Pinned here because it's a
+    real-world correctness property — the CLI accepts xhigh
+    (verified by ``claude --effort xhigh -p hi`` returning 0) and
+    the picker must reflect that.
+    """
+    # Synthesise the actual API shape (no xhigh) — same as live data.
+    api_response = {
+        "data": [
+            {
+                "id": "claude-opus-4-7",
+                "display_name": "Claude Opus 4.7",
+                "max_input_tokens": 1_000_000,
+                "max_tokens": 128_000,
+                "capabilities": {
+                    "effort": {
+                        "supported": True,
+                        "low": {"supported": True},
+                        "medium": {"supported": True},
+                        "high": {"supported": True},
+                        "max": {"supported": True},
+                    },
+                },
+            },
+        ],
+    }
+
+    # Stub the HTTP fetch + the CLI probe so the discovery can run
+    # without network or subprocess.
+    import io
+    import core.model_discovery as md
+    md.invalidate_discovery_cache()
+
+    class _FakeResp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **kw: _FakeResp(json.dumps(api_response).encode()),
+    )
+    monkeypatch.setattr(
+        "core.model_discovery._build_anthropic_request_headers",
+        lambda: {"Authorization": "Bearer test"},
+    )
+    monkeypatch.setattr(
+        "core.model_discovery._discover_claude_code_effort_levels_uncached",
+        lambda: ["low", "medium", "high", "xhigh", "max"],
+    )
+
+    caps = md.discover_claude_code_capabilities()
+    levels = caps["claude-opus-4-7"]["reasoning_levels"]
+    # CLI list wins — xhigh appears even though API didn't list it.
+    assert levels == ["low", "medium", "high", "xhigh", "max"]
+    assert "xhigh" in levels, (
+        "xhigh must surface from CLI help even when /v1/models omits it"
+    )
 
 
 def test_picker_payload_handles_missing_capability_data(
