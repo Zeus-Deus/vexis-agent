@@ -70,7 +70,7 @@ def _empty_path_env(tmp_path: Path) -> dict[str, str]:
     # is a bash builtin so it doesn't need a PATH entry; uname and
     # whoami do. Anything else should be absent so the soft-dep
     # branches all hit the missing-tool path.
-    for tool in ("bash", "uname", "whoami", "id", "cat", "tr", "sed", "grep"):
+    for tool in ("bash", "uname", "whoami", "id", "cat", "tr", "sed", "grep", "awk"):
         src = shutil.which(tool)
         if src:
             link = fake_bin / tool
@@ -136,6 +136,42 @@ def test_install_sh_version_pin_uses_tag(tmp_path) -> None:
     out = result.stdout + result.stderr
     assert "pinned to v1.2.3" in out
     assert "@v1.2.3" in out
+
+
+def test_install_sh_dry_run_detects_existing_install(tmp_path) -> None:
+    """When pipx is on PATH and reports vexis-agent already installed,
+    --dry-run should describe the update path, not the fresh-install
+    path. This is the curl-bash re-run UX."""
+    env = _empty_path_env(tmp_path)
+    fake_bin = Path(env["PATH"])
+
+    # Fake pipx that returns 'vexis-agent ...' from `pipx list --short`.
+    pipx_stub = fake_bin / "pipx"
+    pipx_stub.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = list ] && [ \"$2\" = --short ]; then\n"
+        "    echo 'vexis-agent 0.0.1'\n"
+        "    exit 0\n"
+        "fi\n"
+        "echo 'fake pipx: unhandled $@' >&2\n"
+        "exit 0\n"
+    )
+    pipx_stub.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(INSTALL_SH), "--dry-run"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    out = result.stdout + result.stderr
+    # Anchor against the specific update-path messages (not the
+    # generic "pipx already installed" line which also matches
+    # 'already installed').
+    assert "vexis-agent is already installed" in out
+    assert "would update" in out
+    assert "skip the setup wizard" in out
 
 
 def test_install_sh_rejects_unknown_arg(tmp_path) -> None:

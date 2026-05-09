@@ -244,19 +244,49 @@ ensure_pipx() {
 
 ensure_pipx
 
-# ── install vexis-agent ─────────────────────────────────────────────
+# ── install vexis-agent (or update if already present) ─────────────
 section "vexis-agent"
+
+# Detect existing pipx install. Re-running curl-bash is the common
+# "I want the latest version" path — short-circuit to pipx upgrade
+# when we can (fast, just refreshes the package), fall back to
+# --force install otherwise (full venv rebuild, slower).
+ALREADY_INSTALLED=0
+if command -v pipx >/dev/null 2>&1; then
+    if pipx list --short 2>/dev/null | awk '{print $1}' | grep -qx 'vexis-agent'; then
+        ALREADY_INSTALLED=1
+    fi
+fi
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
-    warn "[dry-run] would run: pipx install --force '$REPO'"
-    warn "[dry-run] would run: vexis-agent setup (unless --skip-setup)"
+    if [[ "$ALREADY_INSTALLED" -eq 1 ]]; then
+        warn "[dry-run] vexis-agent is already installed — would update via:"
+        warn "[dry-run]   pipx install --force '$REPO'  (rebuilds venv at the new ref)"
+        info "[dry-run] would skip the setup wizard since it already ran on the previous install"
+    else
+        warn "[dry-run] would run: pipx install --force '$REPO'"
+        warn "[dry-run] would run: vexis-agent setup (unless --skip-setup)"
+    fi
     info "[dry-run] would print the soft-dependency advice + next steps"
     exit 0
 fi
 
-info "Installing vexis-agent from ${REPO}"
-# --force so a re-run upgrades cleanly without 'package already installed'.
-pipx install --force "$REPO"
-ok "vexis-agent installed."
+if [[ "$ALREADY_INSTALLED" -eq 1 ]]; then
+    info "vexis-agent is already installed — updating to ${SOURCE_LABEL}."
+    info "(Skipping the setup wizard; your config + workspace are preserved.)"
+    # --force here both refreshes the venv at the new git ref AND
+    # works regardless of whether the old install was from a tag,
+    # main, or a custom VEXIS_REPO. pipx upgrade only works when the
+    # package was originally installed from a registry, which doesn't
+    # apply for our git+ source — so this is the right verb.
+    pipx install --force "$REPO"
+    ok "vexis-agent updated."
+    SKIP_SETUP=1
+else
+    info "Installing vexis-agent from ${REPO}"
+    pipx install --force "$REPO"
+    ok "vexis-agent installed."
+fi
 
 # ── soft-dependency advice ──────────────────────────────────────────
 section "Soft dependencies"
