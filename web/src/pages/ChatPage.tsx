@@ -297,41 +297,97 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
   const handleSend = useCallback(
     async (text: string, attachments: QueuedAttachment[]) => {
       if (!activeName) return;
-      const ts = Date.now();
+      const userTs = Date.now();
+      const assistantTs = userTs + 1;
       // Snapshot the queue so the user bubble can render the same
       // attachments even after the queue is cleared post-send.
       const userMsg: ChatMessage = {
         role: "user",
         content: text,
-        ts,
+        ts: userTs,
         attachments: attachments.length > 0 ? attachments : undefined,
       };
-      setMessages(activeName, (prev) => [...prev, userMsg]);
+      // Append the user bubble + an empty assistant bubble that we'll
+      // grow chunk-by-chunk as the SSE stream arrives. ``assistantTs``
+      // is the unique id we use to find-and-update that bubble during
+      // streaming. Sentinel ``--streaming--`` marker on content lets
+      // the renderer suppress empty-bubble flicker if the brain takes
+      // a beat before its first chunk lands.
+      setMessages(activeName, (prev) => [
+        ...prev,
+        userMsg,
+        { role: "assistant", content: "", ts: assistantTs },
+      ]);
       setPendingSend(true);
-      // Clear the queue immediately (optimistic) so a fast user can
-      // start composing the next message. Don't revoke preview URLs
-      // here — the user bubble still needs them for inline display.
-      // They'll be revoked when the bubble unmounts (page refresh /
-      // session switch wipes the in-memory buffer).
       setAttachmentQueue([]);
+
       try {
-        const { reply } =
-          attachments.length > 0
-            ? await api.chatSendWithAttachments(
-                token,
-                text,
-                // Strip the client-only previewUrl before sending —
-                // server doesn't know what to do with it.
-                attachments.map(({ previewUrl: _p, ...ref }) => ref),
-              )
-            : await api.chatSend(token, text);
-        setMessages(activeName, (prev) => [
-          ...prev,
-          { role: "assistant", content: reply, ts: Date.now() },
-        ]);
-        // Fire-and-forget TTS — don't block the UI on synthesis.
-        // No-op when voice is disabled or muted.
-        void speakReply(reply);
+        await api.chatSendStream(
+          token,
+          {
+            text,
+            attachments:
+              attachments.length > 0
+                ? attachments.map(({ previewUrl: _p, ...ref }) => ref)
+                : undefined,
+          },
+          {
+            onChunk: (chunk) => {
+              // Find the assistant bubble we placed and append the
+              // chunk to its content. ``assistantTs`` stays unique
+              // because we mint it from Date.now()+1 and React re-
+              // render between sends serialises the increments.
+              setMessages(activeName, (prev) =>
+                prev.map((m) =>
+                  m.ts === assistantTs && m.role === "assistant"
+                    ? { ...m, content: m.content + chunk }
+                    : m,
+                ),
+              );
+            },
+            onDone: (full) => {
+              // Replace the streamed content with the canonical
+              // ``done`` payload — should be byte-equal to the
+              // concatenated chunks but the server sends a clean
+              // copy so the UI doesn't accumulate any stream-parse
+              // discrepancies.
+              setMessages(activeName, (prev) =>
+                prev.map((m) =>
+                  m.ts === assistantTs && m.role === "assistant"
+                    ? { ...m, content: full }
+                    : m,
+                ),
+              );
+              // Fire-and-forget TTS on the final reply. Same
+              // contract as the buffered path — runs only when
+              // voice.tts is enabled and not muted.
+              void speakReply(full);
+            },
+            onError: (msg) => {
+              // Remove the empty assistant bubble (or leave its
+              // partial content if anything streamed) and append
+              // a system note describing the failure. Empty msg
+              // means cancel — drop the placeholder silently.
+              setMessages(activeName, (prev) => {
+                const out = prev.filter((m) => {
+                  if (m.ts !== assistantTs) return true;
+                  // Keep the bubble if it has any streamed content;
+                  // drop it if it was empty (no tokens before the
+                  // error fired).
+                  return m.content.length > 0;
+                });
+                if (msg) {
+                  out.push({
+                    role: "system",
+                    content: `⚠️ ${msg}`,
+                    ts: Date.now(),
+                  });
+                }
+                return out;
+              });
+            },
+          },
+        );
       } catch (exc: unknown) {
         if (exc instanceof ApiError && exc.status === 401) {
           onAuthFail();

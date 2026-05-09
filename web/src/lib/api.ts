@@ -231,6 +231,102 @@ export const api = {
       body: { text },
       signal,
     }),
+  /**
+   * Streaming variant — POSTs to /chat/stream, parses the SSE
+   * response with manual ReadableStream + TextDecoder. EventSource
+   * is GET-only so we can't use it; the fetch + ReadableStream
+   * combo is the standard browser pattern for SSE-over-POST.
+   *
+   * Calls back per chunk as text arrives, then once with the full
+   * concatenated reply when the brain emits its ``done`` event.
+   * On error: invokes ``onError`` and stops. AbortController on
+   * the caller side cancels the read mid-stream cleanly.
+   */
+  chatSendStream: async (
+    token: string,
+    payload: {
+      text: string;
+      attachments?: AttachmentRef[];
+      model?: string;
+      reasoning_level?: string;
+    },
+    handlers: {
+      onChunk: (text: string) => void;
+      onDone: (full: string) => void;
+      onError: (message: string) => void;
+      signal?: AbortSignal;
+    },
+  ): Promise<void> => {
+    let resp: Response;
+    try {
+      resp = await fetch("/api/v1/chat/stream", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: handlers.signal,
+      });
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      handlers.onError(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    if (resp.status === 401) {
+      throw new TokenInvalidError();
+    }
+    if (!resp.ok || !resp.body) {
+      let detail = resp.statusText;
+      try { detail = (await resp.json()).detail ?? detail; } catch {}
+      handlers.onError(detail);
+      return;
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    // SSE frames are separated by ``\n\n``. We accumulate raw bytes
+    // in ``buffer`` until we see a frame terminator, parse the
+    // ``data: ...`` line, and feed the JSON payload to the handlers.
+    // Partial frames at the read boundary stay in ``buffer`` until
+    // the next read fills them in.
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let sepIdx;
+        while ((sepIdx = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, sepIdx);
+          buffer = buffer.slice(sepIdx + 2);
+          // Each frame may contain multiple lines; we only care
+          // about ``data: `` lines (per SSE spec there's also
+          // ``event: ``, ``id: ``, ``retry: `` — we don't use them).
+          for (const line of frame.split("\n")) {
+            if (!line.startsWith("data: ")) continue;
+            const json = line.slice(6);
+            try {
+              const evt = JSON.parse(json);
+              if (evt.type === "chunk" && typeof evt.text === "string") {
+                handlers.onChunk(evt.text);
+              } else if (evt.type === "done" && typeof evt.reply === "string") {
+                handlers.onDone(evt.reply);
+              } else if (evt.type === "error") {
+                handlers.onError(
+                  typeof evt.message === "string" ? evt.message : "",
+                );
+              }
+            } catch {
+              // Malformed frame — skip rather than crash the loop.
+            }
+          }
+        }
+      }
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      handlers.onError(e instanceof Error ? e.message : String(e));
+    }
+  },
   chatSessions: (token: string, signal?: AbortSignal) =>
     call<ChatSessionsState>(token, "/chat/sessions", { signal }),
   // History backfill. Lazy-loaded on first switch into a session

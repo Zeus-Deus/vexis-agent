@@ -103,6 +103,70 @@ class MessageHandler:
 
         return reply.strip() or _EMPTY_RESPONSE
 
+    async def stream(
+        self,
+        user_id: int,
+        chat_id: int,
+        text: str,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ):
+        """Streaming variant of :meth:`handle`. Yields incremental
+        text chunks as the brain generates them, plus a sentinel
+        ``("done", full_text)`` at the end so callers can persist
+        the final reply.
+
+        On any failure (rejection, brain error, timeout, session
+        lost) yields ``("error", message_or_None)`` and stops. The
+        SSE route maps these to ``data: {type:..., ...}`` frames.
+
+        Why a sentinel-tagged generator instead of two separate
+        methods (chunks + final): keeps the contract single-pass.
+        Callers don't have to coordinate two iterators or worry
+        about the brain finishing between them. ``yield`` shape:
+
+            ("chunk", str)         — incremental text
+            ("done",  str)         — full reply, fired exactly once
+                                     after the last chunk
+            ("error", str | None)  — error text (None = caller-side
+                                     allow-list rejection, surfaced
+                                     as 401)
+        """
+        if not is_allowed(user_id, self._allowed_user_id):
+            log.warning("Rejected streaming message from user_id=%s", user_id)
+            yield ("error", None)
+            return
+
+        message = await self._inject_context(chat_id, text)
+
+        full = ""
+        try:
+            async for chunk in self._brain.astream(
+                message, chat_id,
+                model=model, reasoning_level=reasoning_level,
+            ):
+                if chunk:
+                    full += chunk
+                    yield ("chunk", chunk)
+        except BrainCancelled:
+            # /cancel handler already replied — don't double-send.
+            yield ("error", "")
+            return
+        except BrainTimeoutError:
+            log.warning("Brain stream timed out for chat_id=%s", chat_id)
+            yield ("error", _BRAIN_TIMEOUT)
+            return
+        except SessionLost:
+            yield ("error", _SESSION_LOST)
+            return
+        except Exception:
+            log.exception("Brain stream failed")
+            yield ("error", _BRAIN_ERROR)
+            return
+
+        yield ("done", full.strip() or _EMPTY_RESPONSE)
+
     async def _inject_context(self, chat_id: int, text: str) -> str:
         """Prepend any pending system notes to the user's message.
 

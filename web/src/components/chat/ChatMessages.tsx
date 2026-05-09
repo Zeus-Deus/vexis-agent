@@ -62,13 +62,21 @@ export function ChatMessages({ messages, pending }: ChatMessagesProps) {
     );
   }
 
+  // Suppress the bottom pulsing indicator when the last message is
+  // already a streaming-in-progress assistant bubble — that bubble
+  // shows its own inline pulse via the empty-content branch in
+  // Bubble. Two indicators stacked would be visual noise.
+  const tail = messages[messages.length - 1];
+  const tailIsStreaming =
+    tail?.role === "assistant" && tail.content === "";
+
   return (
     <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6">
       <div className="max-w-3xl mx-auto flex flex-col gap-5">
         {messages.map((m, i) => (
           <Bubble key={i} message={m} />
         ))}
-        {pending && <PendingBubble />}
+        {pending && !tailIsStreaming && <PendingBubble />}
         <div ref={endRef} />
       </div>
     </div>
@@ -124,7 +132,7 @@ function Bubble({ message }: { message: ChatMessage }) {
           {message.attachments && message.attachments.length > 0 && (
             <BubbleAttachments attachments={message.attachments} isUser={isUser} />
           )}
-          {message.content && (
+          {message.content ? (
             isUser ? (
               <div className="whitespace-pre-wrap text-sm leading-relaxed">
                 {message.content}
@@ -132,6 +140,13 @@ function Bubble({ message }: { message: ChatMessage }) {
             ) : (
               <Markdown source={message.content} />
             )
+          ) : (
+            // Empty-content state on assistant bubbles: streaming
+            // in progress but no tokens have landed yet. Render
+            // the pulse inline so the user sees the bubble is alive
+            // and a reply is on the way. User bubbles never have
+            // empty content (the composer blocks empty sends).
+            !isUser && <InlinePulse />
           )}
         </div>
         {/* Action row — copy + future actions (regenerate, edit).
@@ -265,6 +280,28 @@ function BubbleAttachments({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function InlinePulse() {
+  // Three-dot pulse rendered inside an empty assistant bubble while
+  // waiting for the first streamed chunk. Same visual language as
+  // the standalone PendingBubble below — using the bubble itself as
+  // the container avoids the layout shift that would happen when
+  // the standalone-pending bubble is replaced by the streaming
+  // bubble.
+  return (
+    <div className="flex gap-1.5 items-center text-[var(--color-fg-dim)] py-0.5">
+      <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+      <span
+        className="w-1.5 h-1.5 rounded-full bg-current animate-pulse"
+        style={{ animationDelay: "0.15s" }}
+      />
+      <span
+        className="w-1.5 h-1.5 rounded-full bg-current animate-pulse"
+        style={{ animationDelay: "0.3s" }}
+      />
     </div>
   );
 }

@@ -42,7 +42,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 
@@ -1332,6 +1332,101 @@ class WebDashboard:
                         for s in infos
                     ],
                 }
+            )
+
+        @app.post(
+            "/api/v1/chat/stream",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_chat_stream(body: dict) -> StreamingResponse:
+            """Stream the brain's reply token-by-token via Server-Sent
+            Events. Each chunk is one SSE frame:
+
+                data: {"type":"chunk","text":"…"}\\n\\n
+                ...
+                data: {"type":"done","reply":"…"}\\n\\n
+
+            On error:
+
+                data: {"type":"error","message":"…"}\\n\\n
+
+            Body shape mirrors POST /chat/send: ``text``, optional
+            ``attachments`` (path/name/mime list), optional ``model``
+            and ``reasoning_level`` overrides for voice-call mode.
+            ``done`` carries the full reply so the client doesn't
+            have to re-concat chunks for persistence/TTS.
+            """
+            chat = _chat_or_503()
+            text = _validated_text(body)
+            attachments_raw = body.get("attachments")
+            if attachments_raw is not None:
+                if not isinstance(attachments_raw, list):
+                    raise HTTPException(400, "'attachments' must be a list")
+                hint = _format_attachments_hint(attachments_raw)
+                if hint:
+                    text = f"{hint}\n\n{text}"
+
+            model_raw = body.get("model")
+            model_override = (
+                model_raw.strip() if isinstance(model_raw, str) and model_raw.strip()
+                else None
+            )
+            reasoning_raw = body.get("reasoning_level")
+            reasoning_override = (
+                reasoning_raw.strip()
+                if isinstance(reasoning_raw, str) and reasoning_raw.strip()
+                else None
+            )
+
+            async def sse_events():
+                # Each event is one SSE frame. ``json.dumps`` keeps
+                # newlines safely encoded (raw \n in a frame would
+                # be misparsed as an event terminator).
+                try:
+                    async for event in chat.stream(
+                        text,
+                        model=model_override,
+                        reasoning_level=reasoning_override,
+                    ):
+                        kind, payload = event
+                        if kind == "chunk":
+                            data = json.dumps(
+                                {"type": "chunk", "text": payload}
+                            )
+                            yield f"data: {data}\n\n"
+                        elif kind == "done":
+                            data = json.dumps(
+                                {"type": "done", "reply": payload}
+                            )
+                            yield f"data: {data}\n\n"
+                        elif kind == "error":
+                            # Empty ``payload`` means the handler
+                            # suppressed the message (cancel), no
+                            # error string to surface — still tell
+                            # the UI so it can clean up the bubble.
+                            msg = payload or ""
+                            data = json.dumps(
+                                {"type": "error", "message": msg}
+                            )
+                            yield f"data: {data}\n\n"
+                except Exception:
+                    log.exception("/chat/stream generator raised")
+                    data = json.dumps(
+                        {"type": "error", "message": "stream interrupted"},
+                    )
+                    yield f"data: {data}\n\n"
+
+            return StreamingResponse(
+                sse_events(),
+                media_type="text/event-stream",
+                # Defensive headers — stop intermediate proxies (if
+                # any sneak in front of the daemon) from buffering.
+                # Tailscale serve is direct-pass but doesn't hurt.
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
             )
 
         @app.get(

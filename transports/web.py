@@ -98,6 +98,23 @@ class WebChatTransport:
     async def clear(self) -> str | None:
         return await self._handler.handle_clear(self._user_id)
 
+    async def stream(
+        self,
+        text: str,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ):
+        """Streaming variant of :meth:`send`. Yields ``("chunk", str)``
+        per incremental text fragment, ``("done", full_reply)`` once
+        at the end, or ``("error", message)`` on failure. Same
+        per-turn override semantics as ``send``."""
+        async for event in self._handler.stream(
+            self._user_id, WEB_CHAT_ID, text,
+            model=model, reasoning_level=reasoning_level,
+        ):
+            yield event
+
     # ---------- session management ----------
 
     async def new_session(self, name: str | None = None) -> str | None:

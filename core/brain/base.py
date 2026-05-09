@@ -31,7 +31,7 @@ zero subprocess dependencies. The cross-brain contract test
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Union
@@ -308,6 +308,42 @@ class Brain(ABC):
     """
 
     # ─── foreground turn ─────────────────────────────────────────
+
+    async def astream(
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ) -> AsyncIterator[str]:
+        """Streaming variant of :meth:`respond`. Yields incremental
+        text chunks as the model generates them.
+
+        Default implementation here delegates to ``respond`` and
+        yields the full reply once at the end — non-streaming brains
+        still satisfy the contract, just without the live-feel UX.
+        Implementations that natively stream (claude-code via
+        ``--include-partial-messages``, future opencode) override
+        this to yield per-delta.
+
+        Same per-turn override semantics as ``respond``: ``model``
+        and ``reasoning_level`` flow through identically. Telegram
+        and the text-chat tab don't call this — the streaming SSE
+        route on the dashboard is the only caller today. Same
+        exception surface: BrainTimeout, BrainCancelled, SessionLost,
+        BrainError.
+
+        Marked NOT-abstract so concrete brains are free to inherit
+        the default fallback. Brains that override it MUST yield at
+        least one chunk on success (empty reply → yield "") so
+        downstream callers can rely on that for the "done" signal.
+        """
+        reply = await self.respond(
+            message, chat_id,
+            model=model, reasoning_level=reasoning_level,
+        )
+        yield reply
 
     @abstractmethod
     async def respond(
