@@ -21,7 +21,18 @@ export function Tabs({ tabs, active, onChange, trailing }: TabsProps) {
   return (
     <nav className="border-b border-[var(--color-border)]">
       <div className="max-w-[1400px] w-full mx-auto px-3 sm:px-5 flex items-stretch">
-        <ul className="flex flex-1 items-stretch overflow-x-auto">
+        {/*
+          ``overflow-x-auto`` lets the tab row scroll horizontally on
+          narrow viewports. We pin ``overflow-y`` to ``hidden`` because
+          the CSS spec promotes a ``visible`` cross-axis to ``auto``
+          whenever the other axis is non-visible — and a 1px rounding
+          delta between scrollHeight and clientHeight is enough for
+          wheel and touch gestures to scroll the tab strip vertically,
+          which on mobile reads as the tabs bouncing in and out of view.
+          ``overscroll-contain`` keeps a horizontal swipe on the strip
+          from chaining up to the page once the strip hits its edge.
+        */}
+        <ul className="flex flex-1 items-stretch overflow-x-auto overflow-y-hidden overscroll-contain">
           {tabs.map((tab) => {
             const isActive = tab.id === active;
             return (
