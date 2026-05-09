@@ -40,6 +40,21 @@ dev = [
 
 [project.scripts]
 vexis-agent = "vexis_agent.cli:app"
+# Dispatch wrappers — historically bash files in scripts/, now console
+# scripts so pipx-installed users get them on PATH automatically. The
+# bash files in scripts/ remain for dev-checkout convenience but are no
+# longer the canonical entry points.
+vexis-bg = "vexis_agent.tools.background_cli:main"
+vexis-browse = "vexis_agent.tools.browser_cli:main"
+vexis-desktop = "vexis_agent.tools.desktop_cli:main"
+vexis-mem = "vexis_agent.tools.memory_cli:main"
+vexis-skill = "vexis_agent.tools.skills_cli:main"
+vexis-stream = "vexis_agent.tools.livestream_cli:main"
+vexis-click = "vexis_agent.tools.desktop_control_cli:main_click"
+vexis-dispatch = "vexis_agent.tools.desktop_control_cli:main_dispatch"
+vexis-focus-wait = "vexis_agent.tools.desktop_control_cli:main_focus_wait"
+vexis-key = "vexis_agent.tools.desktop_control_cli:main_key"
+vexis-type = "vexis_agent.tools.desktop_control_cli:main_type"
 
 [tool.setuptools.packages.find]
 where = ["."]

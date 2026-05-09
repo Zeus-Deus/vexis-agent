@@ -103,5 +103,36 @@ def main() -> int:
         return 1
 
 
+# Console-script aliases. The dispatch wrappers in `scripts/` historically
+# called `python -m vexis_agent.tools.desktop_control_cli <subcommand>`;
+# pipx-installed users get these as PATH-resident binaries. Each prepends
+# its fixed subcommand to argv before delegating to the unified parser
+# in main(), so behaviour stays identical to the bash wrappers.
+
+def _alias(subcommand: str) -> int:
+    sys.argv = [sys.argv[0], subcommand, *sys.argv[1:]]
+    return main()
+
+
+def main_click() -> int:
+    return _alias("click")
+
+
+def main_dispatch() -> int:
+    return _alias("dispatch")
+
+
+def main_focus_wait() -> int:
+    return _alias("focus-wait")
+
+
+def main_key() -> int:
+    return _alias("key")
+
+
+def main_type() -> int:
+    return _alias("type")
+
+
 if __name__ == "__main__":
     sys.exit(main())

@@ -271,8 +271,12 @@ def _build_system_prompt_for_workspace(workspace: Path) -> str:
         format_relationships_for_system_prompt,
     )
 
+    # CAPABILITIES.md ships as package data — see brain/claude_code.py
+    # for the matching read site; both adapters use the same source.
+    from vexis_agent.data import read_capabilities
+
     soul = _read_markdown(workspace / "SOUL.md") or DEFAULT_SOUL
-    capabilities = _read_markdown(_PROJECT_ROOT / "CAPABILITIES.md")
+    capabilities = read_capabilities()
     parts: list[str] = [soul]
     if capabilities:
         parts.append(capabilities)

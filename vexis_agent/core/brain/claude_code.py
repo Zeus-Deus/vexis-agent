@@ -240,8 +240,12 @@ def build_system_prompt(workspace: Path) -> str:
         format_relationships_for_system_prompt,
     )
 
+    # CAPABILITIES.md ships as package data — readable identically
+    # under pipx-installed wheels and editable source checkouts.
+    from vexis_agent.data import read_capabilities
+
     soul = _read_markdown(workspace / "SOUL.md") or DEFAULT_SOUL
-    capabilities = _read_markdown(_PROJECT_ROOT / "CAPABILITIES.md")
+    capabilities = read_capabilities()
     parts: list[str] = [soul]
     if capabilities:
         parts.append(capabilities)

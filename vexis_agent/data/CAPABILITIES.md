@@ -7,7 +7,7 @@ you are; this file tells you what you can do.
 
 Take a screenshot of the user's desktop:
 
-    ~/projects/vexis-agent/scripts/vexis-desktop --scope focused-monitor
+    vexis-desktop --scope focused-monitor
 
 Other scopes:
 
@@ -86,11 +86,11 @@ Use the right tool for each job.
 Always use `hyprctl dispatch` for window/workspace operations. It's
 faster, more reliable, and matches the user's actual keybindings.
 
-    ~/projects/vexis-agent/scripts/vexis-dispatch "workspace 3"
-    ~/projects/vexis-agent/scripts/vexis-dispatch "focuswindow class:^(brave-browser)$"
-    ~/projects/vexis-agent/scripts/vexis-dispatch "togglefloating"
-    ~/projects/vexis-agent/scripts/vexis-dispatch "killactive"
-    ~/projects/vexis-agent/scripts/vexis-dispatch "exec [workspace 2 silent] kitty"
+    vexis-dispatch "workspace 3"
+    vexis-dispatch "focuswindow class:^(brave-browser)$"
+    vexis-dispatch "togglefloating"
+    vexis-dispatch "killactive"
+    vexis-dispatch "exec [workspace 2 silent] kitty"
 
 The user's actual bindings (Super+1..0 for workspaces, Super+W to
 close, Super+T to float, Super+F for fullscreen, Super+arrows for
@@ -102,8 +102,8 @@ muscle memory expects the same dispatchers.
 
 For typing arbitrary text:
 
-    ~/projects/vexis-agent/scripts/vexis-type "hello, sir"
-    ~/projects/vexis-agent/scripts/vexis-type "user@example.com"
+    vexis-type "hello, sir"
+    vexis-type "user@example.com"
 
 `wtype` respects the active keyboard layout and handles UTF-8.
 Don't use ydotool for typing — it produces wrong characters for
@@ -113,10 +113,10 @@ symbols and non-US layouts.
 
 For clicking and modifier-key combinations:
 
-    ~/projects/vexis-agent/scripts/vexis-click --button left
-    ~/projects/vexis-agent/scripts/vexis-click --button right --count 2
-    ~/projects/vexis-agent/scripts/vexis-key KEY_LEFTCTRL KEY_C
-    ~/projects/vexis-agent/scripts/vexis-key KEY_LEFTALT KEY_TAB
+    vexis-click --button left
+    vexis-click --button right --count 2
+    vexis-key KEY_LEFTCTRL KEY_C
+    vexis-key KEY_LEFTALT KEY_TAB
 
 ### Focus race condition — wait after focus changes
 
@@ -124,9 +124,9 @@ If you change focus and then type, the keystrokes may land on the
 wrong window because focus hasn't settled. Always poll for focus
 between operations:
 
-    ~/projects/vexis-agent/scripts/vexis-dispatch "focuswindow class:^(brave-browser)$"
-    ~/projects/vexis-agent/scripts/vexis-focus-wait "brave-browser" --timeout 2
-    ~/projects/vexis-agent/scripts/vexis-type "hello"
+    vexis-dispatch "focuswindow class:^(brave-browser)$"
+    vexis-focus-wait "brave-browser" --timeout 2
+    vexis-type "hello"
 
 ### Hyprland docs
 
@@ -174,7 +174,7 @@ Take a screenshot BEFORE the next action when:
 
 ### How to verify
 
-Use `~/projects/vexis-agent/scripts/vexis-look` to capture the focused
+Use `vexis-look` to capture the focused
 monitor. The image is auto-attached to your reply via the existing
 `/tmp/vexis-screenshot-*.png` detection — you can reference the path
 in your reasoning, but you don't need to send it to the user unless
@@ -244,7 +244,7 @@ question). The stream costs CPU and screen-capture bandwidth.
 
 ### Starting
 
-    ~/projects/vexis-agent/scripts/vexis-stream start
+    vexis-stream start
 
 Returns JSON with the URL. Send the URL to the user in your reply.
 The user can open it in any browser on any device signed into their
@@ -255,7 +255,7 @@ Example reply:
 
 ### Keeping it alive during work
 
-    ~/projects/vexis-agent/scripts/vexis-stream touch
+    vexis-stream touch
 
 Run this between turns during a task. The stream auto-stops after
 5 minutes of inactivity; touching extends the deadline. You don't
@@ -265,14 +265,14 @@ need to touch on every micro-action — once per major step is fine.
 
 When the task is done, or the user says "stop streaming":
 
-    ~/projects/vexis-agent/scripts/vexis-stream stop
+    vexis-stream stop
 
 Always stop the stream when a task completes. Streams left running
 unnecessarily are a waste.
 
 ### Checking status
 
-    ~/projects/vexis-agent/scripts/vexis-stream status
+    vexis-stream status
 
 JSON with `running`, `url` (if running), `started_at`,
 `last_activity`, `seconds_until_idle_stop`. Useful when the user
@@ -337,7 +337,7 @@ might want to keep chatting regardless of duration.
 
 ### How to spawn a background task
 
-    ~/projects/vexis-agent/scripts/vexis-bg spawn <name> '<prompt>'
+    vexis-bg spawn <name> '<prompt>'
 
 `<name>` should be kebab-case, descriptive, 3-30 chars:
 `fix-login-bug`, `add-dark-mode`, `refactor-auth-module`. Must start
@@ -357,7 +357,7 @@ Returns JSON with the task name and spawn time. Tell the user clearly:
 If the user asks "how's that going" or you want to peek mid-task, read
 the last 50 lines of the task log:
 
-    ~/projects/vexis-agent/scripts/vexis-bg tail fix-login-bug
+    vexis-bg tail fix-login-bug
 
 The log is the agent CLI's structured event stream output, so you'll
 see structured tool-use and partial-message events. Use what you read
@@ -371,13 +371,13 @@ Don't dump the raw log to the user. Read it, summarize.
 
 ### Cancelling
 
-    ~/projects/vexis-agent/scripts/vexis-bg cancel fix-login-bug
+    vexis-bg cancel fix-login-bug
 
 The user can also cancel via Telegram with `/cancel fix-login-bug`.
 
 ### Listing
 
-    ~/projects/vexis-agent/scripts/vexis-bg status
+    vexis-bg status
 
 JSON list of all known tasks (running and recently finished within the
 last hour). Pass `--name fix-login-bug` to get a single record.
@@ -453,10 +453,10 @@ every session:
 
 Mutate them via the `vexis-mem` CLI. One verb, three actions, two targets:
 
-    ~/projects/vexis-agent/scripts/vexis-mem add memory "Codemux infra at 203.0.113.42"
-    ~/projects/vexis-agent/scripts/vexis-mem add user   "Prefers concise replies"
-    ~/projects/vexis-agent/scripts/vexis-mem replace memory --old "Codemux infra" --new "Codemux infra (Hetzner box)"
-    ~/projects/vexis-agent/scripts/vexis-mem remove user --old "Prefers concise"
+    vexis-mem add memory "Codemux infra at 203.0.113.42"
+    vexis-mem add user   "Prefers concise replies"
+    vexis-mem replace memory --old "Codemux infra" --new "Codemux infra (Hetzner box)"
+    vexis-mem remove user --old "Prefers concise"
 
 Returns JSON. On overflow you'll get `success: false` plus the
 current entries — decide what to consolidate, then retry.
@@ -493,7 +493,7 @@ block of your system prompt — name + one-line description.
 **Always scan that block before replying.** If a skill's description
 even partially matches the task, load its body:
 
-    ~/projects/vexis-agent/scripts/vexis-skill view <name>
+    vexis-skill view <name>
 
 The body is markdown — read it and apply its guidance. Loading via
 `view` is the right move; don't try to reconstruct a skill from
@@ -514,7 +514,7 @@ corrected you on), write it down:
     # Body
     Procedural instructions, gotchas, links to references...
     EOF
-    ~/projects/vexis-agent/scripts/vexis-skill create <name> --content-file /tmp/new-skill.md
+    vexis-skill create <name> --content-file /tmp/new-skill.md
 
 After creating, the skill won't appear in your `<available_skills>`
 block until next session — same frozen-snapshot rule as memory. The
@@ -522,9 +522,9 @@ skill IS on disk and visible to `vexis-skill list` immediately.
 
 ### Modifying an existing skill
 
-    ~/projects/vexis-agent/scripts/vexis-skill patch <name> --old-string "OLD" --new-string "NEW"
-    ~/projects/vexis-agent/scripts/vexis-skill edit <name> --content-file /tmp/full-rewrite.md
-    ~/projects/vexis-agent/scripts/vexis-skill write-file <name> --file references/foo.md --content-file /tmp/foo.md
+    vexis-skill patch <name> --old-string "OLD" --new-string "NEW"
+    vexis-skill edit <name> --content-file /tmp/full-rewrite.md
+    vexis-skill write-file <name> --file references/foo.md --content-file /tmp/foo.md
 
 ### Pinned skills
 
@@ -542,7 +542,7 @@ brain session rotation. Before answering any question about
 background-task state ("what's running?", "is X done yet?", "how's
 the refactor going?"), run:
 
-    ~/projects/vexis-agent/scripts/vexis-bg status
+    vexis-bg status
 
 That JSON is ground truth. Your in-conversation memory of what tasks
 you spawned can be stale; the daemon's registry is not.
@@ -626,13 +626,13 @@ you can continue.
 
 ### Subcommands
 
-    ~/projects/vexis-agent/scripts/vexis-browse navigate https://example.com
+    vexis-browse navigate https://example.com
 
 Navigates and returns `{ok, url, title, snapshot, element_count}`. The
 inline `snapshot` is the same DSL `snapshot` returns — there's usually
 no need to call `snapshot` immediately after `navigate`.
 
-    ~/projects/vexis-agent/scripts/vexis-browse snapshot
+    vexis-browse snapshot
 
 Returns `{ok, snapshot, url, title, element_count}`. The DSL is
 tab-indented `[index]<tag attr=val />`:
@@ -650,16 +650,16 @@ first snapshot on a fresh page never has markers; they only appear
 when the same page mutates between snapshots. The integer `index`
 is the stable identifier you pass to `click` and `type`.
 
-    ~/projects/vexis-agent/scripts/vexis-browse click 38
-    ~/projects/vexis-agent/scripts/vexis-browse type 35 "user@example.com"
-    ~/projects/vexis-agent/scripts/vexis-browse type 35 "extra" --no-clear
-    ~/projects/vexis-agent/scripts/vexis-browse press Enter
-    ~/projects/vexis-agent/scripts/vexis-browse press Control+L
-    ~/projects/vexis-agent/scripts/vexis-browse back
-    ~/projects/vexis-agent/scripts/vexis-browse scroll down
-    ~/projects/vexis-agent/scripts/vexis-browse scroll up --pages 2
-    ~/projects/vexis-agent/scripts/vexis-browse screenshot
-    ~/projects/vexis-agent/scripts/vexis-browse screenshot --full-page
+    vexis-browse click 38
+    vexis-browse type 35 "user@example.com"
+    vexis-browse type 35 "extra" --no-clear
+    vexis-browse press Enter
+    vexis-browse press Control+L
+    vexis-browse back
+    vexis-browse scroll down
+    vexis-browse scroll up --pages 2
+    vexis-browse screenshot
+    vexis-browse screenshot --full-page
 
 `type` clears the field by default. Pass `--no-clear` to append. `press`
 takes a key chord using browser-style names (`Enter`, `Tab`, `Escape`,

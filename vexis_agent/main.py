@@ -170,22 +170,64 @@ async def _run() -> None:
 
     acquire_daemon_lock()
 
-    for cmd in (
-        "claude",
-        "voxtype",
-        "ffmpeg",
-        "grim",
-        "hyprctl",
-        "jq",
-        "ydotool",
-        "wtype",
-    ):
+    # Brain CLI prerequisite is conditional on the configured kind —
+    # users on opencode shouldn't be blocked by a missing `claude`,
+    # and vice-versa. The null brain has no CLI to require (test fake).
+    from vexis_agent.core.yaml_config import brain_kind as _brain_kind_fn
+
+    _BRAIN_BINARIES: dict[str, tuple[str, str]] = {
+        "claude-code": (
+            "claude",
+            "Install via the official guide at "
+            "https://docs.anthropic.com/claude/claude-code, then run "
+            "'claude /login'.",
+        ),
+        "opencode": (
+            "opencode",
+            "Install with: curl -fsSL https://opencode.ai/install | bash",
+        ),
+        "null": ("", ""),  # test fake — no CLI required.
+    }
+    kind = _brain_kind_fn()
+    binary, install_hint = _BRAIN_BINARIES.get(kind, ("claude", ""))
+    if binary and shutil.which(binary) is None:
+        raise RuntimeError(
+            f"`{binary}` CLI not found on PATH "
+            f"(brain.kind={kind} in ~/.vexis/config.yaml). {install_hint}"
+        )
+
+    # Wayland-Hyprland actuator + tooling deps. vexis-agent is
+    # Hyprland-targeted; these are required for the desktop-control,
+    # screenshot, and dispatch tools. On non-Hyprland systems these
+    # tools won't work — we fail fast here rather than letting the
+    # MCP servers crash mid-call. Voice deps (voxtype, ffmpeg) live in
+    # this list because the Telegram transport accepts voice notes by
+    # default; users without voice should still see a clean error
+    # rather than a stack trace mid-message.
+    _REQUIRED_TOOLS: dict[str, str] = {
+        "voxtype":  "Install via your distro or pip; speech-to-text for voice notes.",
+        "ffmpeg":   "Install via your distro: pacman -S ffmpeg / apt install ffmpeg / dnf install ffmpeg.",
+        "grim":     "Wayland screenshot tool: pacman -S grim / apt install grim.",
+        "hyprctl":  "Hyprland's runtime CLI; ships with Hyprland itself.",
+        "jq":       "Shell JSON tool: pacman -S jq / apt install jq / dnf install jq.",
+        "ydotool":  "Wayland uinput injector. Arch: pacman -S ydotool. Make sure ydotool.service is enabled.",
+        "wtype":    "Wayland xdotool-equivalent for typing. pacman -S wtype.",
+    }
+    for cmd, hint in _REQUIRED_TOOLS.items():
         if shutil.which(cmd) is None:
-            raise RuntimeError(f"`{cmd}` CLI not found on PATH")
+            raise RuntimeError(
+                f"`{cmd}` CLI not found on PATH. {hint}\n"
+                f"Run 'vexis-agent doctor' for the full readiness check."
+            )
 
     for cmd in ("tailscale",):
         if shutil.which(cmd) is None:
-            log.warning("`%s` not found on PATH; live streaming unavailable", cmd)
+            log.warning(
+                "`%s` not found on PATH; live streaming + remote dashboard "
+                "URL unavailable. Daemon continues; install Tailscale and "
+                "run 'tailscale up' to enable.",
+                cmd,
+            )
 
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     socket = Path(runtime) / ".ydotool_socket"
@@ -234,15 +276,17 @@ async def _run() -> None:
         # daemon startup over it.
         log.exception("relationships USER.md seed install raised")
 
-    # CAPABILITIES.md sits at the repo root (one level above the package).
-    # main.py lives at vexis_agent/main.py post-Phase-2, so .parent.parent
-    # gets us to the source-checkout root that holds CAPABILITIES.md.
-    capabilities_path = Path(__file__).resolve().parent.parent / "CAPABILITIES.md"
-    if not capabilities_path.is_file():
+    # CAPABILITIES.md ships as package data (vexis_agent/data/) so
+    # pipx-installed users without a source checkout still get it.
+    # The startup warning fires only if the wheel build dropped the
+    # file — a packaging regression, not an end-user problem.
+    from vexis_agent.data import read_capabilities
+
+    if read_capabilities() is None:
         log.warning(
-            "CAPABILITIES.md missing from project root (%s). "
-            "Vexis won't know which tools are available.",
-            capabilities_path,
+            "CAPABILITIES.md missing from package data. "
+            "Vexis won't know which tools are available — likely a "
+            "packaging build issue; reinstall with 'vexis-agent update'."
         )
 
     sessions = SessionStore(state_path=state_dir() / "session.json")
