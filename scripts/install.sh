@@ -18,15 +18,17 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Activate the conda env if it's not already active. Skip if
 # CONDA_DEFAULT_ENV is already vexis-agent_env (re-running inside
-# a shell that's already activated).
+# a shell that's already activated). Uses `conda shell.bash hook`
+# so this works regardless of which conda distribution or install
+# prefix is on the developer's machine.
 if [[ "${CONDA_DEFAULT_ENV:-}" != "vexis-agent_env" ]]; then
-    if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
-        # shellcheck disable=SC1091
-        source "$HOME/miniconda3/etc/profile.d/conda.sh"
+    if command -v conda >/dev/null 2>&1; then
+        # shellcheck disable=SC1090
+        eval "$(conda shell.bash hook)"
         conda activate vexis-agent_env
     else
-        echo "WARN: miniconda profile not found at \$HOME/miniconda3/etc/profile.d/conda.sh" >&2
-        echo "WARN: continuing with the current Python — make sure 'vexis-agent_env' is active." >&2
+        echo "WARN: conda not found on PATH — make sure 'vexis-agent_env' is active." >&2
+        echo "WARN: continuing with the current Python." >&2
     fi
 fi
 

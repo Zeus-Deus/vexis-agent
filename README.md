@@ -30,10 +30,11 @@ tools out, agent CLI in the middle.
    cd vexis-agent
    ```
 
-3. **Set up the conda env**:
+3. **Set up a Python venv**:
    ```bash
-   conda env create -f environment.yml -n vexis-agent_env
-   conda activate vexis-agent_env
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -e .
    ```
    (All dependencies live inside this env. Never install to global
    Python.)
