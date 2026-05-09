@@ -234,7 +234,10 @@ async def _run() -> None:
         # daemon startup over it.
         log.exception("relationships USER.md seed install raised")
 
-    capabilities_path = Path(__file__).resolve().parent / "CAPABILITIES.md"
+    # CAPABILITIES.md sits at the repo root (one level above the package).
+    # main.py lives at vexis_agent/main.py post-Phase-2, so .parent.parent
+    # gets us to the source-checkout root that holds CAPABILITIES.md.
+    capabilities_path = Path(__file__).resolve().parent.parent / "CAPABILITIES.md"
     if not capabilities_path.is_file():
         log.warning(
             "CAPABILITIES.md missing from project root (%s). "
