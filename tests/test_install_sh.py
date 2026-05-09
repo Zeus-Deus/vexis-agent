@@ -57,25 +57,30 @@ def test_install_sh_help_lists_dry_run_and_env_vars() -> None:
 
 
 def _empty_path_env(tmp_path: Path) -> dict[str, str]:
-    """A subset of os.environ that drops pipx (and most else) from
-    PATH but keeps the basic toolchain (bash, sudo if present, etc).
-    The dry-run branch should not need anything beyond bash itself."""
+    """A subset of os.environ that drops pipx + brain CLIs + Wayland
+    tools from PATH but keeps the basic toolchain (bash, uname,
+    whoami) so the installer's banner / platform / soft-dep
+    sections can render. The --dry-run branch never tries to
+    actually invoke pipx, sudo, or the Wayland tools — it only
+    checks command -v for each."""
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    # We DO need bash and the basics in PATH for the script to run at
-    # all — point at a curated subset of /usr/bin that excludes pipx.
-    safe = []
-    for tool in ("bash", "uname", "id"):
+    # The installer prints the OS arch (uname -m), the current user
+    # (whoami), and probes 'command -v' for many soft deps. command
+    # is a bash builtin so it doesn't need a PATH entry; uname and
+    # whoami do. Anything else should be absent so the soft-dep
+    # branches all hit the missing-tool path.
+    for tool in ("bash", "uname", "whoami", "id", "cat", "tr", "sed", "grep"):
         src = shutil.which(tool)
         if src:
             link = fake_bin / tool
             if not link.exists():
                 link.symlink_to(src)
-            safe.append(tool)
     env = {
         "PATH": str(fake_bin),
         "HOME": str(tmp_path / "home"),
-        "EUID": "1000",  # script reads $EUID via bash builtin; subprocess inherits
+        "EUID": "1000",
+        "XDG_SESSION_TYPE": "wayland",  # avoid the X11 warning
     }
     Path(env["HOME"]).mkdir()
     return env
@@ -137,3 +142,48 @@ def test_install_sh_rejects_unknown_arg(tmp_path) -> None:
         text=True,
     )
     assert result.returncode != 0
+
+
+def test_install_sh_help_documents_skip_setup() -> None:
+    """Phase 5e added --skip-setup; the help text must surface it."""
+    result = subprocess.run(
+        ["bash", str(INSTALL_SH), "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "--skip-setup" in result.stdout
+
+
+def test_install_sh_dry_run_includes_banner_and_section_headers(tmp_path) -> None:
+    """Banner + section markers should render in --dry-run mode so
+    the user sees what hermes-style installers do."""
+    env = _empty_path_env(tmp_path)
+    result = subprocess.run(
+        ["bash", str(INSTALL_SH), "--dry-run"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    out = result.stdout + result.stderr
+    # Box-drawing banner
+    assert "vexis-agent installer" in out
+    # Section markers
+    assert "◆ Platform" in out
+    assert "◆ Channel" in out
+    assert "◆ pipx" in out
+
+
+def test_install_sh_no_color_strips_ansi(tmp_path) -> None:
+    """NO_COLOR=1 should suppress every ANSI escape sequence."""
+    env = _empty_path_env(tmp_path)
+    env["NO_COLOR"] = "1"
+    result = subprocess.run(
+        ["bash", str(INSTALL_SH), "--dry-run"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "\033[" not in result.stdout, "NO_COLOR did not strip ANSI escapes"
