@@ -143,8 +143,16 @@ def _canned_prompts(answers: dict[str, str]):
     return _prompt
 
 
-def test_run_setup_writes_config_and_dotenv(tmp_path, monkeypatch) -> None:
+@pytest.fixture
+def isolated_setup_env(tmp_path, monkeypatch):
+    """Isolate VEXIS_HOME + VEXIS_WORKSPACE so wizard runs don't write
+    to the developer's real ~/.vexis or ~/vexis-workspace."""
     monkeypatch.setenv("VEXIS_HOME", str(tmp_path / "v"))
+    monkeypatch.setenv("VEXIS_WORKSPACE", str(tmp_path / "ws"))
+    return tmp_path
+
+
+def test_run_setup_writes_config_and_dotenv(isolated_setup_env) -> None:
     answers = {
         "Telegram bot token": "1234:abcd",
         "Allowed Telegram user ID": "98765",
@@ -153,6 +161,7 @@ def test_run_setup_writes_config_and_dotenv(tmp_path, monkeypatch) -> None:
         prompt=_canned_prompts(answers),
         install_service=False,
         require_interactive=False,
+        print_banner=False,
     )
     assert result.config_path.read_text(encoding="utf-8").startswith(
         "# vexis-agent — example configuration."
@@ -161,12 +170,16 @@ def test_run_setup_writes_config_and_dotenv(tmp_path, monkeypatch) -> None:
     assert "TELEGRAM_BOT_TOKEN=1234:abcd" in env_body
     assert "TELEGRAM_ALLOWED_USER_ID=98765" in env_body
     assert result.service_installed is False
+    # Workspace was created with subdirs
+    assert result.workspace.is_dir()
+    assert (result.workspace / "memories").is_dir()
+    assert (result.workspace / "skills").is_dir()
+    assert result.workspace_claude_md.is_file()
 
 
-def test_run_setup_reset_archives_existing(tmp_path, monkeypatch) -> None:
-    home = tmp_path / "v"
+def test_run_setup_reset_archives_existing(isolated_setup_env) -> None:
+    home = isolated_setup_env / "v"
     home.mkdir()
-    monkeypatch.setenv("VEXIS_HOME", str(home))
     (home / "config.yaml").write_text("# old config\n", encoding="utf-8")
     (home / ".env").write_text("TELEGRAM_BOT_TOKEN=old\n", encoding="utf-8")
 
@@ -175,17 +188,16 @@ def test_run_setup_reset_archives_existing(tmp_path, monkeypatch) -> None:
         install_service=False,
         reset=True,
         require_interactive=False,
+        print_banner=False,
     )
     assert result.archived_config is not None
     assert result.archived_dotenv is not None
     assert result.archived_config.exists()
     assert result.archived_dotenv.exists()
-    # Fresh files were re-written from templates.
     assert "vexis-agent — example" in result.config_path.read_text()
 
 
-def test_run_setup_install_service_calls_install(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("VEXIS_HOME", str(tmp_path / "v"))
+def test_run_setup_install_service_calls_install(monkeypatch, isolated_setup_env) -> None:
     called = {}
 
     def fake_install_user_unit(**kwargs):
@@ -199,9 +211,140 @@ def test_run_setup_install_service_calls_install(monkeypatch, tmp_path) -> None:
         prompt=_canned_prompts({"token": "x", "user ID": "1"}),
         install_service=True,
         require_interactive=False,
+        print_banner=False,
     )
     assert "kwargs" in called
     assert result.service_installed is True
+
+
+# ── Phase 5b helpers ──────────────────────────────────────────────
+
+
+def test_check_brain_cli_claude_code_present(tmp_path, monkeypatch) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "claude"
+    fake.write_text("")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    bc = sw.check_brain_cli("claude-code")
+    assert bc.kind == "claude-code"
+    assert bc.binary == "claude"
+    assert bc.found is True
+
+
+def test_check_brain_cli_opencode_missing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    bc = sw.check_brain_cli("opencode")
+    assert bc.binary == "opencode"
+    assert bc.found is False
+    assert "opencode.ai/install" in bc.install_hint
+
+
+def test_check_brain_cli_null_no_binary() -> None:
+    bc = sw.check_brain_cli("null")
+    assert bc.found is True
+    assert bc.binary == ""
+
+
+def test_workspace_path_honors_env(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VEXIS_WORKSPACE", str(tmp_path / "ws"))
+    assert sw.workspace_path() == tmp_path / "ws"
+    monkeypatch.delenv("VEXIS_WORKSPACE")
+    assert sw.workspace_path() == Path.home() / "vexis-workspace"
+
+
+def test_ensure_workspace_creates_subdirs(tmp_path) -> None:
+    ws = tmp_path / "ws"
+    sw.ensure_workspace(ws)
+    assert ws.is_dir()
+    assert (ws / "memories").is_dir()
+    assert (ws / "skills").is_dir()
+
+
+def test_ensure_workspace_claude_md_writes_template(tmp_path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    path, written = sw.ensure_workspace_claude_md(ws)
+    assert written is True
+    body = path.read_text(encoding="utf-8")
+    assert "Vexis workspace" in body or "Vexis" in body
+    # Idempotent on re-run
+    path2, written2 = sw.ensure_workspace_claude_md(ws)
+    assert written2 is False
+
+
+def test_ensure_agents_md_symlink_only_for_opencode(tmp_path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "CLAUDE.md").write_text("x\n")
+    # claude-code → no symlink created
+    link, status = sw.ensure_agents_md_symlink(ws, "claude-code")
+    assert link is None
+    assert status == "skipped_not_opencode"
+    assert not (ws / "AGENTS.md").exists()
+    # opencode → symlink created
+    link, status = sw.ensure_agents_md_symlink(ws, "opencode")
+    assert status == "created"
+    assert link.is_symlink()
+    assert os.readlink(link) == "CLAUDE.md"
+
+
+def test_ensure_agents_md_symlink_idempotent(tmp_path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "CLAUDE.md").write_text("x\n")
+    sw.ensure_agents_md_symlink(ws, "opencode")
+    _, status = sw.ensure_agents_md_symlink(ws, "opencode")
+    assert status == "already_correct"
+
+
+def test_ensure_agents_md_symlink_refuses_real_file(tmp_path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "CLAUDE.md").write_text("x\n")
+    (ws / "AGENTS.md").write_text("hand-written content\n")
+    link, status = sw.ensure_agents_md_symlink(ws, "opencode")
+    assert status == "refused_real_file"
+    # Real file untouched
+    assert (ws / "AGENTS.md").read_text() == "hand-written content\n"
+
+
+def test_check_tailscale_when_missing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    ts = sw.check_tailscale()
+    assert ts.installed is False
+    assert ts.logged_in is False
+
+
+def test_run_setup_creates_workspace_for_opencode(isolated_setup_env, monkeypatch) -> None:
+    """When brain.kind=opencode, the wizard should write the AGENTS.md
+    symlink. Force the kind by writing config.yaml before run_setup."""
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    (home / "config.yaml").write_text("brain:\n  kind: opencode\n")
+
+    result = sw.run_setup(
+        prompt=_canned_prompts({"token": "x", "user ID": "1"}),
+        install_service=False,
+        require_interactive=False,
+        print_banner=False,
+    )
+    assert result.agents_md_status == "created"
+    link = result.workspace / "AGENTS.md"
+    assert link.is_symlink()
+    assert os.readlink(link) == "CLAUDE.md"
+
+
+def test_run_setup_skips_agents_md_for_claude_code(isolated_setup_env) -> None:
+    result = sw.run_setup(
+        prompt=_canned_prompts({"token": "x", "user ID": "1"}),
+        install_service=False,
+        require_interactive=False,
+        print_banner=False,
+    )
+    assert result.agents_md_status == "skipped_not_opencode"
+    assert not (result.workspace / "AGENTS.md").exists()
 
 
 def test_format_summary_renders_archive_lines(tmp_path) -> None:
@@ -214,7 +357,9 @@ def test_format_summary_renders_archive_lines(tmp_path) -> None:
         service_installed=False,
     )
     out = sw.format_summary(result)
-    assert "archived: " + str(tmp_path / "config.yaml.bak.X") in out
+    # Two spaces after the colon — column-aligned with the other
+    # summary lines (config:/secrets:/workspace:/archived:).
+    assert "archived:  " + str(tmp_path / "config.yaml.bak.X") in out
     assert "Next steps:" in out
 
 

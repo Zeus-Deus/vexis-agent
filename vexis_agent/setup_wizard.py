@@ -1,20 +1,22 @@
 """``vexis-agent setup`` — interactive first-run wizard.
 
-Plan §7.3. Sequence:
+Plan §7.3 + Phase 5b expansion. Sequence:
 
   1. TTY check (refuse non-tty unless --reset overrides).
-  2. Ensure $VEXIS_HOME exists.
-  3. Copy shipped config.example.yaml → $VEXIS_HOME/config.yaml (skip if present).
-  4. Copy shipped dotenv.example → $VEXIS_HOME/.env (skip if present), mode 0600.
-  5. Prompt for TELEGRAM_BOT_TOKEN; write to .env.
-  6. Prompt for TELEGRAM_ALLOWED_USER_ID; write to .env.
-  7. Prompt: install systemd service?  → optionally call install_user_unit.
-  8. Print final summary.
+  2. Ensure $VEXIS_HOME exists; copy shipped templates if absent.
+  3. Prompt for TELEGRAM_BOT_TOKEN + TELEGRAM_ALLOWED_USER_ID.
+  4. Brain CLI check — verify configured brain.kind binary is on
+     PATH; print install hint + offer to skip if missing.
+  5. Workspace setup — mkdir $VEXIS_WORKSPACE, copy
+     workspace CLAUDE.md template, symlink AGENTS.md (opencode).
+  6. Tailscale soft-check — warn if not on PATH or not logged in.
+  7. Optional: install systemd user unit.
+  8. Print final tool-availability summary + next-step hints.
 
-``--reset`` archives an existing config.yaml + .env to *.bak.<utc>
-before re-running. Existing ~/.vexis state (curator, learning,
-daemon.pid, goals.json, …) is left untouched — the wizard never
-deletes user data.
+``--reset`` archives existing config.yaml + .env to *.bak.<utc>
+before re-running. User state under ``$VEXIS_HOME`` (curator,
+learning, daemon.pid, goals.json, …) is left untouched — the
+wizard never deletes data.
 
 The module is importable without prompting so tests can drive
 individual steps with mocked inputs. ``run_setup()`` is the public
@@ -27,8 +29,9 @@ import logging
 import os
 import shutil
 import stat
+import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
@@ -45,6 +48,64 @@ DOTENV_FILENAME = ".env"
 # Resource paths inside the wheel (vexis_agent.data).
 _CONFIG_TEMPLATE = "config.example.yaml"
 _DOTENV_TEMPLATE = "dotenv.example"
+_WORKSPACE_CLAUDE_TEMPLATE = "workspace_CLAUDE.md.template"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# ANSI color helpers — mirror hermes' style without adding a dep.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _color_supported() -> bool:
+    """Best-guess: emit ANSI only if stdout is a tty AND TERM looks
+    capable. Honors NO_COLOR (https://no-color.org/)."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if not sys.stdout.isatty():
+        return False
+    return os.environ.get("TERM", "") not in ("", "dumb")
+
+
+_USE_COLOR = _color_supported()
+
+
+def _c(code: str, text: str) -> str:
+    return f"{code}{text}\033[0m" if _USE_COLOR else text
+
+
+def _bold(text: str) -> str:    return _c("\033[1m", text)
+def _cyan(text: str) -> str:    return _c("\033[36m", text)
+def _green(text: str) -> str:   return _c("\033[32m", text)
+def _yellow(text: str) -> str:  return _c("\033[33m", text)
+def _red(text: str) -> str:     return _c("\033[31m", text)
+def _dim(text: str) -> str:     return _c("\033[2m", text)
+
+
+def section(title: str) -> None:
+    """Section header. Cyan ◆ prefix, blank line above."""
+    print()
+    print(_bold(_cyan(f"◆ {title}")))
+
+
+def ok(msg: str) -> None:
+    print(f"  {_green('✓')} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"  {_yellow('!')} {msg}")
+
+
+def err(msg: str) -> None:
+    print(f"  {_red('✗')} {msg}")
+
+
+def info(msg: str) -> None:
+    print(f"  {_dim('→')} {msg}")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Errors
+# ──────────────────────────────────────────────────────────────────────
 
 
 class SetupAborted(RuntimeError):
@@ -57,9 +118,7 @@ class SetupAborted(RuntimeError):
 
 
 def require_tty(*, stdin: Optional[object] = None) -> None:
-    """Refuse non-TTY runs. Setup is interactive by design — env-only
-    deployments can hand-edit ~/.vexis/config.yaml + .env using the
-    shipped examples (or cat-pipe them into place)."""
+    """Refuse non-TTY runs. Setup is interactive by design."""
     s = stdin if stdin is not None else sys.stdin
     is_tty = getattr(s, "isatty", lambda: False)()
     if not is_tty:
@@ -77,8 +136,6 @@ def read_template(name: str) -> str:
 
 
 def ensure_config_yaml(home: Path, *, force: bool = False) -> Path:
-    """Create $VEXIS_HOME/config.yaml from the shipped template if it
-    doesn't exist (or if force=True). Returns the path."""
     target = home / CONFIG_FILENAME
     if target.exists() and not force:
         return target
@@ -88,12 +145,8 @@ def ensure_config_yaml(home: Path, *, force: bool = False) -> Path:
 
 
 def ensure_dotenv(home: Path, *, force: bool = False) -> Path:
-    """Create $VEXIS_HOME/.env from the shipped template if missing.
-    Sets mode 0600 — secrets aren't world-readable. Returns the path."""
     target = home / DOTENV_FILENAME
     if target.exists() and not force:
-        # Tighten perms even on pre-existing files; a re-run shouldn't
-        # leave a 0644 .env behind.
         try:
             os.chmod(target, stat.S_IRUSR | stat.S_IWUSR)
         except OSError:
@@ -106,11 +159,6 @@ def ensure_dotenv(home: Path, *, force: bool = False) -> Path:
 
 
 def archive_existing(path: Path) -> Optional[Path]:
-    """Move ``path`` to ``<path>.bak.<utc>`` if it exists.
-
-    Used by ``--reset`` so a re-run doesn't silently overwrite a
-    working config. Returns the archive path (or None if nothing to do).
-    """
     if not path.exists():
         return None
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -120,13 +168,11 @@ def archive_existing(path: Path) -> Optional[Path]:
 
 
 def update_env_value(env_path: Path, key: str, value: str) -> None:
-    """Set ``KEY=VALUE`` in a dotenv file, preserving comments + order
-    of the surrounding lines.
+    """Set ``KEY=VALUE`` in a dotenv, preserving comments + line order.
 
-    If the key already appears, its line is replaced. Otherwise the
-    line is appended at the end. Whitespace around ``=`` is normalized.
-    Values are written verbatim — no quoting; the daemon's dotenv
-    loader handles quoting on read.
+    Replaces if the key already appears; appends otherwise. Commented
+    lines (``# KEY=…``) are NOT treated as definitions, so editable
+    examples don't get clobbered.
     """
     text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
     lines = text.splitlines()
@@ -143,9 +189,148 @@ def update_env_value(env_path: Path, key: str, value: str) -> None:
             break
     if not replaced:
         lines.append(new_line)
-    # Preserve trailing newline so dotenv parsers don't misread the
-    # final line.
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ── Brain detection ───────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class BrainCheck:
+    """Result of probing whether the configured brain CLI is reachable."""
+
+    kind: str
+    binary: str            # "" for null brain
+    found: bool
+    install_hint: str      # one-liner to surface in the wizard
+
+
+_BRAIN_INSTALL_HINTS: dict[str, tuple[str, str]] = {
+    "claude-code": (
+        "claude",
+        "Install: see https://docs.anthropic.com/claude/claude-code, "
+        "then run 'claude /login'.",
+    ),
+    "opencode": (
+        "opencode",
+        "Install: curl -fsSL https://opencode.ai/install | bash",
+    ),
+    "null": ("", ""),
+}
+
+
+def check_brain_cli(kind: str) -> BrainCheck:
+    binary, hint = _BRAIN_INSTALL_HINTS.get(kind, ("claude", ""))
+    if not binary:  # null brain
+        return BrainCheck(kind=kind, binary="", found=True, install_hint="")
+    return BrainCheck(
+        kind=kind,
+        binary=binary,
+        found=shutil.which(binary) is not None,
+        install_hint=hint,
+    )
+
+
+# ── Workspace setup ────────────────────────────────────────────────
+
+
+def workspace_path() -> Path:
+    """Resolve the user's vexis-workspace. Honors VEXIS_WORKSPACE env
+    var; defaults to ~/vexis-workspace."""
+    raw = os.environ.get("VEXIS_WORKSPACE")
+    return Path(raw).expanduser() if raw else Path.home() / "vexis-workspace"
+
+
+def ensure_workspace(ws: Path) -> Path:
+    """mkdir -p the workspace, plus the gittable subdirs the daemon
+    expects (memories/, skills/). Returns the path."""
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "memories").mkdir(exist_ok=True)
+    (ws / "skills").mkdir(exist_ok=True)
+    return ws
+
+
+def ensure_workspace_claude_md(ws: Path) -> tuple[Path, bool]:
+    """Drop the workspace CLAUDE.md template if missing.
+
+    Returns (path, written) — written=True if we actually wrote the
+    file, False if a user-edited copy was preserved.
+    """
+    target = ws / "CLAUDE.md"
+    if target.exists():
+        return target, False
+    target.write_text(read_template(_WORKSPACE_CLAUDE_TEMPLATE), encoding="utf-8")
+    return target, True
+
+
+def ensure_agents_md_symlink(ws: Path, brain_kind: str) -> tuple[Optional[Path], str]:
+    """Symlink ``<ws>/AGENTS.md → CLAUDE.md`` so opencode (and any
+    future AGENTS.md-reading brain) finds the same content
+    claude-code reads from CLAUDE.md.
+
+    Only acts when brain.kind=opencode — claude-code doesn't need
+    AGENTS.md, and creating one for users on claude-code would just
+    be dead-symlink noise. Refuses to overwrite a real (non-symlink)
+    AGENTS.md so a hand-maintained file isn't clobbered.
+
+    Returns (path, status) where status ∈ {"created", "already_correct",
+    "skipped_not_opencode", "refused_real_file", "replaced_wrong_target"}.
+    """
+    if brain_kind != "opencode":
+        return None, "skipped_not_opencode"
+    link = ws / "AGENTS.md"
+    target_name = "CLAUDE.md"
+    if link.is_symlink():
+        if os.readlink(link) == target_name:
+            return link, "already_correct"
+        link.unlink()
+        link.symlink_to(target_name)
+        return link, "replaced_wrong_target"
+    if link.exists():
+        return link, "refused_real_file"
+    link.symlink_to(target_name)
+    return link, "created"
+
+
+# ── Tailscale soft check ───────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class TailscaleCheck:
+    installed: bool
+    logged_in: bool
+    detail: str = ""
+
+
+def check_tailscale() -> TailscaleCheck:
+    """Probe for Tailscale. Daemon runs fine without it (dashboard on
+    localhost only, livestream disabled), so this is informational —
+    we never abort setup over tailscale."""
+    if shutil.which("tailscale") is None:
+        return TailscaleCheck(
+            installed=False,
+            logged_in=False,
+            detail="tailscale CLI not on PATH",
+        )
+    try:
+        out = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return TailscaleCheck(
+            installed=True, logged_in=False, detail=f"status probe failed: {exc}"
+        )
+    if out.returncode != 0:
+        return TailscaleCheck(
+            installed=True,
+            logged_in=False,
+            detail="tailscale not logged in (run 'tailscale up')",
+        )
+    return TailscaleCheck(installed=True, logged_in=True)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -155,96 +340,27 @@ def update_env_value(env_path: Path, key: str, value: str) -> None:
 
 @dataclass
 class SetupResult:
-    """Summary of a wizard run. Useful for tests + the post-run banner."""
-
     home: Path
     config_path: Path
     dotenv_path: Path
+    workspace: Optional[Path] = None
+    workspace_claude_md: Optional[Path] = None
+    agents_md_status: str = "skipped_not_opencode"
     archived_config: Optional[Path] = None
     archived_dotenv: Optional[Path] = None
     service_installed: bool = False
+    brain_check: Optional[BrainCheck] = None
+    tailscale_check: Optional[TailscaleCheck] = None
 
 
-# Prompt provider: () -> str. Tests inject a callable that returns
-# canned answers; the CLI uses ``input()`` (or click.prompt for masked).
 PromptFn = Callable[[str, bool], str]
 
 
 def _default_prompt(message: str, secret: bool) -> str:
-    """Default prompt: prints ``message`` and reads from stdin.
-    ``secret=True`` could mask input via getpass; we keep it visible
-    here because Telegram tokens are pasted in full, and getpass
-    surprises users who can't see typos.
-    """
     sys.stdout.write(message)
     sys.stdout.flush()
     raw = sys.stdin.readline()
     return raw.rstrip("\n")
-
-
-def run_setup(
-    *,
-    reset: bool = False,
-    install_service: Optional[bool] = None,
-    prompt: PromptFn = _default_prompt,
-    confirm: Optional[Callable[[str], bool]] = None,
-    require_interactive: bool = True,
-) -> SetupResult:
-    """Drive the wizard. Returns a SetupResult.
-
-    Parameters mostly exist for test injection:
-      ``prompt`` — function taking ``(message, secret)`` and returning a
-        line. Replace in tests with a closure returning canned values.
-      ``confirm`` — function taking a yes/no question, returning bool.
-      ``install_service`` — pre-decided answer to "install service?"
-        (None = ask interactively).
-      ``require_interactive`` — when False, skip the TTY check (used by
-        ``--reset`` runs and tests).
-    """
-    if require_interactive:
-        require_tty()
-
-    home = vexis_dir()
-    home.mkdir(parents=True, exist_ok=True)
-
-    archived_config: Optional[Path] = None
-    archived_dotenv: Optional[Path] = None
-    if reset:
-        archived_config = archive_existing(home / CONFIG_FILENAME)
-        archived_dotenv = archive_existing(home / DOTENV_FILENAME)
-
-    config_path = ensure_config_yaml(home)
-    dotenv_path = ensure_dotenv(home)
-
-    token = prompt("Telegram bot token (from @BotFather): ", True).strip()
-    if token:
-        update_env_value(dotenv_path, "TELEGRAM_BOT_TOKEN", token)
-
-    user_id = prompt(
-        "Allowed Telegram user ID (numeric — yours): ", False
-    ).strip()
-    if user_id:
-        update_env_value(dotenv_path, "TELEGRAM_ALLOWED_USER_ID", user_id)
-
-    service_installed = False
-    decision = install_service
-    if decision is None:
-        confirm_fn = confirm if confirm is not None else _default_confirm
-        decision = confirm_fn("Install the systemd user service now? [y/N] ")
-    if decision:
-        from vexis_agent.daemon.systemd import install_user_unit
-
-        install_user_unit()
-        service_installed = True
-
-    return SetupResult(
-        home=home,
-        config_path=config_path,
-        dotenv_path=dotenv_path,
-        archived_config=archived_config,
-        archived_dotenv=archived_dotenv,
-        service_installed=service_installed,
-    )
 
 
 def _default_confirm(message: str) -> bool:
@@ -254,24 +370,216 @@ def _default_confirm(message: str) -> bool:
     return raw in {"y", "yes"}
 
 
+def _read_brain_kind(home: Path) -> str:
+    """Best-effort read of brain.kind from the just-written
+    config.yaml. Mirrors yaml_config.brain_kind() but doesn't import
+    it — keeps the wizard surface small and lets the wizard run
+    before the config_yaml import path is wired."""
+    cfg = home / CONFIG_FILENAME
+    if not cfg.exists():
+        return "claude-code"
+    try:
+        import yaml
+
+        data = yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
+    except Exception:  # pragma: no cover — malformed config = default
+        return "claude-code"
+    raw = (data.get("brain") or {}).get("kind", "claude-code")
+    if isinstance(raw, str) and raw.strip() in {"claude-code", "opencode", "null"}:
+        return raw.strip()
+    return "claude-code"
+
+
+def run_setup(
+    *,
+    reset: bool = False,
+    install_service: Optional[bool] = None,
+    prompt: PromptFn = _default_prompt,
+    confirm: Optional[Callable[[str], bool]] = None,
+    require_interactive: bool = True,
+    print_banner: bool = True,
+) -> SetupResult:
+    """Drive the wizard. Returns a SetupResult."""
+    confirm_fn = confirm if confirm is not None else _default_confirm
+
+    if require_interactive:
+        require_tty()
+
+    if print_banner:
+        _print_banner()
+
+    # ── 1. config + .env templates ────────────────────────────────
+    section("Configuration")
+    home = vexis_dir()
+    home.mkdir(parents=True, exist_ok=True)
+
+    archived_config = None
+    archived_dotenv = None
+    if reset:
+        archived_config = archive_existing(home / CONFIG_FILENAME)
+        archived_dotenv = archive_existing(home / DOTENV_FILENAME)
+        if archived_config:
+            warn(f"archived previous config to {archived_config}")
+        if archived_dotenv:
+            warn(f"archived previous .env to {archived_dotenv}")
+
+    config_path = ensure_config_yaml(home)
+    dotenv_path = ensure_dotenv(home)
+    ok(f"config: {config_path}")
+    ok(f"secrets: {dotenv_path} (mode 0600)")
+
+    # ── 2. Telegram secrets ───────────────────────────────────────
+    section("Telegram")
+    info("From @BotFather: /newbot, then copy the token.")
+    token = prompt("    Telegram bot token: ", True).strip()
+    if token:
+        update_env_value(dotenv_path, "TELEGRAM_BOT_TOKEN", token)
+        ok("TELEGRAM_BOT_TOKEN written")
+    else:
+        warn("skipped — set TELEGRAM_BOT_TOKEN later in ~/.vexis/.env")
+
+    info("Your numeric Telegram user ID (use @userinfobot to look up).")
+    user_id = prompt("    Allowed Telegram user ID: ", False).strip()
+    if user_id:
+        update_env_value(dotenv_path, "TELEGRAM_ALLOWED_USER_ID", user_id)
+        ok("TELEGRAM_ALLOWED_USER_ID written")
+    else:
+        warn(
+            "skipped — set TELEGRAM_ALLOWED_USER_ID later in ~/.vexis/.env "
+            "(daemon refuses to start without it)"
+        )
+
+    # ── 3. Brain CLI check ────────────────────────────────────────
+    section("Brain CLI")
+    brain_kind = _read_brain_kind(home)
+    info(f"configured brain.kind: {brain_kind}")
+    bc = check_brain_cli(brain_kind)
+    if bc.found:
+        if bc.binary:
+            ok(f"{bc.binary} on PATH")
+        else:
+            ok("null brain — no CLI required (test-only)")
+    else:
+        err(f"{bc.binary} NOT on PATH")
+        info(bc.install_hint)
+        warn(
+            "daemon will refuse to start until the brain CLI is reachable. "
+            "Install it, then re-run 'vexis-agent setup' or 'vexis-agent doctor'."
+        )
+
+    # ── 4. Workspace setup ────────────────────────────────────────
+    section("Workspace")
+    workspace = workspace_path()
+    ensure_workspace(workspace)
+    ok(f"workspace: {workspace}")
+    ws_claude, written = ensure_workspace_claude_md(workspace)
+    if written:
+        ok(f"wrote workspace CLAUDE.md template at {ws_claude}")
+    else:
+        info(f"workspace CLAUDE.md already exists at {ws_claude} (kept)")
+    agents_link, agents_status = ensure_agents_md_symlink(workspace, brain_kind)
+    if agents_status == "created":
+        ok(f"AGENTS.md → CLAUDE.md (opencode discovery)")
+    elif agents_status == "already_correct":
+        info("AGENTS.md symlink already pointed at CLAUDE.md")
+    elif agents_status == "replaced_wrong_target":
+        ok("re-pointed existing AGENTS.md symlink at CLAUDE.md")
+    elif agents_status == "refused_real_file":
+        warn(
+            f"{agents_link} is a real file — refusing to overwrite. "
+            "Delete or rename it, then re-run 'vexis-agent setup'."
+        )
+
+    # ── 5. Tailscale soft-check ───────────────────────────────────
+    section("Tailscale (optional)")
+    ts = check_tailscale()
+    if ts.installed and ts.logged_in:
+        ok("tailscale up — dashboard reachable from your phone")
+    elif ts.installed:
+        warn(ts.detail or "tailscale not logged in")
+        info("Dashboard works on http://127.0.0.1:8766 only without tailscale.")
+    else:
+        warn("tailscale not installed — dashboard will be localhost-only")
+        info(
+            "Install: https://tailscale.com/download. After installing run "
+            "'tailscale up' to log in."
+        )
+
+    # ── 6. Optional: install systemd service ──────────────────────
+    section("Service")
+    decision = install_service
+    if decision is None:
+        decision = confirm_fn("    Install the systemd user service now? [y/N] ")
+    service_installed = False
+    if decision:
+        from vexis_agent.daemon.systemd import install_user_unit
+
+        install_user_unit()
+        service_installed = True
+        ok("systemd user unit installed at ~/.config/systemd/user/vexis-agent.service")
+    else:
+        info("skipped — run 'vexis-agent service install' later if you want it.")
+
+    return SetupResult(
+        home=home,
+        config_path=config_path,
+        dotenv_path=dotenv_path,
+        workspace=workspace,
+        workspace_claude_md=ws_claude,
+        agents_md_status=agents_status,
+        archived_config=archived_config,
+        archived_dotenv=archived_dotenv,
+        service_installed=service_installed,
+        brain_check=bc,
+        tailscale_check=ts,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Banner + summary
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _print_banner() -> None:
+    """Hermes-style box. Skip when stdout isn't a terminal (test
+    capture, log redirect)."""
+    line1 = "       vexis-agent setup wizard"
+    line2 = "  Telegram-bridged agent for Linux (Hyprland)."
+    bar = "─" * 56
+    print()
+    print(_cyan(f"┌{bar}┐"))
+    print(_cyan("│") + _bold(line1.ljust(56)) + _cyan("│"))
+    print(_cyan(f"├{bar}┤"))
+    print(_cyan("│") + line2.ljust(56) + _cyan("│"))
+    print(_cyan(f"└{bar}┘"))
+
+
 def format_summary(result: SetupResult) -> str:
-    """Final banner. Print this; don't bury the next-step instructions."""
-    lines = [
-        "vexis-agent setup complete.",
-        f"  config:   {result.config_path}",
-        f"  secrets:  {result.dotenv_path}  (mode 0600)",
-    ]
+    """Final post-wizard banner. Plain text — color decisions are made
+    in the live print loop, not here."""
+    lines = ["", "vexis-agent setup complete.", ""]
+    lines.append(f"  config:    {result.config_path}")
+    lines.append(f"  secrets:   {result.dotenv_path}  (mode 0600)")
+    if result.workspace:
+        lines.append(f"  workspace: {result.workspace}")
     if result.archived_config:
-        lines.append(f"  archived: {result.archived_config}")
+        lines.append(f"  archived:  {result.archived_config}")
     if result.archived_dotenv:
-        lines.append(f"  archived: {result.archived_dotenv}")
-    if result.service_installed:
+        lines.append(f"  archived:  {result.archived_dotenv}")
+    lines.append("")
+
+    if result.brain_check and not result.brain_check.found:
+        lines.append("⚠ Brain CLI missing — install it before starting:")
+        lines.append(f"    {result.brain_check.install_hint}")
         lines.append("")
-        lines.append("Service installed. Enable + start with:")
+
+    if result.service_installed:
+        lines.append("Service installed. Start it with:")
         lines.append("  systemctl --user enable --now vexis-agent.service")
     else:
-        lines.append("")
         lines.append("Next steps:")
-        lines.append("  vexis-agent run                 # foreground")
-        lines.append("  vexis-agent service install     # systemd user unit")
+        lines.append("  vexis-agent doctor               # readiness check")
+        lines.append("  vexis-agent run                  # foreground")
+        lines.append("  vexis-agent service install      # systemd user unit")
+
     return "\n".join(lines)
