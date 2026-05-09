@@ -389,10 +389,14 @@ def refresh_claude_code_models() -> set[str]:
 # ``effort.supported: false`` with no per-level keys; others
 # (opus-4-7) have all four levels supported. Probe (2026-05-07)
 # confirmed the levels match the claude CLI's ``--effort`` flag
-# values, except CLI also accepts ``xhigh`` which is NOT in the
-# API response — so the picker only shows levels the API
-# advertises (source of truth = capability response, not CLI).
-_CLAUDE_CODE_REASONING_LEVELS = ("low", "medium", "high", "max")
+# values. We extract levels DYNAMICALLY by iterating effort.keys()
+# rather than against a hardcoded tuple — if Anthropic ever adds a
+# new level (xhigh, ultra, etc.) it'll surface in the picker
+# without a code change.
+
+# Meta-keys we skip when iterating ``effort.keys()`` — these aren't
+# levels, they're presence flags / metadata.
+_EFFORT_META_KEYS = frozenset({"supported"})
 
 
 def _extract_claude_code_reasoning_levels(model_entry: dict) -> list[str]:
@@ -401,7 +405,14 @@ def _extract_claude_code_reasoning_levels(model_entry: dict) -> list[str]:
     Returns an empty list when the model doesn't support reasoning
     at all (``capabilities.effort.supported`` is False, or the
     capabilities block is absent entirely). Picker uses the empty
-    list as the signal to skip the reasoning step for that model."""
+    list as the signal to skip the reasoning step for that model.
+
+    Dynamic over the API response: any key under ``effort`` whose
+    value is a dict with ``supported: true`` and that isn't a meta
+    key (``supported`` itself) becomes a level. New levels Anthropic
+    adds — ``xhigh``, ``ultra``, anything — flow through without
+    requiring this constant to be updated.
+    """
     if not isinstance(model_entry, dict):
         return []
     caps = model_entry.get("capabilities")
@@ -411,11 +422,39 @@ def _extract_claude_code_reasoning_levels(model_entry: dict) -> list[str]:
     if not isinstance(effort, dict) or not effort.get("supported"):
         return []
     out: list[str] = []
-    for level in _CLAUDE_CODE_REASONING_LEVELS:
-        sub = effort.get(level)
+    for level, sub in effort.items():
+        if level in _EFFORT_META_KEYS:
+            continue
         if isinstance(sub, dict) and sub.get("supported"):
             out.append(level)
     return out
+
+
+def _extract_claude_code_context_info(model_entry: dict) -> dict[str, object]:
+    """Pull context window + max output + display name from a
+    /v1/models entry. All fields are optional in the API response;
+    missing values become None so the picker can show '—' rather
+    than crash. Source: live ``/v1/models`` response fields
+    ``max_input_tokens``, ``max_tokens``, ``display_name``.
+    """
+    if not isinstance(model_entry, dict):
+        return {
+            "display_name": None, "max_input_tokens": None, "max_tokens": None,
+        }
+
+    def _int_or_none(value: object) -> int | None:
+        return value if isinstance(value, int) and value > 0 else None
+
+    def _str_or_none(value: object) -> str | None:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    return {
+        "display_name": _str_or_none(model_entry.get("display_name")),
+        "max_input_tokens": _int_or_none(model_entry.get("max_input_tokens")),
+        "max_tokens": _int_or_none(model_entry.get("max_tokens")),
+    }
 
 
 def _discover_claude_code_capabilities_uncached() -> dict[str, dict]:
@@ -449,8 +488,12 @@ def _discover_claude_code_capabilities_uncached() -> dict[str, dict]:
         model_id = entry.get("id")
         if not isinstance(model_id, str):
             continue
+        info = _extract_claude_code_context_info(entry)
         out[model_id] = {
             "reasoning_levels": _extract_claude_code_reasoning_levels(entry),
+            "display_name": info["display_name"],
+            "max_input_tokens": info["max_input_tokens"],
+            "max_tokens": info["max_tokens"],
         }
     return out
 
@@ -538,7 +581,32 @@ def _parse_opencode_verbose(text: str) -> dict[str, dict]:
                         continue
                     if "thinking" in payload or "reasoningEffort" in payload:
                         reasoning_levels.append(name)
-            out[full_id] = {"reasoning_levels": sorted(reasoning_levels)}
+
+            # opencode reports context + max output under ``limit``,
+            # display name as ``name``. Same shape we extract from
+            # claude-code's /v1/models — keeps the wire format
+            # consistent across brains.
+            display_name: str | None = None
+            max_input_tokens: int | None = None
+            max_tokens: int | None = None
+            name_raw = meta.get("name")
+            if isinstance(name_raw, str) and name_raw.strip():
+                display_name = name_raw.strip()
+            limit = meta.get("limit")
+            if isinstance(limit, dict):
+                ctx = limit.get("context")
+                if isinstance(ctx, int) and ctx > 0:
+                    max_input_tokens = ctx
+                out_lim = limit.get("output")
+                if isinstance(out_lim, int) and out_lim > 0:
+                    max_tokens = out_lim
+
+            out[full_id] = {
+                "reasoning_levels": sorted(reasoning_levels),
+                "display_name": display_name,
+                "max_input_tokens": max_input_tokens,
+                "max_tokens": max_tokens,
+            }
             i = j
             continue
         i += 1

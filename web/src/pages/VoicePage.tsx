@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import type {
+  AvailableModel,
   PiperVoice,
   VoiceSettings,
   VoiceSettingsUpdate,
@@ -448,93 +449,145 @@ function VoicePicker({
   );
 }
 
+// Token count → "1.0M", "200K", "64K", "12.5K" etc. Compact form so
+// the per-row metadata stays scannable.
+function formatTokens(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000;
+    return `${m % 1 === 0 ? m.toFixed(0) : m.toFixed(1)}M`;
+  }
+  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
+  return String(n);
+}
+
 function CallModePicker({
   available,
   selected,
   onChange,
 }: {
-  available: { id: string; reasoning_levels: string[] }[];
+  available: AvailableModel[];
   // Empty string = "use brain default"; any other value = explicit
   // model id override.
   selected: string;
   onChange: (value: string) => void;
 }) {
+  const [query, setQuery] = useState("");
+
+  // Filter pipeline — case-insensitive substring match against
+  // both the canonical id and the display_name. Memoised so a
+  // 273-model opencode list doesn't refilter on every render.
+  // Default option is rendered separately above the search results
+  // so it's never hidden by an aggressive filter.
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return available;
+    return available.filter((m) => {
+      if (m.id.toLowerCase().includes(q)) return true;
+      if (m.display_name?.toLowerCase().includes(q)) return true;
+      return false;
+    });
+  }, [available, query]);
+
   return (
     <div className="space-y-3">
       <p className="text-xs text-[var(--color-fg-2)]">
         Per-turn override for voice call mode only — text chat and
-        Telegram keep using your account default.
+        Telegram keep using your account default. All values pulled
+        live from the brain's discovery; nothing hardcoded.
       </p>
 
-      <div className="space-y-1">
-        {/* Default option always first — anchors the picker. */}
-        <label
-          className={[
-            "flex items-start gap-3 px-3 py-2 rounded-md cursor-pointer",
-            "border transition-colors",
-            selected === ""
-              ? "border-[var(--color-accent)] bg-[var(--color-base)]"
-              : "border-transparent hover:border-[var(--color-border-strong)]",
-          ].join(" ")}
-        >
-          <input
-            type="radio"
-            name="call-model"
-            value=""
-            checked={selected === ""}
-            onChange={() => onChange("")}
-            className="accent-[var(--color-accent)] mt-0.5"
-          />
-          <div className="flex-1 min-w-0">
-            <div className="text-sm text-[var(--color-fg)]">
-              Default
-            </div>
-            <div className="text-[10px] text-[var(--color-fg-dim)] mt-0.5">
-              Use whatever Claude Code is configured to use globally.
-            </div>
+      {/* Default option pinned above the search — never filtered out. */}
+      <label
+        className={[
+          "flex items-start gap-3 px-3 py-2 rounded-md cursor-pointer",
+          "border transition-colors",
+          selected === ""
+            ? "border-[var(--color-accent)] bg-[var(--color-base)]"
+            : "border-transparent hover:border-[var(--color-border-strong)]",
+        ].join(" ")}
+      >
+        <input
+          type="radio"
+          name="call-model"
+          value=""
+          checked={selected === ""}
+          onChange={() => onChange("")}
+          className="accent-[var(--color-accent)] mt-0.5"
+        />
+        <div className="flex-1 min-w-0">
+          <div className="text-sm text-[var(--color-fg)]">Default</div>
+          <div className="text-[10px] text-[var(--color-fg-dim)] mt-0.5">
+            Use whatever the brain is configured to use globally.
           </div>
-        </label>
+        </div>
+      </label>
 
+      {/* Search bar — only useful with more than a handful of
+          models, but renders unconditionally for a consistent
+          control surface across brains. */}
+      {available.length > 0 && (
+        <div className="flex items-center gap-2">
+          <div className="flex-1 relative">
+            <input
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search models…"
+              className={[
+                "w-full bg-[var(--color-base)] border border-[var(--color-border-strong)]",
+                "rounded px-2.5 py-1.5 pl-7 text-xs text-[var(--color-fg)]",
+                "placeholder:text-[var(--color-fg-dim)]",
+                "focus:outline-none focus:border-[var(--color-accent)]",
+              ].join(" ")}
+            />
+            <span
+              aria-hidden
+              className="absolute left-2 top-1/2 -translate-y-1/2 text-[var(--color-fg-dim)] text-[11px]"
+            >
+              ⌕
+            </span>
+          </div>
+          <span className="text-[10px] text-[var(--color-fg-dim)] tabular-nums shrink-0">
+            {filtered.length === available.length
+              ? `${available.length} models`
+              : `${filtered.length} / ${available.length}`}
+          </span>
+        </div>
+      )}
+
+      {/* Scrollable results. max-height keeps a 273-entry opencode
+          list contained while still leaving room for the reasoning
+          picker beneath. */}
+      <div
+        className={[
+          "space-y-1 max-h-[420px] overflow-y-auto",
+          "rounded-md",
+          // Subtle inset border tells the user "this scrolls".
+          available.length > 6
+            ? "border border-[var(--color-border)] p-1"
+            : "",
+        ].join(" ")}
+      >
         {available.length === 0 ? (
           <div className="text-xs text-[var(--color-fg-dim)] px-3 py-2">
-            No models discovered yet. The list populates from Claude
-            Code's <code className="font-mono">/v1/models</code>{" "}
-            response — the dashboard refreshes it on the Models tab.
+            No models discovered yet. The list populates from the
+            active brain's discovery API; the Models tab can refresh
+            the cache.
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="text-xs text-[var(--color-fg-dim)] px-3 py-2">
+            No matches for <code className="font-mono">{query}</code>.
+            Clear the search or try a substring of the model name.
           </div>
         ) : (
-          available.map((m) => (
-            <label
+          filtered.map((m) => (
+            <ModelRadio
               key={m.id}
-              className={[
-                "flex items-start gap-3 px-3 py-2 rounded-md cursor-pointer",
-                "border transition-colors",
-                selected === m.id
-                  ? "border-[var(--color-accent)] bg-[var(--color-base)]"
-                  : "border-transparent hover:border-[var(--color-border-strong)]",
-              ].join(" ")}
-            >
-              <input
-                type="radio"
-                name="call-model"
-                value={m.id}
-                checked={selected === m.id}
-                onChange={() => onChange(m.id)}
-                className="accent-[var(--color-accent)] mt-0.5"
-              />
-              <div className="flex-1 min-w-0">
-                <div className="text-sm text-[var(--color-fg)] font-mono truncate">
-                  {m.id}
-                </div>
-                {m.reasoning_levels.length > 0 && (
-                  <div className="text-[10px] text-[var(--color-fg-dim)] mt-0.5">
-                    Reasoning levels:{" "}
-                    {m.reasoning_levels
-                      .map((l) => (l === "" ? "off" : l))
-                      .join(" · ")}
-                  </div>
-                )}
-              </div>
-            </label>
+              model={m}
+              selected={selected === m.id}
+              onSelect={() => onChange(m.id)}
+            />
           ))
         )}
       </div>
@@ -553,6 +606,76 @@ function CallModePicker({
         </button>
       )}
     </div>
+  );
+}
+
+function ModelRadio({
+  model,
+  selected,
+  onSelect,
+}: {
+  model: AvailableModel;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  // Build the per-row metadata strip from whatever discovery
+  // surfaced. Each piece is hidden when its source field is null,
+  // so a model with no context window simply shows fewer chips
+  // rather than rendering "—".
+  const meta: string[] = [];
+  if (model.max_input_tokens) {
+    meta.push(`${formatTokens(model.max_input_tokens)} context`);
+  }
+  if (model.max_tokens) {
+    meta.push(`${formatTokens(model.max_tokens)} output`);
+  }
+  if (model.reasoning_levels.length > 0) {
+    meta.push(`reasoning: ${model.reasoning_levels.join("/")}`);
+  }
+  return (
+    <label
+      className={[
+        "flex items-start gap-3 px-3 py-2 rounded-md cursor-pointer",
+        "border transition-colors",
+        selected
+          ? "border-[var(--color-accent)] bg-[var(--color-base)]"
+          : "border-transparent hover:border-[var(--color-border-strong)]",
+      ].join(" ")}
+    >
+      <input
+        type="radio"
+        name="call-model"
+        value={model.id}
+        checked={selected}
+        onChange={onSelect}
+        className="accent-[var(--color-accent)] mt-0.5"
+      />
+      <div className="flex-1 min-w-0">
+        {/* Display name as the primary label when discovery
+            provides one; otherwise the canonical id sits alone.
+            Keeps the row scannable without losing the actual id
+            (always shown as a smaller monospace subtitle). */}
+        {model.display_name ? (
+          <>
+            <div className="text-sm text-[var(--color-fg)] truncate">
+              {model.display_name}
+            </div>
+            <div className="text-[10px] text-[var(--color-fg-dim)] font-mono truncate">
+              {model.id}
+            </div>
+          </>
+        ) : (
+          <div className="text-sm text-[var(--color-fg)] font-mono truncate">
+            {model.id}
+          </div>
+        )}
+        {meta.length > 0 && (
+          <div className="text-[10px] text-[var(--color-fg-dim)] mt-1 tabular-nums">
+            {meta.join(" · ")}
+          </div>
+        )}
+      </div>
+    </label>
   );
 }
 

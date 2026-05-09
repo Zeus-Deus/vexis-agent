@@ -2580,32 +2580,47 @@ class WebDashboard:
         from a future Claude release surface automatically without
         touching this file.
 
-        Per-entry shape:
+        Per-entry shape (uniform across brains so the UI doesn't
+        fork by brain kind):
+
             {
-              "id": str,             # model id (e.g. "claude-haiku-4-5")
-              "reasoning_levels": list[str],  # ["", "low", "medium", ...]
+              "id": str,                       # model id (canonical form)
+              "display_name": str | None,      # friendly label, e.g.
+                                               #   "Claude Opus 4.7"
+              "reasoning_levels": list[str],   # dynamic per-model
+              "max_input_tokens": int | None,  # context window
+              "max_tokens": int | None,        # max output tokens
             }
+
+        Every value comes from the brain's native discovery
+        (Anthropic ``/v1/models`` for claude-code; ``opencode models
+        --verbose`` for opencode). Nothing is hardcoded — adding a
+        new model to either backend surfaces here automatically.
 
         Bare-alias filter: Anthropic's ``/v1/models`` returns both the
         full ID (e.g. ``claude-haiku-4-5-20251001``) AND the lowercase
         family alias (``haiku``, ``sonnet``, ``opus``). The aliases
-        are valid CLI inputs — they always resolve to "whatever's the
-        latest" — but they're confusing in a picker for two reasons:
-          1. They don't carry reasoning-level metadata, so the user
-             would pick an alias and lose access to ``--effort``.
-          2. They look like bugs ("why is there a model called just
-             'opus'?"), as the user surfaced.
-        We hide them by requiring claude-code IDs to start with
-        ``claude-`` and opencode IDs to contain ``/`` (which is the
-        ``provider/model`` shape opencode uses). A user who really
-        wants the alias can still type it into the config YAML by
-        hand; the picker just stays clean.
+        are valid CLI inputs but confusing in a picker (no reasoning
+        metadata, look like UI bugs). Hidden by requiring claude-code
+        IDs to start with ``claude-`` and opencode IDs to contain
+        ``/``.
         """
         from core.model_discovery import (
             discover_claude_code_capabilities,
             discover_claude_code_models,
+            discover_opencode_capabilities,
             discover_opencode_models,
         )
+
+        def _from_caps(mid: str, caps: dict) -> dict:
+            entry = caps.get(mid) or {}
+            return {
+                "id": mid,
+                "display_name": entry.get("display_name"),
+                "reasoning_levels": entry.get("reasoning_levels", []),
+                "max_input_tokens": entry.get("max_input_tokens"),
+                "max_tokens": entry.get("max_tokens"),
+            }
 
         if active_brain == "claude-code":
             ids = sorted(
@@ -2613,21 +2628,14 @@ class WebDashboard:
                 if m.startswith("claude-")
             )
             caps = discover_claude_code_capabilities()
-            return [
-                {
-                    "id": mid,
-                    "reasoning_levels": (caps.get(mid) or {}).get(
-                        "reasoning_levels", []
-                    ),
-                }
-                for mid in ids
-            ]
+            return [_from_caps(mid, caps) for mid in ids]
         if active_brain == "opencode":
-            return [
-                {"id": mid, "reasoning_levels": []}
-                for mid in sorted(discover_opencode_models())
-                if "/" in mid
-            ]
+            ids = sorted(
+                m for m in discover_opencode_models()
+                if "/" in m
+            )
+            caps = discover_opencode_capabilities()
+            return [_from_caps(mid, caps) for mid in ids]
         # null brain — no real model list to surface.
         return []
 

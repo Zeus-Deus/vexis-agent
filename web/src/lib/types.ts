@@ -647,16 +647,29 @@ export interface PiperVoice {
 }
 
 export interface AvailableModel {
-  // Native model id as Claude Code (or future brains) reports it.
-  // Surfaced to the picker without any transformation so future
-  // models appear automatically.
+  // Native model id as the active brain reports it. Surfaced to the
+  // picker without any transformation so future models appear
+  // automatically.
+  //   - claude-code: "claude-opus-4-7" / "claude-haiku-4-5-20251001"
+  //   - opencode:    "anthropic/claude-sonnet-4-7" / "openrouter/..."
   id: string;
+  // Friendly name from the API (Anthropic's ``display_name``,
+  // opencode's ``name``). Null when discovery doesn't carry one —
+  // UI falls back to the id.
+  display_name: string | null;
   // Empty list = no reasoning controls for this model. Non-empty
-  // list = the user could pick one of these (e.g. "low", "medium",
-  // "high") in a future iteration. Currently we don't expose a
-  // reasoning picker — collected here so the UI can grow into it
-  // without a wire-format change.
+  // list = the user can pick one (e.g. "low", "medium", "high",
+  // "max") in the reasoning sub-picker. Dynamic over the discovery
+  // response — Anthropic adding a new level (``xhigh``, ``ultra``)
+  // surfaces here automatically.
   reasoning_levels: string[];
+  // Context window in tokens (Anthropic's ``max_input_tokens``,
+  // opencode's ``limit.context``). Null when discovery doesn't
+  // expose it.
+  max_input_tokens: number | null;
+  // Max output tokens per turn (Anthropic's ``max_tokens``,
+  // opencode's ``limit.output``).
+  max_tokens: number | null;
 }
 
 export interface VoiceSettings {
