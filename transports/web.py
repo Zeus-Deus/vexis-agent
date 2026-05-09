@@ -71,7 +71,13 @@ class WebChatTransport:
 
     # ---------- conversation ----------
 
-    async def send(self, text: str, *, model: str | None = None) -> str | None:
+    async def send(
+        self,
+        text: str,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ) -> str | None:
         """Send a user message; return the brain's reply (or ``None``
         if the handler suppressed it — currently only happens when the
         underlying user_id fails the allow-list check, which shouldn't
@@ -79,12 +85,14 @@ class WebChatTransport:
         we forward the ``None`` rather than raising so the route can
         respond with a clean 401 if it ever does).
 
-        ``model`` is an optional per-turn override (voice call mode
-        passes it through from the ``voice.call_mode.model`` config
-        knob). ``None`` keeps the brain's account default behavior;
-        Telegram and the text-chat tab always pass ``None``."""
+        ``model`` and ``reasoning_level`` are optional per-turn
+        overrides (voice call mode passes them through from
+        ``voice.call_mode.{model,reasoning_level}`` config). ``None``
+        on either keeps the brain's account default; Telegram and
+        the text-chat tab always pass ``None`` for both."""
         return await self._handler.handle(
-            self._user_id, WEB_CHAT_ID, text, model=model,
+            self._user_id, WEB_CHAT_ID, text,
+            model=model, reasoning_level=reasoning_level,
         )
 
     async def clear(self) -> str | None:

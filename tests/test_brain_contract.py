@@ -584,24 +584,27 @@ def test_null_brain_respond_returns_canned_response(null_brain: BrainNull):
 def test_null_brain_records_calls(null_brain: BrainNull):
     asyncio.run(null_brain.respond("first", chat_id=42))
     asyncio.run(null_brain.respond("second", chat_id=99))
-    # Tuple shape is (message, chat_id, model). Third slot is the
-    # per-turn model override — None when the caller didn't pass one
-    # (the typical foreground-turn case).
+    # Tuple shape is (message, chat_id, model, reasoning_level). The
+    # last two are per-turn overrides — None when the caller didn't
+    # pass them (the typical foreground-turn case).
     assert null_brain.calls() == [
-        ("first", 42, None),
-        ("second", 99, None),
+        ("first", 42, None, None),
+        ("second", 99, None, None),
     ]
 
 
 def test_null_brain_records_model_override(null_brain: BrainNull):
-    """Regression: the foreground model override (used by voice call
-    mode) must round-trip through the BrainNull recorder so tests
-    can assert that the override was forwarded down the stack."""
-    asyncio.run(null_brain.respond("hi", chat_id=1, model="claude-haiku-4-5"))
-    asyncio.run(null_brain.respond("again", chat_id=1))
+    """Regression: the foreground model + reasoning overrides used
+    by voice call mode must round-trip through the BrainNull recorder
+    so tests can assert they were forwarded down the stack."""
+    asyncio.run(null_brain.respond(
+        "hi", chat_id=1,
+        model="claude-opus-4-7", reasoning_level="high",
+    ))
+    asyncio.run(null_brain.respond("plain", chat_id=1))
     assert null_brain.calls() == [
-        ("hi", 1, "claude-haiku-4-5"),
-        ("again", 1, None),
+        ("hi", 1, "claude-opus-4-7", "high"),
+        ("plain", 1, None, None),
     ]
 
 

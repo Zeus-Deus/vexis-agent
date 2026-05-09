@@ -71,6 +71,16 @@ export function VoicePage({ token, onAuthFail }: VoicePageProps) {
   // ``selected`` value.
   const effectiveCallModel =
     draft.call_mode?.model ?? state?.call_mode.model ?? "";
+  const effectiveCallReasoning =
+    draft.call_mode?.reasoning_level ?? state?.call_mode.reasoning_level ?? "";
+  // Reasoning sub-picker only renders when the selected model carries
+  // a non-empty ``reasoning_levels`` list. Recomputes when either the
+  // model changes (user picks a different one) or the available list
+  // changes (refresh fired). Empty list = no reasoning picker.
+  const selectedModelEntry = state?.call_mode.available_models.find(
+    (m) => m.id === effectiveCallModel,
+  );
+  const reasoningLevelsForSelected = selectedModelEntry?.reasoning_levels ?? [];
 
   const dirty =
     Object.keys(draft).length > 0 &&
@@ -213,10 +223,33 @@ export function VoicePage({ token, onAuthFail }: VoicePageProps) {
           onChange={(value) =>
             setDraft((d) => ({
               ...d,
-              call_mode: { ...d.call_mode, model: value },
+              call_mode: {
+                ...d.call_mode,
+                model: value,
+                // Switching model invalidates the reasoning pick —
+                // a level valid for opus-4-7 isn't necessarily valid
+                // for haiku-4-5. Reset to empty so the user
+                // re-selects intentionally; the server's writer also
+                // drops orphaned reasoning_level if model is unset.
+                reasoning_level: "",
+              },
             }))
           }
         />
+        {reasoningLevelsForSelected.length > 0 && (
+          <div className="mt-4 pt-4 border-t border-[var(--color-border)]">
+            <ReasoningPicker
+              levels={reasoningLevelsForSelected}
+              selected={effectiveCallReasoning}
+              onChange={(value) =>
+                setDraft((d) => ({
+                  ...d,
+                  call_mode: { ...d.call_mode, reasoning_level: value },
+                }))
+              }
+            />
+          </div>
+        )}
       </Section>
 
       {/* Save bar */}
@@ -520,6 +553,76 @@ function CallModePicker({
         </button>
       )}
     </div>
+  );
+}
+
+function ReasoningPicker({
+  levels,
+  selected,
+  onChange,
+}: {
+  // Levels exactly as discovery reports them — typically
+  // ["low", "medium", "high"] or ["low", "medium", "high", "max"].
+  // We don't reorder so the picker always reflects what the model
+  // actually exposes.
+  levels: string[];
+  // Empty string = "use the model's default reasoning" — distinct
+  // from any of the named levels.
+  selected: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="text-xs uppercase tracking-wider text-[var(--color-fg-dim)]">
+        Reasoning effort
+      </div>
+      <p className="text-[11px] text-[var(--color-fg-dim)]">
+        Higher = more thoughtful but slower. Default lets the model
+        pick — usually the right call for chat.
+      </p>
+      <div className="flex flex-wrap gap-2">
+        {/* "Default" option first; matches the model picker's pattern. */}
+        <ReasoningChip
+          label="Default"
+          checked={selected === ""}
+          onClick={() => onChange("")}
+        />
+        {levels.map((level) => (
+          <ReasoningChip
+            key={level}
+            label={level}
+            checked={selected === level}
+            onClick={() => onChange(level)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ReasoningChip({
+  label,
+  checked,
+  onClick,
+}: {
+  label: string;
+  checked: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={[
+        "px-3 py-1.5 rounded-md text-xs transition-colors capitalize",
+        "border",
+        checked
+          ? "border-[var(--color-accent)] bg-[var(--color-accent)]/10 text-[var(--color-fg)]"
+          : "border-[var(--color-border-strong)] text-[var(--color-fg-2)] hover:text-[var(--color-fg)] hover:border-[var(--color-accent)]",
+      ].join(" ")}
+    >
+      {label}
+    </button>
   );
 }
 

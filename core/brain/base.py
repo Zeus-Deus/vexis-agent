@@ -311,7 +311,12 @@ class Brain(ABC):
 
     @abstractmethod
     async def respond(
-        self, message: str, chat_id: int, *, model: str | None = None,
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
     ) -> str:
         """Run one foreground turn. Returns the assistant's final text.
 
@@ -323,6 +328,16 @@ class Brain(ABC):
         this turn only. Used by voice call mode (``voice.call_mode.model``
         config knob) so the call surface can run a faster model
         without shifting every other foreground turn.
+
+        ``reasoning_level`` is the matching per-turn reasoning override
+        (``low``/``medium``/``high``/``max`` for claude-code, where it
+        translates to ``--effort``; ``low``/``medium``/``high`` for
+        opencode where it becomes ``--variant``). ``None`` means
+        "no flag — let the model use its default". Should only be set
+        when the chosen ``model`` actually supports reasoning levels;
+        the dashboard validates this upstream by reading capabilities
+        from ``core.model_discovery``. Same per-turn isolation as
+        ``model`` — Telegram and text-chat always pass ``None``.
 
         Side effects: writes to the per-chat ``StatusFile`` for
         ``/status``, registers the running subprocess with

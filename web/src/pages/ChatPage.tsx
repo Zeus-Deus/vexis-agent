@@ -184,7 +184,7 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
           enabled: false,
           stt: { provider: "null", available: false },
           tts: { provider: "null", available: false },
-          call_mode: { model: "" },
+          call_mode: { model: "", reasoning_level: "" },
         });
       }
     })();
@@ -604,11 +604,12 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
             open={callOpen}
             onTurn={handleCallTurn}
             onClose={() => setCallOpen(false)}
-            // Sourced from voice.call_mode.model in config (via the
-            // /chat/voice/info probe). Empty string = brain default;
-            // any other value is the model override the call modal
-            // applies for every turn while open.
+            // Sourced from voice.call_mode.{model,reasoning_level} in
+            // config (via the /chat/voice/info probe). Empty string =
+            // brain default; any other value is the override the call
+            // modal applies for every turn while open.
             modelOverride={voiceInfo?.call_mode.model ?? ""}
+            reasoningOverride={voiceInfo?.call_mode.reasoning_level ?? ""}
           />
         </Suspense>
       )}

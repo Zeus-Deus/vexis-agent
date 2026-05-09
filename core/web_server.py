@@ -1543,6 +1543,9 @@ class WebDashboard:
                     # Empty string = "use brain default" (matches the
                     # Voice tab's wire format for symmetry).
                     "model": yaml_config.voice_call_mode_model() or "",
+                    "reasoning_level": (
+                        yaml_config.voice_call_mode_reasoning_level() or ""
+                    ),
                 },
             }
 
@@ -1558,6 +1561,9 @@ class WebDashboard:
             # the Voice tab). Empty string / missing both fall through
             # to "use brain default".
             model: str | None = Form(default=None),
+            # Optional reasoning effort. Same source — voice call mode.
+            # Empty/missing fall through to "no --effort flag".
+            reasoning_level: str | None = Form(default=None),
         ) -> JSONResponse:
             """STT round-trip: receive audio → transcribe → send the
             transcription to the brain → return both the transcript
@@ -1626,9 +1632,16 @@ class WebDashboard:
             # Empty-string model = unset; treat as None so the brain
             # uses its account default. Saves the frontend from having
             # to omit the form field when the user hasn't picked an
-            # override.
+            # override. Same idea for reasoning_level.
             override = model.strip() if isinstance(model, str) and model.strip() else None
-            reply = await chat.send(transcript, model=override)
+            effort = (
+                reasoning_level.strip()
+                if isinstance(reasoning_level, str) and reasoning_level.strip()
+                else None
+            )
+            reply = await chat.send(
+                transcript, model=override, reasoning_level=effort,
+            )
             if reply is None:
                 raise HTTPException(401, "message rejected")
             return JSONResponse({"transcript": transcript, "reply": reply})
@@ -2572,6 +2585,21 @@ class WebDashboard:
               "id": str,             # model id (e.g. "claude-haiku-4-5")
               "reasoning_levels": list[str],  # ["", "low", "medium", ...]
             }
+
+        Bare-alias filter: Anthropic's ``/v1/models`` returns both the
+        full ID (e.g. ``claude-haiku-4-5-20251001``) AND the lowercase
+        family alias (``haiku``, ``sonnet``, ``opus``). The aliases
+        are valid CLI inputs — they always resolve to "whatever's the
+        latest" — but they're confusing in a picker for two reasons:
+          1. They don't carry reasoning-level metadata, so the user
+             would pick an alias and lose access to ``--effort``.
+          2. They look like bugs ("why is there a model called just
+             'opus'?"), as the user surfaced.
+        We hide them by requiring claude-code IDs to start with
+        ``claude-`` and opencode IDs to contain ``/`` (which is the
+        ``provider/model`` shape opencode uses). A user who really
+        wants the alias can still type it into the config YAML by
+        hand; the picker just stays clean.
         """
         from core.model_discovery import (
             discover_claude_code_capabilities,
@@ -2580,7 +2608,10 @@ class WebDashboard:
         )
 
         if active_brain == "claude-code":
-            ids = sorted(discover_claude_code_models())
+            ids = sorted(
+                m for m in discover_claude_code_models()
+                if m.startswith("claude-")
+            )
             caps = discover_claude_code_capabilities()
             return [
                 {
@@ -2595,6 +2626,7 @@ class WebDashboard:
             return [
                 {"id": mid, "reasoning_levels": []}
                 for mid in sorted(discover_opencode_models())
+                if "/" in mid
             ]
         # null brain — no real model list to surface.
         return []
@@ -2608,6 +2640,7 @@ class WebDashboard:
         from core.yaml_config import (
             brain_kind,
             voice_call_mode_model,
+            voice_call_mode_reasoning_level,
             voice_enabled,
             voice_stt_provider,
             voice_tts_binary,
@@ -2677,6 +2710,9 @@ class WebDashboard:
             # boolean).
             "call_mode": {
                 "model": voice_call_mode_model() or "",
+                # Empty string = "no --effort flag, model default";
+                # symmetric with model field's empty-string sentinel.
+                "reasoning_level": voice_call_mode_reasoning_level() or "",
                 # Available models surfaced for the picker. Same
                 # discovery the Models tab uses; cached 5 min
                 # in core.model_discovery so this poll is cheap.
@@ -2762,26 +2798,33 @@ class WebDashboard:
             if not isinstance(payload["call_mode"], dict):
                 raise HTTPException(400, "call_mode must be an object")
             call_mode = dict(voice_section.get("call_mode") or {})
-            if "model" in payload["call_mode"]:
-                v = payload["call_mode"]["model"]
-                # Accept null, empty string, or sentinel "default" as
-                # "reset to brain default" — drop the key in any of
-                # those cases. ``voice_call_mode_model()`` matches
-                # the same set, so they're consistent across read +
-                # write paths.
+            # Both knobs use the same null/empty/``default`` reset
+            # semantics. Pulled out so model and reasoning_level
+            # share the validation.
+            for key in ("model", "reasoning_level"):
+                if key not in payload["call_mode"]:
+                    continue
+                v = payload["call_mode"][key]
                 if (
                     v is None
                     or (isinstance(v, str) and (
                         not v.strip() or v.strip().lower() == "default"
                     ))
                 ):
-                    call_mode.pop("model", None)
+                    call_mode.pop(key, None)
                 elif isinstance(v, str):
-                    call_mode["model"] = v.strip()
+                    call_mode[key] = v.strip()
                 else:
                     raise HTTPException(
-                        400, "call_mode.model must be a string or null",
+                        400,
+                        f"call_mode.{key} must be a string or null",
                     )
+            # Reasoning is meaningful only WITH a model — if the user
+            # cleared model but kept reasoning_level, drop the orphan
+            # so we don't pass --effort to whatever account-default
+            # model happens to be (which might not support reasoning).
+            if "model" not in call_mode and "reasoning_level" in call_mode:
+                call_mode.pop("reasoning_level")
             # If the section ended up empty, drop it entirely so the
             # YAML doesn't sprout dangling empty objects.
             if call_mode:

@@ -323,12 +323,18 @@ class ClaudeCodeBrain(Brain):
         return prompt
 
     async def respond(
-        self, message: str, chat_id: int, *, model: str | None = None,
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
     ) -> str:
         log.info(
-            "Brain.respond starting for chat %d%s",
+            "Brain.respond starting for chat %d%s%s",
             chat_id,
             f" (model override: {model})" if model else "",
+            f" (reasoning: {reasoning_level})" if reasoning_level else "",
         )
         session_id = self._session.get()
         # First call pins the UUID with --session-id; subsequent calls resume it.
@@ -367,6 +373,12 @@ class ClaudeCodeBrain(Brain):
         # here unchanged.
         if model:
             argv += ["--model", model]
+        # Per-turn reasoning effort. ``--effort`` is the same flag
+        # spawn_aux uses; mapping is identical so the user can pick
+        # any level the discovery surface reports for the model
+        # they chose. ``None`` means no flag.
+        if reasoning_level:
+            argv += ["--effort", reasoning_level]
         log.debug(
             "Spawning claude -p (%s=%s, cwd=%s)",
             session_flag[0],

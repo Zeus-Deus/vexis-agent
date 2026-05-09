@@ -952,6 +952,7 @@ def voice_call_mode_model() -> str | None:
         voice:
           call_mode:
             model: claude-haiku-4-5    # any model id Claude Code accepts
+            reasoning_level: medium    # only when the model supports it
 
     Reset by deleting the key (or setting to ``default``).
     """
@@ -959,6 +960,26 @@ def voice_call_mode_model() -> str | None:
     if not isinstance(section, dict):
         return None
     raw = section.get("model")
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned or cleaned.lower() == "default":
+        return None
+    return cleaned
+
+
+def voice_call_mode_reasoning_level() -> str | None:
+    """Per-turn reasoning effort for voice call mode. ``None`` means
+    "no flag — let the model use its baked-in default reasoning".
+    Only meaningful when the chosen model supports reasoning levels;
+    the dashboard validates this client-side via the capability map
+    served on /api/v1/voice. Same null/empty/``default`` sentinels
+    as :func:`voice_call_mode_model` for consistency.
+    """
+    section = _section("voice").get("call_mode", {})
+    if not isinstance(section, dict):
+        return None
+    raw = section.get("reasoning_level")
     if not isinstance(raw, str):
         return None
     cleaned = raw.strip()

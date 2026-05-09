@@ -60,11 +60,13 @@ class BrainNull(Brain):
         self._pending_exc: BrainError | None = None
         self._pending_aux_exc: BrainError | None = None
         # Call recorder for test assertions.
-        # Tuple shape: (message, chat_id, model). The third element is
-        # the per-turn override and is None for the typical case where
-        # the caller didn't pass one — tests that don't care about
-        # overrides can ignore it.
-        self._respond_calls: list[tuple[str, int, str | None]] = []
+        # Tuple shape: (message, chat_id, model, reasoning_level).
+        # The last two are per-turn overrides and are None for the
+        # typical case where the caller didn't pass them — tests that
+        # don't care about overrides can ignore them.
+        self._respond_calls: list[
+            tuple[str, int, str | None, str | None]
+        ] = []
         # Aux call records: full kwarg snapshot so tests can assert on
         # ``env_overrides``, ``allow_tools``, ``timeout_seconds``, etc.
         # ``aux_calls()`` returns a list of (prompt, tier) tuples for
@@ -117,12 +119,20 @@ class BrainNull(Brain):
     # ─── Brain ABC implementations ───────────────────────────────
 
     async def respond(
-        self, message: str, chat_id: int, *, model: str | None = None,
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
     ) -> str:
-        # ``model`` accepted for ABC parity; recorded so tests can
-        # assert that the override was forwarded correctly through
-        # the handler/transport stack.
-        self._respond_calls.append((message, chat_id, model))
+        # ``model`` and ``reasoning_level`` accepted for ABC parity;
+        # recorded so tests can assert that overrides are forwarded
+        # correctly through the handler/transport stack. Tuple shape
+        # is (message, chat_id, model, reasoning_level).
+        self._respond_calls.append(
+            (message, chat_id, model, reasoning_level),
+        )
         if self._pending_exc is not None:
             exc = self._pending_exc
             self._pending_exc = None

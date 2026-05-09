@@ -39,6 +39,10 @@ interface VoiceCallModeProps {
    *  text-chat tab. Any other value forwards to /chat/voice as a
    *  multipart ``model`` form field. */
   modelOverride: string;
+  /** Per-turn reasoning effort. Empty = no --effort flag.
+   *  Symmetric with modelOverride; forwarded as ``reasoning_level``
+   *  multipart form field. */
+  reasoningOverride: string;
 }
 
 const STATE_LABEL: Record<VadState, string> = {
@@ -57,6 +61,7 @@ export function VoiceCallMode({
   onTurn,
   onClose,
   modelOverride,
+  reasoningOverride,
 }: VoiceCallModeProps) {
   const [state, setState] = useState<VadState>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -122,6 +127,7 @@ export function VoiceCallMode({
         // Form(default=None) falls through cleanly otherwise.
         const { transcript, reply } = await api.chatVoice(token, file, {
           model: modelOverride || undefined,
+          reasoning_level: reasoningOverride || undefined,
         });
         onTurnRef.current(transcript, reply);
         // Synthesize and play the reply.
@@ -181,7 +187,7 @@ export function VoiceCallMode({
         if (inflightRef.current === ctrl) inflightRef.current = null;
       }
     },
-    [token, modelOverride],
+    [token, modelOverride, reasoningOverride],
   );
 
   // Bring up VAD when the modal opens, tear it down when it closes

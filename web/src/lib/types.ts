@@ -599,6 +599,7 @@ export interface VoiceInfo {
   // forwarded to /chat/voice as a multipart ``model`` form field.
   call_mode: {
     model: string;
+    reasoning_level: string;
   };
 }
 
@@ -675,6 +676,10 @@ export interface VoiceSettings {
     // Empty string = "use brain default". Same sentinel the radio
     // list uses so the wire format and UI state line up.
     model: string;
+    // Empty string = "no --effort flag, model default reasoning".
+    // Only meaningful when ``model`` corresponds to an entry in
+    // ``available_models`` whose ``reasoning_levels`` is non-empty.
+    reasoning_level: string;
     available_models: AvailableModel[];
   };
 }
@@ -691,6 +696,7 @@ export interface VoiceSettingsUpdate {
     // null / "" / "default" all mean "reset to brain default" on the
     // server side; UI sends "" for clarity.
     model?: string | null;
+    reasoning_level?: string | null;
   };
 }
 

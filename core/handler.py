@@ -68,13 +68,14 @@ class MessageHandler:
         text: str,
         *,
         model: str | None = None,
+        reasoning_level: str | None = None,
     ) -> str | None:
-        """Foreground turn entrypoint. ``model`` is an optional
-        per-turn override forwarded straight to ``Brain.respond``.
-        ``None`` (the default) means "use the brain's account default"
-        — preserves the existing Telegram + text-chat path bit-for-bit.
-        Voice call mode is the only caller passing a non-None value
-        today, sourced from ``voice.call_mode.model`` in
+        """Foreground turn entrypoint. ``model`` and ``reasoning_level``
+        are optional per-turn overrides forwarded straight to
+        ``Brain.respond``. ``None`` (the default) on either preserves
+        the existing Telegram + text-chat path bit-for-bit. Voice call
+        mode is the only caller passing non-None values today, sourced
+        from ``voice.call_mode.{model,reasoning_level}`` in
         ``~/.vexis/config.yaml``.
         """
         if not is_allowed(user_id, self._allowed_user_id):
@@ -84,7 +85,10 @@ class MessageHandler:
         message = await self._inject_context(chat_id, text)
 
         try:
-            reply = await self._brain.respond(message, chat_id, model=model)
+            reply = await self._brain.respond(
+                message, chat_id,
+                model=model, reasoning_level=reasoning_level,
+            )
         except BrainCancelled:
             # /cancel handler already replied; nothing more to send.
             return None

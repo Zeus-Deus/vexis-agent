@@ -270,7 +270,7 @@ export const api = {
   chatVoice: async (
     token: string,
     audio: Blob,
-    opts: { model?: string } = {},
+    opts: { model?: string; reasoning_level?: string } = {},
   ): Promise<VoiceReply> => {
     const fd = new FormData();
     // Hint extension via the second arg so the server's tempfile
@@ -281,11 +281,14 @@ export const api = {
                 audio.type.includes("webm") ? "webm" :
                 audio.type.includes("wav") ? "wav" : "bin";
     fd.append("audio", audio, `voice.${ext}`);
-    // Per-turn model override (voice call mode). Omitted entirely
-    // when unset so the server's ``Form(default=None)`` falls
-    // through to the brain default — preserves current behaviour
-    // for any caller that doesn't pass ``opts.model``.
+    // Per-turn overrides (voice call mode). Omitted entirely when
+    // unset so the server's ``Form(default=None)`` falls through to
+    // brain defaults — preserves current behaviour for any caller
+    // that doesn't pass these.
     if (opts.model) fd.append("model", opts.model);
+    if (opts.reasoning_level) {
+      fd.append("reasoning_level", opts.reasoning_level);
+    }
     const resp = await fetch("/api/v1/chat/voice", {
       method: "POST",
       headers: { Authorization: `Bearer ${token}` },

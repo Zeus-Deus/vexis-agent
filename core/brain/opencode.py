@@ -646,12 +646,18 @@ class OpenCodeBrain(Brain):
     # ─── foreground turn ─────────────────────────────────────────
 
     async def respond(
-        self, message: str, chat_id: int, *, model: str | None = None,
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
     ) -> str:
         log.info(
-            "OpenCodeBrain.respond starting for chat %d%s",
+            "OpenCodeBrain.respond starting for chat %d%s%s",
             chat_id,
             f" (model override: {model})" if model else "",
+            f" (reasoning: {reasoning_level})" if reasoning_level else "",
         )
 
         # Phase C Day 4: ``is_initialized`` flips to True after the
@@ -690,6 +696,11 @@ class OpenCodeBrain(Brain):
             argv += ["--session", stored_token]
         else:
             argv += ["--title", f"vexis-chat-{chat_id}"]
+        # Per-turn reasoning effort. opencode uses ``--variant`` for
+        # per-call reasoning selection (mirrors spawn_aux). ``None``
+        # means no flag, model uses its baked-in default.
+        if reasoning_level:
+            argv += ["--variant", reasoning_level]
         argv.append(message)
 
         env = {**os.environ, "VEXIS_CHAT_ID": str(chat_id)}
