@@ -593,6 +593,13 @@ export interface VoiceInfo {
   enabled: boolean;        // mirrors voice.enabled in ~/.vexis/config.yaml
   stt: VoiceCapability;
   tts: VoiceCapability;
+  // Per-turn model override for voice call mode. Empty string =
+  // "use the brain's account default" (current behavior — same as
+  // Telegram and the text-chat tab). Any other value is a model id
+  // forwarded to /chat/voice as a multipart ``model`` form field.
+  call_mode: {
+    model: string;
+  };
 }
 
 export interface VoiceReply {
@@ -638,6 +645,19 @@ export interface PiperVoice {
   has_config: boolean;
 }
 
+export interface AvailableModel {
+  // Native model id as Claude Code (or future brains) reports it.
+  // Surfaced to the picker without any transformation so future
+  // models appear automatically.
+  id: string;
+  // Empty list = no reasoning controls for this model. Non-empty
+  // list = the user could pick one of these (e.g. "low", "medium",
+  // "high") in a future iteration. Currently we don't expose a
+  // reasoning picker — collected here so the UI can grow into it
+  // without a wire-format change.
+  reasoning_levels: string[];
+}
+
 export interface VoiceSettings {
   enabled: boolean;
   stt: {
@@ -651,6 +671,12 @@ export interface VoiceSettings {
     binary: string | null;
   };
   available_voices: PiperVoice[];
+  call_mode: {
+    // Empty string = "use brain default". Same sentinel the radio
+    // list uses so the wire format and UI state line up.
+    model: string;
+    available_models: AvailableModel[];
+  };
 }
 
 export interface VoiceSettingsUpdate {
@@ -660,6 +686,11 @@ export interface VoiceSettingsUpdate {
     provider?: string;
     voice_model_path?: string | null;
     binary?: string | null;
+  };
+  call_mode?: {
+    // null / "" / "default" all mean "reset to brain default" on the
+    // server side; UI sends "" for clarity.
+    model?: string | null;
   };
 }
 

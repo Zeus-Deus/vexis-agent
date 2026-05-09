@@ -61,7 +61,22 @@ class MessageHandler:
         self._dispatched_turn_index: dict[str, int] = {}
         self._cursor_lock = asyncio.Lock()
 
-    async def handle(self, user_id: int, chat_id: int, text: str) -> str | None:
+    async def handle(
+        self,
+        user_id: int,
+        chat_id: int,
+        text: str,
+        *,
+        model: str | None = None,
+    ) -> str | None:
+        """Foreground turn entrypoint. ``model`` is an optional
+        per-turn override forwarded straight to ``Brain.respond``.
+        ``None`` (the default) means "use the brain's account default"
+        — preserves the existing Telegram + text-chat path bit-for-bit.
+        Voice call mode is the only caller passing a non-None value
+        today, sourced from ``voice.call_mode.model`` in
+        ``~/.vexis/config.yaml``.
+        """
         if not is_allowed(user_id, self._allowed_user_id):
             log.warning("Rejected message from user_id=%s", user_id)
             return None
@@ -69,7 +84,7 @@ class MessageHandler:
         message = await self._inject_context(chat_id, text)
 
         try:
-            reply = await self._brain.respond(message, chat_id)
+            reply = await self._brain.respond(message, chat_id, model=model)
         except BrainCancelled:
             # /cancel handler already replied; nothing more to send.
             return None

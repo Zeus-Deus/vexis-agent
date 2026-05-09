@@ -66,6 +66,11 @@ export function VoicePage({ token, onAuthFail }: VoicePageProps) {
     draft.tts?.voice_model_path ?? state?.tts.voice_model_path ?? null;
   const effectiveBinary =
     draft.tts?.binary ?? state?.tts.binary ?? null;
+  // Empty string is the "use brain default" sentinel — single source
+  // of truth between wire format, draft, and the radio list's
+  // ``selected`` value.
+  const effectiveCallModel =
+    draft.call_mode?.model ?? state?.call_mode.model ?? "";
 
   const dirty =
     Object.keys(draft).length > 0 &&
@@ -198,6 +203,20 @@ export function VoicePage({ token, onAuthFail }: VoicePageProps) {
             text-only.
           </p>
         )}
+      </Section>
+
+      {/* Voice call mode — per-feature backend model override */}
+      <Section title="Voice call mode — backend model">
+        <CallModePicker
+          available={state.call_mode.available_models}
+          selected={effectiveCallModel}
+          onChange={(value) =>
+            setDraft((d) => ({
+              ...d,
+              call_mode: { ...d.call_mode, model: value },
+            }))
+          }
+        />
       </Section>
 
       {/* Save bar */}
@@ -392,6 +411,114 @@ function VoicePicker({
           </label>
         ))}
       </div>
+    </div>
+  );
+}
+
+function CallModePicker({
+  available,
+  selected,
+  onChange,
+}: {
+  available: { id: string; reasoning_levels: string[] }[];
+  // Empty string = "use brain default"; any other value = explicit
+  // model id override.
+  selected: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-[var(--color-fg-2)]">
+        Per-turn override for voice call mode only — text chat and
+        Telegram keep using your account default.
+      </p>
+
+      <div className="space-y-1">
+        {/* Default option always first — anchors the picker. */}
+        <label
+          className={[
+            "flex items-start gap-3 px-3 py-2 rounded-md cursor-pointer",
+            "border transition-colors",
+            selected === ""
+              ? "border-[var(--color-accent)] bg-[var(--color-base)]"
+              : "border-transparent hover:border-[var(--color-border-strong)]",
+          ].join(" ")}
+        >
+          <input
+            type="radio"
+            name="call-model"
+            value=""
+            checked={selected === ""}
+            onChange={() => onChange("")}
+            className="accent-[var(--color-accent)] mt-0.5"
+          />
+          <div className="flex-1 min-w-0">
+            <div className="text-sm text-[var(--color-fg)]">
+              Default
+            </div>
+            <div className="text-[10px] text-[var(--color-fg-dim)] mt-0.5">
+              Use whatever Claude Code is configured to use globally.
+            </div>
+          </div>
+        </label>
+
+        {available.length === 0 ? (
+          <div className="text-xs text-[var(--color-fg-dim)] px-3 py-2">
+            No models discovered yet. The list populates from Claude
+            Code's <code className="font-mono">/v1/models</code>{" "}
+            response — the dashboard refreshes it on the Models tab.
+          </div>
+        ) : (
+          available.map((m) => (
+            <label
+              key={m.id}
+              className={[
+                "flex items-start gap-3 px-3 py-2 rounded-md cursor-pointer",
+                "border transition-colors",
+                selected === m.id
+                  ? "border-[var(--color-accent)] bg-[var(--color-base)]"
+                  : "border-transparent hover:border-[var(--color-border-strong)]",
+              ].join(" ")}
+            >
+              <input
+                type="radio"
+                name="call-model"
+                value={m.id}
+                checked={selected === m.id}
+                onChange={() => onChange(m.id)}
+                className="accent-[var(--color-accent)] mt-0.5"
+              />
+              <div className="flex-1 min-w-0">
+                <div className="text-sm text-[var(--color-fg)] font-mono truncate">
+                  {m.id}
+                </div>
+                {m.reasoning_levels.length > 0 && (
+                  <div className="text-[10px] text-[var(--color-fg-dim)] mt-0.5">
+                    Reasoning levels:{" "}
+                    {m.reasoning_levels
+                      .map((l) => (l === "" ? "off" : l))
+                      .join(" · ")}
+                  </div>
+                )}
+              </div>
+            </label>
+          ))
+        )}
+      </div>
+
+      {selected !== "" && (
+        <button
+          type="button"
+          onClick={() => onChange("")}
+          className={[
+            "text-xs px-2 py-1 rounded transition-colors",
+            "text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]",
+            "hover:bg-[var(--color-base)]",
+          ].join(" ")}
+        >
+          ↺ Reset to default
+        </button>
+      )}
     </div>
   );
 }

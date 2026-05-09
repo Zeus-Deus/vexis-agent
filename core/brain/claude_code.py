@@ -322,8 +322,14 @@ class ClaudeCodeBrain(Brain):
         self._system_prompt_cache[session_uuid] = prompt
         return prompt
 
-    async def respond(self, message: str, chat_id: int) -> str:
-        log.info("Brain.respond starting for chat %d", chat_id)
+    async def respond(
+        self, message: str, chat_id: int, *, model: str | None = None,
+    ) -> str:
+        log.info(
+            "Brain.respond starting for chat %d%s",
+            chat_id,
+            f" (model override: {model})" if model else "",
+        )
         session_id = self._session.get()
         # First call pins the UUID with --session-id; subsequent calls resume it.
         if self._session.is_initialized():
@@ -354,6 +360,13 @@ class ClaudeCodeBrain(Brain):
         # for each tool use and the call would hang. Step 6.5 will add a
         # PreToolUse hook that consults core.safety for hard enforcement.
         argv += ["--permission-mode", "bypassPermissions"]
+        # Per-turn model override (voice call mode is the only caller
+        # today; see ``voice.call_mode.model`` in ~/.vexis/config.yaml).
+        # ``None`` keeps the canonical "no --model flag, use account
+        # default" behavior — Telegram and text-chat tab path through
+        # here unchanged.
+        if model:
+            argv += ["--model", model]
         log.debug(
             "Spawning claude -p (%s=%s, cwd=%s)",
             session_flag[0],

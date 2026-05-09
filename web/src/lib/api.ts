@@ -267,7 +267,11 @@ export const api = {
   // application/json — the browser handles multipart boundary
   // generation only when fetch sees a FormData body and we DON'T
   // override Content-Type.
-  chatVoice: async (token: string, audio: Blob): Promise<VoiceReply> => {
+  chatVoice: async (
+    token: string,
+    audio: Blob,
+    opts: { model?: string } = {},
+  ): Promise<VoiceReply> => {
     const fd = new FormData();
     // Hint extension via the second arg so the server's tempfile
     // suffix-detection picks the right ffmpeg demuxer. Browsers
@@ -277,6 +281,11 @@ export const api = {
                 audio.type.includes("webm") ? "webm" :
                 audio.type.includes("wav") ? "wav" : "bin";
     fd.append("audio", audio, `voice.${ext}`);
+    // Per-turn model override (voice call mode). Omitted entirely
+    // when unset so the server's ``Form(default=None)`` falls
+    // through to the brain default — preserves current behaviour
+    // for any caller that doesn't pass ``opts.model``.
+    if (opts.model) fd.append("model", opts.model);
     const resp = await fetch("/api/v1/chat/voice", {
       method: "POST",
       headers: { Authorization: `Bearer ${token}` },

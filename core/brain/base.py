@@ -310,8 +310,19 @@ class Brain(ABC):
     # ─── foreground turn ─────────────────────────────────────────
 
     @abstractmethod
-    async def respond(self, message: str, chat_id: int) -> str:
+    async def respond(
+        self, message: str, chat_id: int, *, model: str | None = None,
+    ) -> str:
         """Run one foreground turn. Returns the assistant's final text.
+
+        ``model`` is an optional per-turn override. ``None`` (the
+        default) means "use the brain's account default" — the
+        canonical foreground behaviour, preserved bit-for-bit so
+        Telegram and the text-chat tab keep their existing semantics.
+        When set, the brain spawns its CLI with ``--model <id>`` for
+        this turn only. Used by voice call mode (``voice.call_mode.model``
+        config knob) so the call surface can run a faster model
+        without shifting every other foreground turn.
 
         Side effects: writes to the per-chat ``StatusFile`` for
         ``/status``, registers the running subprocess with

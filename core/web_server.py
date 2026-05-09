@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -1525,7 +1525,10 @@ class WebDashboard:
         async def get_voice_info() -> dict:
             """One-shot capability probe. Lets the UI render the
             mic button only when STT is actually wired and decide
-            whether to autoplay TTS on assistant replies."""
+            whether to autoplay TTS on assistant replies. Also
+            ships the per-feature call-mode model override so the
+            voice-call modal can apply it to /chat/voice without
+            a second round-trip."""
             stt = stt_provider()
             tts = tts_provider()
             return {
@@ -1536,6 +1539,11 @@ class WebDashboard:
                     "available": tts.name != "null",
                     "mime_type": tts.mime_type,
                 },
+                "call_mode": {
+                    # Empty string = "use brain default" (matches the
+                    # Voice tab's wire format for symmetry).
+                    "model": yaml_config.voice_call_mode_model() or "",
+                },
             }
 
         @app.post(
@@ -1544,6 +1552,12 @@ class WebDashboard:
         )
         async def post_chat_voice(
             audio: UploadFile = File(...),
+            # Optional per-turn model override — voice call mode
+            # passes this when the user has set
+            # ``voice.call_mode.model`` in config (or picked one in
+            # the Voice tab). Empty string / missing both fall through
+            # to "use brain default".
+            model: str | None = Form(default=None),
         ) -> JSONResponse:
             """STT round-trip: receive audio → transcribe → send the
             transcription to the brain → return both the transcript
@@ -1609,7 +1623,12 @@ class WebDashboard:
             if not transcript.strip():
                 raise HTTPException(422, "empty transcription")
 
-            reply = await chat.send(transcript)
+            # Empty-string model = unset; treat as None so the brain
+            # uses its account default. Saves the frontend from having
+            # to omit the form field when the user hasn't picked an
+            # override.
+            override = model.strip() if isinstance(model, str) and model.strip() else None
+            reply = await chat.send(transcript, model=override)
             if reply is None:
                 raise HTTPException(401, "message rejected")
             return JSONResponse({"transcript": transcript, "reply": reply})
@@ -2540,6 +2559,46 @@ class WebDashboard:
     # Voice settings (dashboard surface — phase 3a)
     # ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _voice_call_mode_available_models_static(active_brain: str) -> list[dict]:
+        """Build the available-models list for the Voice tab's
+        call-mode picker. Pulled out so the test surface is small —
+        delegating to ``core.model_discovery`` means new models
+        from a future Claude release surface automatically without
+        touching this file.
+
+        Per-entry shape:
+            {
+              "id": str,             # model id (e.g. "claude-haiku-4-5")
+              "reasoning_levels": list[str],  # ["", "low", "medium", ...]
+            }
+        """
+        from core.model_discovery import (
+            discover_claude_code_capabilities,
+            discover_claude_code_models,
+            discover_opencode_models,
+        )
+
+        if active_brain == "claude-code":
+            ids = sorted(discover_claude_code_models())
+            caps = discover_claude_code_capabilities()
+            return [
+                {
+                    "id": mid,
+                    "reasoning_levels": (caps.get(mid) or {}).get(
+                        "reasoning_levels", []
+                    ),
+                }
+                for mid in ids
+            ]
+        if active_brain == "opencode":
+            return [
+                {"id": mid, "reasoning_levels": []}
+                for mid in sorted(discover_opencode_models())
+            ]
+        # null brain — no real model list to surface.
+        return []
+
     def _voice_payload(self) -> dict:
         """Snapshot for the Voice tab. Combines the current ``voice.*``
         config with a filesystem walk for installed Piper models so
@@ -2547,11 +2606,18 @@ class WebDashboard:
         trips."""
         from core.voice.discovery import find_piper_voices
         from core.yaml_config import (
+            brain_kind,
+            voice_call_mode_model,
             voice_enabled,
             voice_stt_provider,
             voice_tts_binary,
             voice_tts_provider,
             voice_tts_voice_model_path,
+        )
+        from core.model_discovery import (
+            discover_claude_code_capabilities,
+            discover_claude_code_models,
+            discover_opencode_models,
         )
         # Include the parent dir of any currently-configured model in
         # the search paths so non-standard install locations still
@@ -2604,6 +2670,24 @@ class WebDashboard:
                 }
                 for v in voices
             ],
+            # Per-turn model override for voice call mode. Empty
+            # string sentinel ("") in the wire format = "use brain
+            # default" so the UI radio list can stay simple
+            # (single source of truth, no separate "use default"
+            # boolean).
+            "call_mode": {
+                "model": voice_call_mode_model() or "",
+                # Available models surfaced for the picker. Same
+                # discovery the Models tab uses; cached 5 min
+                # in core.model_discovery so this poll is cheap.
+                # Per-model ``reasoning_levels`` come from
+                # capability discovery (Anthropic /v1/models for
+                # claude-code; opencode doesn't expose these so
+                # we ship an empty list).
+                "available_models": self._voice_call_mode_available_models_static(
+                    brain_kind()
+                ),
+            },
         }
 
     def _voice_set(self, payload: dict) -> dict:
@@ -2673,6 +2757,37 @@ class WebDashboard:
                     raise HTTPException(400, f"tts.{key} must be a string or null")
                 tts[key] = v.strip()
             voice_section["tts"] = tts
+
+        if "call_mode" in payload:
+            if not isinstance(payload["call_mode"], dict):
+                raise HTTPException(400, "call_mode must be an object")
+            call_mode = dict(voice_section.get("call_mode") or {})
+            if "model" in payload["call_mode"]:
+                v = payload["call_mode"]["model"]
+                # Accept null, empty string, or sentinel "default" as
+                # "reset to brain default" — drop the key in any of
+                # those cases. ``voice_call_mode_model()`` matches
+                # the same set, so they're consistent across read +
+                # write paths.
+                if (
+                    v is None
+                    or (isinstance(v, str) and (
+                        not v.strip() or v.strip().lower() == "default"
+                    ))
+                ):
+                    call_mode.pop("model", None)
+                elif isinstance(v, str):
+                    call_mode["model"] = v.strip()
+                else:
+                    raise HTTPException(
+                        400, "call_mode.model must be a string or null",
+                    )
+            # If the section ended up empty, drop it entirely so the
+            # YAML doesn't sprout dangling empty objects.
+            if call_mode:
+                voice_section["call_mode"] = call_mode
+            else:
+                voice_section.pop("call_mode", None)
 
         proposed["voice"] = voice_section
 

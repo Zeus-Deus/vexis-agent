@@ -33,6 +33,12 @@ interface VoiceCallModeProps {
   onTurn: (transcript: string | null, reply: string | null) => void;
   /** End-call: parent should unmount the component. */
   onClose: () => void;
+  /** Per-turn model override (sourced from voice.call_mode.model in
+   *  ~/.vexis/config.yaml via the voice-info probe). Empty string =
+   *  use the brain's account default — same as Telegram and the
+   *  text-chat tab. Any other value forwards to /chat/voice as a
+   *  multipart ``model`` form field. */
+  modelOverride: string;
 }
 
 const STATE_LABEL: Record<VadState, string> = {
@@ -50,6 +56,7 @@ export function VoiceCallMode({
   open,
   onTurn,
   onClose,
+  modelOverride,
 }: VoiceCallModeProps) {
   const [state, setState] = useState<VadState>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -111,7 +118,11 @@ export function VoiceCallMode({
         // the trade-off: a fast user can cancel via End-Call, but
         // a barge-in mid-transcribe sees the upload finish before
         // the new recording starts. The window is brief.
-        const { transcript, reply } = await api.chatVoice(token, file);
+        // Forward modelOverride only when set so the server's
+        // Form(default=None) falls through cleanly otherwise.
+        const { transcript, reply } = await api.chatVoice(token, file, {
+          model: modelOverride || undefined,
+        });
         onTurnRef.current(transcript, reply);
         // Synthesize and play the reply.
         setState("thinking");
@@ -170,7 +181,7 @@ export function VoiceCallMode({
         if (inflightRef.current === ctrl) inflightRef.current = null;
       }
     },
-    [token],
+    [token, modelOverride],
   );
 
   // Bring up VAD when the modal opens, tear it down when it closes

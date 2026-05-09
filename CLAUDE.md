@@ -111,7 +111,9 @@ Two-step resolution: subsystems pick an abstract size tier
 `subsystem_tier(<name>)`; the active brain translates tier →
 native model id via `models.tiers.<brain-kind>.<tier>` config
 or `DEFAULT_TIER_MAP_<BRAIN>`. Foreground turn uses the brain's
-account default — no `--model` flag.
+account default (no `--model` flag) — unless the caller passes a
+per-turn override (voice call mode does, sourced from
+`voice.call_mode.model`; Telegram/text-chat always pass `None`).
 
 Override per-subsystem under `models.subsystems.<name>` in
 `~/.vexis/config.yaml`. Legacy raw-string keys (e.g.

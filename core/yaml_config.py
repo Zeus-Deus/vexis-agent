@@ -941,6 +941,32 @@ def voice_tts_voice_model_path() -> str | None:
     return path if isinstance(path, str) and path.strip() else None
 
 
+def voice_call_mode_model() -> str | None:
+    """Per-turn model override for voice call mode. ``None`` (the
+    default — unset, or sentinel string ``default``) means "use the
+    brain's account default" — same as Telegram and the text-chat tab.
+
+    The dashboard's Voice tab is the canonical writer; users can also
+    edit this manually:
+
+        voice:
+          call_mode:
+            model: claude-haiku-4-5    # any model id Claude Code accepts
+
+    Reset by deleting the key (or setting to ``default``).
+    """
+    section = _section("voice").get("call_mode", {})
+    if not isinstance(section, dict):
+        return None
+    raw = section.get("model")
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned or cleaned.lower() == "default":
+        return None
+    return cleaned
+
+
 def voice_tts_binary() -> str | None:
     """Optional absolute path to the piper binary. None falls back
     to ``shutil.which("piper")`` from the daemon's PATH.
