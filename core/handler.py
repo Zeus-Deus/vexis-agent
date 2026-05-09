@@ -156,6 +156,62 @@ class MessageHandler:
             return None
         return _format_sessions(self._sessions.list())
 
+    def handle_history(
+        self, user_id: int, name: str, limit: int = 50,
+    ) -> list[dict] | None:
+        """Return the last ``limit`` conversational turns of the
+        named session as a list of plain dicts:
+            [{"role": "user"|"assistant", "content": str, "ts": int}, ...]
+
+        ``ts`` is unix milliseconds (matches what the chat UI's
+        in-memory buffer uses). Returns:
+          - ``None`` when ``user_id`` fails the allow-list (route
+            translates to 401)
+          - empty list when the session exists but has no messages
+            (pristine session that's never been written to) OR the
+            session name doesn't exist (caller can either 404 or
+            treat as empty — the route currently 404s by checking
+            sessions_for first)
+          - list of messages otherwise
+
+        Reads via ``brain.iter_messages(uuid)`` — both brains
+        implement that ABC method (claude-code reads JSONL via
+        ``core.transcripts``; opencode reads SQLite directly).
+        Skips tool_call-only assistant messages with empty text
+        because they don't render meaningfully in chat bubbles.
+        """
+        if not is_allowed(user_id, self._allowed_user_id):
+            log.warning("Rejected history-for from user_id=%s", user_id)
+            return None
+        if limit <= 0:
+            return []
+        # Resolve name → uuid via SessionStore. Avoids exposing
+        # ``brain.iter_messages`` to the dashboard which speaks in
+        # names, not uuids.
+        sessions = self._sessions.list()
+        target = next((s for s in sessions if s.name == name), None)
+        if target is None:
+            return []
+        # Drain the iterator into a list so we can ``[-limit:]``.
+        # Tool-call-only messages (assistant turns where the model
+        # only emitted tool_use blocks, no text) get filtered: their
+        # text is empty so they'd render as blank bubbles.
+        messages: list[dict] = []
+        for tm in self._brain.iter_messages(target.uuid):
+            if not tm.text:
+                continue
+            messages.append(
+                {
+                    "role": tm.role,
+                    "content": tm.text,
+                    # Unix milliseconds — what JS's ``Date`` constructor
+                    # consumes, matches the in-memory ChatMessage shape
+                    # the UI already uses.
+                    "ts": int(tm.timestamp.timestamp() * 1000),
+                }
+            )
+        return messages[-limit:] if len(messages) > limit else messages
+
     def sessions_for(self, user_id: int) -> list[SessionInfo] | None:
         if not is_allowed(user_id, self._allowed_user_id):
             log.warning("Rejected session-list-for from user_id=%s", user_id)

@@ -84,6 +84,11 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
 
   const activeName = sessions?.find((s) => s.is_active)?.name ?? "";
   const messages = activeName ? buffers[activeName] ?? [] : [];
+  // Track which session names have had their history fetched
+  // already (per page-load). Once loaded, switching away and back
+  // reuses the in-memory buffer rather than re-fetching — avoids
+  // hammering the brain's transcript reader on every tab switch.
+  const historyLoadedRef = useRef<Set<string>>(new Set());
 
   // Server returns sessions in their on-disk insertion order (oldest
   // first). The chat UX wants newest first — that's where the active
@@ -140,6 +145,52 @@ export function ChatPage({ token, onAuthFail, fullscreen }: ChatPageProps) {
     // doesn't leave an orphan fetch holding component state.
     return () => ctrl.abort();
   }, [refreshSessions]);
+
+  // Lazy-load history when the active session changes (or when the
+  // sessions list first arrives with an active session pinned).
+  // Skipped when:
+  //   - already loaded once this page-load (Set lookup)
+  //   - the buffer already has messages (user is mid-conversation —
+  //     don't stomp what they just typed)
+  // Cancels via AbortController on session change / unmount so a
+  // slow brain transcript read doesn't land into the wrong session.
+  useEffect(() => {
+    if (!activeName) return;
+    if (historyLoadedRef.current.has(activeName)) return;
+    if ((buffers[activeName]?.length ?? 0) > 0) {
+      // Mark as loaded so we don't refetch on the next render.
+      historyLoadedRef.current.add(activeName);
+      return;
+    }
+    const ctrl = new AbortController();
+    (async () => {
+      try {
+        const data = await api.chatHistory(token, activeName, {
+          limit: 50, signal: ctrl.signal,
+        });
+        // Convert to the in-memory ChatMessage shape — same fields
+        // as our send-time messages, just sourced from disk.
+        const fetched: ChatMessage[] = data.messages.map((m) => ({
+          role: m.role as ChatMessage["role"],
+          content: m.content,
+          ts: m.ts,
+        }));
+        setMessages(activeName, fetched);
+        historyLoadedRef.current.add(activeName);
+      } catch (exc) {
+        if (exc instanceof DOMException && exc.name === "AbortError") return;
+        if (exc instanceof ApiError && exc.status === 401) {
+          onAuthFail();
+          return;
+        }
+        // Non-401 errors: log silently. History backfill is a
+        // nice-to-have; failing to load shouldn't block sending.
+        // Mark loaded so we don't retry on every render.
+        historyLoadedRef.current.add(activeName);
+      }
+    })();
+    return () => ctrl.abort();
+  }, [activeName, token, buffers, onAuthFail, setMessages]);
 
   // Refresh sessions when the tab becomes visible again — phones
   // suspend background tabs aggressively, and a backgrounded chat

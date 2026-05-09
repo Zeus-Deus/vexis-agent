@@ -581,6 +581,20 @@ export interface ChatReply {
   reply: string;
 }
 
+export interface ChatHistoryMessage {
+  // "user" | "assistant" — same vocabulary the in-memory ChatMessage
+  // type uses so backfilled history can populate the buffer without
+  // a translation step.
+  role: string;
+  content: string;
+  // Unix milliseconds. JS ``new Date(ts)`` handles it.
+  ts: number;
+}
+
+export interface ChatHistoryState {
+  messages: ChatHistoryMessage[];
+}
+
 // ----- voice -----
 
 export interface VoiceCapability {

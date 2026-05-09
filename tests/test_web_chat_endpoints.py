@@ -46,6 +46,10 @@ class _StubChat:
         self.send_reply: str | None = "stubbed reply"
         self.session_reply: str | None = "stubbed session reply"
         self.sessions: list | None = []  # list of WebSessionInfo-shaped objects
+        # Default empty so unrelated tests don't accidentally
+        # trigger a populated history. Tests that exercise history
+        # set this list (or to None to simulate the 401-equivalent).
+        self.history_messages: list[dict] | None = []
 
     def _record(self, name: str, *args, **kwargs) -> None:
         self.calls.append((name, args, kwargs))
@@ -77,6 +81,10 @@ class _StubChat:
     def list_sessions(self):
         self._record("list_sessions")
         return self.sessions
+
+    def history(self, name: str, limit: int = 50):
+        self._record("history", name, limit=limit)
+        return self.history_messages
 
 
 class _FakeSessionInfo:
@@ -375,6 +383,120 @@ def test_clear(
     r = client_with_chat.post("/api/v1/chat/clear", headers=_auth())
     assert r.status_code == 200
     assert stub_chat.calls == [("clear", (), {})]
+
+
+# ──────────────────────────────────────────────────────────────────
+# Session history backfill — /chat/sessions/{name}/history
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_history_returns_messages(
+    client_with_chat: TestClient, stub_chat: _StubChat,
+) -> None:
+    """Stub returns three messages → route forwards them as-is in
+    the wire format."""
+    stub_chat.history_messages = [
+        {"role": "user", "content": "hi", "ts": 1000},
+        {"role": "assistant", "content": "hello", "ts": 1100},
+        {"role": "user", "content": "again", "ts": 2000},
+    ]
+    r = client_with_chat.get(
+        "/api/v1/chat/sessions/work/history",
+        headers=_auth(),
+    )
+    assert r.status_code == 200
+    assert r.json() == {
+        "messages": [
+            {"role": "user", "content": "hi", "ts": 1000},
+            {"role": "assistant", "content": "hello", "ts": 1100},
+            {"role": "user", "content": "again", "ts": 2000},
+        ],
+    }
+    # Default limit is 50.
+    assert stub_chat.calls == [("history", ("work",), {"limit": 50})]
+
+
+def test_history_honours_limit_query_param(
+    client_with_chat: TestClient, stub_chat: _StubChat,
+) -> None:
+    stub_chat.history_messages = []
+    r = client_with_chat.get(
+        "/api/v1/chat/sessions/work/history?limit=10",
+        headers=_auth(),
+    )
+    assert r.status_code == 200
+    assert stub_chat.calls == [("history", ("work",), {"limit": 10})]
+
+
+def test_history_caps_excessive_limit(
+    client_with_chat: TestClient, stub_chat: _StubChat,
+) -> None:
+    """Server caps at 500 — protects the brain's transcript reader
+    from a malicious/buggy UI asking for a million messages."""
+    stub_chat.history_messages = []
+    r = client_with_chat.get(
+        "/api/v1/chat/sessions/work/history?limit=10000",
+        headers=_auth(),
+    )
+    assert r.status_code == 200
+    # The handler receives the capped value, not 10000.
+    assert stub_chat.calls == [("history", ("work",), {"limit": 500})]
+
+
+def test_history_clamps_negative_limit_to_one(
+    client_with_chat: TestClient, stub_chat: _StubChat,
+) -> None:
+    """Negative / zero limits coerce to 1 — the route always
+    returns at least one message slot to fill, never a hard error."""
+    stub_chat.history_messages = []
+    r = client_with_chat.get(
+        "/api/v1/chat/sessions/work/history?limit=-5",
+        headers=_auth(),
+    )
+    assert r.status_code == 200
+    assert stub_chat.calls == [("history", ("work",), {"limit": 1})]
+
+
+def test_history_unknown_session_returns_empty_array(
+    client_with_chat: TestClient, stub_chat: _StubChat,
+) -> None:
+    """Unknown session = empty array, status 200. The UI treats
+    'just-created session' the same as 'doesn't exist' — neither
+    has prior messages and both should land in the same
+    'show empty state' branch."""
+    # Stub returns empty list for any name.
+    stub_chat.history_messages = []
+    r = client_with_chat.get(
+        "/api/v1/chat/sessions/never-existed/history",
+        headers=_auth(),
+    )
+    assert r.status_code == 200
+    assert r.json() == {"messages": []}
+
+
+def test_history_requires_auth(client_with_chat: TestClient) -> None:
+    r = client_with_chat.get("/api/v1/chat/sessions/work/history")
+    assert r.status_code == 401
+
+
+def test_history_503_when_chat_disabled(client_no_chat: TestClient) -> None:
+    r = client_no_chat.get(
+        "/api/v1/chat/sessions/work/history", headers=_auth(),
+    )
+    assert r.status_code == 503
+
+
+def test_history_401_when_handler_returns_none(
+    client_with_chat: TestClient, stub_chat: _StubChat,
+) -> None:
+    """Handler returns None when user_id allow-list rejects —
+    shouldn't be reachable through the dashboard's token gate but
+    we forward as 401 to keep the contract honest."""
+    stub_chat.history_messages = None  # type: ignore[assignment]
+    r = client_with_chat.get(
+        "/api/v1/chat/sessions/work/history", headers=_auth(),
+    )
+    assert r.status_code == 401
 
 
 # ──────────────────────────────────────────────────────────────────

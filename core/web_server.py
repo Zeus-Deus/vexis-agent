@@ -1334,6 +1334,36 @@ class WebDashboard:
                 }
             )
 
+        @app.get(
+            "/api/v1/chat/sessions/{name}/history",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_chat_session_history(
+            name: str, limit: int = 50,
+        ) -> JSONResponse:
+            """Backfill prior turns for a session — populates the
+            chat pane on session switch so the user sees what was
+            said before instead of a blank conversation. Reads via
+            the brain's native store (claude-code JSONL or opencode
+            SQLite) through the existing ``Brain.iter_messages``
+            ABC method.
+
+            Empty array on unknown / empty sessions (200, not 404)
+            so the UI can treat 'switch to brand-new session' the
+            same as 'switch to empty stub' without branching.
+            """
+            chat = _chat_or_503()
+            # Cap the limit to prevent a malicious/buggy UI from
+            # asking for 1M messages and burning seconds reading the
+            # full JSONL. 500 is comfortably above any sane chat
+            # session length; users don't typically scroll past a
+            # few hundred turns of context.
+            capped = max(1, min(int(limit), 500))
+            messages = chat.history(name, limit=capped)
+            if messages is None:
+                raise HTTPException(401, "history rejected")
+            return JSONResponse({"messages": messages})
+
         @app.post(
             "/api/v1/chat/sessions/new",
             dependencies=[Depends(_require_auth)],

@@ -112,6 +112,15 @@ class WebChatTransport:
     async def delete_session(self, name: str) -> str | None:
         return await self._handler.handle_delete(self._user_id, name)
 
+    def history(self, name: str, limit: int = 50) -> list[dict] | None:
+        """Backfill the last ``limit`` turns of a named session for
+        the chat UI. Returns ``None`` only when the user_id allow-
+        list rejects (route maps to 401); empty list for unknown /
+        empty sessions (route returns 200 with empty messages).
+        Each entry: ``{role, content, ts}`` where ``ts`` is
+        unix milliseconds (matches the in-memory ChatMessage shape)."""
+        return self._handler.handle_history(self._user_id, name, limit=limit)
+
     def list_sessions(self) -> list[WebSessionInfo] | None:
         """Snapshot the session list in wire format. Returns ``None``
         only when the handler rejects the user_id (shouldn't happen

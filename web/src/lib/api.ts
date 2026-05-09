@@ -7,6 +7,7 @@ import type {
   ApproveSensitivePayload,
   BrowserState,
   AttachmentRef,
+  ChatHistoryState,
   ChatReply,
   ChatSessionsState,
   VoiceInfo,
@@ -232,6 +233,17 @@ export const api = {
     }),
   chatSessions: (token: string, signal?: AbortSignal) =>
     call<ChatSessionsState>(token, "/chat/sessions", { signal }),
+  // History backfill. Lazy-loaded on first switch into a session
+  // per page-load so the conversation pane shows prior turns
+  // instead of a blank canvas.
+  chatHistory: (
+    token: string, name: string, opts: { limit?: number; signal?: AbortSignal } = {},
+  ) =>
+    call<ChatHistoryState>(
+      token,
+      `/chat/sessions/${encodeURIComponent(name)}/history?limit=${opts.limit ?? 50}`,
+      { signal: opts.signal },
+    ),
   chatNewSession: (token: string, name?: string) =>
     call<ChatReply>(token, "/chat/sessions/new", {
       method: "POST",
