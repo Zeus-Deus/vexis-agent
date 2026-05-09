@@ -46,9 +46,9 @@ from pathlib import Path
 # Allow running as a plain script from any cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX  # noqa: E402
-from core.paths import learning_curator_archive_dir  # noqa: E402
-from core.transcripts import (  # noqa: E402
+from vexis_agent.core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX  # noqa: E402
+from vexis_agent.core.paths import learning_curator_archive_dir  # noqa: E402
+from vexis_agent.core.transcripts import (  # noqa: E402
     claude_session_jsonl_dir,
     iter_messages,
 )

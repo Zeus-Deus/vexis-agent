@@ -15,8 +15,8 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from core import tailscale
-from core.web_server import DashboardConfig, WebDashboard
+from vexis_agent.core import tailscale
+from vexis_agent.core.web_server import DashboardConfig, WebDashboard
 
 
 _TOKEN = "test-token-cafef00d"

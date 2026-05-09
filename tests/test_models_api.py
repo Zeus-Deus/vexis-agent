@@ -35,8 +35,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from core.running_tasks import RunningTasks
-from core.web_server import DashboardConfig, WebDashboard
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.web_server import DashboardConfig, WebDashboard
 
 
 _TOKEN = "test-token-models-cafef00d"
@@ -63,9 +63,9 @@ def _build_dashboard(
     # Redirect ~/.vexis/config.yaml to tmp.
     cfg_dir = tmp_path / "vexis"
     cfg_dir.mkdir()
-    monkeypatch.setattr("core.yaml_config.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.vexis_dir", lambda: cfg_dir)
     monkeypatch.setattr(
-        "core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
+        "vexis_agent.core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
     )
 
     dashboard = WebDashboard.__new__(WebDashboard)
@@ -397,7 +397,7 @@ def test_get_models_grouped_field_present_in_fallback_payload(
     def _explode(*_a, **_k):
         raise RuntimeError("synthetic blow-up")
     monkeypatch.setattr(
-        "core.model_validator.build_resolution_table", _explode,
+        "vexis_agent.core.model_validator.build_resolution_table", _explode,
     )
     r = client.get("/api/v1/models", headers=_hdr())
     data = r.json()
@@ -459,7 +459,7 @@ def test_get_models_handles_unexpected_payload_failure(
     def _explode(*_a, **_k):
         raise RuntimeError("synthetic blow-up")
     monkeypatch.setattr(
-        "core.model_validator.build_resolution_table", _explode,
+        "vexis_agent.core.model_validator.build_resolution_table", _explode,
     )
     r = client.get("/api/v1/models", headers=_hdr())
     assert r.status_code == 200
@@ -505,8 +505,8 @@ def test_contract_slash_status_and_api_share_resolution_data(
     # (without spinning up a Telegram update — we go direct to the
     # render function). Re-import inside the test so monkeypatched
     # config paths take effect.
-    from transports.telegram import TelegramTransport
-    from core.running_tasks import RunningTasks
+    from vexis_agent.transports.telegram import TelegramTransport
+    from vexis_agent.core.running_tasks import RunningTasks
     transport = TelegramTransport.__new__(TelegramTransport)
     transport._allowed_user_id = 1  # type: ignore[attr-defined]
     transport._running_tasks = RunningTasks()  # type: ignore[attr-defined]
@@ -519,7 +519,7 @@ def test_contract_slash_status_and_api_share_resolution_data(
     # the same rules in TS via ``formatConfiguredCell`` /
     # ``formatResolvesToCell``). Pin via the shared helper so any
     # drift surfaces as a contract violation.
-    from core.model_validator import format_resolution_display
+    from vexis_agent.core.model_validator import format_resolution_display
     for row in api_data["subsystems"]:
         name = row["name"]
         expected = format_resolution_display(
@@ -556,8 +556,8 @@ def test_contract_validator_findings_appear_in_both_surfaces(
     ] + [f for f in api_data["global_findings"] if f["severity"] == "error"]
     assert api_errors  # at least the rule-4 learning_review error
 
-    from transports.telegram import TelegramTransport
-    from core.running_tasks import RunningTasks
+    from vexis_agent.transports.telegram import TelegramTransport
+    from vexis_agent.core.running_tasks import RunningTasks
     transport = TelegramTransport.__new__(TelegramTransport)
     transport._allowed_user_id = 1  # type: ignore[attr-defined]
     transport._running_tasks = RunningTasks()  # type: ignore[attr-defined]

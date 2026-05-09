@@ -58,10 +58,10 @@ from pathlib import Path
 import psutil
 import pytest
 
-from core.brain.base import BrainCancelled
-from core.brain.opencode import OpenCodeBrain
-from core.running_tasks import RunningTasks
-from core.sessions import SessionStore
+from vexis_agent.core.brain.base import BrainCancelled
+from vexis_agent.core.brain.opencode import OpenCodeBrain
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
 
 
 pytestmark = pytest.mark.brain_smoke_opencode

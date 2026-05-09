@@ -12,7 +12,7 @@ from unittest import mock
 
 import pytest
 
-from core import yaml_config
+from vexis_agent.core import yaml_config
 
 
 # --------------------------------------------------------------------
@@ -76,7 +76,7 @@ def _patch_config(tmp_path: Path, body: str | None) -> None:
     def fake_vexis_dir() -> Path:
         return tmp_path
 
-    return mock.patch("core.yaml_config.vexis_dir", side_effect=fake_vexis_dir)
+    return mock.patch("vexis_agent.core.yaml_config.vexis_dir", side_effect=fake_vexis_dir)
 
 
 def test_model_brain_defaults_to_default_sentinel(tmp_path):

@@ -32,19 +32,19 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from core import model_discovery as md
-from core.brain.claude_code import ClaudeCodeBrain
-from core.brain.null import BrainNull
-from core.brain.opencode import OpenCodeBrain
-from core.model_validator import (
+from vexis_agent.core import model_discovery as md
+from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.null import BrainNull
+from vexis_agent.core.brain.opencode import OpenCodeBrain
+from vexis_agent.core.model_validator import (
     ValidationFinding,
     brain_instance_to_kind,
     build_resolution_table,
     check_brain_kind_consistency,
 )
-from core.running_tasks import RunningTasks
-from core.sessions import SessionStore
-from core.web_server import DashboardConfig, WebDashboard
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
+from vexis_agent.core.web_server import DashboardConfig, WebDashboard
 
 
 _TOKEN = "test-token-startup-validator"
@@ -202,10 +202,10 @@ def _build_dashboard(
     Day 5 ``running_brain_kind`` parameter."""
     cfg_dir = tmp_path / "vexis"
     cfg_dir.mkdir(exist_ok=True)
-    monkeypatch.setattr("core.paths.vexis_dir", lambda: cfg_dir)
-    monkeypatch.setattr("core.yaml_config.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.paths.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.vexis_dir", lambda: cfg_dir)
     monkeypatch.setattr(
-        "core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
+        "vexis_agent.core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
     )
 
     dashboard = WebDashboard.__new__(WebDashboard)
@@ -337,10 +337,10 @@ def test_slash_status_surfaces_canary(
     in the rendered text."""
     cfg_dir = tmp_path / "vexis"
     cfg_dir.mkdir()
-    monkeypatch.setattr("core.paths.vexis_dir", lambda: cfg_dir)
-    monkeypatch.setattr("core.yaml_config.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.paths.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.vexis_dir", lambda: cfg_dir)
     monkeypatch.setattr(
-        "core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
+        "vexis_agent.core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
     )
     _seed_config(
         cfg_dir / "config.yaml", "brain:\n  kind: opencode\n",
@@ -357,7 +357,7 @@ def test_slash_status_surfaces_canary(
         def __init__(self, brain):
             self._brain = brain
 
-    from transports.telegram import TelegramTransport
+    from vexis_agent.transports.telegram import TelegramTransport
     transport = TelegramTransport.__new__(TelegramTransport)
     transport._handler = _FakeHandler(brain)  # type: ignore[attr-defined]
     transport._allowed_user_id = 1  # type: ignore[attr-defined]
@@ -375,10 +375,10 @@ def test_slash_status_silent_when_brain_matches_disk(
     Slash text doesn't surface the canary."""
     cfg_dir = tmp_path / "vexis"
     cfg_dir.mkdir()
-    monkeypatch.setattr("core.paths.vexis_dir", lambda: cfg_dir)
-    monkeypatch.setattr("core.yaml_config.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.paths.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.vexis_dir", lambda: cfg_dir)
     monkeypatch.setattr(
-        "core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
+        "vexis_agent.core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
     )
     _seed_config(
         cfg_dir / "config.yaml", "brain:\n  kind: claude-code\n",
@@ -393,7 +393,7 @@ def test_slash_status_silent_when_brain_matches_disk(
         def __init__(self, brain):
             self._brain = brain
 
-    from transports.telegram import TelegramTransport
+    from vexis_agent.transports.telegram import TelegramTransport
     transport = TelegramTransport.__new__(TelegramTransport)
     transport._handler = _FakeHandler(brain)  # type: ignore[attr-defined]
     transport._allowed_user_id = 1  # type: ignore[attr-defined]

@@ -21,9 +21,9 @@ from pathlib import Path
 
 import pytest
 
-from core.coherence_judge import CoherenceVerdict
-from core.relationships.curator import RelationshipsCurator
-from core.relationships.store import (
+from vexis_agent.core.coherence_judge import CoherenceVerdict
+from vexis_agent.core.relationships.curator import RelationshipsCurator
+from vexis_agent.core.relationships.store import (
     Fact,
     Person,
     RelationshipsStore,
@@ -31,8 +31,8 @@ from core.relationships.store import (
     relationships_live_path,
     relationships_shadow_path,
 )
-from core.relationships.triggers import TriggerVerdict
-from core.transcripts import claude_session_jsonl_dir
+from vexis_agent.core.relationships.triggers import TriggerVerdict
+from vexis_agent.core.transcripts import claude_session_jsonl_dir
 
 
 @pytest.fixture

@@ -27,12 +27,12 @@ import json
 
 import pytest
 
-from core.model_discovery import (
+from vexis_agent.core.model_discovery import (
     _extract_claude_code_context_info,
     _extract_claude_code_reasoning_levels,
     _parse_claude_code_effort_help,
 )
-from core.web_server import WebDashboard
+from vexis_agent.core.web_server import WebDashboard
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -314,11 +314,11 @@ def test_picker_payload_includes_all_fields_for_claude_code(
     through to the picker payload. Pins the wire format so a UI
     refactor can't quietly drop a field."""
     monkeypatch.setattr(
-        "core.model_discovery.discover_claude_code_models",
+        "vexis_agent.core.model_discovery.discover_claude_code_models",
         lambda: {"claude-opus-4-7", "claude-haiku-4-5", "haiku"},
     )
     monkeypatch.setattr(
-        "core.model_discovery.discover_claude_code_capabilities",
+        "vexis_agent.core.model_discovery.discover_claude_code_capabilities",
         lambda: {
             "claude-opus-4-7": {
                 "reasoning_levels": ["low", "medium", "high", "max"],
@@ -360,11 +360,11 @@ def test_picker_payload_uniform_shape_across_brains(
     claude-code and opencode — both brains must produce the same
     keys in every entry."""
     monkeypatch.setattr(
-        "core.model_discovery.discover_opencode_models",
+        "vexis_agent.core.model_discovery.discover_opencode_models",
         lambda: {"anthropic/claude-sonnet-4-7", "openai/gpt-5", "bare-no-slash"},
     )
     monkeypatch.setattr(
-        "core.model_discovery.discover_opencode_capabilities",
+        "vexis_agent.core.model_discovery.discover_opencode_capabilities",
         lambda: {
             "anthropic/claude-sonnet-4-7": {
                 "reasoning_levels": ["low", "high"],
@@ -428,7 +428,7 @@ def test_picker_xhigh_surfaces_when_cli_advertises_it(
     # Stub the HTTP fetch + the CLI probe so the discovery can run
     # without network or subprocess.
     import io
-    import core.model_discovery as md
+    import vexis_agent.core.model_discovery as md
     md.invalidate_discovery_cache()
 
     class _FakeResp(io.BytesIO):
@@ -439,11 +439,11 @@ def test_picker_xhigh_surfaces_when_cli_advertises_it(
         lambda *a, **kw: _FakeResp(json.dumps(api_response).encode()),
     )
     monkeypatch.setattr(
-        "core.model_discovery._build_anthropic_request_headers",
+        "vexis_agent.core.model_discovery._build_anthropic_request_headers",
         lambda: {"Authorization": "Bearer test"},
     )
     monkeypatch.setattr(
-        "core.model_discovery._discover_claude_code_effort_levels_uncached",
+        "vexis_agent.core.model_discovery._discover_claude_code_effort_levels_uncached",
         lambda: ["low", "medium", "high", "xhigh", "max"],
     )
 
@@ -463,11 +463,11 @@ def test_picker_payload_handles_missing_capability_data(
     capabilities (e.g. discovery cache miss) should still appear
     with all fields set to safe defaults."""
     monkeypatch.setattr(
-        "core.model_discovery.discover_claude_code_models",
+        "vexis_agent.core.model_discovery.discover_claude_code_models",
         lambda: {"claude-orphan-model"},
     )
     monkeypatch.setattr(
-        "core.model_discovery.discover_claude_code_capabilities",
+        "vexis_agent.core.model_discovery.discover_claude_code_capabilities",
         lambda: {},  # capabilities cache empty / failed
     )
     out = WebDashboard._voice_call_mode_available_models_static("claude-code")
@@ -489,7 +489,7 @@ def test_opencode_parser_extracts_context_and_display_name() -> None:
     """The verbose output's ``limit.context`` becomes
     max_input_tokens, ``limit.output`` becomes max_tokens, ``name``
     becomes display_name. Pin the schema mapping."""
-    from core.model_discovery import _parse_opencode_verbose
+    from vexis_agent.core.model_discovery import _parse_opencode_verbose
     raw = """anthropic/claude-test
 {
   "id": "claude-test",
@@ -520,7 +520,7 @@ def test_opencode_parser_extracts_provider_and_free_badge() -> None:
     that need a Copilot subscription, openrouter freebies that
     bill against the user's own OpenRouter key) do NOT get the
     badge because they're not universally free."""
-    from core.model_discovery import _parse_opencode_verbose
+    from vexis_agent.core.model_discovery import _parse_opencode_verbose
     raw = """opencode/free-model
 {
   "id": "free-model",
@@ -564,7 +564,7 @@ def test_opencode_free_badge_only_on_opencode_provider() -> None:
     NOT free because the user pays via their OpenRouter API key.
     Both must NOT carry the badge.
     """
-    from core.model_discovery import _parse_opencode_verbose
+    from vexis_agent.core.model_discovery import _parse_opencode_verbose
     raw = """github-copilot/claude-haiku-4.5
 {
   "id": "claude-haiku-4.5",
@@ -607,7 +607,7 @@ def test_opencode_picker_sorts_free_first(
     order is preserved (sorted is stable). 237 models is too many
     to scroll through, so floating the free tier saves a scroll."""
     monkeypatch.setattr(
-        "core.model_discovery.discover_opencode_models",
+        "vexis_agent.core.model_discovery.discover_opencode_models",
         lambda: {
             "openrouter/zzz-model",
             "opencode/aaa-free",
@@ -617,7 +617,7 @@ def test_opencode_picker_sorts_free_first(
         },
     )
     monkeypatch.setattr(
-        "core.model_discovery.discover_opencode_capabilities",
+        "vexis_agent.core.model_discovery.discover_opencode_capabilities",
         lambda: {
             "opencode/aaa-free": {
                 "provider": "opencode", "free": True,
@@ -657,7 +657,7 @@ def test_opencode_parser_falls_back_to_id_prefix_when_provider_missing() -> None
     """Older opencode versions might omit ``providerID``. Fall back
     to the prefix in the full id (everything before the first ``/``)
     so the picker still gets a provider tag."""
-    from core.model_discovery import _parse_opencode_verbose
+    from vexis_agent.core.model_discovery import _parse_opencode_verbose
     raw = """legacy-provider/model-x
 {
   "id": "model-x",
@@ -677,7 +677,7 @@ def test_opencode_parser_partial_zero_cost_not_free() -> None:
     """A model with input=0 but output>0 is NOT free — covers
     weird cache-only freebies and prevents accidental "free" badges
     on models that charge for output."""
-    from core.model_discovery import _parse_opencode_verbose
+    from vexis_agent.core.model_discovery import _parse_opencode_verbose
     raw = """oddprovider/cache-only
 {
   "id": "cache-only",
@@ -694,7 +694,7 @@ def test_opencode_parser_partial_zero_cost_not_free() -> None:
 def test_opencode_parser_handles_missing_limits() -> None:
     """A model entry without a ``limit`` block must not crash —
     just leaves the token fields as None."""
-    from core.model_discovery import _parse_opencode_verbose
+    from vexis_agent.core.model_discovery import _parse_opencode_verbose
     raw = """opencode/lite
 {
   "id": "lite",

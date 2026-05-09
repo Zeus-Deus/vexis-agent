@@ -23,11 +23,11 @@ from typing import AsyncIterator
 import pytest
 from fastapi.testclient import TestClient
 
-from core.brain.null import BrainNull
-from core.handler import MessageHandler
-from core.sessions import SessionStore
-from core.web_server import DashboardConfig, WebDashboard
-from transports.web import WebChatTransport, _truncate_preview
+from vexis_agent.core.brain.null import BrainNull
+from vexis_agent.core.handler import MessageHandler
+from vexis_agent.core.sessions import SessionStore
+from vexis_agent.core.web_server import DashboardConfig, WebDashboard
+from vexis_agent.transports.web import WebChatTransport, _truncate_preview
 
 
 _TOKEN = "test-token-stream-cafef00d"
@@ -357,7 +357,7 @@ def test_handler_stream_emits_dict_error_with_code(tmp_path: Path) -> None:
     chat UI can pick a per-error recovery affordance. Pin the
     BrainTimeoutError → ``brain_timeout`` mapping; same shape
     expected for BrainError / SessionLost / generic Exception."""
-    from core.brain.base import BrainTimeoutError
+    from vexis_agent.core.brain.base import BrainTimeoutError
 
     class TimeyBrain(BrainNull):
         async def astream(
@@ -403,7 +403,7 @@ def test_handler_stream_emits_dict_error_with_code(tmp_path: Path) -> None:
 def test_stream_route_error_frame_includes_code(tmp_path: Path) -> None:
     """End-to-end: SSE route serializes the dict error payload as
     ``data: {"type":"error","code":"...","message":"..."}``."""
-    from core.brain.base import BrainError
+    from vexis_agent.core.brain.base import BrainError
 
     class CrashBrain(BrainNull):
         async def astream(

@@ -20,15 +20,15 @@ from pathlib import Path
 
 import pytest
 
-from core.voice import (
+from vexis_agent.core.voice import (
     STTUnavailable,
     TTSUnavailable,
     stt_provider,
     tts_provider,
     voice_enabled,
 )
-from core.voice.null import NullSTT, NullTTS
-from core.voice.piper import PiperTTS
+from vexis_agent.core.voice.null import NullSTT, NullTTS
+from vexis_agent.core.voice.piper import PiperTTS
 
 
 def _write_config(path: Path, body: str) -> None:
@@ -40,7 +40,7 @@ def vexis_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect ~/.vexis/config.yaml to tmp so tests don't touch
     the real one. Returns the path so each test can rewrite it."""
     cfg = tmp_path / "config.yaml"
-    monkeypatch.setattr("core.yaml_config._config_path", lambda: cfg)
+    monkeypatch.setattr("vexis_agent.core.yaml_config._config_path", lambda: cfg)
     return cfg
 
 
@@ -85,7 +85,7 @@ def test_voxtype_resolves_when_enabled(vexis_config: Path) -> None:
         vexis_config,
         "voice:\n  enabled: true\n  stt:\n    provider: voxtype\n",
     )
-    from core.voice.voxtype_provider import VoxtypeSTT
+    from vexis_agent.core.voice.voxtype_provider import VoxtypeSTT
     provider = stt_provider()
     assert isinstance(provider, VoxtypeSTT)
     assert provider.name == "voxtype"
@@ -132,7 +132,7 @@ def test_explicit_null_provider(vexis_config: Path) -> None:
         "  stt:\n    provider: voxtype\n"
         "  tts:\n    provider: null\n",
     )
-    from core.voice.voxtype_provider import VoxtypeSTT
+    from vexis_agent.core.voice.voxtype_provider import VoxtypeSTT
     assert isinstance(stt_provider(), VoxtypeSTT)
     assert isinstance(tts_provider(), NullTTS)
 
@@ -188,7 +188,7 @@ def test_piper_empty_text_returns_empty_bytes(tmp_path: Path) -> None:
 
 def test_looks_like_piper_tts_accepts_real_piper(tmp_path: Path) -> None:
     """Script wrapper that imports the piper module → accepted."""
-    from core.voice.piper import _looks_like_piper_tts
+    from vexis_agent.core.voice.piper import _looks_like_piper_tts
     fake = tmp_path / "piper"
     fake.write_text(
         "#!/usr/bin/env python3\n"
@@ -200,7 +200,7 @@ def test_looks_like_piper_tts_accepts_real_piper(tmp_path: Path) -> None:
 
 def test_looks_like_piper_tts_rejects_gtk_gaming_mouse(tmp_path: Path) -> None:
     """The Arch gaming-mouse ``piper`` (GTK app) imports gi → rejected."""
-    from core.voice.piper import _looks_like_piper_tts
+    from vexis_agent.core.voice.piper import _looks_like_piper_tts
     fake = tmp_path / "piper"
     fake.write_text(
         "#!/usr/bin/env python3\n"
@@ -214,7 +214,7 @@ def test_looks_like_piper_tts_rejects_gtk_gaming_mouse(tmp_path: Path) -> None:
 def test_looks_like_piper_tts_accepts_elf_binary(tmp_path: Path) -> None:
     """Standalone Piper builds are ELF binaries — accepted by magic
     bytes since they aren't the Python GTK wrapper."""
-    from core.voice.piper import _looks_like_piper_tts
+    from vexis_agent.core.voice.piper import _looks_like_piper_tts
     fake = tmp_path / "piper"
     # ELF magic; rest is junk but the validator only reads the head.
     fake.write_bytes(b"\x7fELF\x02\x01\x01" + b"\x00" * 100)
@@ -223,7 +223,7 @@ def test_looks_like_piper_tts_accepts_elf_binary(tmp_path: Path) -> None:
 
 def test_looks_like_piper_tts_rejects_unknown_script(tmp_path: Path) -> None:
     """A random Python script that isn't piper-tts shouldn't pass."""
-    from core.voice.piper import _looks_like_piper_tts
+    from vexis_agent.core.voice.piper import _looks_like_piper_tts
     fake = tmp_path / "thing"
     fake.write_text("#!/usr/bin/env python3\nprint('hi')\n")
     assert _looks_like_piper_tts(str(fake)) is False
@@ -234,7 +234,7 @@ def test_resolve_piper_binary_trusts_explicit_unconditionally() -> None:
     return it. The PiperTTS subprocess will fail loudly later if the
     pin was wrong; trusting the override matches every other pinnable
     config knob in vexis."""
-    from core.voice.piper import _resolve_piper_binary
+    from vexis_agent.core.voice.piper import _resolve_piper_binary
     assert _resolve_piper_binary("/some/explicit/path") == "/some/explicit/path"
 
 
@@ -282,7 +282,7 @@ def test_resolve_piper_binary_returns_none_when_nothing_found(
 ) -> None:
     """No PATH entry, no conda envs, no pip install → None. The
     PiperTTS provider then raises TTSUnavailable with a clear hint."""
-    from core.voice import piper as piper_mod
+    from vexis_agent.core.voice import piper as piper_mod
     monkeypatch.setattr(piper_mod.shutil, "which", lambda _name: None)
     # Point HOME at a tmp dir with no conda envs.
     monkeypatch.setattr(piper_mod.Path, "home", staticmethod(lambda: tmp_path))
@@ -303,7 +303,7 @@ def test_provider_hot_reload(vexis_config: Path) -> None:
         vexis_config,
         "voice:\n  enabled: true\n  stt:\n    provider: voxtype\n",
     )
-    from core.voice.voxtype_provider import VoxtypeSTT
+    from vexis_agent.core.voice.voxtype_provider import VoxtypeSTT
     assert isinstance(stt_provider(), VoxtypeSTT)
     # Flip back off; same again.
     _write_config(vexis_config, "voice:\n  enabled: false\n")

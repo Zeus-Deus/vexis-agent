@@ -15,9 +15,9 @@ from pathlib import Path
 
 import pytest
 
-from core import learning_curator as lc
-from core.learning_curator import LearningController, ReviewRecord, ReviewedStore
-from core.transcripts import claude_session_jsonl_dir, iter_messages
+from vexis_agent.core import learning_curator as lc
+from vexis_agent.core.learning_curator import LearningController, ReviewRecord, ReviewedStore
+from vexis_agent.core.transcripts import claude_session_jsonl_dir, iter_messages
 
 
 # ``review_fn`` injected into LearningController so tests don't spawn
@@ -355,9 +355,9 @@ def test_review_one_tracks_spawned_uuids(env, monkeypatch):
     seeded JSONLs — the default ``BrainNull`` knows about no
     sessions.
     """
-    from core.brain.claude_code import ClaudeCodeBrain
-    from core.running_tasks import RunningTasks
-    from core.sessions import SessionStore
+    from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+    from vexis_agent.core.running_tasks import RunningTasks
+    from vexis_agent.core.sessions import SessionStore
 
     workspace = env
     _stage_session(workspace, "abandoned", "2026-05-02T10:00:00Z")
@@ -575,7 +575,7 @@ def test_real_review_returns_skipped_outcome_for_oversized(env, monkeypatch):
     Uses many ~5KB messages so the tail-read still finds a recent
     timestamp (an individual message larger than the tail-read window
     would hide it — see test_oversized_single_message_caveat below)."""
-    from core import learning_review as lr
+    from vexis_agent.core import learning_review as lr
 
     workspace = env
     pdir = claude_session_jsonl_dir(workspace)
@@ -598,7 +598,7 @@ def test_real_review_returns_skipped_outcome_for_oversized(env, monkeypatch):
     # mediates spawns. An empty BrainNull would raise on exhaustion
     # if anything spawned — same fail-loud guarantee as the old
     # AssertionError, just routed through the brain.
-    from core.brain.null import BrainNull
+    from vexis_agent.core.brain.null import BrainNull
 
     monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=12))
     controller = LearningController(workspace=workspace, brain=BrainNull())
@@ -616,7 +616,7 @@ def test_real_review_triage_no_skips_sonnet_end_to_end(env, monkeypatch):
     returns NO finishes the tick without ever spawning sonnet, and
     the recorded outcome distinguishes triage-skipped from a
     full-review nothing-to-save."""
-    from core import learning_review as lr
+    from vexis_agent.core import learning_review as lr
 
     workspace = env
     _stage_session(workspace, "skim-me", "2026-05-02T10:00:00Z")
@@ -629,8 +629,8 @@ def test_real_review_triage_no_skips_sonnet_end_to_end(env, monkeypatch):
     # raises AssertionError, which is the same fail-loud guarantee
     # the pre-Phase-B ``raise AssertionError("sonnet must not be
     # called")`` provided).
-    from core.brain.base import AuxResult
-    from core.brain.null import BrainNull
+    from vexis_agent.core.brain.base import AuxResult
+    from vexis_agent.core.brain.null import BrainNull
 
     # Triage NO → sonnet should NOT fire. The relationships extractor
     # also runs per tick (commit 6) and consumes one AuxResult; pre-
@@ -664,7 +664,7 @@ def test_real_review_triage_yes_runs_sonnet_end_to_end(env, monkeypatch):
     (here also nothing-to-save, but via the full path so the outcome
     string is the legacy 'nothing to save' without the (triage)
     suffix)."""
-    from core import learning_review as lr
+    from vexis_agent.core import learning_review as lr
 
     workspace = env
     _stage_session(workspace, "look-deeper", "2026-05-02T10:00:00Z")
@@ -672,8 +672,8 @@ def test_real_review_triage_yes_runs_sonnet_end_to_end(env, monkeypatch):
 
     # Phase B: pre-load BrainNull with two AuxResults — triage YES
     # then sonnet's "Nothing to save."
-    from core.brain.base import AuxResult
-    from core.brain.null import BrainNull
+    from vexis_agent.core.brain.base import AuxResult
+    from vexis_agent.core.brain.null import BrainNull
 
     # Triage YES (call 1) → sonnet "Nothing to save." (call 2) →
     # extractor empty JSON (call 3, runs after review per tick order).
@@ -725,7 +725,7 @@ def test_oversized_single_message_invisible_to_tail_read(env):
         "message": {"role": "user", "content": massive_text},
     }) + "\n", encoding="utf-8")
 
-    from core.transcripts import iter_session_metas
+    from vexis_agent.core.transcripts import iter_session_metas
     metas = list(iter_session_metas(workspace))
     assert len(metas) == 1
     # Last message timestamp is None — tail-read missed it.
@@ -741,14 +741,14 @@ def _make_review_output_with(lessons: list[dict]):
     """Build a minimal ReviewOutput carrying ``lessons`` as the
     verified set. Lets us drive ``_write_verified`` directly without
     spinning up the full review subprocess."""
-    from core.learning_review import ReviewOutput
+    from vexis_agent.core.learning_review import ReviewOutput
     return ReviewOutput(verified_lessons=lessons)
 
 
 def _meta(uuid: str = "sess-1") -> "SessionMeta":
     """Minimal SessionMeta for dispatcher tests. The dispatcher only
     reads ``session_uuid`` (Day 3 onwards, for the IDENTITY queue)."""
-    from core.transcripts import SessionMeta
+    from vexis_agent.core.transcripts import SessionMeta
     return SessionMeta(
         session_uuid=uuid,
         jsonl_path=Path(f"/tmp/{uuid}.jsonl"),
@@ -782,7 +782,7 @@ def test_dispatcher_routes_procedural_s3_to_staging(env):
     )
     assert written.written == 1
     # The actual content lives in the staging tree:
-    from core.learning_writes import shadow_skills_root
+    from vexis_agent.core.learning_writes import shadow_skills_root
     staged = shadow_skills_root(workspace) / "time-bound-listings" / "SKILL.md"
     assert staged.exists()
     assert "origin: learning-curator" in staged.read_text(encoding="utf-8")
@@ -798,8 +798,8 @@ def test_dispatcher_routes_procedural_s1_to_staging(env):
     """A PROCEDURAL/S1 patch stages a SKILL.md mutation in .shadow/."""
     workspace = env
     # Set up a live skill the patch can target:
-    from core.skills import create_skill
-    from core.paths import skills_dir
+    from vexis_agent.core.skills import create_skill
+    from vexis_agent.core.paths import skills_dir
     create_skill(
         skills_dir(workspace),
         "comm-style",
@@ -824,13 +824,13 @@ def test_dispatcher_routes_procedural_s1_to_staging(env):
         workspace, _make_review_output_with([lesson]), meta=_meta(), shadow=True
     )
     assert written.written == 1
-    from core.learning_writes import shadow_skills_root
+    from vexis_agent.core.learning_writes import shadow_skills_root
     staged = shadow_skills_root(workspace) / "comm-style" / "SKILL.md"
     assert staged.exists()
     body = staged.read_text(encoding="utf-8")
     assert "## Brevity" in body
     # Live skill is unchanged (Day 2 never writes live):
-    from core.paths import skills_dir as sd
+    from vexis_agent.core.paths import skills_dir as sd
     live = (sd(workspace) / "comm-style" / "SKILL.md").read_text(encoding="utf-8")
     assert "## Brevity" not in live
     # Audit shadow records both the lesson and the staging path:
@@ -857,7 +857,7 @@ def test_dispatcher_routes_situational_to_memory_shadow(env):
     assert "Class: SITUATIONAL" in audit
     assert "Hetzner" in audit
     # No skill staging happened:
-    from core.learning_writes import list_staged_skills
+    from vexis_agent.core.learning_writes import list_staged_skills
     assert list_staged_skills(workspace) == []
 
 
@@ -889,8 +889,8 @@ def test_dispatcher_identity_first_observation_queues_no_write(env):
     user_shadow = workspace / "memories" / "USER-SHADOW.md"
     assert not user_shadow.exists()
     # Queue file got the candidate:
-    from core.user_candidates import UserCandidateStore
-    from core.paths import user_candidates_path
+    from vexis_agent.core.user_candidates import UserCandidateStore
+    from vexis_agent.core.paths import user_candidates_path
     queue = UserCandidateStore(user_candidates_path()).list_all()
     assert len(queue) == 1
     assert queue[0].claim == "User prefers concise responses."
@@ -939,8 +939,8 @@ def test_dispatcher_identity_second_session_promotes(env):
     audit = (workspace / "memories" / "MEMORY-SHADOW.md").read_text(encoding="utf-8")
     assert "promoted to USER-SHADOW.md" in audit
     # Queue marks the claim promoted:
-    from core.user_candidates import UserCandidateStore
-    from core.paths import user_candidates_path
+    from vexis_agent.core.user_candidates import UserCandidateStore
+    from vexis_agent.core.paths import user_candidates_path
     queue = UserCandidateStore(user_candidates_path()).get(
         "User prefers concise responses."
     )
@@ -980,8 +980,8 @@ def test_dispatcher_identity_alias_path_attaches_to_existing_claim(env):
     assert "User prefers concise responses for direct factual questions." in body
     assert "User wants tight, no-preamble answers" not in body
     # Queue has only one entry:
-    from core.user_candidates import UserCandidateStore
-    from core.paths import user_candidates_path
+    from vexis_agent.core.user_candidates import UserCandidateStore
+    from vexis_agent.core.paths import user_candidates_path
     queue = UserCandidateStore(user_candidates_path()).list_all()
     assert len(queue) == 1
 
@@ -992,8 +992,8 @@ def test_housekeeping_expires_stale_user_candidates_periodically(env, monkeypatc
     older than the window are removed. Promoted claims are retained
     even when stale (audit trail)."""
     workspace = env
-    from core.paths import user_candidates_path
-    from core.user_candidates import UserCandidateStore, DEFAULT_WINDOW
+    from vexis_agent.core.paths import user_candidates_path
+    from vexis_agent.core.user_candidates import UserCandidateStore, DEFAULT_WINDOW
     # Seed a stale unpromoted claim and a stale-but-promoted claim.
     store = UserCandidateStore(user_candidates_path())
     far_past = _utc(hour=10) - DEFAULT_WINDOW - timedelta(days=1)
@@ -1046,7 +1046,7 @@ def test_tick_report_includes_write_summary_fields(env, monkeypatch):
     controller.run_now()
 
     # Most-recent log dir
-    from core.paths import learning_logs_dir
+    from vexis_agent.core.paths import learning_logs_dir
     tick_dirs = sorted(learning_logs_dir().iterdir(), reverse=True)
     assert tick_dirs, "expected at least one tick log dir"
     report_md = (tick_dirs[0] / "REPORT.md").read_text(encoding="utf-8")
@@ -1069,8 +1069,8 @@ def test_audit_text_surfaces_curator_authored_skills(env, monkeypatch):
     ``origin: learning-curator*`` in their YAML frontmatter so the
     user can see what's been promoted vs hand-authored."""
     workspace = env
-    from core.skills import create_skill
-    from core.paths import skills_dir
+    from vexis_agent.core.skills import create_skill
+    from vexis_agent.core.paths import skills_dir
     create_skill(
         skills_dir(workspace),
         "curator-made",
@@ -1099,8 +1099,8 @@ def test_audit_text_surfaces_user_candidate_queue(env, monkeypatch):
     """Day 5: /learning audit shows pending USER claims with
     distinct-session count and days-until-expiry."""
     workspace = env
-    from core.user_candidates import UserCandidateStore
-    from core.paths import user_candidates_path
+    from vexis_agent.core.user_candidates import UserCandidateStore
+    from vexis_agent.core.paths import user_candidates_path
     store = UserCandidateStore(user_candidates_path())
     store.add_occurrence("User prefers terse responses.", "sess-1", "ev",
                          now=_utc(hour=10))
@@ -1290,7 +1290,7 @@ def test_run_json_persists_by_tier_for_aggregation(env, monkeypatch):
     _stage_session(workspace, "tick-a", "2026-05-02T10:00:00Z")
     LearningController(workspace=workspace, review_fn=stub).run_now()
 
-    from core.paths import learning_logs_dir
+    from vexis_agent.core.paths import learning_logs_dir
     tick_dirs = sorted(learning_logs_dir().iterdir())
     assert len(tick_dirs) == 1
     payload = json.loads((tick_dirs[0] / "run.json").read_text(encoding="utf-8"))
@@ -1375,8 +1375,8 @@ def test_dispatcher_identity_overlap_gate_collapses_paraphrase_shorter_to_longer
     }
     lc._write_verified(workspace, _make_review_output_with([shorter]),
                        meta=_meta("sess-2"), shadow=True)
-    from core.user_candidates import UserCandidateStore
-    from core.paths import user_candidates_path
+    from vexis_agent.core.user_candidates import UserCandidateStore
+    from vexis_agent.core.paths import user_candidates_path
     queue = UserCandidateStore(user_candidates_path()).list_all()
     # Single accumulator under the longer (existing) claim text:
     assert len(queue) == 1, (
@@ -1411,8 +1411,8 @@ def test_dispatcher_identity_overlap_gate_collapses_paraphrase_longer_to_shorter
     }
     lc._write_verified(workspace, _make_review_output_with([longer]),
                        meta=_meta("sess-2"), shadow=True)
-    from core.user_candidates import UserCandidateStore
-    from core.paths import user_candidates_path
+    from vexis_agent.core.user_candidates import UserCandidateStore
+    from vexis_agent.core.paths import user_candidates_path
     queue = UserCandidateStore(user_candidates_path()).list_all()
     # Single accumulator under the SHORTER (existing) claim text —
     # the gate folds into whichever was already in the queue:
@@ -1467,8 +1467,8 @@ def test_dispatcher_identity_no_overlap_creates_separate_claims(env):
                        meta=_meta("sess-1"), shadow=True)
     lc._write_verified(workspace, _make_review_output_with([b]),
                        meta=_meta("sess-2"), shadow=True)
-    from core.user_candidates import UserCandidateStore
-    from core.paths import user_candidates_path
+    from vexis_agent.core.user_candidates import UserCandidateStore
+    from vexis_agent.core.paths import user_candidates_path
     queue = UserCandidateStore(user_candidates_path()).list_all()
     assert len(queue) == 2
     assert {c.claim for c in queue} == {a["lesson"], b["lesson"]}
@@ -1505,8 +1505,8 @@ def test_dispatcher_identity_overlap_does_not_override_explicit_alias(env):
     }
     lc._write_verified(workspace, _make_review_output_with([aliased]),
                        meta=_meta("sess-2"), shadow=True)
-    from core.user_candidates import UserCandidateStore
-    from core.paths import user_candidates_path
+    from vexis_agent.core.user_candidates import UserCandidateStore
+    from vexis_agent.core.paths import user_candidates_path
     queue = UserCandidateStore(user_candidates_path()).list_all()
     # One claim, threshold met, promoted (the alias won):
     assert len(queue) == 1
@@ -1528,8 +1528,8 @@ def test_dispatcher_identity_alias_to_unknown_claim_falls_back_to_fresh(env):
         "target": {"user_claim_alias": "Nonexistent claim that was never seen."},
     }
     lc._write_verified(workspace, _make_review_output_with([lesson]), meta=_meta("sess-1"), shadow=True)
-    from core.user_candidates import UserCandidateStore
-    from core.paths import user_candidates_path
+    from vexis_agent.core.user_candidates import UserCandidateStore
+    from vexis_agent.core.paths import user_candidates_path
     queue = UserCandidateStore(user_candidates_path()).list_all()
     # Fresh claim under the lesson's own text:
     assert len(queue) == 1
@@ -1543,8 +1543,8 @@ def test_dispatcher_records_failed_stage_in_audit(env):
     increment the written count."""
     workspace = env
     # Set up a live collision so the S3 stage will refuse:
-    from core.skills import create_skill
-    from core.paths import skills_dir
+    from vexis_agent.core.skills import create_skill
+    from vexis_agent.core.paths import skills_dir
     create_skill(
         skills_dir(workspace),
         "occupied-name",
@@ -1622,8 +1622,8 @@ def test_format_lesson_entry_legacy_v1_shape_renders():
 from datetime import datetime as _datetime, timezone as _timezone
 from unittest import mock
 
-from core.coherence_judge import CoherenceVerdict
-from core.transcripts import TranscriptMessage as _TranscriptMessage
+from vexis_agent.core.coherence_judge import CoherenceVerdict
+from vexis_agent.core.transcripts import TranscriptMessage as _TranscriptMessage
 
 
 def _tmsg(role: str, text: str, *, ts: str = "2026-05-02T10:00:00Z",
@@ -1663,7 +1663,7 @@ def test_coherence_coherent_verdict_silent_in_shadow(env):
     lesson = _proc_lesson()
     messages = [_tmsg("user", "do Y please")]
     with mock.patch(
-        "core.learning_curator.run_coherence_judge",
+        "vexis_agent.core.learning_curator.run_coherence_judge",
         return_value=CoherenceVerdict.coherent(),
     ) as judge_mock:
         summary = lc._write_verified(
@@ -1699,7 +1699,7 @@ def test_coherence_incoherent_verdict_annotates_shadow(env):
         explanation="evidence is about Tailscale; lesson is about Python",
     )
     with mock.patch(
-        "core.learning_curator.run_coherence_judge",
+        "vexis_agent.core.learning_curator.run_coherence_judge",
         return_value=verdict,
     ):
         summary = lc._write_verified(
@@ -1736,7 +1736,7 @@ def test_coherence_near_miss_verdict_annotates_shadow(env):
         explanation="evidence is one tactical exchange",
     )
     with mock.patch(
-        "core.learning_curator.run_coherence_judge",
+        "vexis_agent.core.learning_curator.run_coherence_judge",
         return_value=verdict,
     ):
         summary = lc._write_verified(
@@ -1761,7 +1761,7 @@ def test_coherence_skipped_when_messages_empty(env):
     workspace = env
     lesson = _proc_lesson()
     with mock.patch(
-        "core.learning_curator.run_coherence_judge"
+        "vexis_agent.core.learning_curator.run_coherence_judge"
     ) as judge_mock:
         # No messages kwarg → judge not called
         lc._write_verified(
@@ -1808,7 +1808,7 @@ def test_coherence_summary_aggregates_across_lessons(env):
         ),
     ]
     with mock.patch(
-        "core.learning_curator.run_coherence_judge",
+        "vexis_agent.core.learning_curator.run_coherence_judge",
         side_effect=verdicts,
     ):
         summary = lc._write_verified(
@@ -2157,7 +2157,7 @@ def test_coherence_audit_text_judges_shadow_entries(env):
         ),
     ]
     with mock.patch(
-        "core.learning_curator.run_coherence_judge",
+        "vexis_agent.core.learning_curator.run_coherence_judge",
         side_effect=verdicts,
     ) as judge_mock:
         out = controller._coherence_audit_text(shadow_only=True)
@@ -2220,7 +2220,7 @@ def test_coherence_audit_skips_live_when_shadow_only(env):
         encoding="utf-8",
     )
     with mock.patch(
-        "core.learning_curator.run_coherence_judge",
+        "vexis_agent.core.learning_curator.run_coherence_judge",
         return_value=CoherenceVerdict.coherent(),
     ) as judge_mock:
         controller._coherence_audit_text(shadow_only=True)
@@ -2250,7 +2250,7 @@ def test_coherence_audit_includes_live_when_not_shadow_only(env):
         encoding="utf-8",
     )
     with mock.patch(
-        "core.learning_curator.run_coherence_judge",
+        "vexis_agent.core.learning_curator.run_coherence_judge",
         return_value=CoherenceVerdict.coherent(),
     ) as judge_mock:
         controller._coherence_audit_text(shadow_only=False)
@@ -2269,7 +2269,7 @@ def test_handle_telegram_dispatches_coherence_audit_subcommand(env):
         encoding="utf-8",
     )
     with mock.patch(
-        "core.learning_curator.run_coherence_judge",
+        "vexis_agent.core.learning_curator.run_coherence_judge",
         return_value=CoherenceVerdict.coherent(),
     ):
         out = asyncio.run(
@@ -2309,7 +2309,7 @@ def test_end_to_end_coherent_then_incoherent_through_pipeline(env):
 
     # Tick A: COHERENT
     with mock.patch(
-        "core.learning_curator.run_coherence_judge",
+        "vexis_agent.core.learning_curator.run_coherence_judge",
         return_value=CoherenceVerdict.coherent(),
     ):
         s_a = lc._write_verified(
@@ -2333,7 +2333,7 @@ def test_end_to_end_coherent_then_incoherent_through_pipeline(env):
         "lesson is about Z; evidence cites W",
     )
     with mock.patch(
-        "core.learning_curator.run_coherence_judge",
+        "vexis_agent.core.learning_curator.run_coherence_judge",
         return_value=inc_verdict,
     ):
         s_b = lc._write_verified(

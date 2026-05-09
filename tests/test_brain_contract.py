@@ -47,7 +47,7 @@ from pathlib import Path
 
 import pytest
 
-from core.brain.base import (
+from vexis_agent.core.brain.base import (
     AuxResult,
     Brain,
     BrainAuthRequired,
@@ -66,11 +66,11 @@ from core.brain.base import (
     ToolEnd,
     ToolStart,
 )
-from core.brain.claude_code import ClaudeCodeBrain
-from core.brain.null import BrainNull
-from core.brain.opencode import OpenCodeBrain
-from core.running_tasks import RunningTasks
-from core.sessions import SessionStore
+from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.null import BrainNull
+from vexis_agent.core.brain.opencode import OpenCodeBrain
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -361,7 +361,7 @@ def test_claude_code_spawn_aux_argv_shape_with_tier(
         captured["timeout"] = kwargs.get("timeout")
         return _FakeCP()
 
-    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.claude_code.subprocess.run", _fake_run)
     result = asyncio.run(
         claude_brain.spawn_aux(
             "test prompt",
@@ -402,7 +402,7 @@ def test_claude_code_spawn_aux_allow_tools_adds_permission_flag(
         captured["argv"] = list(argv)
         return _FakeCP()
 
-    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.claude_code.subprocess.run", _fake_run)
     asyncio.run(claude_brain.spawn_aux("p", model_tier=None, allow_tools=True))
     assert "--permission-mode" in captured["argv"]
     perm_idx = captured["argv"].index("--permission-mode")
@@ -425,7 +425,7 @@ def test_claude_code_spawn_aux_no_tier_omits_model_flag(
         captured["argv"] = list(argv)
         return _FakeCP()
 
-    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.claude_code.subprocess.run", _fake_run)
     asyncio.run(claude_brain.spawn_aux("p"))  # tier=None
     assert "--model" not in captured["argv"]
 
@@ -448,7 +448,7 @@ def test_claude_code_spawn_aux_legacy_raw_model_passes_through(
         captured["argv"] = list(argv)
         return _FakeCP()
 
-    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.claude_code.subprocess.run", _fake_run)
     asyncio.run(claude_brain.spawn_aux("p", model_tier="haiku"))
     assert "--model" in captured["argv"]
     model_idx = captured["argv"].index("--model")
@@ -465,7 +465,7 @@ def test_claude_code_spawn_aux_timeout_raises_brain_timeout(
     def _fake_run(argv, **kwargs):
         raise subprocess_module.TimeoutExpired(cmd=argv, timeout=1.0)
 
-    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.claude_code.subprocess.run", _fake_run)
     with pytest.raises(BrainTimeoutError, match="timed out"):
         asyncio.run(claude_brain.spawn_aux("p", timeout_seconds=1.0))
 
@@ -478,7 +478,7 @@ def test_claude_code_spawn_aux_missing_binary_raises_not_installed(
     def _fake_run(argv, **kwargs):
         raise FileNotFoundError("[Errno 2] No such file: 'claude'")
 
-    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.claude_code.subprocess.run", _fake_run)
     with pytest.raises(BrainNotInstalled, match="not on PATH"):
         asyncio.run(claude_brain.spawn_aux("p"))
 
@@ -498,7 +498,7 @@ def test_claude_code_spawn_aux_returns_nonzero_returncode_without_raising(
     def _fake_run(argv, **kwargs):
         return _FakeCP()
 
-    monkeypatch.setattr("core.brain.claude_code.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.claude_code.subprocess.run", _fake_run)
     result = asyncio.run(claude_brain.spawn_aux("p"))
     assert result.returncode == 2
     assert "claude said no" in result.stderr

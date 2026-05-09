@@ -20,8 +20,8 @@ from typing import Any
 
 import pytest
 
-from core import background_tasks as bg_module
-from core.background_tasks import (
+from vexis_agent.core import background_tasks as bg_module
+from vexis_agent.core.background_tasks import (
     BackgroundTaskLimitReached,
     BackgroundTasks,
     InvalidTaskName,

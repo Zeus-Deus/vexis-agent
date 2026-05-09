@@ -19,9 +19,9 @@ from pathlib import Path
 
 import pytest
 
-from core.relationships.consent import mint
-from core.relationships.curator import RelationshipsCurator
-from core.relationships.store import (
+from vexis_agent.core.relationships.consent import mint
+from vexis_agent.core.relationships.curator import RelationshipsCurator
+from vexis_agent.core.relationships.store import (
     Fact,
     Person,
     RelationshipsStore,
@@ -29,7 +29,7 @@ from core.relationships.store import (
     relationships_live_path,
     serialize_relationships_file,
 )
-from core.relationships.triggers import TriggerVerdict
+from vexis_agent.core.relationships.triggers import TriggerVerdict
 
 
 @pytest.fixture
@@ -264,8 +264,8 @@ def test_relationships_restore_subcommand_dispatch(
 ):
     """``/learning relationships-restore <slug>`` reaches the
     curator's ``.restore`` and returns its reply text."""
-    from core.learning_curator import LearningController
-    from core.relationships.curator import TurnLevelResult
+    from vexis_agent.core.learning_curator import LearningController
+    from vexis_agent.core.relationships.curator import TurnLevelResult
 
     # Build a minimal LearningController via __new__ so we don't have
     # to wire the full daemon thread / config plumbing.
@@ -299,7 +299,7 @@ def test_relationships_restore_subcommand_dispatch(
 def test_relationships_restore_subcommand_usage_when_no_args(
     workspace: Path,
 ):
-    from core.learning_curator import LearningController
+    from vexis_agent.core.learning_curator import LearningController
     controller = LearningController.__new__(LearningController)
     controller._relationships_curator = None  # type: ignore[attr-defined]
     reply = asyncio.run(

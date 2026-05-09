@@ -8,8 +8,8 @@ no funnels / solo tailnet), and the typed-error branches per section.
 
 from __future__ import annotations
 
-from core import tailscale
-from transports.telegram import _format_tailscale_reply
+from vexis_agent.core import tailscale
+from vexis_agent.transports.telegram import _format_tailscale_reply
 
 
 _NODE_OK = tailscale.NodeStatus(

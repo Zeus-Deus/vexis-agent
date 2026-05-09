@@ -25,12 +25,12 @@ from pathlib import Path
 
 import pytest
 
-from core.brain.claude_code import build_system_prompt
-from core.relationships.candidate_store import (
+from vexis_agent.core.brain.claude_code import build_system_prompt
+from vexis_agent.core.relationships.candidate_store import (
     RelationshipsCandidateStore,
     candidates_path,
 )
-from core.relationships.store import (
+from vexis_agent.core.relationships.store import (
     Fact,
     Person,
     relationships_archive_path,
@@ -167,8 +167,8 @@ def test_live_relationships_block_appears_after_user_block(workspace: Path):
     by writing distinct sentinels in USER.md and RELATIONSHIPS.md
     and asserting their relative position.
     """
-    from core.memory import MemoryStore
-    from core.paths import memories_dir
+    from vexis_agent.core.memory import MemoryStore
+    from vexis_agent.core.paths import memories_dir
     _seed_live(workspace)
     user_store = MemoryStore(memories_dir(workspace))
     user_store.add(target="user", content="VEXIS_USER_BLOCK_SENTINEL")
@@ -238,7 +238,7 @@ def test_format_relationships_helper_returns_empty_when_absent(workspace: Path):
     """``format_relationships_for_system_prompt`` reads ONLY the
     live file and returns empty when it doesn't exist or is
     empty — the caller in build_system_prompt drops empty blocks."""
-    from core.relationships.store import format_relationships_for_system_prompt
+    from vexis_agent.core.relationships.store import format_relationships_for_system_prompt
     out = format_relationships_for_system_prompt(workspace)
     assert out == ""
 

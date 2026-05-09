@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from core.memory import MemoryStore
-from core.relationships.consent import (
+from vexis_agent.core.memory import MemoryStore
+from vexis_agent.core.relationships.consent import (
     ConsentError,
     PendingTokens,
     derive_fact_ids,

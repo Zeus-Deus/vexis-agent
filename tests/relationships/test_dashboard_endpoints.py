@@ -27,16 +27,16 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from core.relationships.candidate_store import RelationshipsCandidateStore
-from core.relationships.curator import RelationshipsCurator
-from core.relationships.store import (
+from vexis_agent.core.relationships.candidate_store import RelationshipsCandidateStore
+from vexis_agent.core.relationships.curator import RelationshipsCurator
+from vexis_agent.core.relationships.store import (
     Fact,
     Person,
     relationships_archive_path,
     relationships_live_path,
     serialize_relationships_file,
 )
-from core.web_server import WebDashboard
+from vexis_agent.core.web_server import WebDashboard
 
 
 _TOKEN = "test-token-deadbeef"
@@ -83,7 +83,7 @@ def _build_dashboard(workspace: Path) -> tuple[WebDashboard, RelationshipsCurato
     dashboard._relationships_mutation_log = defaultdict(deque)  # type: ignore[attr-defined]
     # Other fields _build_app touches (web_dist + browser); set
     # safe defaults.
-    from core.web_server import DashboardConfig
+    from vexis_agent.core.web_server import DashboardConfig
     dashboard._config = DashboardConfig(  # type: ignore[attr-defined]
         host="127.0.0.1",
         port=0,
@@ -276,7 +276,7 @@ def test_post_approve_with_sensitive_pattern_returns_422(
     _seed_candidate(curator, slug="sarah", display_name="Sarah",
                     qualifier="friend", fact_text="benign for the test")
     # Force the scanner inside RelationshipsStore.add_live to fire.
-    from core import learning_review as lr_module
+    from vexis_agent.core import learning_review as lr_module
 
     def fake_scan(text, scope, *, target_file):
         return f"medical:{target_file}"
@@ -413,7 +413,7 @@ def test_post_reject_specific_facts(workspace: Path):
         slug="sarah", display_name="Sarah", qualifier="coworker",
         fact_text="B", session_uuid="s2", turn_index=1,
     )
-    from core.relationships.consent import _fact_id
+    from vexis_agent.core.relationships.consent import _fact_id
     fid_a = _fact_id("A")
     fid_b = _fact_id("B")
     client = _client(dashboard)
@@ -438,7 +438,7 @@ def test_post_edit_changes_fact_id(workspace: Path):
     dashboard, curator = _build_dashboard(workspace)
     _seed_candidate(curator, slug="sarah", display_name="Sarah",
                     qualifier="coworker", fact_text="tech lead")
-    from core.relationships.consent import _fact_id
+    from vexis_agent.core.relationships.consent import _fact_id
     old_id = _fact_id("tech lead")
     client = _client(dashboard)
     resp = client.post(
@@ -460,7 +460,7 @@ def test_post_edit_400_on_empty_text(workspace: Path):
     dashboard, curator = _build_dashboard(workspace)
     _seed_candidate(curator, slug="sarah", display_name="Sarah",
                     qualifier="coworker", fact_text="x")
-    from core.relationships.consent import _fact_id
+    from vexis_agent.core.relationships.consent import _fact_id
     client = _client(dashboard)
     resp = client.post(
         "/api/v1/relationships/candidates/sarah/edit",

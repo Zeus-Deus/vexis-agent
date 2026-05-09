@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from core.memory import MemoryStore
-from core.relationships import (
+from vexis_agent.core.memory import MemoryStore
+from vexis_agent.core.relationships import (
     RELATIONSHIPS_USER_SEED_MARKER,
     RELATIONSHIPS_USER_SEED_TEXT,
 )

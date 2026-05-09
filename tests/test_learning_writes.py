@@ -25,9 +25,9 @@ from pathlib import Path
 
 import pytest
 
-from core import learning_writes as lw
-from core.paths import skills_dir
-from core.skills import (
+from vexis_agent.core import learning_writes as lw
+from vexis_agent.core.paths import skills_dir
+from vexis_agent.core.skills import (
     ARCHIVE_DIR_NAME,
     PinStore,
     UsageStore,
@@ -81,7 +81,7 @@ def test_shadow_skills_root_created_on_demand(workspace):
 def test_shadow_skills_root_invisible_to_discover_skills(workspace):
     """The whole point of the .shadow/ prefix: discover_skills must
     not see staged skills (they're not real skills yet)."""
-    from core.skills import discover_skills
+    from vexis_agent.core.skills import discover_skills
     _create_live_skill(workspace, "real-skill")
     # Stage a fake skill in .shadow/
     body = "---\nname: ghost\ndescription: D.\norigin: learning-curator\n---\n\nB\n"

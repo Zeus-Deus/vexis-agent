@@ -14,7 +14,7 @@ import logging
 import os
 from pathlib import Path
 
-from core.web_server import _warn_if_dashboard_bundle_stale
+from vexis_agent.core.web_server import _warn_if_dashboard_bundle_stale
 
 
 def _touch(path: Path, mtime: float | None = None) -> None:
@@ -33,7 +33,7 @@ def test_detector_silent_when_bundle_is_newer(tmp_path, caplog):
     _touch(src / "pages" / "ModelsPage.tsx", mtime=1_700_000_000)
     _touch(dist / "index-abc.js", mtime=1_700_000_100)
 
-    caplog.set_level(logging.WARNING, logger="core.web_server")
+    caplog.set_level(logging.WARNING, logger="vexis_agent.core.web_server")
     _warn_if_dashboard_bundle_stale(web / "dist")
     assert not any("STALE DASHBOARD BUNDLE" in r.message for r in caplog.records)
 
@@ -47,7 +47,7 @@ def test_detector_warns_when_source_is_newer(tmp_path, caplog):
     _touch(src / "pages" / "ModelsPage.tsx", mtime=1_700_000_500)
     _touch(dist / "index-abc.js", mtime=1_700_000_100)
 
-    caplog.set_level(logging.WARNING, logger="core.web_server")
+    caplog.set_level(logging.WARNING, logger="vexis_agent.core.web_server")
     _warn_if_dashboard_bundle_stale(web / "dist")
 
     msgs = [r.message for r in caplog.records]
@@ -65,7 +65,7 @@ def test_detector_silent_when_dist_missing(tmp_path, caplog):
     _touch(web / "src" / "pages" / "ModelsPage.tsx")
     # no web/dist created
 
-    caplog.set_level(logging.WARNING, logger="core.web_server")
+    caplog.set_level(logging.WARNING, logger="vexis_agent.core.web_server")
     _warn_if_dashboard_bundle_stale(web / "dist")
     assert not any("STALE DASHBOARD BUNDLE" in r.message for r in caplog.records)
 
@@ -78,7 +78,7 @@ def test_detector_silent_when_src_missing(tmp_path, caplog):
     _touch(dist / "index-abc.js")
     # no web/src
 
-    caplog.set_level(logging.WARNING, logger="core.web_server")
+    caplog.set_level(logging.WARNING, logger="vexis_agent.core.web_server")
     _warn_if_dashboard_bundle_stale(web / "dist")
     assert not any("STALE DASHBOARD BUNDLE" in r.message for r in caplog.records)
 
@@ -97,7 +97,7 @@ def test_detector_only_watches_relevant_extensions(tmp_path, caplog):
     _touch(src / "README.md", mtime=1_700_999_999)
     _touch(src / ".gitkeep", mtime=1_700_999_999)
 
-    caplog.set_level(logging.WARNING, logger="core.web_server")
+    caplog.set_level(logging.WARNING, logger="vexis_agent.core.web_server")
     _warn_if_dashboard_bundle_stale(web / "dist")
     assert not any("STALE DASHBOARD BUNDLE" in r.message for r in caplog.records)
 
@@ -114,7 +114,7 @@ def test_detector_finds_newest_source_across_subdirs(tmp_path, caplog):
     _touch(src / "lib" / "Newer.ts", mtime=1_700_000_500)
     _touch(src / "pages" / "Newest.tsx", mtime=1_700_000_900)
 
-    caplog.set_level(logging.WARNING, logger="core.web_server")
+    caplog.set_level(logging.WARNING, logger="vexis_agent.core.web_server")
     _warn_if_dashboard_bundle_stale(web / "dist")
     msgs = [r.message for r in caplog.records]
     banner = next((m for m in msgs if "STALE DASHBOARD BUNDLE" in m), None)
@@ -136,6 +136,6 @@ def test_detector_handles_empty_dist_assets(tmp_path, caplog):
     dist.mkdir(parents=True)
     _touch(src / "pages" / "ModelsPage.tsx", mtime=1_700_000_500)
 
-    caplog.set_level(logging.WARNING, logger="core.web_server")
+    caplog.set_level(logging.WARNING, logger="vexis_agent.core.web_server")
     _warn_if_dashboard_bundle_stale(web / "dist")
     assert not any("STALE DASHBOARD BUNDLE" in r.message for r in caplog.records)

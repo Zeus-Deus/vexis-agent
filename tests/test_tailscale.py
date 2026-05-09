@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
-from core import tailscale
+from vexis_agent.core import tailscale
 
 
 # ---- realistic fixtures (sliced from real CLI output) ------------------
@@ -134,7 +134,7 @@ def test_serve_status_parses_real_shape():
     fake = _patch_run({
         ("serve", "status", "--json"): _completed(json.dumps(_SERVE_DOC).encode()),
     })
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_serve_status()
     assert result.error is None
     assert len(result.serves) == 2
@@ -150,7 +150,7 @@ def test_serve_status_marks_funnel_mounts():
     fake = _patch_run({
         ("serve", "status", "--json"): _completed(json.dumps(_FUNNEL_DOC).encode()),
     })
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_serve_status()
     assert result.error is None
     assert len(result.serves) == 1
@@ -162,7 +162,7 @@ def test_serve_status_empty_doc_yields_empty_list():
     fake = _patch_run({
         ("serve", "status", "--json"): _completed(b"{}"),
     })
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_serve_status()
     assert result.error is None
     assert result.serves == []
@@ -171,7 +171,7 @@ def test_serve_status_empty_doc_yields_empty_list():
 def test_serve_status_blank_body_treated_as_empty():
     # The CLI emits an empty body on some "nothing configured" paths.
     fake = _patch_run({("serve", "status", "--json"): _completed(b"")})
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_serve_status()
     assert result.error is None
     assert result.serves == []
@@ -184,7 +184,7 @@ def test_funnel_status_filters_to_funnel_mounts_only():
     fake = _patch_run({
         ("funnel", "status", "--json"): _completed(json.dumps(_FUNNEL_DOC).encode()),
     })
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_funnel_status()
     assert result.error is None
     assert len(result.funnels) == 1
@@ -197,7 +197,7 @@ def test_funnel_status_skips_non_funnel_mounts():
     fake = _patch_run({
         ("funnel", "status", "--json"): _completed(json.dumps(_SERVE_DOC).encode()),
     })
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_funnel_status()
     assert result.error is None
     assert result.funnels == []
@@ -210,7 +210,7 @@ def test_node_info_parses_self_block():
     fake = _patch_run({
         ("status", "--json"): _completed(json.dumps(_STATUS_DOC).encode()),
     })
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_node_info()
     assert result.error is None
     assert result.node is not None
@@ -223,7 +223,7 @@ def test_peers_parses_all_peers_and_orders_online_first():
     fake = _patch_run({
         ("status", "--json"): _completed(json.dumps(_STATUS_DOC).encode()),
     })
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_peers()
     assert result.error is None
     hostnames = [p.hostname for p in result.peers]
@@ -247,7 +247,7 @@ def test_peers_handles_solo_tailnet():
     fake = _patch_run({
         ("status", "--json"): _completed(json.dumps(doc).encode()),
     })
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_peers()
     assert result.error is None
     assert result.peers == []
@@ -260,7 +260,7 @@ def test_cli_not_found_returns_typed_error():
     def fake(argv, **_kwargs):
         raise FileNotFoundError("tailscale")
 
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_serve_status()
     assert "not found" in (result.error or "")
     assert result.serves == []
@@ -272,7 +272,7 @@ def test_cli_non_zero_returns_typed_error():
             b"", returncode=1, stderr=b"backend not running"
         ),
     })
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_serve_status()
     assert result.error is not None
     assert "exited 1" in result.error
@@ -284,7 +284,7 @@ def test_cli_malformed_json_returns_typed_error():
     fake = _patch_run({
         ("serve", "status", "--json"): _completed(b"<html>nope</html>"),
     })
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_serve_status()
     assert result.error is not None
     assert "invalid JSON" in result.error
@@ -294,7 +294,7 @@ def test_cli_timeout_returns_typed_error():
     def fake(argv, **kwargs):
         raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout", 5))
 
-    with patch("core.tailscale.subprocess.run", side_effect=fake):
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake):
         result = tailscale.get_node_info()
     assert result.error is not None
     assert "timed out" in result.error
@@ -308,7 +308,7 @@ def test_cache_collapses_two_calls_within_ttl():
     fake = _patch_run({
         ("serve", "status", "--json"): _completed(json.dumps(_SERVE_DOC).encode()),
     })
-    with patch("core.tailscale.subprocess.run", side_effect=fake) as mock_run:
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake) as mock_run:
         tailscale.get_serve_status()
         tailscale.get_serve_status()
     assert mock_run.call_count == 1
@@ -326,7 +326,7 @@ def test_cache_refetches_after_ttl_expires():
 
     cache = tailscale._TtlCache(ttl_seconds=10.0, clock=clock)
     with patch.object(tailscale, "_CACHE", cache):
-        with patch("core.tailscale.subprocess.run", side_effect=fake) as mock_run:
+        with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake) as mock_run:
             tailscale.get_serve_status()         # t=0   miss
             fake_now[0] = 5.0
             tailscale.get_serve_status()         # t=5   hit
@@ -344,7 +344,7 @@ def test_cache_keys_separate_per_function():
         ("serve", "status", "--json"): _completed(serve_doc),
         ("funnel", "status", "--json"): _completed(funnel_doc),
     })
-    with patch("core.tailscale.subprocess.run", side_effect=fake) as mock_run:
+    with patch("vexis_agent.core.tailscale.subprocess.run", side_effect=fake) as mock_run:
         s = tailscale.get_serve_status()
         f = tailscale.get_funnel_status()
     assert mock_run.call_count == 2

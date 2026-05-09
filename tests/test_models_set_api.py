@@ -28,9 +28,9 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from core import model_discovery as md
-from core.running_tasks import RunningTasks
-from core.web_server import DashboardConfig, WebDashboard
+from vexis_agent.core import model_discovery as md
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.web_server import DashboardConfig, WebDashboard
 
 
 _TOKEN = "test-token-models-set-cafef00d"
@@ -51,15 +51,15 @@ def _build_dashboard(
 ) -> WebDashboard:
     cfg_dir = tmp_path / "vexis"
     cfg_dir.mkdir()
-    monkeypatch.setattr("core.paths.vexis_dir", lambda: cfg_dir)
-    monkeypatch.setattr("core.yaml_config.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.paths.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.vexis_dir", lambda: cfg_dir)
     monkeypatch.setattr(
-        "core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
+        "vexis_agent.core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
     )
     # Force model_ux_enabled True for these mutation tests; the
     # disabled-flag short-circuit gets its own test below.
     monkeypatch.setattr(
-        "core.yaml_config.model_ux_enabled", lambda: True,
+        "vexis_agent.core.yaml_config.model_ux_enabled", lambda: True,
     )
 
     dashboard = WebDashboard.__new__(WebDashboard)
@@ -136,15 +136,15 @@ def test_post_set_disabled_when_flag_off(
     covers users who keep the explicit opt-out."""
     cfg_dir = tmp_path / "vexis"
     cfg_dir.mkdir()
-    monkeypatch.setattr("core.paths.vexis_dir", lambda: cfg_dir)
-    monkeypatch.setattr("core.yaml_config.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.paths.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.vexis_dir", lambda: cfg_dir)
     monkeypatch.setattr(
-        "core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
+        "vexis_agent.core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
     )
     # Force model_ux_enabled False explicitly. Day 5 default
     # flipped to True so this test pins the explicit opt-out.
     monkeypatch.setattr(
-        "core.yaml_config.model_ux_enabled", lambda: False,
+        "vexis_agent.core.yaml_config.model_ux_enabled", lambda: False,
     )
 
     dashboard = WebDashboard.__new__(WebDashboard)
@@ -456,15 +456,15 @@ def test_post_discovery_refresh_not_flag_gated(
     flipping the flag."""
     cfg_dir = tmp_path / "vexis"
     cfg_dir.mkdir()
-    monkeypatch.setattr("core.paths.vexis_dir", lambda: cfg_dir)
-    monkeypatch.setattr("core.yaml_config.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.paths.vexis_dir", lambda: cfg_dir)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.vexis_dir", lambda: cfg_dir)
     monkeypatch.setattr(
-        "core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
+        "vexis_agent.core.yaml_config._config_path", lambda: cfg_dir / "config.yaml",
     )
     # Force model_ux_enabled False explicitly so this test
     # exercises the "flag off" case post-Day-5 default flip.
     monkeypatch.setattr(
-        "core.yaml_config.model_ux_enabled", lambda: False,
+        "vexis_agent.core.yaml_config.model_ux_enabled", lambda: False,
     )
     dashboard = WebDashboard.__new__(WebDashboard)
     dashboard._workspace = tmp_path  # type: ignore[attr-defined]

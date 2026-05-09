@@ -18,7 +18,7 @@ import socket
 import stat
 from pathlib import Path
 
-from core.control_socket import ControlSocket, default_socket_path
+from vexis_agent.core.control_socket import ControlSocket, default_socket_path
 
 
 def _client_round_trip(socket_path: Path, payload: dict, timeout: float = 5.0) -> dict:

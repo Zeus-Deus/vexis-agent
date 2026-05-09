@@ -17,14 +17,14 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from core.brain.base import (
+from vexis_agent.core.brain.base import (
     AuxResult,
     BrainError,
     BrainNotInstalled,
     BrainTimeoutError,
 )
-from core.brain.null import BrainNull
-from core.goal_judge import (
+from vexis_agent.core.brain.null import BrainNull
+from vexis_agent.core.goal_judge import (
     GOAL_JUDGE_ENV_VAR,
     GOAL_JUDGE_PROMPT_PREFIX,
     GOAL_JUDGE_TIMEOUT_SECONDS,

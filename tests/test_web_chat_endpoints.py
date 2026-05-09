@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from core.web_server import DashboardConfig, WebDashboard
+from vexis_agent.core.web_server import DashboardConfig, WebDashboard
 
 
 _TOKEN = "test-token-chat-cafef00d"
@@ -530,7 +530,7 @@ def test_history_401_when_handler_returns_none(
 def voice_disabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Point the voice subsystem at an empty config (= voice disabled)."""
     cfg = tmp_path / "config-voice-disabled.yaml"
-    monkeypatch.setattr("core.yaml_config._config_path", lambda: cfg)
+    monkeypatch.setattr("vexis_agent.core.yaml_config._config_path", lambda: cfg)
 
 
 @pytest.fixture
@@ -547,7 +547,7 @@ def voice_enabled_voxtype(
         "  tts:\n    provider: null\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("core.yaml_config._config_path", lambda: cfg)
+    monkeypatch.setattr("vexis_agent.core.yaml_config._config_path", lambda: cfg)
 
 
 def test_voice_info_disabled(
@@ -673,7 +673,7 @@ def attachments_default(
 ) -> None:
     """Empty config = attachments enabled with defaults."""
     cfg = tmp_path / "config-attach-default.yaml"
-    monkeypatch.setattr("core.yaml_config._config_path", lambda: cfg)
+    monkeypatch.setattr("vexis_agent.core.yaml_config._config_path", lambda: cfg)
 
 
 @pytest.fixture
@@ -685,7 +685,7 @@ def attachments_disabled(
         "chat:\n  attachments:\n    enabled: false\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("core.yaml_config._config_path", lambda: cfg)
+    monkeypatch.setattr("vexis_agent.core.yaml_config._config_path", lambda: cfg)
 
 
 def test_attach_requires_auth(client_with_chat: TestClient) -> None:

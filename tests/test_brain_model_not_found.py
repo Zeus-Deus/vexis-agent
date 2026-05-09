@@ -29,18 +29,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.brain.base import BrainError, BrainModelNotFoundError
-from core.brain.claude_code import (
+from vexis_agent.core.brain.base import BrainError, BrainModelNotFoundError
+from vexis_agent.core.brain.claude_code import (
     _CC_MODEL_NOT_FOUND_STDOUT_MARKER,
     ClaudeCodeBrain,
 )
-from core.brain.opencode import OpenCodeBrain, _detect_model_not_found
-from core.model_validator import (
+from vexis_agent.core.brain.opencode import OpenCodeBrain, _detect_model_not_found
+from vexis_agent.core.model_validator import (
     CLAUDE_CODE_MODEL_NOT_FOUND_FIX_TEMPLATE,
     OPENCODE_FORMAT_FIX_TEMPLATE,
 )
-from core.running_tasks import RunningTasks
-from core.sessions import SessionStore
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -53,7 +53,7 @@ def _isolated_yaml_config(monkeypatch, tmp_path):
     """Tier resolution reads ``~/.vexis/config.yaml``. Insulate
     from the user's real config so the brain's tier resolution
     behaves like a fresh install."""
-    from core import yaml_config
+    from vexis_agent.core import yaml_config
     cfg_dir = tmp_path / "vexis-config"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(
@@ -424,7 +424,7 @@ def test_validator_and_backstop_share_suggested_fix_constants():
     same suggested_fix copy for the same condition. Pin by asserting
     both surfaces resolve to the same template-substituted string
     given the same inputs."""
-    from core.model_validator import (
+    from vexis_agent.core.model_validator import (
         OPENCODE_FORMAT_FIX_TEMPLATE,
         validate_models_config,
     )

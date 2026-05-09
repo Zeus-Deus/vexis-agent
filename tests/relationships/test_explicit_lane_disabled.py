@@ -24,8 +24,8 @@ from typing import Any
 
 import pytest
 
-from core.handler import MessageHandler
-from core.running_tasks import RunningTasks
+from vexis_agent.core.handler import MessageHandler
+from vexis_agent.core.running_tasks import RunningTasks
 
 
 class _FakeBrain:
@@ -71,7 +71,7 @@ class _RecordingRelationships:
         chat_id: int | None = None,
     ):
         self.calls.append((session_uuid, turn_index, chat_id))
-        from core.relationships.curator import TurnLevelResult
+        from vexis_agent.core.relationships.curator import TurnLevelResult
         return TurnLevelResult(staged=False, reply_text=None)
 
     def increment_counter(self, name: str, by: int = 1) -> None:
@@ -87,7 +87,7 @@ class _FakeLearningController:
 def _build_transport(
     handler: MessageHandler, relationships
 ):
-    from transports.telegram import TelegramTransport
+    from vexis_agent.transports.telegram import TelegramTransport
     t = TelegramTransport.__new__(TelegramTransport)
     t._handler = handler  # type: ignore[attr-defined]
     t._allowed_user_id = 99  # type: ignore[attr-defined]
@@ -121,7 +121,7 @@ def _build_handler(workspace: Path) -> MessageHandler:
 
 
 def test_flag_default_is_false():
-    from core.yaml_config import relationships_explicit_consent_enabled
+    from vexis_agent.core.yaml_config import relationships_explicit_consent_enabled
     assert relationships_explicit_consent_enabled() is False
 
 
@@ -164,7 +164,7 @@ def test_explicit_lane_enabled_invokes_relationships(
     """With the flag on, the legacy v3b explicit path engages —
     relationships is called, cursor is claimed."""
     monkeypatch.setattr(
-        "core.yaml_config.relationships_explicit_consent_enabled",
+        "vexis_agent.core.yaml_config.relationships_explicit_consent_enabled",
         lambda: True,
     )
     handler = _build_handler(workspace)
@@ -205,9 +205,9 @@ def test_yaml_flag_explicit_value_overrides_default(
         encoding="utf-8",
     )
     # Point yaml_config's reader at this fixture file.
-    monkeypatch.setattr("core.yaml_config._config_path", lambda: cfg_path)
+    monkeypatch.setattr("vexis_agent.core.yaml_config._config_path", lambda: cfg_path)
     # Bypass any caching by re-importing.
-    from core import yaml_config as yc
+    from vexis_agent.core import yaml_config as yc
     # _read_raw caches by mtime; reset cache via private attribute
     # if it exists, otherwise just call.
     raw = yc._read_raw()

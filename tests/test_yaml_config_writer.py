@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from core.yaml_config_writer import (
+from vexis_agent.core.yaml_config_writer import (
     atomic_write_yaml,
     backup_if_commented,
     has_comments,

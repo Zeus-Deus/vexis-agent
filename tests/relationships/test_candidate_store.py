@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from core.relationships.candidate_store import (
+from vexis_agent.core.relationships.candidate_store import (
     Candidate,
     CandidateFact,
     DEFAULT_RECURRENCE_THRESHOLD,
@@ -32,7 +32,7 @@ from core.relationships.candidate_store import (
     DEFAULT_STALE_WINDOW,
     RelationshipsCandidateStore,
 )
-from core.relationships.consent import _fact_id
+from vexis_agent.core.relationships.consent import _fact_id
 
 
 def _now() -> datetime:
@@ -132,7 +132,7 @@ def test_add_observation_strongest_cue_seen_increases(tmp_path: Path):
 
 
 def test_add_observation_appends_occurrences_with_fifo_cap(tmp_path: Path):
-    from core.relationships.candidate_store import MAX_OCCURRENCES_PER_FACT
+    from vexis_agent.core.relationships.candidate_store import MAX_OCCURRENCES_PER_FACT
     store = _store(tmp_path)
     base = _now()
     for i in range(MAX_OCCURRENCES_PER_FACT + 5):

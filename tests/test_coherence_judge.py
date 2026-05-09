@@ -24,15 +24,15 @@ from unittest import mock
 
 import pytest
 
-from core import coherence_judge as cj
-from core.brain.base import (
+from vexis_agent.core import coherence_judge as cj
+from vexis_agent.core.brain.base import (
     AuxResult,
     BrainError,
     BrainNotInstalled,
     BrainTimeoutError,
 )
-from core.brain.null import BrainNull
-from core.coherence_judge import (
+from vexis_agent.core.brain.null import BrainNull
+from vexis_agent.core.coherence_judge import (
     COHERENCE_JUDGE_ENV_VAR,
     CoherenceVerdict,
     WINDOW_MAX_CHARS,
@@ -44,7 +44,7 @@ from core.coherence_judge import (
     find_evidence_message_index,
     run_coherence_judge,
 )
-from core.transcripts import TranscriptMessage
+from vexis_agent.core.transcripts import TranscriptMessage
 
 
 # --------------------------------------------------------------------
@@ -87,7 +87,7 @@ def isolated_yaml_config(monkeypatch, tmp_path):
     ``models.coherence_judge`` legacy raw-string would override the
     default tier and confuse assertions on ``model_tier``. Point the
     config path at a fresh tmp file for every test."""
-    from core import yaml_config
+    from vexis_agent.core import yaml_config
 
     cfg_dir = tmp_path / "vexis-config"
     cfg_dir.mkdir(parents=True, exist_ok=True)

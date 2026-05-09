@@ -73,7 +73,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from core.brain.base import McpServerSpec  # noqa: E402
+from vexis_agent.core.brain.base import McpServerSpec  # noqa: E402
 
 log = logging.getLogger("vexis.install")
 
@@ -129,7 +129,7 @@ def read_canonical_mcp_servers(repo: Path) -> list[McpServerSpec]:
 def resolve_brain_kind() -> str:
     """Read ``brain.kind`` from ``~/.vexis/config.yaml`` via the
     canonical helper. Defaults to ``"claude-code"``."""
-    from core.yaml_config import brain_kind
+    from vexis_agent.core.yaml_config import brain_kind
     return brain_kind()
 
 
@@ -437,10 +437,10 @@ def build_plan(
     def _make_brain():
         # Defer brain construction until apply() so we don't
         # spawn workspace/state side effects during dry-run.
-        from core.brain.claude_code import ClaudeCodeBrain
-        from core.brain.opencode import OpenCodeBrain
-        from core.running_tasks import RunningTasks
-        from core.sessions import SessionStore
+        from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+        from vexis_agent.core.brain.opencode import OpenCodeBrain
+        from vexis_agent.core.running_tasks import RunningTasks
+        from vexis_agent.core.sessions import SessionStore
 
         sess = SessionStore(workspace / ".vexis-install-sessions.json")
         running = RunningTasks()

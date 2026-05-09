@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from core.user_candidates import (
+from vexis_agent.core.user_candidates import (
     DEFAULT_PROMOTION_THRESHOLD,
     DEFAULT_WINDOW,
     UserCandidate,
@@ -293,14 +293,14 @@ def test_max_occurrences_per_claim_constant():
     """The cap is set in the module so tests pin to it; production
     callers can't override (intentional — a buggy expire_stale
     shouldn't be papered over by a generous cap)."""
-    from core.user_candidates import MAX_OCCURRENCES_PER_CLAIM
+    from vexis_agent.core.user_candidates import MAX_OCCURRENCES_PER_CLAIM
     assert MAX_OCCURRENCES_PER_CLAIM == 20
 
 
 def test_add_occurrence_caps_at_max(store_path):
     """Occurrences past the cap drop the OLDEST entries FIFO so the
     queue can't grow unbounded even if expire_stale never runs."""
-    from core.user_candidates import MAX_OCCURRENCES_PER_CLAIM
+    from vexis_agent.core.user_candidates import MAX_OCCURRENCES_PER_CLAIM
     store = UserCandidateStore(store_path)
     # Seed cap+5 occurrences with deterministic increasing timestamps.
     base = _utc(year=2026, month=5, day=3, hour=10)
@@ -329,7 +329,7 @@ def test_cap_does_not_break_eligibility_for_in_window_sessions(store_path):
     """A claim that's been emitted >cap times across many distinct
     sessions still hits the threshold — the cap doesn't drop ALL
     past sessions, just the oldest ones."""
-    from core.user_candidates import MAX_OCCURRENCES_PER_CLAIM
+    from vexis_agent.core.user_candidates import MAX_OCCURRENCES_PER_CLAIM
     store = UserCandidateStore(store_path)
     base = _utc(year=2026, month=5, day=3, hour=10)
     for i in range(MAX_OCCURRENCES_PER_CLAIM + 5):

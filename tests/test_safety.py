@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.safety import check_command
+from vexis_agent.core.safety import check_command
 
 
 # ---------- rm -rf and variants ----------

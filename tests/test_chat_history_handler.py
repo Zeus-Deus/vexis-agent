@@ -19,10 +19,10 @@ from unittest.mock import patch
 
 import pytest
 
-from core.brain.null import BrainNull
-from core.handler import MessageHandler
-from core.sessions import SessionStore
-from core.transcripts import TranscriptMessage
+from vexis_agent.core.brain.null import BrainNull
+from vexis_agent.core.handler import MessageHandler
+from vexis_agent.core.sessions import SessionStore
+from vexis_agent.core.transcripts import TranscriptMessage
 
 
 _ALLOWED_USER_ID = 12345

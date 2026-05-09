@@ -56,7 +56,7 @@ def _isolated_yaml_config(monkeypatch, tmp_path):
     ``~/.vexis/config.yaml`` — keep tests insulated from the
     user's real config so ``resolve_brain_kind()`` returns the
     documented default."""
-    from core import yaml_config
+    from vexis_agent.core import yaml_config
     cfg_dir = tmp_path / "vexis-config"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(

@@ -9,14 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from tools.desktop import (
+from vexis_agent.tools.desktop import (
     CaptureError,
     _build_grim_argv,
     _build_state,
     _build_summary,
     _pretty_class,
 )
-from transports.telegram import _extract_screenshot_paths
+from vexis_agent.transports.telegram import _extract_screenshot_paths
 
 
 # ---------- state shape ----------

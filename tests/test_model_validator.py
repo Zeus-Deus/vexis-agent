@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.model_validator import (
+from vexis_agent.core.model_validator import (
     CLAUDE_CODE_FORMAT_FIX_TEMPLATE,
     DEAD_KNOB_FIX_TEMPLATE,
     EMPTY_TIER_FIX_TEMPLATE,
@@ -39,7 +39,7 @@ from core.model_validator import (
     log_findings,
     validate_models_config,
 )
-from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -392,7 +392,7 @@ def test_format_resolution_display_default_includes_resolved():
     as ``(default → <resolved>)`` so user sees what reset would
     give them. Mirrors dashboard's ``formatConfiguredCell`` TS
     helper — both surfaces share the same rules."""
-    from core.model_validator import format_resolution_display
+    from vexis_agent.core.model_validator import format_resolution_display
     assert format_resolution_display(None, "haiku") == "(default → haiku)"
     assert format_resolution_display(None, "sonnet") == "(default → sonnet)"
 
@@ -401,7 +401,7 @@ def test_format_resolution_display_default_with_no_resolved():
     """Edge case: subsystem has no brain default (e.g. unknown
     subsystem). Falls back to bare ``(default)`` rather than
     rendering a junk arrow."""
-    from core.model_validator import format_resolution_display
+    from vexis_agent.core.model_validator import format_resolution_display
     assert format_resolution_display(None, None) == "(default)"
 
 
@@ -410,7 +410,7 @@ def test_format_resolution_display_passthrough_drops_arrow():
     (picker-written model resolves to itself, OR legacy alias
     passthrough), drop the redundant ``X → X`` arrow. Single
     string."""
-    from core.model_validator import format_resolution_display
+    from vexis_agent.core.model_validator import format_resolution_display
     # Picker-written: resolves to itself.
     assert (
         format_resolution_display("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001")
@@ -423,7 +423,7 @@ def test_format_resolution_display_passthrough_drops_arrow():
 def test_format_resolution_display_translation_keeps_arrow():
     """Translation case: tier or unknown alias → resolved model
     name. Show the arrow."""
-    from core.model_validator import format_resolution_display
+    from vexis_agent.core.model_validator import format_resolution_display
     assert format_resolution_display("small", "haiku") == "small → haiku"
     assert (
         format_resolution_display("large", "anthropic/claude-sonnet-4")
@@ -435,7 +435,7 @@ def test_format_resolution_display_translation_with_no_resolved():
     """Configured but resolved is None (rare — e.g. tier with no
     brain mapping). Show ``X → <brain default>`` so the user
     sees the brain-default fallthrough."""
-    from core.model_validator import format_resolution_display
+    from vexis_agent.core.model_validator import format_resolution_display
     assert (
         format_resolution_display("default", None)
         == "default → <brain default>"
@@ -673,7 +673,7 @@ def test_subsystem_tier_from_config_matches_public(monkeypatch):
     a one-line delegate that reads from disk. They MUST produce
     byte-identical results given the same models section dict.
     Pin the contract."""
-    from core import yaml_config
+    from vexis_agent.core import yaml_config
 
     test_configs = [
         {},
@@ -703,7 +703,7 @@ def test_subsystem_tier_from_config_matches_public(monkeypatch):
 
 def test_model_for_tier_from_config_matches_public(monkeypatch):
     """Same refactor contract for the tier→native helper."""
-    from core import yaml_config
+    from vexis_agent.core import yaml_config
 
     test_configs = [
         ({}, "claude-code", "small"),
@@ -740,7 +740,7 @@ def test_model_for_tier_from_config_matches_public(monkeypatch):
 def test_log_findings_empty_no_op(caplog):
     """No findings → no log lines."""
     import logging
-    caplog.set_level(logging.INFO, logger="core.model_validator")
+    caplog.set_level(logging.INFO, logger="vexis_agent.core.model_validator")
     log_findings([])
     assert caplog.records == []
 
@@ -749,7 +749,7 @@ def test_log_findings_emits_at_severity_levels(caplog):
     """Each finding logs at its severity level so users can grep
     daemon logs by level."""
     import logging
-    caplog.set_level(logging.INFO, logger="core.model_validator")
+    caplog.set_level(logging.INFO, logger="vexis_agent.core.model_validator")
     findings = [
         ValidationFinding("error", "x", "err msg", "fix1"),
         ValidationFinding("warning", "y", "warn msg", "fix2"),

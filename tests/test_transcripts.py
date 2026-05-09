@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from core import transcripts as t
+from vexis_agent.core import transcripts as t
 
 
 # --------------------------------------------------------------------

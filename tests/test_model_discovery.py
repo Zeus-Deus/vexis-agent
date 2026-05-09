@@ -28,7 +28,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core import model_discovery as md
+from vexis_agent.core import model_discovery as md
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -177,7 +177,7 @@ def test_discover_claude_code_models_live_fallback_on_auth_missing(
     warning. urlopen is NOT called — auth gate fails fast before
     network."""
     import logging
-    caplog.set_level(logging.WARNING, logger="core.model_discovery")
+    caplog.set_level(logging.WARNING, logger="vexis_agent.core.model_discovery")
     with patch("urllib.request.urlopen") as urlopen_spy:
         models = md.discover_claude_code_models()
     assert urlopen_spy.call_count == 0
@@ -193,7 +193,7 @@ def test_discover_claude_code_models_live_fallback_on_network_error(
     """urlopen raises URLError (DNS down, connection refused) →
     fall back to hardcoded list + log warning."""
     import logging
-    caplog.set_level(logging.WARNING, logger="core.model_discovery")
+    caplog.set_level(logging.WARNING, logger="vexis_agent.core.model_discovery")
     with patch(
         "urllib.request.urlopen",
         side_effect=urllib.error.URLError("Name or service not known"),
@@ -212,7 +212,7 @@ def test_discover_claude_code_models_live_fallback_on_401_with_reauth_hint(
     includes a re-auth hint so a daemon-log post-mortem is
     actionable."""
     import logging
-    caplog.set_level(logging.WARNING, logger="core.model_discovery")
+    caplog.set_level(logging.WARNING, logger="vexis_agent.core.model_discovery")
     err = urllib.error.HTTPError(
         url=md._ANTHROPIC_MODELS_URL, code=401, msg="Unauthorized",
         hdrs=None, fp=None,  # type: ignore[arg-type]
@@ -243,7 +243,7 @@ def test_discover_claude_code_models_live_fallback_on_parse_error(
 ):
     """Malformed JSON / unexpected shape → fall back rather than crash."""
     import logging
-    caplog.set_level(logging.WARNING, logger="core.model_discovery")
+    caplog.set_level(logging.WARNING, logger="vexis_agent.core.model_discovery")
     bad_response = MagicMock()
     bad_response.__enter__ = MagicMock(
         return_value=MagicMock(read=lambda: b"not json at all"),
@@ -263,7 +263,7 @@ def test_discover_claude_code_models_live_fallback_on_empty_data(
     """API returns valid JSON but data: [] (shouldn't happen, but
     defensive). Treat as failure → fall back."""
     import logging
-    caplog.set_level(logging.WARNING, logger="core.model_discovery")
+    caplog.set_level(logging.WARNING, logger="vexis_agent.core.model_discovery")
     with patch(
         "urllib.request.urlopen",
         return_value=_fake_http_response({"data": [], "has_more": False}),
@@ -999,7 +999,7 @@ def test_claude_code_capabilities_extracts_supported_effort_levels(
         # Stub the CLI probe so this test exercises the
         # API-fallback path (the test's original intent — predates
         # the CLI source of truth).
-        "core.model_discovery._discover_claude_code_effort_levels_uncached",
+        "vexis_agent.core.model_discovery._discover_claude_code_effort_levels_uncached",
         return_value=[],
     ):
         caps = md.discover_claude_code_capabilities()
@@ -1159,7 +1159,7 @@ github-copilot/claude-opus-4.5
         # Stub CLI probe to empty — exercise the API-fallback path.
         # The CLI-canonical path is tested elsewhere
         # (tests/test_voice_call_discovery.py).
-        "core.model_discovery._discover_claude_code_effort_levels_uncached",
+        "vexis_agent.core.model_discovery._discover_claude_code_effort_levels_uncached",
         return_value=[],
     ):
         cc_levels = md.reasoning_levels_for(

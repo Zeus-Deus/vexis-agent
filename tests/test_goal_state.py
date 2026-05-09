@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from core.goal_state import (
+from vexis_agent.core.goal_state import (
     DEFAULT_MAX_TURNS,
     GoalState,
     GoalStateStore,
@@ -189,8 +189,8 @@ def test_save_preserves_other_sessions_rows(tmp_path: Path) -> None:
 
 def _child_writer(path_str: str, sid: str, goal_text: str, count: int) -> None:
     """Worker for the concurrent-write fixture. Saves the same row N times."""
-    from core.goal_state import GoalState as _GoalState
-    from core.goal_state import GoalStateStore as _Store
+    from vexis_agent.core.goal_state import GoalState as _GoalState
+    from vexis_agent.core.goal_state import GoalStateStore as _Store
 
     store = _Store(Path(path_str))
     for i in range(count):

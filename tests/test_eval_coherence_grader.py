@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.coherence_judge import CoherenceVerdict
+from vexis_agent.core.coherence_judge import CoherenceVerdict
 from scripts.eval_learning import (
     COHERENCE_FIXTURES_PATH,
     CoherenceEvalReport,

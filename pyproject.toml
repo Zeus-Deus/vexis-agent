@@ -4,11 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vexis-agent"
-version = "0.0.0"
-description = "Telegram-to-Claude-Code bridge daemon for controlling an Omarchy desktop from a phone."
+version = "0.1.0"
+description = "Telegram bot + agent CLI bridge for controlling an Omarchy desktop from a phone."
 readme = "README.md"
 requires-python = ">=3.11"
+authors = [{ name = "Zeus-Deus" }]
+license = { text = "MIT" }
 dependencies = [
+    "typer>=0.12",
     "python-telegram-bot>=21.0",
     "python-dotenv>=1.0",
     "aiohttp>=3.10",
@@ -16,16 +19,35 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "browser-use==0.12.6",
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]
+# Voice (voxtype STT, piper TTS) — current implementations shell out to
+# external binaries, so the Python side has no pip-installable runtime
+# deps. Keeping this extra reserved for future Python-native voice
+# providers (e.g. a faster-whisper option) so users can opt in without
+# pulling wheel-only ML deps into the base install.
+voice = []
+# Dashboard frontend (web/) is a separate npm-built bundle. The Python
+# server that hosts it (FastAPI + uvicorn) is core, so listing the
+# extra here is purely informational — install nothing extra to use it.
+dashboard = []
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
 ]
 
+[project.scripts]
+vexis-agent = "vexis_agent.cli:app"
+
 [tool.setuptools.packages.find]
-include = ["transports*", "tools*", "core*"]
+where = ["."]
+include = ["vexis_agent*"]
+exclude = ["tests*", "scripts*", ".plans*", "docs*", "web*"]
+
+[tool.setuptools.package-data]
+vexis_agent = ["**/*.yaml", "**/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

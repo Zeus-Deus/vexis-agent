@@ -44,13 +44,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from core.relationships.candidate_store import (  # noqa: E402
+from vexis_agent.core.relationships.candidate_store import (  # noqa: E402
     RelationshipsCandidateStore,
 )
-from core.relationships.extractor import extract_relationships  # noqa: E402
-from core.relationships.store import RelationshipsStore  # noqa: E402
-from core.relationships.triggers import derive_slug  # noqa: E402
-from core.transcripts import TranscriptMessage  # noqa: E402
+from vexis_agent.core.relationships.extractor import extract_relationships  # noqa: E402
+from vexis_agent.core.relationships.store import RelationshipsStore  # noqa: E402
+from vexis_agent.core.relationships.triggers import derive_slug  # noqa: E402
+from vexis_agent.core.transcripts import TranscriptMessage  # noqa: E402
 
 FIXTURE_DIR = REPO_ROOT / "tests" / "relationships" / "fixtures" / "extractor_eval"
 
@@ -220,9 +220,9 @@ async def _run_one(fixture: dict, workspace: Path) -> FixtureResult:
     session_uuid = f"eval-{fixture['name']}"
     # Eval script: real ClaudeCodeBrain spawn so the extractor calls
     # the actual model.
-    from core.brain.claude_code import ClaudeCodeBrain
-    from core.running_tasks import RunningTasks
-    from core.sessions import SessionStore
+    from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+    from vexis_agent.core.running_tasks import RunningTasks
+    from vexis_agent.core.sessions import SessionStore
     eval_brain = ClaudeCodeBrain(
         workspace=workspace,
         session=SessionStore(workspace / ".vexis" / "sessions.json"),

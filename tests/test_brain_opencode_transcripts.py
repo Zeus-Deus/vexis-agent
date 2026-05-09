@@ -36,12 +36,12 @@ from pathlib import Path
 
 import pytest
 
-from core.brain.opencode import (
+from vexis_agent.core.brain.opencode import (
     OpenCodeBrain,
     set_opencode_db_path_override,
 )
-from core.running_tasks import RunningTasks
-from core.sessions import SessionStore
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -473,7 +473,7 @@ def test_is_brain_owned_session_recognises_curator_review_prefix(
     ``CURATOR_REVIEW_PROMPT_PREFIX``. A False positive here would
     let curator-owned sessions get reviewed (the recursion bug
     we fixed back in May 2026)."""
-    from core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX
+    from vexis_agent.core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX
 
     conn = _build_db(db_path)
     sid = "ses_curator"
@@ -494,7 +494,7 @@ def test_is_brain_owned_session_recognises_goal_judge_prefix(
 ):
     """Goal-judge spawns also write JSONL-equivalent rows; the
     curator must skip those too. Same logic, different prefix."""
-    from core.goal_judge import GOAL_JUDGE_PROMPT_PREFIX
+    from vexis_agent.core.goal_judge import GOAL_JUDGE_PROMPT_PREFIX
 
     conn = _build_db(db_path)
     sid = "ses_goaljudge"
@@ -545,7 +545,7 @@ def test_is_brain_owned_session_returns_false_when_first_turn_is_assistant(
     The check should walk past assistant turns to find the first
     user message, which mirrors claude-code's
     ``_is_curator_owned`` behaviour."""
-    from core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX
+    from vexis_agent.core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX
 
     conn = _build_db(db_path)
     sid = "ses_forked"
@@ -577,7 +577,7 @@ def test_run_db_query_returns_none_on_persistent_lock(monkeypatch):
     """When SQLite raises ``database is locked`` repeatedly, the
     helper returns None (the curator path treats None as "skip
     this scan tick")."""
-    from core.brain import opencode as oc
+    from vexis_agent.core.brain import opencode as oc
 
     # Force the fake DB path to exist so we get past the
     # path.exists() short-circuit, then make connect raise.

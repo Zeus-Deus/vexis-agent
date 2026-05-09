@@ -29,22 +29,22 @@ from pathlib import Path
 
 import pytest
 
-import main
-from core import learning_curator as lc
-from core import transcripts as t
-from core.learning_curator import (
+from vexis_agent import main
+from vexis_agent.core import learning_curator as lc
+from vexis_agent.core import transcripts as t
+from vexis_agent.core.learning_curator import (
     MAX_REVIEW_FAILURES,
     LearningController,
     ReviewedStore,
     SpawnedStore,
 )
-from core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX
-from core.paths import (
+from vexis_agent.core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX
+from vexis_agent.core.paths import (
     daemon_pid_path,
     learning_spawned_path,
     learning_state_path,
 )
-from core.transcripts import claude_session_jsonl_dir, iter_messages
+from vexis_agent.core.transcripts import claude_session_jsonl_dir, iter_messages
 
 
 # --------------------------------------------------------------------
@@ -186,9 +186,9 @@ def test_review_one_persists_spawned_uuid_immediately(env, monkeypatch):
     ``ClaudeCodeBrain`` rather than the default ``BrainNull`` so
     the seeded JSONLs are actually visible to the snapshot.
     """
-    from core.brain.claude_code import ClaudeCodeBrain
-    from core.running_tasks import RunningTasks
-    from core.sessions import SessionStore
+    from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+    from vexis_agent.core.running_tasks import RunningTasks
+    from vexis_agent.core.sessions import SessionStore
 
     workspace = env
     pdir = claude_session_jsonl_dir(workspace)
@@ -316,7 +316,7 @@ def test_curator_prompt_invariant():
     content filter looks for. If the prompt is edited and breaks this
     invariant, the filter would silently regress — this assertion
     forces the edit to update the constant in the same diff."""
-    from core.learning_review import _build_review_prompt
+    from vexis_agent.core.learning_review import _build_review_prompt
 
     prompt = _build_review_prompt(
         "(transcript here)",

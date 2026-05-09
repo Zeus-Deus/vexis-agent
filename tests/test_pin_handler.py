@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from core.curator import CuratorController
-from core.handler import MessageHandler
-from core.sessions import SessionStore
-from core.skills import PinStore
+from vexis_agent.core.curator import CuratorController
+from vexis_agent.core.handler import MessageHandler
+from vexis_agent.core.sessions import SessionStore
+from vexis_agent.core.skills import PinStore
 
 
 class _FakeBrain:

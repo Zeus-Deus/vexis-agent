@@ -24,8 +24,8 @@ from unittest.mock import patch
 import aiohttp
 import pytest
 
-from tools import livestream
-from tools.livestream import (
+from vexis_agent.tools import livestream
+from vexis_agent.tools.livestream import (
     FrameProducer,
     LiveStreamDaemon,
     LiveStreamError,

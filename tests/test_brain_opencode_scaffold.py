@@ -36,22 +36,22 @@ from pathlib import Path
 
 import pytest
 
-from core.brain.base import (
+from vexis_agent.core.brain.base import (
     Brain,
     BrainHealth,
     BrainNotInstalled,
     BrainTimeoutError,
     McpServerSpec,
 )
-from core.brain.opencode import (
+from vexis_agent.core.brain.opencode import (
     VEXIS_AUX_AGENT_NAME,
     VEXIS_MCP_PREFIX,
     OpenCodeBrain,
     _build_opencode_config_content,
     _extract_text_from_event_stream,
 )
-from core.running_tasks import RunningTasks
-from core.sessions import SessionStore
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -63,7 +63,7 @@ from core.sessions import SessionStore
 def _isolated_yaml_config(monkeypatch, tmp_path):
     """Tier resolution reads ``~/.vexis/config.yaml``. Tests must
     not see the user's real config."""
-    from core import yaml_config
+    from vexis_agent.core import yaml_config
     cfg_dir = tmp_path / "vexis-config"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(
@@ -223,7 +223,7 @@ def test_healthcheck_brain_auth_required_when_auth_list_fails(
 ):
     """opencode is installed but ``opencode auth list`` returns
     non-zero — surface as actionable BrainHealth(ok=False)."""
-    import core.brain.opencode as oc
+    import vexis_agent.core.brain.opencode as oc
 
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/opencode")
 
@@ -246,7 +246,7 @@ def test_healthcheck_brain_auth_required_when_auth_list_fails(
 def test_healthcheck_ok_when_binary_and_auth_present(
     brain: OpenCodeBrain, monkeypatch
 ):
-    import core.brain.opencode as oc
+    import vexis_agent.core.brain.opencode as oc
 
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/opencode")
 
@@ -585,7 +585,7 @@ def test_spawn_aux_argv_shape_with_tier(
         captured["env"] = dict(kwargs.get("env") or {})
         return _CP()
 
-    monkeypatch.setattr("core.brain.opencode.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.opencode.subprocess.run", _fake_run)
     result = asyncio.run(
         brain.spawn_aux(
             "test prompt", model_tier="small",
@@ -627,7 +627,7 @@ def test_spawn_aux_allow_tools_false_sets_deny_permissions(
         captured["env"] = dict(kwargs.get("env") or {})
         return _CP()
 
-    monkeypatch.setattr("core.brain.opencode.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.opencode.subprocess.run", _fake_run)
     asyncio.run(brain.spawn_aux("p"))  # allow_tools defaults to False
     config_blob = json.loads(captured["env"]["OPENCODE_CONFIG_CONTENT"])
     perm = config_blob["agent"][VEXIS_AUX_AGENT_NAME].get("permission")
@@ -649,7 +649,7 @@ def test_spawn_aux_allow_tools_true_omits_permissions(
         captured["env"] = dict(kwargs.get("env") or {})
         return _CP()
 
-    monkeypatch.setattr("core.brain.opencode.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.opencode.subprocess.run", _fake_run)
     asyncio.run(brain.spawn_aux("p", allow_tools=True))
     config_blob = json.loads(captured["env"]["OPENCODE_CONFIG_CONTENT"])
     assert (
@@ -681,7 +681,7 @@ def test_spawn_aux_extracts_text_from_json_event_stream(
     def _fake_run(argv, **kwargs):
         return _CP()
 
-    monkeypatch.setattr("core.brain.opencode.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.opencode.subprocess.run", _fake_run)
     result = asyncio.run(brain.spawn_aux("p"))
     assert result.stdout == "first second"
 
@@ -701,7 +701,7 @@ def test_spawn_aux_falls_back_to_raw_stdout_when_no_text_events(
     def _fake_run(argv, **kwargs):
         return _CP()
 
-    monkeypatch.setattr("core.brain.opencode.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.opencode.subprocess.run", _fake_run)
     result = asyncio.run(brain.spawn_aux("p"))
     assert "unexpected non-json output" in result.stdout
 
@@ -714,7 +714,7 @@ def test_spawn_aux_timeout_raises_brain_timeout(
     def _fake_run(argv, **kwargs):
         raise subprocess_module.TimeoutExpired(cmd=argv, timeout=1.0)
 
-    monkeypatch.setattr("core.brain.opencode.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.opencode.subprocess.run", _fake_run)
     with pytest.raises(BrainTimeoutError, match="timed out"):
         asyncio.run(brain.spawn_aux("p", timeout_seconds=1.0))
 
@@ -725,7 +725,7 @@ def test_spawn_aux_missing_binary_raises_not_installed(
     def _fake_run(argv, **kwargs):
         raise FileNotFoundError("[Errno 2] No such file: 'opencode'")
 
-    monkeypatch.setattr("core.brain.opencode.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.opencode.subprocess.run", _fake_run)
     with pytest.raises(BrainNotInstalled, match="not on PATH"):
         asyncio.run(brain.spawn_aux("p"))
     # Hint mentions the install command in the exception message.
@@ -745,7 +745,7 @@ def test_spawn_aux_passes_workspace_as_default_cwd(
         captured["cwd"] = kwargs.get("cwd")
         return _CP()
 
-    monkeypatch.setattr("core.brain.opencode.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.opencode.subprocess.run", _fake_run)
     asyncio.run(brain.spawn_aux("p"))
     assert captured["cwd"] == str(workspace)
 
@@ -764,7 +764,7 @@ def test_spawn_aux_explicit_cwd_overrides_workspace(
         captured["cwd"] = kwargs.get("cwd")
         return _CP()
 
-    monkeypatch.setattr("core.brain.opencode.subprocess.run", _fake_run)
+    monkeypatch.setattr("vexis_agent.core.brain.opencode.subprocess.run", _fake_run)
     other = tmp_path / "other"
     other.mkdir()
     asyncio.run(brain.spawn_aux("p", cwd=other))

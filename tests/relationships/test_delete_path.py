@@ -22,14 +22,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.coherence_judge import CoherenceVerdict
-from core.relationships.consent import (
+from vexis_agent.core.coherence_judge import CoherenceVerdict
+from vexis_agent.core.relationships.consent import (
     ConsentError,
     mint,
     verify_for_promotion,
 )
-from core.relationships.curator import RelationshipsCurator
-from core.relationships.store import (
+from vexis_agent.core.relationships.curator import RelationshipsCurator
+from vexis_agent.core.relationships.store import (
     Fact,
     Person,
     RelationshipsStore,
@@ -37,7 +37,7 @@ from core.relationships.store import (
     relationships_live_path,
     serialize_relationships_file,
 )
-from core.relationships.triggers import TriggerVerdict
+from vexis_agent.core.relationships.triggers import TriggerVerdict
 
 
 @pytest.fixture
@@ -359,7 +359,7 @@ def test_curator_delete_does_not_invoke_sensitive_scanner(
     _seed_live_with_sarah(workspace)
 
     # Replace the scanner with a counter so any call would be recorded.
-    from core.relationships import curator as curator_module
+    from vexis_agent.core.relationships import curator as curator_module
     sentinel_calls: list[tuple] = []
 
     def fake_scan(*args, **kwargs):

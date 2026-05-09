@@ -64,23 +64,23 @@ from pathlib import Path
 # Allow `scripts/migrate_shadow_to_v2.py` to import from the project.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.learning_review import _scan_lesson_for_sensitive_content  # noqa: E402
-from core.learning_writes import (  # noqa: E402
+from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content  # noqa: E402
+from vexis_agent.core.learning_writes import (  # noqa: E402
     _resolve_staged_skill_dir,
     shadow_skills_root,
     stage_new_skill,
     stage_skill_patch,
     stage_support_file,
 )
-from core.memory import ENTRY_DELIMITER, MemoryStore  # noqa: E402
-from core.paths import (  # noqa: E402
+from vexis_agent.core.memory import ENTRY_DELIMITER, MemoryStore  # noqa: E402
+from vexis_agent.core.paths import (  # noqa: E402
     memories_dir,
     user_candidates_path,
     vexis_dir,
     workspace_dir,
 )
-from core.user_candidates import UserCandidateStore  # noqa: E402
-from core.yaml_config import (  # noqa: E402
+from vexis_agent.core.user_candidates import UserCandidateStore  # noqa: E402
+from vexis_agent.core.yaml_config import (  # noqa: E402
     model_migration_classifier,
     resolve_model_flag,
 )

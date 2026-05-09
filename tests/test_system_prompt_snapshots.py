@@ -26,11 +26,11 @@ from pathlib import Path
 
 import pytest
 
-from core.brain.base import Brain
-from core.brain.claude_code import ClaudeCodeBrain
-from core.brain.opencode import OpenCodeBrain
-from core.running_tasks import RunningTasks
-from core.sessions import SessionStore
+from vexis_agent.core.brain.base import Brain
+from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.opencode import OpenCodeBrain
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
 
 
 # ──────────────────────────────────────────────────────────────────

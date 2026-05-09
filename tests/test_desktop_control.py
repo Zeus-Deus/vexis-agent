@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from tools import desktop_control
+from vexis_agent.tools import desktop_control
 
 
 @pytest.fixture
@@ -269,7 +269,7 @@ def test_core_subprocess_run_merges_env_over_os_environ(monkeypatch):
     """The shared runner must merge caller env over current env, not replace it.
     Otherwise YDOTOOL_SOCKET would clobber PATH/HOME and ydotool wouldn't even
     exec."""
-    from core import subprocess as csp
+    from vexis_agent.core import subprocess as csp
 
     captured: dict[str, Any] = {}
 

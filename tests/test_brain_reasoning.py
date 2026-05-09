@@ -20,15 +20,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.brain.claude_code import ClaudeCodeBrain
-from core.brain.opencode import OpenCodeBrain
-from core.running_tasks import RunningTasks
-from core.sessions import SessionStore
+from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.opencode import OpenCodeBrain
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
 
 
 @pytest.fixture(autouse=True)
 def _isolated_yaml_config(monkeypatch, tmp_path):
-    from core import yaml_config
+    from vexis_agent.core import yaml_config
     cfg_dir = tmp_path / "vexis-config"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(
@@ -227,8 +227,8 @@ def test_null_records_reasoning_and_context_kwargs():
     """BrainNull is the test fake; it must accept the new kwargs
     AND record them so cross-brain contract tests can assert
     plumbing without spinning up real subprocesses."""
-    from core.brain.null import BrainNull
-    from core.brain.base import AuxResult
+    from vexis_agent.core.brain.null import BrainNull
+    from vexis_agent.core.brain.base import AuxResult
     null = BrainNull(
         aux_results=[AuxResult(stdout="", stderr="", returncode=0)],
     )
