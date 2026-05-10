@@ -44,6 +44,23 @@ def test_should_skip_excludes_browser_profiles() -> None:
     assert bk._should_skip(Path("browser-profiles/Default/Cookies"))
 
 
+def test_should_skip_excludes_backups_directory() -> None:
+    """``$VEXIS_HOME/backups/`` lives inside the directory we walk
+    AND it's where the output zip itself gets written. Without this
+    exclusion the walker crawls into prior backups (compounding the
+    archive size linearly per release) and — worse — picks up the
+    in-progress output file mid-write, producing a recursive
+    self-include that fills the disk before getting killed.
+
+    Surfaced on the first real migration backup of a populated
+    install: zip grew to 10+ GB and was still climbing when the
+    underlying state was only ~300 MB. Same exclusion covers the
+    pre-update snapshots ``daemon.update._pre_update_snapshot``
+    drops there for the same reason — both are regenerable artifacts."""
+    assert bk._should_skip(Path("backups/vexis-20260510T172203Z.zip"))
+    assert bk._should_skip(Path("backups/pre-update-20260510T155537Z.zip"))
+
+
 def test_should_skip_keeps_user_state() -> None:
     assert not bk._should_skip(Path("config.yaml"))
     assert not bk._should_skip(Path("memories/MEMORY.md"))
@@ -194,6 +211,204 @@ def test_restore_raises_when_archive_missing(tmp_path) -> None:
         )
 
 
+# ── --migrate flag (v0.1.5) ────────────────────────────────────────
+
+
+def test_migrate_overwrites_brain_state_but_preserves_machine_local(
+    tmp_path,
+) -> None:
+    """The flag this whole feature exists for. Surfaced when the
+    first real dev → home-server migration ran into the daemon-stub
+    trap: the home server's daemon ran briefly between the wizard
+    install and the restore, and the curator silently wrote a stub
+    USER.md. The default overlay then refused to replace that stub
+    with the dev box's accumulated USER.md, so the user thought
+    their migration succeeded but their accumulated user-prefs
+    learning was silently dropped.
+
+    --migrate fixes the trap by overwriting brain state (USER.md,
+    MEMORY.md, skills, ...) while preserving the destination's
+    machine-local files (.env with the new bot token, config.yaml
+    with the destination's brain.kind, dashboard_token).
+    """
+    home, ws = _build_fixture(tmp_path)
+    # Add the brain-state files we care about preserving across migrate.
+    (ws / "memories").mkdir(exist_ok=True)
+    (ws / "memories" / "USER.md").write_text("DEV-USER-PREFS\n")
+    (ws / "SOUL.md").write_text("DEV-PERSONALITY\n")
+
+    archive = tmp_path / "archive.zip"
+    bk.run_backup(out=archive, home=home, workspace=ws)
+
+    # Destination simulates a freshly-wizard'd home server with a
+    # daemon-generated USER.md stub plus a NEW bot token.
+    new_home = tmp_path / "home2"
+    new_ws = tmp_path / "ws2"
+    new_home.mkdir()
+    new_ws.mkdir()
+    (new_ws / "memories").mkdir()
+    (new_home / ".env").write_text("TELEGRAM_BOT_TOKEN=NEW-BOT-FOR-HOME-SERVER\n")
+    (new_home / "config.yaml").write_text("brain:\n  kind: claude-code\n")
+    (new_ws / "memories" / "USER.md").write_text("daemon-stub\n")
+    (new_ws / "SOUL.md").write_text("daemon-stub\n")
+
+    bk.run_restore(archive, home=new_home, workspace=new_ws, migrate=True)
+
+    # Brain state must come from the backup.
+    assert (new_ws / "memories" / "USER.md").read_text() == "DEV-USER-PREFS\n"
+    assert (new_ws / "SOUL.md").read_text() == "DEV-PERSONALITY\n"
+    # Machine-local files must stay as the destination wrote them.
+    assert "NEW-BOT-FOR-HOME-SERVER" in (new_home / ".env").read_text()
+
+
+def test_migrate_does_not_clobber_dotenv(tmp_path) -> None:
+    """Critical invariant: even when the source's .env has different
+    secrets, --migrate keeps the destination's .env. Pre-fix, users
+    hitting this trap would unknowingly lose their new home-server
+    bot token and end up serving from the dev token, which would
+    silently get a 'bot already polling' conflict on Telegram or
+    (worse) accept messages meant for the dev install."""
+    home, ws = _build_fixture(tmp_path)
+    (home / ".env").write_text("TELEGRAM_BOT_TOKEN=DEV-TOKEN-AAAA\n")
+    archive = tmp_path / "archive.zip"
+    bk.run_backup(out=archive, home=home, workspace=ws)
+
+    new_home = tmp_path / "home2"
+    new_ws = tmp_path / "ws2"
+    new_home.mkdir()
+    new_ws.mkdir()
+    (new_home / ".env").write_text("TELEGRAM_BOT_TOKEN=HOME-TOKEN-BBBB\n")
+
+    bk.run_restore(archive, home=new_home, workspace=new_ws, migrate=True)
+
+    body = (new_home / ".env").read_text()
+    assert "HOME-TOKEN-BBBB" in body, (
+        ".env was overwritten despite --migrate — destination secrets "
+        "must always survive a migrate restore."
+    )
+    assert "DEV-TOKEN-AAAA" not in body
+
+
+def test_overwrite_does_replace_dotenv(tmp_path) -> None:
+    """--overwrite is the explicit "I really mean nuke everything"
+    option. Different from --migrate. This test pins the contrast."""
+    home, ws = _build_fixture(tmp_path)
+    (home / ".env").write_text("TELEGRAM_BOT_TOKEN=DEV-TOKEN-AAAA\n")
+    archive = tmp_path / "archive.zip"
+    bk.run_backup(out=archive, home=home, workspace=ws)
+
+    new_home = tmp_path / "home2"
+    new_ws = tmp_path / "ws2"
+    new_home.mkdir()
+    new_ws.mkdir()
+    (new_home / ".env").write_text("TELEGRAM_BOT_TOKEN=HOME-TOKEN-BBBB\n")
+
+    bk.run_restore(archive, home=new_home, workspace=new_ws, overwrite=True)
+    assert "DEV-TOKEN-AAAA" in (new_home / ".env").read_text()
+
+
+# ── brain-session path re-encoding (v0.1.5) ─────────────────────────
+
+
+def test_brain_session_path_re_encoded_on_restore(tmp_path) -> None:
+    """claude-code session storage is keyed by the encoded workspace
+    path. dev's `/home/zeus/vexis-workspace` encodes to
+    `-home-zeus-vexis-workspace`; pandora's `/home/deus/vexis-workspace`
+    to `-home-deus-vexis-workspace`. Without re-encoding, the dev
+    sessions land at the source-encoded path on the destination —
+    orphaned because the destination's daemon reads from a different
+    directory.
+
+    Pin the fix: a session zipped from one workspace path must land
+    at the destination workspace's encoded path, regardless of how
+    the source encoded it.
+    """
+    # Source: simulate sessions captured under one workspace path.
+    home, ws = _build_fixture(tmp_path)
+    src_workspace_str = "/home/zeus/vexis-workspace"
+    src_encoded = "-home-zeus-vexis-workspace"
+    fake_cc_root = tmp_path / "fake-claude-projects" / src_encoded
+    fake_cc_root.mkdir(parents=True)
+    (fake_cc_root / "session-001.jsonl").write_text(
+        '{"type":"user","text":"hi"}\n'
+    )
+    (fake_cc_root / "session-002.jsonl").write_text(
+        '{"type":"assistant","text":"hello"}\n'
+    )
+
+    # Pack a minimal archive by hand with the source-encoded prefix.
+    archive = tmp_path / "archive.zip"
+    import zipfile
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(
+            f"brain-sessions/claude-code/{src_encoded}/session-001.jsonl",
+            '{"type":"user","text":"hi"}\n',
+        )
+        zf.writestr(
+            f"brain-sessions/claude-code/{src_encoded}/session-002.jsonl",
+            '{"type":"assistant","text":"hello"}\n',
+        )
+
+    # Destination: a workspace at a DIFFERENT absolute path. The
+    # encoded form will differ from the source's.
+    dest_workspace = tmp_path / "dest-ws"
+    dest_workspace.mkdir()
+    dest_encoded = bk._encode_workspace_for_claude_code(dest_workspace)
+    assert dest_encoded != src_encoded, "test setup invalid: paths collide"
+
+    # Point the destination's claude-projects dir at a tmp location
+    # so the test doesn't write into the developer's real ~/.claude.
+    fake_home = tmp_path / "fake-user-home"
+    fake_home.mkdir()
+    monkeypatch_home_target = tmp_path / "monkeypatch-target"
+    monkeypatch_home_target.mkdir()
+
+    # We need to redirect Path.home() inside run_restore. Easiest:
+    # use a context manager that monkeypatches Path.home for the
+    # call. pytest's monkeypatch isn't accessible here, so we
+    # construct one inline using unittest.mock.
+    from unittest.mock import patch
+    with patch.object(
+        bk.Path, "home", classmethod(lambda cls: fake_home)
+    ):
+        bk.run_restore(
+            archive,
+            home=tmp_path / "h",
+            workspace=dest_workspace,
+        )
+
+    dest_dir = fake_home / ".claude" / "projects" / dest_encoded
+    assert dest_dir.exists(), (
+        f"sessions did not land at destination-encoded path "
+        f"{dest_dir}; check the re-encoding logic in run_restore."
+    )
+    assert (dest_dir / "session-001.jsonl").exists()
+    assert (dest_dir / "session-002.jsonl").exists()
+    # And the source-encoded path must NOT exist — that would indicate
+    # the re-encoding silently fell through.
+    assert not (
+        fake_home / ".claude" / "projects" / src_encoded
+    ).exists(), "sessions landed at source-encoded path; re-encoding broke"
+
+
+def test_encode_workspace_matches_transcripts_encoder() -> None:
+    """The re-encoder must match vexis_agent.core.transcripts'
+    canonical encoder — it's the same algorithm, must stay in sync.
+    A drift would silently cause sessions to land at one path while
+    the curator reads from another."""
+    from vexis_agent.core.transcripts import claude_session_jsonl_dir
+
+    workspace = Path("/home/somebody/vexis-workspace")
+    canonical_dir = claude_session_jsonl_dir(workspace)
+    canonical_encoded = canonical_dir.name
+
+    backup_encoded = bk._encode_workspace_for_claude_code(workspace)
+    assert backup_encoded == canonical_encoded, (
+        f"backup encoder out of sync with transcripts encoder: "
+        f"backup={backup_encoded!r}, canonical={canonical_encoded!r}"
+    )
+
+
 def test_default_archive_path_lives_under_vexis_home() -> None:
     """The default archive lands under whatever ``vexis_dir()``
     resolves to (which is patched by tests/conftest.py's autouse
@@ -270,10 +485,19 @@ def test_backup_includes_opencode_db_when_opted_in(
 
 def test_restore_replays_claude_code_sessions(tmp_path, monkeypatch) -> None:
     """Round-trip: pack with --include-brain-sessions, restore against
-    a fresh ~/.claude/projects/ — sessions land back in place."""
+    a fresh ~/.claude/projects/ — sessions land back at the
+    destination's encoded workspace path.
+
+    Updated v0.1.5: the assertion path is the DESTINATION's encoded
+    workspace, not the source's. Pre-fix the restore wrote sessions
+    to the source-encoded path, which orphaned them whenever the
+    destination's workspace lived at a different absolute path
+    (typical when usernames differ — dev=zeus → home=deus). See
+    ``test_brain_session_path_re_encoded_on_restore`` for the
+    explicit pin on the re-encoding contract."""
     home, ws = _build_fixture(tmp_path)
-    encoded = str(ws).replace("/", "-").replace(".", "-")
-    src_cc = tmp_path / "src-home" / ".claude" / "projects" / encoded
+    src_encoded = str(ws).replace("/", "-").replace(".", "-")
+    src_cc = tmp_path / "src-home" / ".claude" / "projects" / src_encoded
     src_cc.mkdir(parents=True)
     (src_cc / "s1.jsonl").write_text("session1")
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "src-home")
@@ -281,7 +505,8 @@ def test_restore_replays_claude_code_sessions(tmp_path, monkeypatch) -> None:
     archive = tmp_path / "a.zip"
     bk.run_backup(out=archive, home=home, workspace=ws, include_brain_sessions=True)
 
-    # Switch HOME for restore — fresh machine.
+    # Switch HOME for restore — fresh machine. Destination workspace
+    # lives at a different absolute path, so its encoding differs.
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "dest-home")
     new_home = tmp_path / "dest-home" / ".vexis"
     new_ws = tmp_path / "dest-home" / "vexis-workspace"
@@ -290,5 +515,14 @@ def test_restore_replays_claude_code_sessions(tmp_path, monkeypatch) -> None:
 
     result = bk.run_restore(archive, home=new_home, workspace=new_ws)
     assert result.brain_sessions_restored == 1
-    restored = tmp_path / "dest-home" / ".claude" / "projects" / encoded / "s1.jsonl"
+    dest_encoded = str(new_ws).replace("/", "-").replace(".", "-")
+    restored = (
+        tmp_path / "dest-home" / ".claude" / "projects" / dest_encoded
+        / "s1.jsonl"
+    )
     assert restored.read_text() == "session1"
+    # And the source-encoded path must NOT have been written — that
+    # would be the v0.1.4-and-earlier bug we just fixed.
+    assert not (
+        tmp_path / "dest-home" / ".claude" / "projects" / src_encoded
+    ).exists(), "session landed at source-encoded path; re-encoding regressed"

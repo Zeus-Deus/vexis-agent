@@ -279,21 +279,64 @@ def backup_restore(
     overwrite: bool = typer.Option(
         False,
         "--overwrite",
-        help="Overwrite existing files (default: skip).",
+        help=(
+            "Replace EVERY file from the archive, including this "
+            "machine's bot token / config / dashboard token. Almost "
+            "never what you want — use --migrate instead."
+        ),
+    ),
+    migrate: bool = typer.Option(
+        False,
+        "--migrate",
+        help=(
+            "New-machine migration mode: overwrite the destination's "
+            "brain state (memories, skills, SOUL.md, USER.md, "
+            "MEMORY.md, RELATIONSHIPS.md, curator/learning state, "
+            "goals.json) with the source's, BUT preserve this "
+            "machine's bot token (.env), config.yaml, and dashboard "
+            "token. Right for seeding a freshly-installed home "
+            "server with your dev box's accumulated brain — the "
+            "default 'skip existing' overlay would leave any "
+            "daemon-generated stub files in place and silently "
+            "drop your real data."
+        ),
     ),
 ) -> None:
     """Restore a backup zip into $VEXIS_HOME + $VEXIS_WORKSPACE.
 
     Run ``vexis-agent setup`` first on a fresh machine; then point
-    this at the backup zip to bring memories, skills, config, and
-    secrets across. Existing files are skipped unless ``--overwrite``
-    is passed.
+    this at the backup zip to bring memories, skills, and curator
+    state across. Three modes:
+
+      * Default (no flags) — strict non-destructive overlay; only
+        fills in missing files. Right for topping up a partial
+        install with the backup's extras.
+      * ``--migrate`` — overwrites brain state, preserves this
+        machine's bot token / config / dashboard token. Right for
+        seeding a brand-new install with another machine's brain.
+      * ``--overwrite`` — replaces EVERYTHING including secrets.
+        Almost never what users want; preserved for tests + true
+        bit-for-bit restores on the same machine.
     """
     from pathlib import Path
 
     from vexis_agent.daemon.backup import run_restore
 
-    result = run_restore(Path(archive).expanduser(), overwrite=overwrite)
+    if overwrite and migrate:
+        typer.echo(
+            "Pass either --overwrite or --migrate, not both. "
+            "--overwrite is the strict superset (replaces secrets too); "
+            "--migrate keeps machine-local files. Pick the one that "
+            "matches your intent.",
+            err=True,
+        )
+        raise typer.Exit(64)
+
+    result = run_restore(
+        Path(archive).expanduser(),
+        overwrite=overwrite,
+        migrate=migrate,
+    )
     typer.echo(
         f"Restored {result.home_files_restored} home file(s) → {result.home_dest}"
     )
@@ -301,8 +344,20 @@ def backup_restore(
         f"Restored {result.workspace_files_restored} workspace file(s) "
         f"→ {result.workspace_dest}"
     )
-    if not overwrite:
-        typer.echo("(existing files skipped — pass --overwrite to replace them)")
+    if result.brain_sessions_restored:
+        typer.echo(
+            f"Restored {result.brain_sessions_restored} brain-session file(s)"
+        )
+    if migrate:
+        typer.echo(
+            "(--migrate: machine-local files preserved — "
+            ".env, config.yaml, dashboard_token)"
+        )
+    elif not overwrite:
+        typer.echo(
+            "(existing files skipped — pass --migrate to replace brain "
+            "state while keeping this machine's bot token/config)"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────
