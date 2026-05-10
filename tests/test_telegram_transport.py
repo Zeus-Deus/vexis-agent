@@ -362,6 +362,24 @@ class _SerialisingHandler:
             return None
         return self._replies.pop(0)
 
+    # Accessors the goal hook (and v3b relationships hook) reach
+    # for. Mirror ``_FakeHandler``'s defaults — without these, the
+    # drain's ``_run_goal_hook`` raises AttributeError on
+    # ``current_session_uuid()``. The exception is caught at the
+    # hook's own try/except, but on Python 3.12 the scheduling
+    # consequences of the caught error reorder enough that the
+    # preceding ``_send_brain_reply`` doesn't land before the test
+    # observes the bot — making "reply-A" go missing on CI's 3.12
+    # job while 3.11 stays green by luck of timing.
+    def current_session_uuid(self) -> str:
+        return "test-session"
+
+    def next_user_turn_index(self, _session_uuid: str) -> int:
+        return 1
+
+    async def claim_next_turn_index(self, _session_uuid: str) -> int | None:
+        return 1
+
 
 def _bot_messages(bot: _FakeBot, chat_id: int) -> list[str]:
     return [text for cid, text in bot.sent_messages if cid == chat_id]
