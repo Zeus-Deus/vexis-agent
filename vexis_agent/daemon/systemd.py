@@ -172,6 +172,19 @@ def systemctl_available() -> bool:
     return shutil.which("systemctl") is not None
 
 
+def enable_and_start() -> subprocess.CompletedProcess[str]:
+    """``systemctl --user enable --now`` — both enable at boot AND
+    start the unit immediately. The wizard's "fully one-shot install"
+    path calls this so a single ``curl … | bash`` ends with a
+    daemon that's running now and survives reboots, with no follow-up
+    systemctl commands needed.
+
+    Raises CalledProcessError on failure (e.g. user-bus unavailable
+    in containers / WSL); the wizard catches and downgrades to a
+    "start it manually" hint."""
+    return _systemctl(["enable", "--now", UNIT_FILENAME])
+
+
 def start() -> subprocess.CompletedProcess[str]:
     """Start the user service. Raises CalledProcessError on failure."""
     return _systemctl(["start", UNIT_FILENAME])

@@ -569,6 +569,7 @@ class SetupResult:
     archived_config: Optional[Path] = None
     archived_dotenv: Optional[Path] = None
     service_installed: bool = False
+    service_started: bool = False
     brain_check: Optional[BrainCheck] = None
     tailscale_check: Optional[TailscaleCheck] = None
     mcp_config_path: Optional[Path] = None
@@ -859,20 +860,56 @@ def run_setup(
             "'tailscale up' to log in."
         )
 
-    # ── 7. Optional: install systemd service ──────────────────────
+    # ── 7. Install + start systemd service ────────────────────────
+    # Default-yes: most users running setup want the daemon up and
+    # surviving reboots. Saying yes here means a single curl-bash
+    # → wizard answers → daemon running, no follow-up systemctl
+    # commands needed. ``vexis-agent uninstall`` or
+    # ``vexis-agent service uninstall`` reverses both steps.
     section("Service")
     decision = install_service
     if decision is None:
-        decision = confirm_fn("Install the systemd user service now?")
+        decision = confirm_fn(
+            "Install + start the systemd user service now? [Y/n]"
+        )
     service_installed = False
+    service_started = False
     if decision:
-        from vexis_agent.daemon.systemd import install_user_unit
+        from vexis_agent.daemon.systemd import (
+            install_user_unit,
+            enable_and_start,
+        )
 
         install_user_unit()
         service_installed = True
         ok("systemd user unit installed at ~/.config/systemd/user/vexis-agent.service")
+
+        # ``enable --now`` enables auto-start at boot AND starts the
+        # unit immediately. Best-effort: containers / WSL without
+        # --user wired up will fail here; we surface the error and
+        # tell the user how to start manually instead of crashing
+        # the whole wizard.
+        try:
+            enable_and_start()
+            service_started = True
+            ok("daemon started + enabled at boot")
+            info(
+                "  status: vexis-agent service status\n"
+                "  logs:   vexis-agent service logs --follow\n"
+                "  stop:   systemctl --user stop vexis-agent.service"
+            )
+        except Exception as exc:
+            warn(f"could not enable+start the service: {exc}")
+            info(
+                "Unit installed; start it manually with:\n"
+                "  systemctl --user enable --now vexis-agent.service"
+            )
     else:
-        info("skipped — run 'vexis-agent service install' later if you want it.")
+        info(
+            "skipped. Install + start later with:\n"
+            "  vexis-agent service install\n"
+            "  systemctl --user enable --now vexis-agent.service"
+        )
 
     return SetupResult(
         home=home,
@@ -884,6 +921,7 @@ def run_setup(
         archived_config=archived_config,
         archived_dotenv=archived_dotenv,
         service_installed=service_installed,
+        service_started=service_started,
         brain_check=bc,
         tailscale_check=ts,
         # Back-compat: mcp_config_path keeps the active brain's path
@@ -938,8 +976,12 @@ def format_summary(result: SetupResult) -> str:
         lines.append(f"    {result.brain_check.install_hint}")
         lines.append("")
 
-    if result.service_installed:
-        lines.append("Service installed. Start it with:")
+    if result.service_started:
+        lines.append("Daemon is running and enabled at boot.")
+        lines.append("  vexis-agent service status       # is it healthy?")
+        lines.append("  vexis-agent service logs -f      # tail the journal")
+    elif result.service_installed:
+        lines.append("Service installed (not started). Start it with:")
         lines.append("  systemctl --user enable --now vexis-agent.service")
     else:
         lines.append("Next steps:")
