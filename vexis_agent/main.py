@@ -405,6 +405,21 @@ async def _run() -> None:
         workspace=workspace, notifier=notifier, brain=brain,
     )
 
+    # /schedule feature (see docs/schedules.md). Manager is a daemon
+    # thread that fires due schedules into the chat FIFO. Disabled
+    # via schedules.enabled: false in config.yaml — when off the
+    # tick body is a no-op and the slash command replies with the
+    # disabled note.
+    from vexis_agent.core.paths import vexis_dir
+    from vexis_agent.core.schedule_manager import ScheduleManager
+    from vexis_agent.core.schedule_state import ScheduleStore
+    schedule_store = ScheduleStore(vexis_dir() / "schedules.json")
+    schedule_manager = ScheduleManager(
+        schedule_store,
+        running_tasks=running_tasks,
+        allowed_user_id=config.telegram_allowed_user_id,
+    )
+
     # Web chat bridges the dashboard chat UI to the same MessageHandler
     # the Telegram transport uses. Sharing the handler means both
     # transports see the same SessionStore and Notifier — slash commands
@@ -450,6 +465,7 @@ async def _run() -> None:
         curator=curator,
         learning_curator=learning_curator,
         dashboard=dashboard,
+        schedule_store=schedule_store,
     )
 
     log.info("Vexis-Agent starting")
@@ -457,9 +473,11 @@ async def _run() -> None:
     await dashboard.start()
     curator.start(asyncio.get_running_loop())
     learning_curator.start(asyncio.get_running_loop())
+    schedule_manager.start(asyncio.get_running_loop())
     try:
         await transport.run()
     finally:
+        schedule_manager.stop()
         learning_curator.stop()
         curator.stop()
         await dashboard.stop()

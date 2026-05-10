@@ -258,6 +258,42 @@ _CANCEL_OK_GOAL_PAUSED_TMPL = (
     "Cancelled, sir. (Goal paused at {turns}/{budget} turns — "
     "/goal resume to keep going.)"
 )
+
+# /schedule strings — kept short so they fit in Telegram message
+# windows without truncation; longer reference material lives in
+# docs/schedules.md (Day 4) and the brain's tool description (which
+# the user typically doesn't see).
+_SCHEDULE_DISABLED_NOTE = (
+    "Scheduling is disabled. Set schedules.enabled: true in "
+    "~/.vexis/config.yaml to enable."
+)
+_SCHEDULE_HELP = (
+    "/schedule — Set reminders and recurring tasks.\n\n"
+    "Examples:\n"
+    "  /schedule remind me every weekday at 9am to do standup\n"
+    "  /schedule in 30 minutes ping me about the build\n\n"
+    "Management:\n"
+    "  /schedule list           — show active schedules\n"
+    "  /schedule pause <id>     — temporarily stop one\n"
+    "  /schedule resume <id>    — start a paused one\n"
+    "  /schedule clear <id>     — remove (audit-retained)"
+)
+_SCHEDULE_ACK = "On it…"
+_SCHEDULE_LIST_EMPTY = (
+    "No active schedules. Create one by telling me what to schedule, "
+    "in chat or after /schedule."
+)
+_SCHEDULE_LIST_HEADER = "Schedules:"
+_SCHEDULE_NOT_FOUND_TMPL = (
+    "No schedule matches {id} (or prefix is ambiguous / shorter than 3 chars). "
+    "Try /schedule list to see ids."
+)
+_SCHEDULE_ALREADY_TERMINAL_TMPL = (
+    "Schedule is already {status} — no action taken. /schedule list to confirm."
+)
+_SCHEDULE_PAUSED_TMPL = "⏸ Schedule {id} paused. /schedule resume {id} to re-arm."
+_SCHEDULE_RESUMED_TMPL = "▶ Schedule {id} resumed. Next fire: {next_fire}"
+_SCHEDULE_CLEARED_TMPL = "✓ Schedule {id} cleared (record retained for audit)."
 _STATUS_IDLE = "Nothing running, sir."
 _STATUS_NO_TOOLS_YET = "No tool activity yet."
 
@@ -467,6 +503,7 @@ class TelegramTransport:
         curator: "CuratorController | None" = None,
         learning_curator: "LearningController | None" = None,
         dashboard: "WebDashboard | None" = None,
+        schedule_store: "object | None" = None,  # ScheduleStore; weak-typed to avoid import cycle
     ) -> None:
         self._handler = handler
         self._running_tasks = running_tasks
@@ -476,6 +513,7 @@ class TelegramTransport:
         self._curator = curator
         self._learning_curator = learning_curator
         self._dashboard = dashboard
+        self._schedule_store = schedule_store
         # Telegram bot commands can't contain hyphens, so /confirm-delete from
         # the spec becomes /confirm_delete here.
         self._pending_deletes: dict[str, datetime] = {}
@@ -514,6 +552,7 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("curator", self._on_curator))
         self._app.add_handler(CommandHandler("learning", self._on_learning))
         self._app.add_handler(CommandHandler("goal", self._on_goal))
+        self._app.add_handler(CommandHandler("schedule", self._on_schedule))
         self._app.add_handler(CommandHandler("model", self._on_model))
         self._app.add_handler(CommandHandler("dashboard", self._on_dashboard))
         self._app.add_handler(CommandHandler("tailscale", self._on_tailscale))
@@ -1553,6 +1592,234 @@ class TelegramTransport:
         await self._dispatch_to_brain(
             msg.get_bot(), msg.chat_id, user.id, goal_text
         )
+
+    async def _on_schedule(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Dispatch /schedule [list|status|pause|resume|clear|<text>].
+
+        Behind ``schedules_enabled()`` — replies with the disabled-note
+        when off so the user finds out via the slash menu rather than
+        silent no-op.
+
+        Subcommand dispatch:
+
+          /schedule                 → help text (local, no brain)
+          /schedule list            → render store rows (local)
+          /schedule status          → alias for list
+          /schedule pause <id>      → store.update_atomic (local)
+          /schedule resume <id>     → store.update_atomic (local)
+          /schedule clear <id>      → store.clear (local)
+          /schedule <anything else> → enqueue synthetic message via
+                                      RunningTasks with origin=
+                                      "schedule_command"; brain calls
+                                      `vexis-agent schedule create` and
+                                      replies with echo-confirmation.
+
+        The slash command handler does NO cron parsing — that lives
+        inside the brain-callable CLI surface so user phrasing always
+        flows through the brain → tool path (single source of parser
+        truth, brain owns echo-confirmation).
+        """
+        from vexis_agent.core.yaml_config import schedules_enabled
+
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /schedule from user_id=%s", user.id)
+            return
+
+        if not schedules_enabled():
+            await msg.reply_text(_SCHEDULE_DISABLED_NOTE)
+            return
+
+        if self._schedule_store is None:
+            log.warning(
+                "/schedule invoked but no schedule_store wired; "
+                "this is a daemon-startup bug"
+            )
+            await msg.reply_text(_SCHEDULE_DISABLED_NOTE)
+            return
+
+        args = ctx.args or []
+        if not args:
+            await msg.reply_text(_SCHEDULE_HELP)
+            return
+
+        sub = args[0].lower()
+
+        # ── local management subcommands ──────────────────────────
+        if sub in ("list", "status"):
+            await msg.reply_text(self._render_schedule_list())
+            return
+
+        if sub == "pause":
+            await self._do_schedule_pause(msg, args[1:])
+            return
+
+        if sub == "resume":
+            await self._do_schedule_resume(msg, args[1:])
+            return
+
+        if sub == "clear":
+            await self._do_schedule_clear(msg, args[1:])
+            return
+
+        # ── create path: dispatch text to the brain via the FIFO ──
+        # Reconstruct the user's text from message.text so punctuation
+        # survives. Strip the leading "/schedule" token.
+        raw_text = (msg.text or "").strip()
+        if raw_text.startswith("/"):
+            after_slash = raw_text[1:]
+            space_idx = after_slash.find(" ")
+            schedule_text = (
+                after_slash[space_idx + 1:] if space_idx >= 0 else ""
+            )
+        else:
+            schedule_text = " ".join(args)
+        schedule_text = schedule_text.strip()
+        if not schedule_text:
+            await msg.reply_text(_SCHEDULE_HELP)
+            return
+
+        # Synthetic message body: the leading [user invoked /schedule]
+        # tag is an explicit-intent hint so the brain treats the
+        # following text as a scheduling request even if the phrasing
+        # is ambiguous.
+        synthetic = f"[user invoked /schedule]\n{schedule_text}"
+
+        # Ack first so the user sees something immediately; the brain
+        # response takes longer.
+        await msg.reply_text(_SCHEDULE_ACK)
+
+        # If a drain is already active for this chat, enqueue;
+        # otherwise claim and dispatch. Mirrors the message-dispatch
+        # flow used by user-typed messages.
+        if await self._running_tasks.claim(msg.chat_id):
+            try:
+                await self._dispatch_to_brain(
+                    msg.get_bot(), msg.chat_id, user.id, synthetic
+                )
+            finally:
+                # Drain release happens inside _dispatch_to_brain's
+                # post-turn loop; nothing further needed here.
+                pass
+        else:
+            await self._running_tasks.enqueue(
+                chat_id=msg.chat_id,
+                user_id=user.id,
+                text=synthetic,
+                origin="schedule_command",
+            )
+
+    def _render_schedule_list(self) -> str:
+        """Render the active+paused schedule list as Telegram-friendly text."""
+        from vexis_agent.core.schedule_state import ScheduleStore
+        store: ScheduleStore = self._schedule_store  # type: ignore[assignment]
+        rows = [r for r in store.list_all() if r.status != "cleared"]
+        if not rows:
+            return _SCHEDULE_LIST_EMPTY
+        # Sort: active first (by next_fire_at asc), then paused, then expired.
+        def _key(r):
+            order = {"active": 0, "paused": 1, "expired": 2}.get(r.status, 3)
+            nfa = r.next_fire_at or datetime.max.replace(tzinfo=timezone.utc)
+            return (order, nfa)
+        rows.sort(key=_key)
+        lines = [_SCHEDULE_LIST_HEADER]
+        for r in rows:
+            preview = r.prompt[:50]
+            if len(r.prompt) > 50:
+                preview += "…"
+            nfa = (
+                r.next_fire_at.isoformat()
+                if r.next_fire_at
+                else "—"
+            )
+            lines.append(
+                f"  {r.id[:6]} · {r.status} · {r.schedule_display}\n"
+                f"      next: {nfa}\n"
+                f"      \"{preview}\""
+            )
+        return "\n".join(lines)
+
+    async def _do_schedule_pause(self, msg, args: list[str]) -> None:
+        if not args:
+            await msg.reply_text("Usage: /schedule pause <id>")
+            return
+        from dataclasses import replace
+        from vexis_agent.core.schedule_state import (
+            ScheduleStore,
+            TerminalScheduleError,
+        )
+        store: ScheduleStore = self._schedule_store  # type: ignore[assignment]
+        sid = store.resolve_id_prefix(args[0]) or args[0]
+        if not store.load(sid):
+            await msg.reply_text(_SCHEDULE_NOT_FOUND_TMPL.format(id=args[0]))
+            return
+        try:
+            store.update_atomic(
+                sid,
+                lambda s: replace(
+                    s, status="paused", paused_reason="user", next_fire_at=None
+                ),
+            )
+        except TerminalScheduleError as exc:
+            await msg.reply_text(
+                _SCHEDULE_ALREADY_TERMINAL_TMPL.format(status=exc.status)
+            )
+            return
+        await msg.reply_text(_SCHEDULE_PAUSED_TMPL.format(id=sid[:6]))
+
+    async def _do_schedule_resume(self, msg, args: list[str]) -> None:
+        if not args:
+            await msg.reply_text("Usage: /schedule resume <id>")
+            return
+        from dataclasses import replace
+        from vexis_agent.core.schedule_state import (
+            ScheduleStore,
+            TerminalScheduleError,
+        )
+        from vexis_agent.tools.schedule_tool.parser import compute_next_fire
+        store: ScheduleStore = self._schedule_store  # type: ignore[assignment]
+        sid = store.resolve_id_prefix(args[0]) or args[0]
+        if not store.load(sid):
+            await msg.reply_text(_SCHEDULE_NOT_FOUND_TMPL.format(id=args[0]))
+            return
+        try:
+            result = store.update_atomic(
+                sid,
+                lambda s: replace(
+                    s,
+                    status="active",
+                    paused_reason=None,
+                    next_fire_at=compute_next_fire(s.schedule, last_fire_at=None),
+                    consecutive_errors=0,
+                ),
+            )
+        except TerminalScheduleError as exc:
+            await msg.reply_text(
+                _SCHEDULE_ALREADY_TERMINAL_TMPL.format(status=exc.status)
+            )
+            return
+        nfa_str = (
+            result.next_fire_at.isoformat() if result.next_fire_at else "—"
+        )
+        await msg.reply_text(
+            _SCHEDULE_RESUMED_TMPL.format(id=sid[:6], next_fire=nfa_str)
+        )
+
+    async def _do_schedule_clear(self, msg, args: list[str]) -> None:
+        if not args:
+            await msg.reply_text("Usage: /schedule clear <id>")
+            return
+        from vexis_agent.core.schedule_state import ScheduleStore
+        store: ScheduleStore = self._schedule_store  # type: ignore[assignment]
+        sid = store.resolve_id_prefix(args[0]) or args[0]
+        if not store.load(sid):
+            await msg.reply_text(_SCHEDULE_NOT_FOUND_TMPL.format(id=args[0]))
+            return
+        store.clear(sid)
+        await msg.reply_text(_SCHEDULE_CLEARED_TMPL.format(id=sid[:6]))
 
     async def _on_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Dispatch /model [status|list|set|reset|...].
