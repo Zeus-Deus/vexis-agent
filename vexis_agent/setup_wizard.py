@@ -553,51 +553,77 @@ class SetupResult:
 
 
 PromptFn = Callable[[str, bool], str]
-
-
-def _default_prompt(message: str, secret: bool) -> str:
-    sys.stdout.write(message)
-    sys.stdout.flush()
-    raw = sys.stdin.readline()
-    return raw.rstrip("\n")
-
-
-def _default_confirm(message: str) -> bool:
-    sys.stdout.write(message)
-    sys.stdout.flush()
-    raw = sys.stdin.readline().strip().lower()
-    return raw in {"y", "yes"}
-
-
 # Choice prompts: a callable that takes (message, options, default_idx)
 # and returns the chosen index. Tests inject canned answers; the
-# default reads stdin and accepts a 1-based numeric pick (or empty
-# for the default).
+# defaults below render via questionary (arrow-key navigation)
+# when stdin is a real TTY and fall back to plain input otherwise.
 ChoiceFn = Callable[[str, list[str], int], int]
 
 
+# Lazy import so the module loads even on systems without questionary
+# (e.g. wheel build environments). The actual prompt-rendering paths
+# raise gracefully if questionary isn't reachable AND the caller
+# didn't inject a custom prompt fn.
+try:
+    import questionary as _q  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover — questionary is a hard dep
+    _q = None  # type: ignore[assignment]
+
+
+def _q_or_abort():
+    """Return the questionary module or raise SetupAborted with a
+    clear error. Called by every default prompt function so the
+    wizard fails fast on a misconfigured install rather than
+    silently degrading to ugly fallback input()."""
+    if _q is None:
+        raise SetupAborted(
+            "questionary not installed; reinstall vexis-agent or pass "
+            "a custom prompt/confirm/choice fn to run_setup()."
+        )
+    return _q
+
+
+def _default_prompt(message: str, secret: bool) -> str:
+    """Free-text prompt. ``secret=True`` is informational — we keep
+    input visible because Telegram tokens get pasted in full and
+    users want to see typos."""
+    q = _q_or_abort()
+    # Strip trailing colon + whitespace so questionary renders its
+    # own clean prompt UI without the existing ": " suffix.
+    label = message.rstrip().rstrip(":").rstrip()
+    ans = q.text(label).ask()
+    if ans is None:
+        raise SetupAborted("setup cancelled by user")
+    return ans
+
+
+def _default_confirm(message: str) -> bool:
+    """Y/N confirm. Default-no unless the message contains [Y/n]."""
+    q = _q_or_abort()
+    label = message.split("[")[0].rstrip().rstrip("?").rstrip()
+    if not label.endswith("?"):
+        label = label + "?"
+    default = "[Y/n]" in message
+    ans = q.confirm(label, default=default).ask()
+    if ans is None:
+        raise SetupAborted("setup cancelled by user")
+    return ans
+
+
 def _default_choice(message: str, options: list[str], default_idx: int) -> int:
-    """Numbered-list prompt. Empty input → default; out-of-range or
-    non-numeric → re-prompt up to a few times then bail to default."""
-    sys.stdout.write(f"{message}\n")
-    for i, opt in enumerate(options):
-        marker = "*" if i == default_idx else " "
-        sys.stdout.write(f"   {marker} {i + 1}) {opt}\n")
-    for _ in range(3):
-        sys.stdout.write(f"    [{default_idx + 1}]: ")
-        sys.stdout.flush()
-        raw = sys.stdin.readline().strip()
-        if not raw:
-            return default_idx
-        try:
-            picked = int(raw)
-        except ValueError:
-            sys.stdout.write(f"      not a number — pick 1..{len(options)}\n")
-            continue
-        if 1 <= picked <= len(options):
-            return picked - 1
-        sys.stdout.write(f"      out of range — pick 1..{len(options)}\n")
-    return default_idx
+    """Arrow-key navigable list. ↑/↓ to move, Enter to pick,
+    Ctrl-C to abort the wizard."""
+    q = _q_or_abort()
+    label = message.lstrip().rstrip()
+    default_choice = (
+        options[default_idx]
+        if 0 <= default_idx < len(options)
+        else None
+    )
+    ans = q.select(label, choices=options, default=default_choice).ask()
+    if ans is None:
+        raise SetupAborted("setup cancelled by user")
+    return options.index(ans)
 
 
 def _set_brain_kind(config_path: Path, kind: str) -> None:
@@ -690,7 +716,7 @@ def run_setup(
     # ── 2. Telegram secrets ───────────────────────────────────────
     section("Telegram")
     info("From @BotFather: /newbot, then copy the token.")
-    token = prompt("    Telegram bot token: ", True).strip()
+    token = prompt("Telegram bot token", True).strip()
     if token:
         update_env_value(dotenv_path, "TELEGRAM_BOT_TOKEN", token)
         ok("TELEGRAM_BOT_TOKEN written")
@@ -698,7 +724,7 @@ def run_setup(
         warn("skipped — set TELEGRAM_BOT_TOKEN later in ~/.vexis/.env")
 
     info("Your numeric Telegram user ID (use @userinfobot to look up).")
-    user_id = prompt("    Allowed Telegram user ID: ", False).strip()
+    user_id = prompt("Allowed Telegram user ID", False).strip()
     if user_id:
         update_env_value(dotenv_path, "TELEGRAM_ALLOWED_USER_ID", user_id)
         ok("TELEGRAM_ALLOWED_USER_ID written")
@@ -725,7 +751,7 @@ def run_setup(
         except ValueError:
             default_idx = 0
         picked_idx = choice_fn(
-            "  Which brain should vexis-agent use?", labels, default_idx
+            "Which brain should vexis-agent use?", labels, default_idx
         )
         brain_kind = brain_options[picked_idx]
     if brain_kind != current:
@@ -814,7 +840,7 @@ def run_setup(
     section("Service")
     decision = install_service
     if decision is None:
-        decision = confirm_fn("    Install the systemd user service now? [y/N] ")
+        decision = confirm_fn("Install the systemd user service now?")
     service_installed = False
     if decision:
         from vexis_agent.daemon.systemd import install_user_unit
