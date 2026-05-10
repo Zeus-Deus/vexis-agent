@@ -170,8 +170,7 @@ def _hangup_protection() -> Iterator[None]:
     is preserved across exec(), which means pip/git children inherit
     the protection.
 
-    Restores the previous handler on exit even on exception. Same
-    pattern hermes uses (hermes_cli.main._install_hangup_protection).
+    Restores the previous handler on exit even on exception.
     """
     if not hasattr(signal, "SIGHUP"):  # pragma: no cover — Windows
         yield

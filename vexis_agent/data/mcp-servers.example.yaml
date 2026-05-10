@@ -1,50 +1,34 @@
 # vexis-agent — user-declared MCP servers.
 #
-# Copy this file to ~/.vexis/mcp-servers.yaml (or
-# $VEXIS_HOME/mcp-servers.yaml) and uncomment the entries you want
-# vexis to wire into the workspace MCP config. Then run
-# `vexis-agent setup` or `vexis-agent service restart` so the brain
-# picks them up.
+# Copy to ~/.vexis/mcp-servers.yaml (or $VEXIS_HOME/mcp-servers.yaml)
+# and add entries for each MCP server you want vexis to wire into the
+# workspace MCP config. Run `vexis-agent setup` (or
+# `vexis-agent service restart`) so the brain picks them up.
 #
-# Each entry's `binary` is checked against PATH at wizard time;
-# entries whose binary isn't installed get skipped silently. Drop
-# aspirational entries here without breaking anything.
-#
-# This is vexis's plugin mechanism: every "plugin" is a standalone
-# MCP server. Install the server's binary normally (brew, npm,
-# cargo, your distro's package manager); declare it here. See
-# .plans/plugin-architecture-research.md for the design rationale.
+# The wizard skips any entry whose `binary` isn't on PATH, so you can
+# declare aspirational entries without breaking anything.
 
 servers: []
 
-# Examples — uncomment to enable:
+# Example shapes — uncomment and adapt:
 #
 # servers:
-#   # Peekaboo — macOS desktop control via MCP.
-#   - name: peekaboo
-#     binary: npx                       # binary that must exist on PATH
-#     command: npx
-#     args: ["-y", "@steipete/peekaboo"]
-#     env:
-#       PEEKABOO_AI_PROVIDERS: anthropic/claude-opus-4
+#   # Direct binary, no args.
+#   - name: my-tool
+#     command: my-tool
+#     args: []
 #
-#   # Playwright — browser automation MCP (alternative to vexis's
-#   # built-in browser_use tools).
-#   - name: playwright
+#   # Tool that runs via a launcher (npx / pipx run / uvx / cargo run).
+#   # The `binary` field is the PATH check; defaults to `command`.
+#   - name: my-launched-tool
 #     binary: npx
 #     command: npx
-#     args: ["-y", "@playwright/mcp@latest"]
+#     args: ["-y", "some-mcp-package"]
 #
-#   # filesystem — read-only file access for paths you whitelist.
-#   - name: filesystem
-#     binary: mcp-server-filesystem
-#     command: mcp-server-filesystem
-#     args: ["~/Documents"]
-#
-#   # A locally-installed custom MCP — example shape:
-#   - name: my-tool
-#     binary: my-tool
+#   # Tool that needs per-server env (API keys, config paths, etc.).
+#   - name: my-tool-with-env
 #     command: my-tool
 #     args: ["--mcp"]
 #     env:
-#       MY_TOOL_KEY_FILE: ~/.config/my-tool/key
+#       MY_TOOL_API_KEY: "..."
+#       MY_TOOL_CONFIG: "~/.config/my-tool/cfg"

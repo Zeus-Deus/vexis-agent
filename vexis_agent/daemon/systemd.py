@@ -2,10 +2,9 @@
 
 Renders the unit at install time so the actual venv python (sys.executable
 of the running ``vexis-agent`` process) and the resolved ``VEXIS_HOME`` get
-baked into the unit. That mirrors hermes' ``gateway install`` and
-openclaw's ``daemon install`` patterns: a static ``.service`` file
-shipped in the repo would point at the wrong python on every machine
-that doesn't match the dev's pipx layout.
+baked into the unit. A static ``.service`` file shipped in the repo
+would point at the wrong python on every machine that doesn't match
+the dev's pipx layout.
 
 Decision D6 in ``.plans/packaging-implementation-plan.md`` §2.
 

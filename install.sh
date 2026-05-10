@@ -24,7 +24,7 @@
 #      stdin can't reach a TTY.
 #
 # Plan §7.2 (.plans/packaging-implementation-plan.md), revised in
-# Phase 5e to mirror the hermes/openclaw banner-and-auto-setup UX.
+# Phase 5e for banner + auto-setup UX.
 
 set -euo pipefail
 

@@ -52,7 +52,7 @@ _WORKSPACE_CLAUDE_TEMPLATE = "workspace_CLAUDE.md.template"
 
 
 # ──────────────────────────────────────────────────────────────────────
-# ANSI color helpers — mirror hermes' style without adding a dep.
+# ANSI color helpers. No external dep — keeps the wizard surface small.
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -321,18 +321,17 @@ def _user_mcp_specs() -> list[dict]:
     Schema (every key is optional except ``name`` + ``command``):
 
       servers:
-        - name: peekaboo               # MCP server name (required)
-          binary: peekaboo             # presence check (optional);
+        - name: my-tool                # MCP server name (required)
+          binary: my-tool              # presence check (optional);
                                        # default: same as command's argv[0]
-          command: npx                 # binary to invoke (required)
-          args: ["-y", "@steipete/peekaboo"]
+          command: my-tool             # binary to invoke (required)
+          args: ["--mcp"]
           env:
-            PEEKABOO_AI_PROVIDERS: anthropic/claude-opus-4
+            MY_TOOL_API_KEY: "..."
 
     The wizard skips entries whose ``binary`` isn't on PATH so users
     can declare aspirational servers without having them installed
-    yet. This is the canonical "vexis plugin" mechanism; see
-    .plans/plugin-architecture-research.md for the design.
+    yet. This is vexis's extension mechanism — see CONTRIBUTING.md.
 
     Missing file → empty list (default state). Malformed file →
     warning + empty list (don't fail the whole wizard over YAML
@@ -398,8 +397,7 @@ def detect_mcp_servers() -> list[dict]:
             out.append(spec)
             seen.add(spec["name"])
     # User entries are appended; if a user declares an entry with the
-    # same name as a built-in, the user's wins (matches the hermes
-    # convention of "later sources override earlier ones").
+    # same name as a built-in, the user's wins.
     for spec in _user_mcp_specs():
         if spec["name"] in seen:
             # Replace built-in with user-defined. Drop the built-in
@@ -850,7 +848,7 @@ def run_setup(
 
 
 def _print_banner() -> None:
-    """Hermes-style box. Skip when stdout isn't a terminal (test
+    """ANSI banner box. Skip when stdout isn't a terminal (test
     capture, log redirect)."""
     line1 = "       vexis-agent setup wizard"
     line2 = "  Telegram-bridged agent for Linux (Hyprland)."

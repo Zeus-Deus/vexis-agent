@@ -155,43 +155,20 @@ PID files, and SQLite WAL sidecars (which can produce torn restores).
 
 Secrets (`.env`, dashboard token) restore at mode 0600.
 
-## Extending vexis (MCP-as-plugin model)
+## Extending vexis
 
-vexis doesn't have a bespoke plugin loader. Instead, every "plugin"
-is a standalone **MCP server** — a separate tool/binary that speaks
-the Model Context Protocol. You install it the way its docs say
-(`brew install …`, `npm install -g …`, `cargo install …`, distro
-package, …), declare it in `~/.vexis/mcp-servers.yaml`, and the
-wizard wires it into your workspace's MCP config so the brain sees
-the new tools on next spawn.
-
-A copy-pasteable starter lives at
-`vexis_agent/data/mcp-servers.example.yaml`. Example:
+Add new tools by declaring MCP servers in `~/.vexis/mcp-servers.yaml`:
 
 ```yaml
-# ~/.vexis/mcp-servers.yaml
 servers:
-  - name: peekaboo                # macOS desktop control
-    binary: npx
-    command: npx
-    args: ["-y", "@steipete/peekaboo"]
-  - name: playwright              # browser automation
-    binary: npx
-    command: npx
-    args: ["-y", "@playwright/mcp@latest"]
+  - name: my-tool
+    command: my-tool
+    args: ["--mcp"]
 ```
 
-After editing, run `vexis-agent setup` (or just `vexis-agent service
-restart` if you've already done setup). Entries whose `binary` isn't
-on PATH get skipped silently; aspirational entries don't break
-anything.
-
-This composes cleanly with the wider Linux AI-tools ecosystem —
-the same MCP server you use with vexis works with claude-code,
-opencode, Cursor, and so on. See `CONTRIBUTING.md` for the full
-extension story and `.plans/plugin-architecture-research.md` for
-the design rationale (why MCP-as-plugin instead of a hermes-style
-Python plugin loader).
+Re-run `vexis-agent setup` (or `vexis-agent service restart`) and
+the brain picks them up. Entries whose binary isn't on PATH are
+skipped. Full schema in `vexis_agent/data/mcp-servers.example.yaml`.
 
 ## Choosing your brain
 
@@ -272,10 +249,9 @@ Idempotent.
 
 ## Status
 
-Packaging effort landed on the `packaging-effort` branch. Everything
-above (curl-bash install with auto-setup, hermes-style wizard,
-systemd lifecycle, doctor with 10 checks, backup/restore, robust
-update with snapshots + log mirror, MCP auto-detection) is
-implemented and dogfooded on the maintainer's dev box. The repo is
-single-user by design; no plans for PyPI / AUR / Docker until the
-curl-bash flow is battle-tested in production.
+Packaging effort landed on the `packaging-effort` branch. Curl-bash
+install, interactive setup wizard, systemd lifecycle, doctor,
+backup/restore, robust update with pre-snapshots, and MCP auto-
+detection are all implemented and dogfooded on the maintainer's
+dev box. Single-user by design; no plans for PyPI / AUR / Docker
+yet.

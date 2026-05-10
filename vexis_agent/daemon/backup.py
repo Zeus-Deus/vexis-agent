@@ -35,8 +35,6 @@ Excluded by design:
   - browser-profiles/ — regenerable + can be huge.
   - Runtime PID files (daemon.pid).
 
-Pattern cribbed from hermes_cli/backup.py — kept much smaller because
-vexis's state surface is smaller.
 """
 
 from __future__ import annotations
@@ -92,8 +90,8 @@ def _should_skip(rel: Path) -> bool:
 def _walk_for_backup(root: Path) -> Iterable[Path]:
     """Yield every file under ``root`` that survives the exclude rules.
 
-    Walks lazily so we never hold the full file list in memory — same
-    posture hermes uses for ``~/.hermes`` (which can grow large)."""
+    Walks lazily so we never hold the full file list in memory — the
+    workspace + curator state can grow large over time."""
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune in-place so os.walk doesn't recurse into excluded dirs.
         dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIR_NAMES]
