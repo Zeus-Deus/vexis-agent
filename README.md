@@ -157,7 +157,7 @@ Secrets (`.env`, dashboard token) restore at mode 0600.
 
 ## Extending vexis
 
-Add new tools by declaring MCP servers in `~/.vexis/mcp-servers.yaml`:
+**New tools — declare an MCP server** in `~/.vexis/mcp-servers.yaml`:
 
 ```yaml
 servers:
@@ -168,7 +168,22 @@ servers:
 
 Re-run `vexis-agent setup` (or `vexis-agent service restart`) and
 the brain picks them up. Entries whose binary isn't on PATH are
-skipped. Full schema in `vexis_agent/data/mcp-servers.example.yaml`.
+skipped. Full schema: `vexis_agent/data/mcp-servers.example.yaml`.
+
+**New skills — `vexis-skill create`** or drop a SKILL.md by hand:
+
+```bash
+# via the helper (creates the directory, validates frontmatter)
+vexis-skill create my-skill --content-file ~/my-skill.md
+
+# or directly
+mkdir -p ~/vexis-workspace/skills/my-skill
+$EDITOR ~/vexis-workspace/skills/my-skill/SKILL.md
+```
+
+The brain auto-discovers everything in `~/vexis-workspace/skills/`
+on next session — no restart needed. `vexis-skill list/view/edit/
+patch/archive` round out the surface.
 
 ## Choosing your brain
 

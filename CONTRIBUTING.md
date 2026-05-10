@@ -54,6 +54,26 @@ the new tools on the next spawn.
 
 Full schema + commented examples: `vexis_agent/data/mcp-servers.example.yaml`.
 
+## Adding skills
+
+Skills are markdown procedure documents the brain reads on every
+session. Two ways to add one:
+
+```bash
+# via the helper — validates frontmatter, sets up the directory
+vexis-skill create my-skill --content-file ~/my-skill.md
+
+# or directly — the brain auto-discovers everything under
+# ~/vexis-workspace/skills/<name>/SKILL.md on next session
+mkdir -p ~/vexis-workspace/skills/my-skill
+$EDITOR ~/vexis-workspace/skills/my-skill/SKILL.md
+```
+
+Other commands: `vexis-skill list / view / edit / patch / archive
+/ restore / write-file / remove-file`. The curator can also promote
+skills from your past sessions automatically — see CLAUDE.md's
+"Learning curator" section.
+
 ## Extending at the source level
 
 For deeper extensions, the layered architecture supports it:
