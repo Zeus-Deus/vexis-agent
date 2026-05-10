@@ -341,6 +341,40 @@ def test_pickup_preview_short_text_no_ellipsis():
 # --- drain + queue + Picking up ack ----------------------------------------
 
 
+class _ReleaseEvent(asyncio.Event):
+    """Release-gate that consumes the previous turn's ``in_call`` set
+    state at the same instant it fires.
+
+    Tests step turns forward with the pattern::
+
+        await wait_for(handler.in_call.wait())   # turn N entered
+        handler.release_call.set()
+        await wait_for(handler.in_call.wait())   # wait for turn N+1
+
+    Without this synchronisation, ``in_call`` is still set from
+    turn N when the second ``wait_for`` evaluates ``in_call.is_set()``
+    — Event.wait() returns immediately on a set flag, so the test
+    fires before turn N+1 actually enters handle, and any
+    side-effects expected to land between (reply send, "Picking up:"
+    ack, queue pop) haven't run yet. Python 3.11 happened to
+    schedule the drain task ahead of the test in most interleavings;
+    3.12 reorders enough to expose the race.
+
+    Clearing ``in_call`` inside ``set()`` (synchronously, before any
+    await can yield control) makes the second ``wait_for`` see a
+    cleared event and properly block until the next handle entry
+    sets it.
+    """
+
+    def __init__(self, in_call: asyncio.Event) -> None:
+        super().__init__()
+        self._in_call = in_call
+
+    def set(self) -> None:  # type: ignore[override]
+        self._in_call.clear()
+        super().set()
+
+
 class _SerialisingHandler:
     """Brain stub that lets the test step the drain forward one turn at
     a time. Each `handle()` waits on a per-call gate the test releases."""
@@ -349,13 +383,15 @@ class _SerialisingHandler:
         self._replies = list(replies)
         self.calls: list[str] = []
         self.in_call = asyncio.Event()
-        self.release_call = asyncio.Event()
+        self.release_call = _ReleaseEvent(self.in_call)
 
     async def handle(self, user_id: int, chat_id: int, text: str) -> str | None:
         self.calls.append(text)
         self.in_call.set()
         await self.release_call.wait()
-        # Reset for the next turn.
+        # Reset for the next turn. ``in_call`` may already be clear
+        # (the test's ``release_call.set()`` consumed it via
+        # ``_ReleaseEvent``) — the assignment is a safe no-op then.
         self.in_call.clear()
         self.release_call.clear()
         if not self._replies:
