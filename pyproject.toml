@@ -67,6 +67,11 @@ vexis_agent = ["**/*.yaml", "**/*.json", "data/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Repo root on sys.path so `from scripts.* import ...` resolves under
+# CI's pip-install-of-the-package layout (scripts/ is excluded from
+# the wheel — see [tool.setuptools.packages.find].exclude — but the
+# eval + dev-setup tests import from it directly).
+pythonpath = ["."]
 addopts = "-q -m 'not eval and not brain_smoke and not brain_smoke_opencode'"
 markers = [
     "eval: integration eval that calls real claude -p (cost/network); opt-in via -m eval",
