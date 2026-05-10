@@ -277,6 +277,8 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     if [[ "$ALREADY_INSTALLED" -eq 1 ]]; then
         SKIP_SETUP=1
     fi
+elif [[ "$DRY_RUN" -eq 1 ]]; then
+    : # Already handled above.
 elif [[ "$ALREADY_INSTALLED" -eq 1 ]]; then
     info "vexis-agent is already installed — updating to ${SOURCE_LABEL}."
     info "(Skipping the setup wizard; your config + workspace are preserved.)"
@@ -292,6 +294,35 @@ else
     info "Installing vexis-agent from ${REPO}"
     pipx install --force "$REPO"
     ok "vexis-agent installed."
+fi
+
+# pipx installs console scripts to ~/.local/bin. On a fresh Arch
+# install (pipx-from-pacman + first-ever pipx use) that directory
+# isn't yet on PATH for the current shell, so vexis-agent etc. are
+# unreachable until the user logs out + back in. Two-pronged fix:
+#   1. Add it to PATH for the rest of THIS run so the auto-launched
+#      setup wizard works.
+#   2. Run `pipx ensurepath` so it persists into future shells (this
+#      writes to the user's shell rc; pipx's own opt-in for that
+#      mutation is exactly this command).
+if [[ "$DRY_RUN" -ne 1 ]]; then
+    pipx_path="$HOME/.local/bin"
+    case ":$PATH:" in
+        *":$pipx_path:"*) : ;;
+        *)
+            export PATH="$pipx_path:$PATH"
+            # pipx ensurepath is the canonical way to add the dir to
+            # the user's shell rc. Quiet output unless something
+            # surprising happens; a non-zero exit is non-fatal here.
+            if pipx ensurepath --force >/dev/null 2>&1; then
+                ok "Added ${pipx_path} to your shell rc (via 'pipx ensurepath')."
+                info "Open a new shell or 'source ~/.bashrc' to pick it up."
+            else
+                warn "Added ${pipx_path} to PATH for this shell only."
+                info "Run ${BOLD}pipx ensurepath${RESET} to make it permanent."
+            fi
+            ;;
+    esac
 fi
 
 # ── soft-dependency advice ──────────────────────────────────────────
