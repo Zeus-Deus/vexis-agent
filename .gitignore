@@ -27,6 +27,10 @@ SOUL.md
 # Codemux dev tooling — local MCP config, not a vexis runtime artifact.
 .mcp.json
 
+# Per-user agent context (skills, memories, settings). Not part of the
+# package; ignored so private notes can't leak into the public repo.
+.claude/
+
 # Per-brain instruction-file symlink. CLAUDE.md is canonical (gitted);
 # AGENTS.md is the symlink the install script creates so opencode and
 # any future AGENTS.md-reading brain can find the same content. The
