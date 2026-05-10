@@ -8,23 +8,31 @@ is the transport layer; the brain is whatever CLI you point it at.
 
 Single-user by design. Hyprland/Wayland-targeted. Tailscale-friendly.
 
+> **Linux only.** Hyprland/Wayland-targeted. macOS and Windows are
+> not supported and the installer will refuse to run on them.
+> Distros tested: Arch, Debian/Ubuntu, Fedora, openSUSE.
+
 ## Install
 
 ### One-liner (curl-bash)
 
-Linux only (Arch, Debian/Ubuntu, Fedora, openSUSE supported out of
-the box). Auto-runs the setup wizard at the end so you finish
-configured.
+Auto-runs the setup wizard at the end so you finish configured.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zeus-Deus/vexis-agent/main/install.sh | bash
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/Zeus-Deus/vexis-agent/main/install.sh | bash
 ```
+
+The `--proto '=https' --tlsv1.2` flags pin the transport to modern
+TLS over HTTPS — defense-in-depth against a compromised redirect or
+ancient TLS downgrade. Drop them at your own risk; they're free.
 
 The installer:
 
 - Refuses to run as root (single-user by design).
 - Installs `pipx` if missing, via your distro's package manager.
-- `pipx install --force git+https://github.com/Zeus-Deus/vexis-agent.git`.
+- Resolves the newest semver release tag and installs from it (falls
+  back to the `main` branch when the repo has no tags yet).
 - Surfaces missing soft dependencies (brain CLI, Hyprland/Wayland
   tools, Tailscale) with distro-specific install hints.
 - Auto-runs `vexis-agent setup` unless `--skip-setup` is passed.
@@ -34,10 +42,14 @@ Flags (when piping into bash, pass them after `bash -s --`):
 - `--dry-run` — print what would happen, don't install.
 - `--skip-setup` — install only; don't launch the wizard.
 
-Env knobs:
+Every flag has a matching env var, which is the ergonomic path when
+you're piping curl into bash (no `bash -s --` gymnastics):
 
-- `VEXIS_CHANNEL=stable|dev` — `main` (default) vs `develop` branch.
+- `VEXIS_VERSION=v0.2.0` — pin to a specific tag or commit. Default
+  empty = newest semver tag, falling back to `main`.
 - `VEXIS_REPO=git+...` — override the source URL (forks, mirrors).
+- `VEXIS_SKIP_SETUP=1` — same effect as `--skip-setup`.
+- `VEXIS_DRY_RUN=1` — same effect as `--dry-run`.
 - `NO_COLOR=1` — disable ANSI escapes.
 
 ### Manual install

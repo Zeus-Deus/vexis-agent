@@ -2,16 +2,22 @@
 # vexis-agent installer — Linux only (Hyprland-targeted, Wayland-only).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Zeus-Deus/vexis-agent/main/install.sh | bash
+#   curl --proto '=https' --tlsv1.2 -fsSL \
+#       https://raw.githubusercontent.com/Zeus-Deus/vexis-agent/main/install.sh | bash
 #
 # Or with options (when piping into bash, pass them after `bash -s --`):
-#   curl -fsSL ... | bash -s -- --dry-run
-#   curl -fsSL ... | bash -s -- --skip-setup
+#   curl ... | bash -s -- --dry-run
+#   curl ... | bash -s -- --skip-setup
 #
-# Env knobs:
+# Env knobs (every CLI flag has a matching env var so curl-bash callers
+# don't need the awkward `bash -s --` syntax — handy for CI / Ansible /
+# Nix / Dockerfile use):
 #   VEXIS_VERSION=<tag-or-sha> pin to a specific git tag or commit
-#                              (e.g. v0.2.0). Default empty = latest main.
-#   VEXIS_REPO=git+...         override the source URL (forks, mirrors, ...).
+#                              (e.g. v0.2.0). Default empty = newest
+#                              semver tag, falling back to main.
+#   VEXIS_REPO=git+...         override the source URL (forks, mirrors).
+#   VEXIS_SKIP_SETUP=1         skip the auto-setup wizard (= --skip-setup).
+#   VEXIS_DRY_RUN=1            print plan and exit (= --dry-run).
 #   NO_COLOR=1                 disable ANSI colors (per https://no-color.org/).
 #
 # What this script does (roughly):
@@ -61,9 +67,22 @@ info() { printf '  %s→%s %s\n' "$DIM" "$RESET" "$*"; }
 ok()   { printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
 
 # ── arg parsing ─────────────────────────────────────────────────────
-DRY_RUN=0
+# Env vars set the defaults; CLI flags override. This pattern is
+# necessary because piping into bash makes flag-passing awkward
+# (`bash -s -- --skip-setup`) — env vars are the ergonomic path.
+# Treat any non-empty value as truthy so `VEXIS_SKIP_SETUP=true` works
+# alongside `=1`. Reject anything that would be a no-op (=0, =false,
+# empty) at default-0.
+_envflag() {
+    local raw="${1:-}"
+    case "$raw" in
+        ""|0|false|FALSE|no|NO) echo 0 ;;
+        *) echo 1 ;;
+    esac
+}
+DRY_RUN="$(_envflag "${VEXIS_DRY_RUN:-}")"
 SHOW_HELP=0
-SKIP_SETUP=0
+SKIP_SETUP="$(_envflag "${VEXIS_SKIP_SETUP:-}")"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)
@@ -99,11 +118,15 @@ Flags:
                 end up with a configured daemon in one shot.
   -h, --help    Show this help.
 
-Environment:
-  VEXIS_VERSION  Pin to a git tag or commit (e.g. v0.2.0).
-                 Default empty = latest commit on main.
-  VEXIS_REPO     Override the install source (default: GitHub main).
-  NO_COLOR       Disable ANSI colors.
+Environment (every flag has a matching env var so curl-bash callers
+can avoid the awkward `bash -s --` syntax):
+  VEXIS_VERSION    Pin to a git tag or commit (e.g. v0.2.0).
+                   Default empty = newest semver tag (falls back to main).
+  VEXIS_REPO       Override the install source (default: GitHub main).
+  VEXIS_SKIP_SETUP Set to 1 to skip the auto-setup wizard.
+                   Same effect as --skip-setup.
+  VEXIS_DRY_RUN    Set to 1 for dry-run mode. Same effect as --dry-run.
+  NO_COLOR         Disable ANSI colors.
 EOF
     exit 0
 fi
