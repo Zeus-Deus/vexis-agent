@@ -35,8 +35,9 @@ to expect.
 
 ## Adding tools (MCP servers)
 
-To make vexis do something it doesn't do today, install an MCP
-server and declare it in `~/.vexis/mcp-servers.yaml`:
+`~/.vexis/mcp-servers.yaml` is the **universal MCP config** — one
+source of truth, regardless of which brain (claude-code / opencode)
+you're running. Declare each server once:
 
 ```yaml
 servers:
@@ -48,9 +49,12 @@ servers:
 ```
 
 Re-run `vexis-agent setup` (or restart the daemon). The wizard
-detects each server whose binary is on PATH, writes the matching
-entry into the workspace MCP config, and the brain auto-discovers
-the new tools on the next spawn.
+detects each server whose binary is on PATH and writes BOTH
+per-brain native files: `<workspace>/.mcp.json` (claude-code's
+``mcpServers`` shape) and `<workspace>/opencode.json` (opencode's
+``mcp`` block with the `vexis-` namespace prefix). Switching
+brains later (edit ``brain.kind``, restart) is zero-friction —
+the new brain's native config is already there.
 
 Full schema + commented examples: `vexis_agent/data/mcp-servers.example.yaml`.
 

@@ -411,7 +411,9 @@ def detect_mcp_servers() -> list[dict]:
 def write_mcp_config(workspace: Path, brain_kind: str, specs: list[dict]) -> Optional[Path]:
     """Translate spec dicts into McpServerSpec objects and call the
     matching brain's writer. Returns the path written (None for the
-    null brain or if no writer applies)."""
+    null brain or if no writer applies). Used by tests + as a
+    per-brain primitive; production callers want
+    ``write_all_mcp_configs`` so brain-switching is zero-friction."""
     if not specs and brain_kind == "null":
         return None
     # Lazy-import — keeps the wizard's startup graph small for
@@ -432,6 +434,27 @@ def write_mcp_config(workspace: Path, brain_kind: str, specs: list[dict]) -> Opt
     if brain_kind == "opencode":
         return _write_opencode_mcp(workspace, typed)
     return None
+
+
+def write_all_mcp_configs(workspace: Path, specs: list[dict]) -> list[Path]:
+    """Write the MCP config for **every** brain that has a writer,
+    not just the currently-configured one. Returns the list of paths
+    actually written.
+
+    The universal config is ``$VEXIS_HOME/mcp-servers.yaml`` (the
+    user-facing source of truth). The per-brain native files
+    (``<workspace>/.mcp.json`` for claude-code, ``<workspace>/
+    opencode.json`` for opencode) are derived caches; we write them
+    both on every wizard run so switching ``brain.kind`` later
+    requires zero MCP rework — the new brain's native file already
+    exists, with the same servers wired up.
+    """
+    paths: list[Path] = []
+    for kind in ("claude-code", "opencode"):
+        path = write_mcp_config(workspace, kind, specs)
+        if path is not None:
+            paths.append(path)
+    return paths
 
 
 def _write_claude_code_mcp(workspace: Path, servers: list) -> Path:
@@ -549,6 +572,7 @@ class SetupResult:
     brain_check: Optional[BrainCheck] = None
     tailscale_check: Optional[TailscaleCheck] = None
     mcp_config_path: Optional[Path] = None
+    mcp_config_paths: list = field(default_factory=list)
     mcp_servers_wired: list = field(default_factory=list)
 
 
@@ -797,29 +821,28 @@ def run_setup(
         )
 
     # ── 5. MCP servers ────────────────────────────────────────────
+    # We write per-brain native MCP configs for BOTH claude-code AND
+    # opencode every wizard run, regardless of the currently-active
+    # brain. ~/.vexis/mcp-servers.yaml is the source of truth; the
+    # workspace/.mcp.json + workspace/opencode.json files are derived
+    # caches. Switching brains later (edit brain.kind, restart) is
+    # zero-friction: the other brain's native file is already there.
     section("MCP servers")
     detected = detect_mcp_servers()
-    mcp_path: Optional[Path] = None
+    mcp_paths: list[Path] = []
     if detected:
         names = [s["name"] for s in detected]
         info(f"detected: {', '.join(names)}")
-        mcp_path = write_mcp_config(workspace, brain_kind, detected)
-        if mcp_path:
-            ok(f"wrote {mcp_path}")
-        else:
-            info("null brain — MCP config skipped")
+        mcp_paths = write_all_mcp_configs(workspace, detected)
+        for p in mcp_paths:
+            ok(f"wrote {p}")
     else:
         info(
-            "no MCP servers auto-detected. The brain runs fine without "
-            "any; add custom entries by editing the workspace MCP config "
-            "(<workspace>/.mcp.json for claude-code, "
-            "<workspace>/opencode.json for opencode)."
+            "no MCP servers detected. Edit ~/.vexis/mcp-servers.yaml "
+            "to declare custom servers; the wizard wires them into "
+            "both .mcp.json (claude-code) and opencode.json on the "
+            "next run."
         )
-        if shutil.which("omarchy-kb") is None:
-            info(
-                "Tip: install omarchy-kb if you want Omarchy/Hyprland "
-                "system knowledge in the brain."
-            )
 
     # ── 6. Tailscale soft-check ───────────────────────────────────
     section("Tailscale (optional)")
@@ -863,7 +886,16 @@ def run_setup(
         service_installed=service_installed,
         brain_check=bc,
         tailscale_check=ts,
-        mcp_config_path=mcp_path,
+        # Back-compat: mcp_config_path keeps the active brain's path
+        # (most code reads this); mcp_config_paths is the full list.
+        mcp_config_path=next(
+            (p for p in mcp_paths if (
+                (brain_kind == "claude-code" and p.name == ".mcp.json")
+                or (brain_kind == "opencode" and p.name == "opencode.json")
+            )),
+            None,
+        ),
+        mcp_config_paths=mcp_paths,
         mcp_servers_wired=[s["name"] for s in detected],
     )
 

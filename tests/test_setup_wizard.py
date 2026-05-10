@@ -437,8 +437,15 @@ def test_run_setup_wires_mcp_when_detected(
         brain_kind_override="claude-code",
     )
     assert result.mcp_servers_wired == ["omarchy-kb"]
+    # BOTH per-brain native files get written every wizard run so
+    # switching brains later (edit brain.kind, restart) is zero-
+    # friction. The active brain's path is exposed via the
+    # mcp_config_path back-compat shortcut.
+    assert result.workspace / ".mcp.json" in result.mcp_config_paths
+    assert result.workspace / "opencode.json" in result.mcp_config_paths
+    assert (result.workspace / ".mcp.json").is_file()
+    assert (result.workspace / "opencode.json").is_file()
     assert result.mcp_config_path == result.workspace / ".mcp.json"
-    assert result.mcp_config_path.is_file()
 
 
 def test_set_brain_kind_rewrites_existing_value(tmp_path) -> None:
@@ -635,6 +642,21 @@ def test_detect_mcp_servers_user_overrides_builtin(
     omarchy_entries = [s for s in detected if s["name"] == "omarchy-kb"]
     assert len(omarchy_entries) == 1, "user override didn't replace built-in"
     assert omarchy_entries[0]["args"] == ["--user-flag"]
+
+
+def test_write_all_mcp_configs_writes_both_brains(tmp_path) -> None:
+    """Universal-config invariant: write_all_mcp_configs writes both
+    .mcp.json (claude-code shape) AND opencode.json (opencode shape)
+    every call, regardless of which brain is currently configured.
+    Switching brains later picks up the same servers without rework."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    specs = [{"name": "tool", "command": "tool", "args": ["--mcp"]}]
+    paths = sw.write_all_mcp_configs(workspace, specs)
+    names = sorted(p.name for p in paths)
+    assert names == [".mcp.json", "opencode.json"]
+    assert (workspace / ".mcp.json").is_file()
+    assert (workspace / "opencode.json").is_file()
 
 
 def test_run_setup_skips_mcp_when_nothing_detected(

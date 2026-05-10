@@ -157,7 +157,9 @@ Secrets (`.env`, dashboard token) restore at mode 0600.
 
 ## Extending vexis
 
-**New tools — declare an MCP server** in `~/.vexis/mcp-servers.yaml`:
+**New tools — declare an MCP server** in `~/.vexis/mcp-servers.yaml`
+(the universal config — one source of truth, regardless of which
+brain you're on):
 
 ```yaml
 servers:
@@ -167,8 +169,11 @@ servers:
 ```
 
 Re-run `vexis-agent setup` (or `vexis-agent service restart`) and
-the brain picks them up. Entries whose binary isn't on PATH are
-skipped. Full schema: `vexis_agent/data/mcp-servers.example.yaml`.
+both per-brain native files get refreshed: `<workspace>/.mcp.json`
+for claude-code and `<workspace>/opencode.json` for opencode.
+Switching `brain.kind` later is zero-friction — the new brain's
+native config is already there. Entries whose binary isn't on
+PATH are skipped. Full schema: `vexis_agent/data/mcp-servers.example.yaml`.
 
 **New skills — `vexis-skill create`** or drop a SKILL.md by hand:
 
