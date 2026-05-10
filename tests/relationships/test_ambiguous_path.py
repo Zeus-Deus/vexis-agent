@@ -29,19 +29,19 @@ from pathlib import Path
 
 import pytest
 
-from core.relationships.curator import RelationshipsCurator
-from core.relationships.pending import (
+from vexis_agent.core.relationships.curator import RelationshipsCurator
+from vexis_agent.core.relationships.pending import (
     MAX_AMBIGUITY_REPROMPTS,
     PendingDisambiguationStore,
     PendingEntry,
 )
-from core.relationships.store import (
+from vexis_agent.core.relationships.store import (
     Fact,
     Person,
     relationships_live_path,
     serialize_relationships_file,
 )
-from core.relationships.triggers import TriggerVerdict
+from vexis_agent.core.relationships.triggers import TriggerVerdict
 
 
 @pytest.fixture

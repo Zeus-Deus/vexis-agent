@@ -16,10 +16,10 @@ from pathlib import Path
 
 import pytest
 
-from core import curator as cur
-from core.brain.base import AuxResult
-from core.brain.null import BrainNull
-from core.skills import (
+from vexis_agent.core import curator as cur
+from vexis_agent.core.brain.base import AuxResult
+from vexis_agent.core.brain.null import BrainNull
+from vexis_agent.core.skills import (
     ARCHIVE_DIR_NAME,
     PinStore,
     STATE_ACTIVE,
@@ -274,8 +274,8 @@ def test_run_once_prunes_backups_before_running(
 ):
     """The daemon's _run_once should call prune_backups(keep=11) before
     each pass, so steady state is 12 tarballs (11 old + 1 fresh)."""
-    from core.curator import CuratorController
-    from core.skills import CURATOR_BACKUPS_DIR_NAME
+    from vexis_agent.core.curator import CuratorController
+    from vexis_agent.core.skills import CURATOR_BACKUPS_DIR_NAME
 
     backups = workspace / "skills" / CURATOR_BACKUPS_DIR_NAME
     backups.mkdir(parents=True)
@@ -314,7 +314,7 @@ def test_run_curator_phase2_records_archived_names(workspace: Path):
         # Simulate the LLM archiving 'beta' by actually invoking the
         # archive directly. This is what the real LLM would do via
         # vexis-skill archive beta.
-        from core.skills import archive_skill
+        from vexis_agent.core.skills import archive_skill
         archive_skill(workspace / "skills", "beta")
 
     brain = _SideEffectBrain(

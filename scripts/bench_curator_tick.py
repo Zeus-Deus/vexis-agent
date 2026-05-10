@@ -58,8 +58,8 @@ def main() -> int:
 
     # Lazy-import after sys.path is set.
     import tempfile
-    from core.brain.null import BrainNull
-    from core.learning_curator import LearningController
+    from vexis_agent.core.brain.null import BrainNull
+    from vexis_agent.core.learning_curator import LearningController
 
     with tempfile.TemporaryDirectory(prefix="vexis-bench-") as tmp:
         # Empty workspace + null brain — the simplest possible

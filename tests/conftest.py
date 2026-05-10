@@ -29,12 +29,12 @@ from pathlib import Path
 
 import pytest
 
-from core.brain.base import Brain
-from core.brain.claude_code import ClaudeCodeBrain
-from core.brain.null import BrainNull
-from core.brain.opencode import OpenCodeBrain, set_opencode_db_path_override
-from core.running_tasks import RunningTasks
-from core.sessions import SessionStore
+from vexis_agent.core.brain.base import Brain
+from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.null import BrainNull
+from vexis_agent.core.brain.opencode import OpenCodeBrain, set_opencode_db_path_override
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
 
 
 @pytest.fixture(autouse=True)
@@ -73,7 +73,7 @@ def _isolate_vexis_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     # consistency. yaml_config's own ``_config_path`` already calls
     # vexis_dir() under the hood, so a single vexis_dir patch keeps
     # both read and write going to the same place.
-    monkeypatch.setattr("core.paths.vexis_dir", lambda: private_root)
+    monkeypatch.setattr("vexis_agent.core.paths.vexis_dir", lambda: private_root)
     yield
 
 
@@ -119,7 +119,7 @@ def _block_claude_code_live_discovery(
     None because the path doesn't exist. Discovery falls through
     to the hardcoded fallback list deterministically."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    from core import model_discovery as _md
+    from vexis_agent.core import model_discovery as _md
     monkeypatch.setattr(
         _md, "_CLAUDE_OAUTH_PATH",
         tmp_path / "no-claude-credentials.json",

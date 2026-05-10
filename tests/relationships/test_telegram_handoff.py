@@ -30,8 +30,8 @@ from typing import Any
 
 import pytest
 
-from core.handler import MessageHandler
-from core.transcripts import claude_session_jsonl_dir
+from vexis_agent.core.handler import MessageHandler
+from vexis_agent.core.transcripts import claude_session_jsonl_dir
 
 
 # ---------------------------------------------------------------- helpers
@@ -274,7 +274,7 @@ class _RecordingRelationships:
     turn_index) it was called with and returns a stub TurnLevelResult."""
 
     def __init__(self, reply_text: str | None) -> None:
-        from core.relationships.curator import TurnLevelResult
+        from vexis_agent.core.relationships.curator import TurnLevelResult
         self.calls: list[tuple[str, int]] = []
         self._reply_text = reply_text
         self._result_cls = TurnLevelResult
@@ -313,8 +313,8 @@ class _FakeLearningController:
 def _make_transport_with_curator(
     handler, allowed_user_id: int, relationships
 ):
-    from transports.telegram import TelegramTransport
-    from core.running_tasks import RunningTasks
+    from vexis_agent.transports.telegram import TelegramTransport
+    from vexis_agent.core.running_tasks import RunningTasks
     t = TelegramTransport.__new__(TelegramTransport)
     t._handler = handler  # type: ignore[attr-defined]
     t._allowed_user_id = allowed_user_id  # type: ignore[attr-defined]
@@ -355,7 +355,7 @@ def test_hook_fires_inside_drain_with_real_session_uuid(
     """
 
     monkeypatch.setattr(
-        "core.yaml_config.relationships_explicit_consent_enabled",
+        "vexis_agent.core.yaml_config.relationships_explicit_consent_enabled",
         lambda: True,
     )
     pdir = claude_session_jsonl_dir(workspace)
@@ -406,7 +406,7 @@ def test_cursor_collision_skips_staging_silently(
     """
 
     monkeypatch.setattr(
-        "core.yaml_config.relationships_explicit_consent_enabled",
+        "vexis_agent.core.yaml_config.relationships_explicit_consent_enabled",
         lambda: True,
     )
     handler = _build_handler(workspace, "sess-coll")

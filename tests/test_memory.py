@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from core.memory import (
+from vexis_agent.core.memory import (
     ENTRY_DELIMITER,
     MemoryError_,
     MemoryStore,

@@ -9,14 +9,14 @@ from unittest import mock
 
 import pytest
 
-from core.brain.null import BrainNull
-from core.goal_judge import judge_goal as _real_judge_goal  # noqa: F401  # ensure module is loadable
-from core.goal_manager import (
+from vexis_agent.core.brain.null import BrainNull
+from vexis_agent.core.goal_judge import judge_goal as _real_judge_goal  # noqa: F401  # ensure module is loadable
+from vexis_agent.core.goal_manager import (
     CONTINUATION_PROMPT_TEMPLATE,
     GoalAlreadyActiveError,
     GoalManager,
 )
-from core.goal_state import GoalState, GoalStateStore, TerminalGoalError
+from vexis_agent.core.goal_state import GoalState, GoalStateStore, TerminalGoalError
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -214,7 +214,7 @@ def _patch_judge(verdict: str, reason: str, *, parse_failed: bool = False):
     so existing call sites don't change; tests exercising the
     parse-failure path opt in explicitly."""
     return mock.patch(
-        "core.goal_manager.judge_goal",
+        "vexis_agent.core.goal_manager.judge_goal",
         new=mock.AsyncMock(return_value=(verdict, reason, parse_failed)),
     )
 
@@ -641,7 +641,7 @@ def test_evaluate_auto_pauses_after_three_parse_failures(
     Pins the exact threshold matching
     ``DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES`` (=3). Mirrors hermes'
     `test_auto_pause_after_three_consecutive_parse_failures`."""
-    from core.goal_state import DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES
+    from vexis_agent.core.goal_state import DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES
 
     assert DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES == 3
 

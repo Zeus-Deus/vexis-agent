@@ -1,0 +1,62 @@
+# vexis-agent — example configuration.
+#
+# Copy to ~/.vexis/config.yaml (or $VEXIS_HOME/config.yaml) and edit.
+# Every block below is optional: a missing file → all defaults; a
+# malformed file → warning + defaults. The canonical schema lives in
+# vexis_agent/core/yaml_config.py — keep these two in sync.
+#
+# Secrets (Telegram bot token, allowed user ID, provider API keys)
+# go in ~/.vexis/.env, NOT here. See .env.example.
+
+# ── brain abstraction (Phase C, see docs/brains.md) ─────────────────
+brain:
+  kind: claude-code            # or "opencode" or "null". Selects which
+                               # agent CLI vexis spawns under. Switching
+                               # to opencode requires the legacy-keys →
+                               # tier-schema migration in docs/migration.md.
+
+# ── memory limits ───────────────────────────────────────────────────
+memory:
+  memory_char_limit: 2200
+  user_char_limit: 1375
+
+# ── learning curator ────────────────────────────────────────────────
+curator:
+  enabled: true
+  interval_hours: 168
+  min_idle_hours: 2
+  stale_after_days: 30
+  archive_after_days: 90
+
+# ── per-subsystem model selection ───────────────────────────────────
+# Subsystems pick an abstract tier (tiny/small/medium/large); the
+# active brain translates tier → native model id via the tiers map
+# below or its built-in defaults. Foreground turns never pass a
+# --model flag (sentinel "default") unless overridden by voice call
+# mode. See docs/model-ux.md for the resolution table.
+models:
+  brain: default
+  subsystems:
+    learning_review: small
+    learning_triage: tiny
+    coherence_judge: small
+    relationships_extractor: medium
+    relationships_classifier: tiny
+    goal_judge: large
+    curator: small
+  tiers:
+    claude-code:
+      large: sonnet
+    opencode:
+      large: anthropic/claude-sonnet-4
+      medium: anthropic/claude-sonnet-3-7
+
+# ── goals (v3d, see docs/goals.md) ──────────────────────────────────
+goals:
+  enabled: true
+  max_turns: 20
+
+# ── relationships (v3c, see docs/relationships.md) ──────────────────
+relationships:
+  explicit_consent_enabled: false
+  approval_hint_enabled: true

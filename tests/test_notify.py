@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from core.notify import Notifier
+from vexis_agent.core.notify import Notifier
 
 
 class FakeBot:

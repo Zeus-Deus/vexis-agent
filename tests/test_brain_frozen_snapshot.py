@@ -10,11 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from core.brain.claude_code import ClaudeCodeBrain
-from core.memory import MemoryStore
-from core.paths import memories_dir
-from core.running_tasks import RunningTasks
-from core.sessions import SessionStore
+from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.memory import MemoryStore
+from vexis_agent.core.paths import memories_dir
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
 
 
 @pytest.fixture
@@ -81,7 +81,7 @@ def test_snapshot_rebuilds_when_uuid_rotates(
 
 
 def test_snapshot_cache_evicts_oldest_after_max(brain: ClaudeCodeBrain):
-    from core.brain.claude_code import _SYSTEM_PROMPT_CACHE_MAX
+    from vexis_agent.core.brain.claude_code import _SYSTEM_PROMPT_CACHE_MAX
 
     # Fill the cache one over capacity. The oldest entry should be
     # evicted; the newest one must be present.

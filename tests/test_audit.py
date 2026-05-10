@@ -3,7 +3,7 @@ that classifies Vexis's textual response as 'asked first' vs 'just ran it'."""
 
 from __future__ import annotations
 
-from core.brain.claude_code import audit_destructive_mentions
+from vexis_agent.core.brain.claude_code import audit_destructive_mentions
 
 
 def _classify(text: str) -> list[tuple[str, bool]]:
@@ -74,9 +74,9 @@ def test_logging_emits_info_lines(caplog) -> None:
     We verify the format here without spawning subprocess."""
     import logging
 
-    from core.brain import claude_code
+    from vexis_agent.core.brain import claude_code
 
-    caplog.set_level(logging.INFO, logger="core.brain.claude_code")
+    caplog.set_level(logging.INFO, logger="vexis_agent.core.brain.claude_code")
     response = "I ran `rm -rf old/`. Should I also `git push --force origin main`?"
     for reason, asked in audit_destructive_mentions(response):
         if asked:

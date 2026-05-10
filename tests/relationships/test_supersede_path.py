@@ -26,14 +26,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.coherence_judge import CoherenceVerdict
-from core.relationships.consent import (
+from vexis_agent.core.coherence_judge import CoherenceVerdict
+from vexis_agent.core.relationships.consent import (
     ConsentError,
     mint,
     verify_for_promotion,
 )
-from core.relationships.curator import RelationshipsCurator
-from core.relationships.store import (
+from vexis_agent.core.relationships.curator import RelationshipsCurator
+from vexis_agent.core.relationships.store import (
     Fact,
     Person,
     RelationshipsStore,
@@ -41,8 +41,8 @@ from core.relationships.store import (
     relationships_live_path,
     serialize_relationships_file,
 )
-from core.relationships.triggers import TriggerVerdict
-from core.transcripts import claude_session_jsonl_dir
+from vexis_agent.core.relationships.triggers import TriggerVerdict
+from vexis_agent.core.transcripts import claude_session_jsonl_dir
 
 
 @pytest.fixture

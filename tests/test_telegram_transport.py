@@ -18,10 +18,10 @@ from typing import Any
 
 import pytest
 
-from core import paths, status as status_module
-from core.running_tasks import RunningTasks
-from core.status import StatusSnapshot
-from transports.telegram import (
+from vexis_agent.core import paths, status as status_module
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.status import StatusSnapshot
+from vexis_agent.transports.telegram import (
     _INCOMING_PHOTO_DIR,
     _PICKING_UP_PREFIX,
     _STATUS_IDLE,

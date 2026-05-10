@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from core import paths, status
+from vexis_agent.core import paths, status
 
 
 @pytest.fixture

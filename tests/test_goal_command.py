@@ -14,10 +14,10 @@ from unittest import mock
 
 import pytest
 
-from core.goal_manager import GoalManager
-from core.goal_state import GoalState, GoalStateStore
-from core.running_tasks import QueuedMessage, RunningTasks
-from transports.telegram import (
+from vexis_agent.core.goal_manager import GoalManager
+from vexis_agent.core.goal_state import GoalState, GoalStateStore
+from vexis_agent.core.running_tasks import QueuedMessage, RunningTasks
+from vexis_agent.transports.telegram import (
     TelegramTransport,
     _CANCEL_OK,
     _CANCEL_OK_GOAL_PAUSED_TMPL,
@@ -112,8 +112,8 @@ class _FakeHandler:
         workspace: Path | None = None,
         brain=None,
     ) -> None:
-        from core.brain.base import AuxResult
-        from core.brain.null import BrainNull
+        from vexis_agent.core.brain.base import AuxResult
+        from vexis_agent.core.brain.null import BrainNull
 
         self.reply = reply
         self._workspace = workspace or Path("/tmp")
@@ -156,19 +156,19 @@ def goals_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     ``_build_goal_manager`` calls) to a tmp file so tests don't
     touch the user's real ~/.vexis/goals.json."""
     path = tmp_path / "goals.json"
-    monkeypatch.setattr("core.paths.goals_path", lambda: path)
+    monkeypatch.setattr("vexis_agent.core.paths.goals_path", lambda: path)
     return path
 
 
 @pytest.fixture
 def goals_on(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force ``goals_enabled()`` True regardless of the user's config."""
-    monkeypatch.setattr("core.yaml_config.goals_enabled", lambda: True)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.goals_enabled", lambda: True)
 
 
 @pytest.fixture
 def goals_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("core.yaml_config.goals_enabled", lambda: False)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.goals_enabled", lambda: False)
 
 
 @pytest.fixture
@@ -521,7 +521,7 @@ def test_cancel_mid_kickoff_does_not_run_goal_hook(
         await transport._on_cancel(upd, _ctx())
         # Drain now reaches the goal hook with reply="" because the
         # brain raised BrainCancelled and handler returned None.
-        with mock.patch("core.goal_manager.judge_goal") as fake_judge:
+        with mock.patch("vexis_agent.core.goal_manager.judge_goal") as fake_judge:
             await transport._run_goal_hook(bot, _CHAT, "")
             # Judge MUST NOT be called — bail before that.
             fake_judge.assert_not_called()
@@ -558,7 +558,7 @@ def test_pause_during_judge_call_drops_continuation(
         session_uuid=_SESSION, workspace=Path("/tmp"), store=store
     ).set("g")
 
-    from core.goal_manager import CONTINUATION_PROMPT_TEMPLATE, GoalManager as _GM
+    from vexis_agent.core.goal_manager import CONTINUATION_PROMPT_TEMPLATE, GoalManager as _GM
 
     async def evaluate_with_concurrent_pause(self, last_response: str, brain) -> dict:
         # Stand in for evaluate_after_turn: do the manager's work
@@ -750,7 +750,7 @@ def test_user_message_arrives_first_during_goal_hook(
         # Phase B: judge_goal is async — use AsyncMock so the awaited
         # call returns the (verdict, reason) tuple.
         with mock.patch(
-            "core.goal_manager.judge_goal",
+            "vexis_agent.core.goal_manager.judge_goal",
             new=mock.AsyncMock(return_value=("continue", "more", False)),
         ):
             await transport._run_goal_hook(bot, _CHAT, "brain reply")
@@ -808,7 +808,7 @@ def test_continuation_arrives_first_then_user_message(
         # Drain claimed; queue empty.
         await transport._running_tasks.claim(_CHAT)
         with mock.patch(
-            "core.goal_manager.judge_goal", side_effect=judge_capture
+            "vexis_agent.core.goal_manager.judge_goal", side_effect=judge_capture
         ):
             # First hook call → enqueues continuation.
             await transport._run_goal_hook(bot, _CHAT, "first reply")
@@ -872,7 +872,7 @@ def test_post_cancel_resume_kicks_loop_again(
     async def scenario() -> None:
         # 1) Plain user message after the paused state. Hook should
         #    NOT fire (state is paused → is_active False at top).
-        with mock.patch("core.goal_manager.judge_goal") as fake_judge:
+        with mock.patch("vexis_agent.core.goal_manager.judge_goal") as fake_judge:
             await transport._run_goal_hook(bot, _CHAT, "casual reply")
             fake_judge.assert_not_called()
         assert transport._running_tasks.queue_depth(_CHAT) == 0
@@ -888,7 +888,7 @@ def test_post_cancel_resume_kicks_loop_again(
         # 3) Next post-turn hook now DOES enqueue a continuation.
         await transport._running_tasks.claim(_CHAT)
         with mock.patch(
-            "core.goal_manager.judge_goal",
+            "vexis_agent.core.goal_manager.judge_goal",
             new=mock.AsyncMock(return_value=("continue", "more", False)),
         ):
             await transport._run_goal_hook(bot, _CHAT, "brain reply after resume")
@@ -978,7 +978,7 @@ def test_budget_exhaustion_renders_pause_message_at_transport_layer(
     """
     # Override goals_max_turns to 2 so we can exhaust the budget
     # in a few hook calls.
-    monkeypatch.setattr("core.yaml_config.goals_max_turns", lambda: 2)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.goals_max_turns", lambda: 2)
 
     store = GoalStateStore(goals_file)
     GoalManager(
@@ -993,7 +993,7 @@ def test_budget_exhaustion_renders_pause_message_at_transport_layer(
     async def scenario() -> None:
         await transport._running_tasks.claim(_CHAT)
         with mock.patch(
-            "core.goal_manager.judge_goal",
+            "vexis_agent.core.goal_manager.judge_goal",
             new=mock.AsyncMock(return_value=("continue", "not yet", False)),
         ):
             # Turn 1 → continue, enqueues continuation.
@@ -1124,7 +1124,7 @@ def test_pause_does_not_cancel_running_brain_proc(
         with mock.patch.object(
             transport._running_tasks, "cancel", wraps=transport._running_tasks.cancel
         ) as cancel_spy, \
-                mock.patch("core.running_tasks._kill_group") as kill_spy:
+                mock.patch("vexis_agent.core.running_tasks._kill_group") as kill_spy:
             upd, _bot, msg = _update("/goal pause")
             await transport._on_goal(upd, _ctx("pause"))
 

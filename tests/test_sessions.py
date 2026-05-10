@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from core.sessions import SessionStore, _gen_name, _validate_name
+from vexis_agent.core.sessions import SessionStore, _gen_name, _validate_name
 
 
 def _read(path: Path) -> dict:
@@ -90,7 +90,7 @@ def test_migration_preserves_uninitialized_flag(state_path: Path) -> None:
 
 
 def test_migration_logs_info(state_path: Path, caplog) -> None:
-    caplog.set_level(logging.INFO, logger="core.sessions")
+    caplog.set_level(logging.INFO, logger="vexis_agent.core.sessions")
     state_path.write_text(json.dumps({"session_id": "u", "initialized": False}))
     SessionStore(state_path)
     assert any("Migrated single session" in r.message for r in caplog.records)

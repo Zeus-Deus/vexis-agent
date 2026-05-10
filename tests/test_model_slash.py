@@ -30,8 +30,8 @@ from typing import Any
 
 import pytest
 
-from core.running_tasks import RunningTasks
-from transports.telegram import TelegramTransport
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.transports.telegram import TelegramTransport
 
 
 _USER = 1001
@@ -177,10 +177,10 @@ def vexis_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     ~/.vexis/."""
     home = tmp_path / "vexis"
     home.mkdir()
-    monkeypatch.setattr("core.paths.vexis_dir", lambda: home)
-    monkeypatch.setattr("core.yaml_config.vexis_dir", lambda: home)
+    monkeypatch.setattr("vexis_agent.core.paths.vexis_dir", lambda: home)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.vexis_dir", lambda: home)
     monkeypatch.setattr(
-        "core.yaml_config._config_path", lambda: home / "config.yaml"
+        "vexis_agent.core.yaml_config._config_path", lambda: home / "config.yaml"
     )
     return home
 
@@ -188,12 +188,12 @@ def vexis_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 def model_ux_on(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force ``model_ux_enabled()`` True regardless of config."""
-    monkeypatch.setattr("core.yaml_config.model_ux_enabled", lambda: True)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.model_ux_enabled", lambda: True)
 
 
 @pytest.fixture
 def model_ux_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("core.yaml_config.model_ux_enabled", lambda: False)
+    monkeypatch.setattr("vexis_agent.core.yaml_config.model_ux_enabled", lambda: False)
 
 
 @pytest.fixture
@@ -682,7 +682,7 @@ def patched_discovery(monkeypatch: pytest.MonkeyPatch):
     # renders the single-brain (no brain-suffix labels) layout.
     # Cross-brain-specific tests override this to populate both.
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda kind: fixture_with_aliases if kind == "claude-code" else {},
     )
     return fixture
@@ -750,7 +750,7 @@ def test_picker_no_discovery_falls_back_to_typed_arg_hint(
     pointing at the typed-arg path + /model refresh. No inline
     keyboard."""
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda _kind: {},
     )
     upd, _bot, msg = _update("/model set curator")
@@ -776,7 +776,7 @@ def test_refresh_calls_in_process_helper_and_replies_with_counts(
     counts."""
     _seed_config(vexis_home / "config.yaml", "brain:\n  kind: opencode\n")
     monkeypatch.setattr(
-        "core.yaml_config.brain_kind", lambda: "opencode",
+        "vexis_agent.core.yaml_config.brain_kind", lambda: "opencode",
     )
     refresh_called: list[None] = []
 
@@ -785,10 +785,10 @@ def test_refresh_calls_in_process_helper_and_replies_with_counts(
         return {"anthropic/claude-sonnet-4", "openai/gpt-4o"}
 
     monkeypatch.setattr(
-        "core.model_discovery.refresh_opencode_models", _fake_refresh,
+        "vexis_agent.core.model_discovery.refresh_opencode_models", _fake_refresh,
     )
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda _kind: {
             "anthropic": ["anthropic/claude-sonnet-4"],
             "openai": ["openai/gpt-4o"],
@@ -813,7 +813,7 @@ def test_refresh_on_claude_code_calls_live_discovery(
     effects: the refresh helper actually fires, and the reply
     surfaces per-provider counts (anthropic bucket)."""
     monkeypatch.setattr(
-        "core.yaml_config.brain_kind", lambda: "claude-code",
+        "vexis_agent.core.yaml_config.brain_kind", lambda: "claude-code",
     )
     refresh_called: list[None] = []
 
@@ -822,10 +822,10 @@ def test_refresh_on_claude_code_calls_live_discovery(
         return {"claude-opus-4-7", "claude-sonnet-4-6", "haiku", "sonnet"}
 
     monkeypatch.setattr(
-        "core.model_discovery.refresh_claude_code_models", _fake_refresh,
+        "vexis_agent.core.model_discovery.refresh_claude_code_models", _fake_refresh,
     )
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda _kind: {
             "anthropic": [
                 "claude-opus-4-7", "claude-sonnet-4-6", "haiku", "sonnet",
@@ -845,7 +845,7 @@ def test_refresh_on_null_brain_is_informational(
 ):
     """null brain (and any future brain without a discovery
     backend) reports cleanly rather than crashing the handler."""
-    monkeypatch.setattr("core.yaml_config.brain_kind", lambda: "null")
+    monkeypatch.setattr("vexis_agent.core.yaml_config.brain_kind", lambda: "null")
     upd, _bot, msg = _update("/model refresh")
     asyncio.run(transport._on_model(upd, _ctx("refresh")))
     out = msg.reply_log[0]
@@ -899,7 +899,7 @@ def test_callback_model_select_writes_via_shared_reply_builder(
     shared reply-builder is wired up correctly."""
     # curator's sorted-DEFAULT_SUBSYSTEM_TIERS index. Resolved at
     # runtime so this test stays robust to subsystem additions.
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
 
     upd, _bot, query = _callback(
@@ -924,8 +924,8 @@ def test_callback_model_select_validator_refusal_does_not_write(
     refuses the write and the callback edits the picker message
     to the refusal copy. Config file unchanged."""
     _seed_config(vexis_home / "config.yaml", "brain:\n  kind: opencode\n")
-    monkeypatch.setattr("core.yaml_config.brain_kind", lambda: "opencode")
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    monkeypatch.setattr("vexis_agent.core.yaml_config.brain_kind", lambda: "opencode")
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
 
     # 'sonnet' is a bare alias — rule 4 refuses on opencode.
@@ -949,16 +949,16 @@ def test_callback_model_select_opencode_unknown_id_refused_post_day_4(
     behavior — promotion + wiring together turn the warning into
     an actual refusal."""
     _seed_config(vexis_home / "config.yaml", "brain:\n  kind: opencode\n")
-    monkeypatch.setattr("core.yaml_config.brain_kind", lambda: "opencode")
+    monkeypatch.setattr("vexis_agent.core.yaml_config.brain_kind", lambda: "opencode")
     monkeypatch.setattr(
-        "core.model_discovery.discovery_for_validator",
+        "vexis_agent.core.model_discovery.discovery_for_validator",
         lambda _kinds: {
             "opencode": {"anthropic/claude-haiku-3-5"},
             "claude-code": set(),
             "null": set(),
         },
     )
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
 
     upd, _bot, query = _callback(
@@ -982,9 +982,9 @@ def test_typed_arg_set_opencode_unknown_id_also_refused_post_day_4(
     that the wiring lives in the shared helper, not in either
     surface alone."""
     _seed_config(vexis_home / "config.yaml", "brain:\n  kind: opencode\n")
-    monkeypatch.setattr("core.yaml_config.brain_kind", lambda: "opencode")
+    monkeypatch.setattr("vexis_agent.core.yaml_config.brain_kind", lambda: "opencode")
     monkeypatch.setattr(
-        "core.model_discovery.discovery_for_validator",
+        "vexis_agent.core.model_discovery.discovery_for_validator",
         lambda _kinds: {
             "opencode": {"anthropic/claude-haiku-3-5"},
             "claude-code": set(),
@@ -1082,7 +1082,7 @@ def test_callback_page_one_renders_next_button_and_first_slice(
     from telegram import InlineKeyboardMarkup
     big_bucket = [f"anthropic/m-{i:02d}" for i in range(25)]
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda _kind: {"anthropic": big_bucket},
     )
     upd, _bot, query = _callback("model_pick_provider:curator:cc:anthropic:0")
@@ -1110,7 +1110,7 @@ def test_callback_page_two_renders_prev_button_and_remainder(
     from telegram import InlineKeyboardMarkup
     big_bucket = [f"anthropic/m-{i:02d}" for i in range(25)]
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda _kind: {"anthropic": big_bucket},
     )
     upd, _bot, query = _callback("model_pick_page:curator:cc:anthropic:1:0")
@@ -1172,7 +1172,7 @@ def patched_family_discovery(monkeypatch: pytest.MonkeyPatch):
     # for that); scoping to one brain keeps the keyboard layout
     # predictable.
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda kind: dict(fixture) if kind == "claude-code" else {},
     )
     return fixture
@@ -1260,7 +1260,7 @@ def test_picker_no_toggle_when_provider_has_no_dated_variants(
     button stays out of the keyboard. Hidden-count suffix also
     absent from the reply text."""
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda _kind: {
             "anthropic": [
                 "anthropic/claude-haiku-3-5",
@@ -1291,7 +1291,7 @@ def test_picker_dated_only_family_shows_most_recent_in_default(
     which falls back to the most-recent dated when no unversioned
     is present."""
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda _kind: {
             "anthropic": [
                 "claude-foo-1-20240101",
@@ -1327,7 +1327,7 @@ def test_picker_pagination_preserves_expand_flag(
     # Collapsed: 15 buttons (1 per family). Expanded: 45 (3 per family).
     # PICKER_PAGE_SIZE = 20 → expanded paginates (3 pages); collapsed doesn't.
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda _kind: {"anthropic": bucket},
     )
     upd, _bot, query = _callback("model_pick_provider:goal_judge:cc:anthropic:1")
@@ -1391,8 +1391,8 @@ def test_callback_data_for_worst_case_model_id_fits_in_64_bytes():
     If this test ever fails, the encoding choice in
     ``_subsystem_to_index`` needs revisiting — see its docstring
     for the budget arithmetic."""
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
-    from transports.telegram import _CB_DATA_MAX_BYTES, TelegramTransport
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.transports.telegram import _CB_DATA_MAX_BYTES, TelegramTransport
 
     longest_sub = max(DEFAULT_SUBSYSTEM_TIERS, key=len)
     sidx = TelegramTransport._subsystem_to_index(longest_sub)
@@ -1412,8 +1412,8 @@ def test_callback_data_for_worst_case_model_id_fits_in_64_bytes():
 def test_callback_data_for_provider_with_brain_and_expand_flag_fits():
     """Cross-brain pin: ``model_pick_provider`` carries
     brain_short + provider + expand flag. Pin the worst-case fits."""
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
-    from transports.telegram import _CB_DATA_MAX_BYTES
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.transports.telegram import _CB_DATA_MAX_BYTES
 
     longest_sub = max(DEFAULT_SUBSYSTEM_TIERS, key=len)
     longest_provider = "github-copilot"  # longest in opencode TUI's priority list
@@ -1428,8 +1428,8 @@ def test_callback_data_for_provider_with_brain_and_expand_flag_fits():
 
 def test_callback_data_for_page_with_brain_and_expand_flag_fits():
     """Sibling pin for ``model_pick_page``."""
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
-    from transports.telegram import _CB_DATA_MAX_BYTES
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.transports.telegram import _CB_DATA_MAX_BYTES
 
     longest_sub = max(DEFAULT_SUBSYSTEM_TIERS, key=len)
     longest_provider = "github-copilot"
@@ -1462,7 +1462,7 @@ def both_brains_configured(monkeypatch: pytest.MonkeyPatch):
         "openai": ["openai/gpt-4o"],
     }
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda kind: (
             dict(cc_data) if kind == "claude-code"
             else dict(oc_data) if kind == "opencode"
@@ -1496,7 +1496,7 @@ def test_picker_provider_keyboard_single_brain_layout_when_only_one_configured(
     — picker stays single-brain shape.' Bare provider labels (no
     brain suffix)."""
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda kind: (
             {"anthropic": ["claude-opus-4-7"]} if kind == "claude-code"
             else {}
@@ -1516,12 +1516,12 @@ def test_picker_same_brain_model_pick_no_confirmation(
     """Pin spec: 'Picking same-brain model: no restart, current
     behavior.' Active brain is claude-code; picking a claude-code
     model writes immediately + confirmation reply."""
-    monkeypatch.setattr("core.yaml_config.brain_kind", lambda: "claude-code")
+    monkeypatch.setattr("vexis_agent.core.yaml_config.brain_kind", lambda: "claude-code")
     monkeypatch.setattr(
-        "core.model_discovery.reasoning_levels_for",
+        "vexis_agent.core.model_discovery.reasoning_levels_for",
         lambda _kind, _model: [],  # no reasoning step interferes
     )
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
 
     upd, _bot, q = _callback(
@@ -1541,8 +1541,8 @@ def test_picker_cross_brain_model_pick_renders_confirmation(
     """Pin spec: 'Picking other-brain model: confirms, writes
     config, triggers restart.' First half — confirmation step
     renders with Yes/Cancel buttons."""
-    monkeypatch.setattr("core.yaml_config.brain_kind", lambda: "claude-code")
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    monkeypatch.setattr("vexis_agent.core.yaml_config.brain_kind", lambda: "claude-code")
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
 
     # Picking an opencode model while on claude-code.
@@ -1571,8 +1571,8 @@ def test_picker_cross_brain_swap_writes_both_keys_and_triggers_restart(
     """Pin spec second half: 'On confirm: write brain.kind +
     models.subsystems.<name>, then trigger daemon restart.' Mocks
     the restart helper so the test process doesn't actually exit."""
-    monkeypatch.setattr("core.yaml_config.brain_kind", lambda: "claude-code")
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    monkeypatch.setattr("vexis_agent.core.yaml_config.brain_kind", lambda: "claude-code")
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
 
     # Mock the restart helper so the test process survives. Wrap
@@ -1584,7 +1584,7 @@ def test_picker_cross_brain_swap_writes_both_keys_and_triggers_restart(
         restart_calls.append(None)
 
     monkeypatch.setattr(
-        "transports.telegram.TelegramTransport._exit_for_restart_soon",
+        "vexis_agent.transports.telegram.TelegramTransport._exit_for_restart_soon",
         staticmethod(_fake_exit),
     )
 
@@ -1618,9 +1618,9 @@ def test_picker_cross_brain_typed_arg_refuses_when_brain_not_configured(
     that's known to belong to opencode but opencode isn't
     configured, refuse with install instructions."""
     # Active brain = claude-code; opencode NOT configured.
-    monkeypatch.setattr("core.yaml_config.brain_kind", lambda: "claude-code")
+    monkeypatch.setattr("vexis_agent.core.yaml_config.brain_kind", lambda: "claude-code")
     monkeypatch.setattr(
-        "core.model_discovery.discover_models",
+        "vexis_agent.core.model_discovery.discover_models",
         lambda kind: (
             {"haiku", "sonnet", "opus", "claude-opus-4-7"}
             if kind == "claude-code"
@@ -1628,7 +1628,7 @@ def test_picker_cross_brain_typed_arg_refuses_when_brain_not_configured(
         ),
     )
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda kind: (
             {"anthropic": ["claude-opus-4-7"]} if kind == "claude-code"
             else {}  # opencode NOT configured (empty grouping)
@@ -1664,8 +1664,8 @@ def test_callback_data_for_confirm_switch_fits():
     """Cross-brain confirmation callback carries the same
     sidx+brain_short+full_id payload as model_pick_model — same
     byte budget."""
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
-    from transports.telegram import _CB_DATA_MAX_BYTES, TelegramTransport
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.transports.telegram import _CB_DATA_MAX_BYTES, TelegramTransport
 
     longest_sub = max(DEFAULT_SUBSYSTEM_TIERS, key=len)
     sidx = TelegramTransport._subsystem_to_index(longest_sub)
@@ -1697,9 +1697,9 @@ def test_callback_model_select_with_reasoning_renders_reasoning_step(
     keyboard. NO config write happens at this step — the write
     waits for the reasoning callback."""
     from telegram import InlineKeyboardMarkup
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     monkeypatch.setattr(
-        "core.model_discovery.reasoning_levels_for",
+        "vexis_agent.core.model_discovery.reasoning_levels_for",
         lambda _kind, _model: ["low", "medium", "high"],
     )
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
@@ -1730,9 +1730,9 @@ def test_callback_model_select_without_reasoning_writes_immediately(
     """When the model exposes NO reasoning levels (e.g. haiku),
     tapping it writes the config immediately — same behaviour as
     pre-reasoning-step. No reasoning keyboard rendered."""
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     monkeypatch.setattr(
-        "core.model_discovery.reasoning_levels_for",
+        "vexis_agent.core.model_discovery.reasoning_levels_for",
         lambda _kind, _model: [],
     )
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
@@ -1759,9 +1759,9 @@ def test_callback_reasoning_pick_writes_dict_shape(
     Reads the chosen model from session state stashed by the
     earlier model-pick step. Confirmation copy mentions the
     reasoning level."""
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     monkeypatch.setattr(
-        "core.model_discovery.reasoning_levels_for",
+        "vexis_agent.core.model_discovery.reasoning_levels_for",
         lambda _kind, _model: ["low", "medium", "high"],
     )
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
@@ -1793,9 +1793,9 @@ def test_callback_reasoning_default_writes_string_shape(
     level. Picker writes the plain string shape (no reasoning
     override) so the user gets the brain's native default — same
     on-disk shape as the pre-reasoning code path."""
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     monkeypatch.setattr(
-        "core.model_discovery.reasoning_levels_for",
+        "vexis_agent.core.model_discovery.reasoning_levels_for",
         lambda _kind, _model: ["low", "high"],
     )
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
@@ -1825,7 +1825,7 @@ def test_callback_reasoning_recovers_gracefully_on_missing_session(
     model pick and reasoning pick, the picker session state is
     lost. The callback edits the message to a re-issue hint
     rather than crashing."""
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
     # Reasoning callback fires WITHOUT a prior model pick — no
     # session state exists.
@@ -1844,13 +1844,13 @@ def test_callback_back_clears_picker_session(
     a model has been stashed (e.g. the user went model→reasoning
     then back-back to provider list) clears the partial selection
     so a fresh re-entry doesn't accidentally inherit it."""
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     monkeypatch.setattr(
-        "core.model_discovery.reasoning_levels_for",
+        "vexis_agent.core.model_discovery.reasoning_levels_for",
         lambda _kind, _model: ["low", "high"],
     )
     monkeypatch.setattr(
-        "core.model_discovery.discovery_grouped_for_brain",
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
         lambda _kind: {"anthropic": ["claude-opus-4-7"]},
     )
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
@@ -1876,9 +1876,9 @@ def test_callback_cancel_clears_picker_session(
 ):
     """Sibling pin: Cancel mid-multi-step flow clears the partial
     selection too."""
-    from core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
+    from vexis_agent.core.yaml_config import DEFAULT_SUBSYSTEM_TIERS
     monkeypatch.setattr(
-        "core.model_discovery.reasoning_levels_for",
+        "vexis_agent.core.model_discovery.reasoning_levels_for",
         lambda _kind, _model: ["high"],
     )
     sidx = sorted(DEFAULT_SUBSYSTEM_TIERS).index("curator")
@@ -1900,7 +1900,7 @@ def test_callback_data_for_reasoning_fits_in_64_bytes():
     parity but it was deliberately omitted (no flag is
     meaningful at the reasoning step) — see
     ``_make_reasoning_keyboard`` docstring."""
-    from transports.telegram import _CB_DATA_MAX_BYTES
+    from vexis_agent.transports.telegram import _CB_DATA_MAX_BYTES
     # Longest realistic level: "medium" = 6 chars (claude-code) or
     # arbitrary opencode variant names which would also fit easily.
     payload = "model_pick_reasoning:9:medium"

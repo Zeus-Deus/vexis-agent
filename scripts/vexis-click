@@ -3,4 +3,4 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
-exec "$PROJECT_DIR/venv-python" -m tools.desktop_control_cli click "$@"
+exec python3 -m vexis_agent.tools.desktop_control_cli click "$@"

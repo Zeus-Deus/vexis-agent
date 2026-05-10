@@ -1,0 +1,34 @@
+# vexis-agent — user-declared MCP servers.
+#
+# Copy to ~/.vexis/mcp-servers.yaml (or $VEXIS_HOME/mcp-servers.yaml)
+# and add entries for each MCP server you want vexis to wire into the
+# workspace MCP config. Run `vexis-agent setup` (or
+# `vexis-agent service restart`) so the brain picks them up.
+#
+# The wizard skips any entry whose `binary` isn't on PATH, so you can
+# declare aspirational entries without breaking anything.
+
+servers: []
+
+# Example shapes — uncomment and adapt:
+#
+# servers:
+#   # Direct binary, no args.
+#   - name: my-tool
+#     command: my-tool
+#     args: []
+#
+#   # Tool that runs via a launcher (npx / pipx run / uvx / cargo run).
+#   # The `binary` field is the PATH check; defaults to `command`.
+#   - name: my-launched-tool
+#     binary: npx
+#     command: npx
+#     args: ["-y", "some-mcp-package"]
+#
+#   # Tool that needs per-server env (API keys, config paths, etc.).
+#   - name: my-tool-with-env
+#     command: my-tool
+#     args: ["--mcp"]
+#     env:
+#       MY_TOOL_API_KEY: "..."
+#       MY_TOOL_CONFIG: "~/.config/my-tool/cfg"

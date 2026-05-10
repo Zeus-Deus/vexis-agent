@@ -9,7 +9,7 @@
       "notes": "Entry 20 from migration-plan-2026-05-03T100620Z.md (mismatched-attribution). The lesson is about conda env Python; the cited evidence is about Tailscale restart. The user's actual signal in the source session was Tailscale-related; the lesson appears to have been inferred from elsewhere in the session and back-attached to this user message.",
       "lesson": {
         "class": "SITUATIONAL",
-        "lesson": "When invoking vexis-agent tools/CLIs from Bash, use the conda env Python directly (~/miniconda3/envs/vexis-agent_env/bin/python -m ...) rather than the shell wrappers in scripts/, since wrappers may invoke system Python which lacks the required dependencies.",
+        "lesson": "When invoking vexis-agent tools/CLIs from Bash, use the active venv Python directly (python -m ...) rather than the shell wrappers in scripts/, since wrappers may invoke system Python which lacks the required dependencies.",
         "scope": "Running vexis-agent Python tools (livestream, etc.) from Bash on this machine",
         "evidence": "But I just enabled it for you though. Do I need to maybe restart Tailscale? Is that maybe an issue?"
       },

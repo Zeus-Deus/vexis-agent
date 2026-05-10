@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
-from core.skills import (
+from vexis_agent.core.skills import (
     ARCHIVE_DIR_NAME,
     PinStore,
     STATE_ACTIVE,

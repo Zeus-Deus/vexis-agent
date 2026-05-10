@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from core import yaml_config
+from vexis_agent.core import yaml_config
 
 
 @pytest.fixture(autouse=True)

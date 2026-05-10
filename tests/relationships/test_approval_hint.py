@@ -24,9 +24,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from core.learning_curator import LearningController
-from core.relationships.curator import RelationshipsCurator
-from core.web_server import DashboardConfig, WebDashboard
+from vexis_agent.core.learning_curator import LearningController
+from vexis_agent.core.relationships.curator import RelationshipsCurator
+from vexis_agent.core.web_server import DashboardConfig, WebDashboard
 
 
 _TOKEN = "test-token-hint"
@@ -103,7 +103,7 @@ def test_slash_approve_omits_hint_when_flag_off(
     workspace: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(
-        "core.yaml_config.relationships_approval_hint_enabled",
+        "vexis_agent.core.yaml_config.relationships_approval_hint_enabled",
         lambda: False,
     )
     curator = RelationshipsCurator(workspace=workspace)
@@ -154,7 +154,7 @@ def test_dashboard_approve_hint_null_when_flag_off(
     workspace: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(
-        "core.yaml_config.relationships_approval_hint_enabled",
+        "vexis_agent.core.yaml_config.relationships_approval_hint_enabled",
         lambda: False,
     )
     curator = RelationshipsCurator(workspace=workspace)

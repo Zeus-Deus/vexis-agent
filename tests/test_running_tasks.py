@@ -14,7 +14,7 @@ import signal
 
 import pytest
 
-from core.running_tasks import QueuedMessage, RunningTasks, TaskAlreadyRunning
+from vexis_agent.core.running_tasks import QueuedMessage, RunningTasks, TaskAlreadyRunning
 
 
 class FakeProc:
@@ -61,8 +61,8 @@ def patch_killpg(monkeypatch):
         elif sig == signal.SIGTERM and proc.honors_term:
             proc.finish(-signal.SIGTERM)
 
-    monkeypatch.setattr("core.running_tasks.os.getpgid", _getpgid)
-    monkeypatch.setattr("core.running_tasks.os.killpg", _killpg)
+    monkeypatch.setattr("vexis_agent.core.running_tasks.os.getpgid", _getpgid)
+    monkeypatch.setattr("vexis_agent.core.running_tasks.os.killpg", _killpg)
     return procs
 
 

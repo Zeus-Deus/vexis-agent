@@ -24,7 +24,7 @@ Pass criteria for the shadow → live flip (v2 §4.3):
   G8 = 2/2    USER.md threshold respected
 
 Usage:
-    ./venv-python scripts/eval_learning.py [--out report.md]
+    python scripts/eval_learning.py [--out report.md]
 
 Cost: roughly 30-40 LLM calls (10 reviews + ~20 judges). The script
 prints a one-line summary of each scenario as it goes plus a final
@@ -46,15 +46,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Allow `./venv-python scripts/eval_learning.py` from the repo root.
+# Allow `python scripts/eval_learning.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.coherence_judge import (  # noqa: E402
+from vexis_agent.core.coherence_judge import (  # noqa: E402
     CoherenceVerdict,
     run_coherence_judge,
 )
-from core.learning_review import run_review  # noqa: E402
-from core.transcripts import (  # noqa: E402
+from vexis_agent.core.learning_review import run_review  # noqa: E402
+from vexis_agent.core.transcripts import (  # noqa: E402
     SessionMeta,
     TranscriptMessage,
     claude_session_jsonl_dir,
@@ -760,9 +760,9 @@ def run_coherence_eval(workspace: Path) -> CoherenceEvalReport:
             # Eval script: build a real ClaudeCodeBrain pointed at
             # the eval workspace so spawn_aux fires the actual claude
             # subprocess (the eval expects real model calls).
-            from core.brain.claude_code import ClaudeCodeBrain
-            from core.running_tasks import RunningTasks
-            from core.sessions import SessionStore
+            from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+            from vexis_agent.core.running_tasks import RunningTasks
+            from vexis_agent.core.sessions import SessionStore
             eval_brain = ClaudeCodeBrain(
                 workspace=workspace,
                 session=SessionStore(workspace / ".vexis" / "sessions.json"),
@@ -898,11 +898,11 @@ def _preload_scenario(scenario: dict, workspace: Path) -> None:
     ``preload_skills`` / ``preload_memory`` / ``preload_queue``
     fields; missing fields are no-ops.
     """
-    from core.paths import skills_dir as _skills_dir
-    from core.paths import memories_dir as _mem_dir
-    from core.paths import user_candidates_path as _queue_path
-    from core.skills import create_skill
-    from core.user_candidates import UserCandidateStore
+    from vexis_agent.core.paths import skills_dir as _skills_dir
+    from vexis_agent.core.paths import memories_dir as _mem_dir
+    from vexis_agent.core.paths import user_candidates_path as _queue_path
+    from vexis_agent.core.skills import create_skill
+    from vexis_agent.core.user_candidates import UserCandidateStore
 
     for skill_spec in scenario.get("preload_skills", []) or []:
         create_skill(
@@ -1080,8 +1080,8 @@ def run_one_scenario(scenario: dict, workspace: Path) -> ScenarioResult:
         # G8 ✓ iff classification is right (LLM said IDENTITY) AND
         # queue would have only one distinct session UUID after
         # this observation (so no eligibility).
-        from core.paths import user_candidates_path
-        from core.user_candidates import UserCandidateStore
+        from vexis_agent.core.paths import user_candidates_path
+        from vexis_agent.core.user_candidates import UserCandidateStore
         # Simulate the dispatcher's queue add by checking what the
         # eligibility WOULD be with this session's UUID added.
         if result.lesson and result.lesson.get("class") == "IDENTITY":

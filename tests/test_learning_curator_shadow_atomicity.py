@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from core.learning_curator import ENTRY_DELIMITER, _append_to_shadow_file
+from vexis_agent.core.learning_curator import ENTRY_DELIMITER, _append_to_shadow_file
 
 
 def _entries(text: str) -> list[str]:

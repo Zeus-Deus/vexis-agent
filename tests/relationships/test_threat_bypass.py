@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.learning_review import _scan_lesson_for_sensitive_content
+from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
 
 
 def test_named_third_party_blocked_for_user():

@@ -16,10 +16,10 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from core.goal_manager import GoalManager
-from core.goal_state import GoalState, GoalStateStore
-from core.running_tasks import RunningTasks
-from core.web_server import DashboardConfig, WebDashboard
+from vexis_agent.core.goal_manager import GoalManager
+from vexis_agent.core.goal_state import GoalState, GoalStateStore
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.web_server import DashboardConfig, WebDashboard
 
 
 _TOKEN = "test-token-goals-cafef00d"
@@ -45,7 +45,7 @@ class _FakeSessions:
 def _build_dashboard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WebDashboard:
     # Redirect goals.json to tmp so each test has an isolated store.
     goals_file = tmp_path / "goals.json"
-    monkeypatch.setattr("core.paths.goals_path", lambda: goals_file)
+    monkeypatch.setattr("vexis_agent.core.paths.goals_path", lambda: goals_file)
 
     dashboard = WebDashboard.__new__(WebDashboard)
     dashboard._workspace = tmp_path  # type: ignore[attr-defined]

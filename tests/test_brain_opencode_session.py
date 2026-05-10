@@ -35,10 +35,10 @@ from pathlib import Path
 
 import pytest
 
-from core.brain.base import SessionLost
-from core.brain.opencode import OpenCodeBrain
-from core.running_tasks import RunningTasks
-from core.sessions import SessionStore
+from vexis_agent.core.brain.base import SessionLost
+from vexis_agent.core.brain.opencode import OpenCodeBrain
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -50,7 +50,7 @@ from core.sessions import SessionStore
 def _isolated_yaml_config(monkeypatch, tmp_path):
     """Tier resolution reads ``~/.vexis/config.yaml`` — keep tests
     insulated from the user's real config."""
-    from core import yaml_config
+    from vexis_agent.core import yaml_config
     cfg_dir = tmp_path / "vexis-config"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(
@@ -198,7 +198,7 @@ def test_first_call_omits_session_flag_and_harvests_id(
         captured=captured,
     )
     monkeypatch.setattr(
-        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
 
     reply = asyncio.run(brain.respond("hi", chat_id=42))
@@ -230,14 +230,14 @@ def test_first_call_raises_brain_error_on_empty_stream(
     promotes it to a hard error per the research doc's stream-EOF
     resilience requirement.
     """
-    from core.brain.base import BrainError
+    from vexis_agent.core.brain.base import BrainError
 
     spawner = _build_fake_spawner(
         stdout_lines=[],  # empty — no events
         stderr_lines=[b"some diagnostic from opencode\n"],
     )
     monkeypatch.setattr(
-        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
 
     with pytest.raises(BrainError) as ei:
@@ -269,7 +269,7 @@ def test_first_call_warns_when_events_but_no_session_id(
         ],
     )
     monkeypatch.setattr(
-        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
     caplog.set_level(logging.WARNING)
 
@@ -312,7 +312,7 @@ def test_second_call_passes_stored_session_id(
         captured=captured,
     )
     monkeypatch.setattr(
-        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
 
     reply = asyncio.run(brain.respond("hi again", chat_id=42))
@@ -346,7 +346,7 @@ def test_second_call_filters_cross_session_events(
         ],
     )
     monkeypatch.setattr(
-        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
 
     reply = asyncio.run(brain.respond("hi", chat_id=1))
@@ -379,7 +379,7 @@ def test_session_not_found_stderr_raises_session_lost_and_rotates(
         returncode=1,
     )
     monkeypatch.setattr(
-        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
 
     with pytest.raises(SessionLost):
@@ -400,7 +400,7 @@ def test_non_zero_exit_without_session_marker_is_brain_error(
     error, model timeout) must NOT trigger SessionLost rotation
     — that would discard a perfectly valid session id.
     """
-    from core.brain.base import BrainError
+    from vexis_agent.core.brain.base import BrainError
 
     sid = "ses_alive"
     session_store.set(sid)
@@ -412,7 +412,7 @@ def test_non_zero_exit_without_session_marker_is_brain_error(
         returncode=1,
     )
     monkeypatch.setattr(
-        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
 
     with pytest.raises(BrainError) as ei:
@@ -436,7 +436,7 @@ def test_session_not_found_on_first_call_does_not_rotate(
     placeholder UUID and losing it for a follow-up that COULD
     have succeeded with a retry on the same (uninitialised)
     state."""
-    from core.brain.base import BrainError
+    from vexis_agent.core.brain.base import BrainError
 
     # Fresh state — never initialised.
     initial_token = session_store.get()
@@ -447,7 +447,7 @@ def test_session_not_found_on_first_call_does_not_rotate(
         returncode=1,
     )
     monkeypatch.setattr(
-        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
 
     with pytest.raises(BrainError):
@@ -523,7 +523,7 @@ def test_session_error_event_triggers_session_lost(
         returncode=0,  # opencode may exit 0 even with the typed error
     )
     monkeypatch.setattr(
-        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
 
     with pytest.raises(SessionLost):
@@ -565,7 +565,7 @@ def test_session_error_unrelated_does_not_trigger_session_lost(
         returncode=0,
     )
     monkeypatch.setattr(
-        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
 
     # Should NOT raise SessionLost — proceeds and returns text.
@@ -608,7 +608,7 @@ def test_session_error_event_on_uninitialised_does_not_rotate(
         returncode=0,
     )
     monkeypatch.setattr(
-        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
 
     # Must NOT raise SessionLost — we don't have a session to
@@ -643,7 +643,7 @@ def test_respond_sets_opencode_config_content_env(
         captured=captured,
     )
     monkeypatch.setattr(
-        "core.brain.opencode.asyncio.create_subprocess_exec", spawner
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
     )
 
     asyncio.run(brain.respond("hi", chat_id=1))

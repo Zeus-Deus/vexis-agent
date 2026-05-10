@@ -19,8 +19,8 @@ from unittest.mock import patch
 
 import pytest
 
-from core.relationships import triggers
-from core.relationships.triggers import (
+from vexis_agent.core.relationships import triggers
+from vexis_agent.core.relationships.triggers import (
     CLASSIFIER_CONFIDENCE_THRESHOLD,
     TriggerVerdict,
     classifier_errors,
@@ -163,8 +163,8 @@ def test_role_gate_dispatch_path_does_not_invoke_detect_over_replies():
     assistant-role line that would otherwise trigger ADD-1.
     Assert the mock was never called over that line.
     """
-    import core.learning_curator as lc
-    from core.transcripts import claude_session_jsonl_dir
+    import vexis_agent.core.learning_curator as lc
+    from vexis_agent.core.transcripts import claude_session_jsonl_dir
 
     workspace = Path("/tmp/vexis-test-roles")
     pdir = claude_session_jsonl_dir(workspace)
@@ -198,9 +198,9 @@ def test_role_gate_dispatch_path_does_not_invoke_detect_over_replies():
         # is BrainNull (returns empty); we need a real
         # ClaudeCodeBrain so it picks up the seeded JSONL via
         # ``core.transcripts.iter_session_metas``.
-        from core.brain.claude_code import ClaudeCodeBrain
-        from core.running_tasks import RunningTasks
-        from core.sessions import SessionStore
+        from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+        from vexis_agent.core.running_tasks import RunningTasks
+        from vexis_agent.core.sessions import SessionStore
         workspace.mkdir(parents=True, exist_ok=True)
         sess = SessionStore(workspace / "sessions.json")
         cc_brain = ClaudeCodeBrain(

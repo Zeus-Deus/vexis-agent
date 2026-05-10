@@ -21,7 +21,7 @@ already have a Claude Pro/Max subscription or an Anthropic API key.
 - **MCP config**: `<workspace>/.mcp.json` (claude-code's
   convention), shape `{"mcpServers": {<name>: {"command", "args",
   "env"}}}`. Vexis writes this once via
-  `scripts/install.sh`; the curator never rewrites it.
+  `scripts/dev-setup.sh`; the curator never rewrites it.
 - **Project instructions**: `<workspace>/CLAUDE.md` (canonical;
   gitted).
 - **Tool naming**: PascalCase (`Read`, `Edit`, `Bash`, `TodoWrite`,
@@ -172,7 +172,7 @@ the curator state silently if missed.
 - `core/yaml_config.py` — `brain_kind()`, `model_for_tier()`,
   `subsystem_tier()` — the configuration surface every brain
   reads through.
-- `scripts/install.py` — installer; symlinks AGENTS.md ↔
+- `scripts/dev-setup.py` — installer; symlinks AGENTS.md ↔
   CLAUDE.md, writes per-brain MCP config, verifies the binary is
   on PATH.
 

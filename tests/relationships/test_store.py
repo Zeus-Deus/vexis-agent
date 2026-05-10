@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from core.relationships.consent import ConsentError, mint
-from core.relationships.store import (
+from vexis_agent.core.relationships.consent import ConsentError, mint
+from vexis_agent.core.relationships.store import (
     Fact,
     Person,
     RelationshipsStore,
@@ -154,7 +154,7 @@ def test_store_promote_merges_into_existing_live_person(workspace: Path):
         source_session="s-old",
         facts=(Fact("met at conference", "2026-04-01", "s-oldaaa"),),
     )
-    from core.relationships.store import _write_people
+    from vexis_agent.core.relationships.store import _write_people
     _write_people(
         relationships_live_path(workspace), [pre], kind="live"
     )
@@ -273,7 +273,7 @@ def test_store_promote_verifies_token_against_shadow_facts(
         staged_at=p.staged_at,
         source_turn_index=p.source_turn_index,
     )
-    from core.relationships.store import _write_people
+    from vexis_agent.core.relationships.store import _write_people
     _write_people(
         relationships_shadow_path(workspace), [tampered], kind="shadow",
     )

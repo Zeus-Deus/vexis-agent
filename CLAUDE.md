@@ -37,10 +37,10 @@ Invariants AND Invariants is itself under ~40 lines. Never
 bump for per-feature bloat.
 
 ## Repo layout
-- `core/brain/` — agent CLI adapters (claude-code, opencode, null).
-- `transports/` — messaging adapters. Default: `telegram.py`.
-- `tools/` — MCP servers (desktop-control, tailnet-serve, voxtype, omarchy-kb).
-- `core/` — main loop, auth, config, learning curator, goals, schedules, sessions.
+- `vexis_agent/` — installable package; `cli.py` Typer entry (the
+  `vexis-agent` console script), `main.py` daemon entry, `core/` (loop +
+  brain adapters + curators + goals), `transports/`, `tools/`.
+- `web/` — dashboard frontend (built via `npm run build`).
 
 ## Local dev environment
 - Miniconda env: `vexis-agent_env`. Activate before any `pip install` or running code.

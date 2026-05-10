@@ -31,10 +31,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import migrate_shadow_to_v2 as mig  # noqa: E402
 
-from core.memory import ENTRY_DELIMITER, MemoryStore  # noqa: E402
-from core.paths import memories_dir, user_candidates_path  # noqa: E402
-from core.skills import create_skill  # noqa: E402
-from core.user_candidates import UserCandidateStore  # noqa: E402
+from vexis_agent.core.memory import ENTRY_DELIMITER, MemoryStore  # noqa: E402
+from vexis_agent.core.paths import memories_dir, user_candidates_path  # noqa: E402
+from vexis_agent.core.skills import create_skill  # noqa: E402
+from vexis_agent.core.user_candidates import UserCandidateStore  # noqa: E402
 
 
 # --------------------------------------------------------------------
@@ -202,7 +202,7 @@ def test_apply_skip_is_noop(env):
     summary = mig.apply_plan(env, [row])
     assert summary.ok
     # No skill staging, no MEMORY.md, no queue entry:
-    from core.learning_writes import shadow_skills_root
+    from vexis_agent.core.learning_writes import shadow_skills_root
     assert not (shadow_skills_root(env)).iterdir().__next__() if (shadow_skills_root(env)).exists() and any((shadow_skills_root(env)).iterdir()) else True
     assert not (memories_dir(env) / "MEMORY.md").exists()
     assert UserCandidateStore(user_candidates_path()).list_all() == []
@@ -267,7 +267,7 @@ def test_apply_s2_stages_support_file(env):
     )
     summary = mig.apply_plan(env, [row])
     assert summary.ok, summary.results[0].message
-    from core.learning_writes import shadow_skills_root
+    from vexis_agent.core.learning_writes import shadow_skills_root
     staged = shadow_skills_root(env) / "umbrella" / "references" / "dutch-bge-m3.md"
     assert staged.exists()
     body = staged.read_text(encoding="utf-8")
@@ -312,7 +312,7 @@ def test_apply_s3_stages_new_skill(env):
     )
     summary = mig.apply_plan(env, [row])
     assert summary.ok, summary.results[0].message
-    from core.learning_writes import shadow_skills_root
+    from vexis_agent.core.learning_writes import shadow_skills_root
     staged = shadow_skills_root(env) / "time-bound-listings" / "SKILL.md"
     assert staged.exists()
     body = staged.read_text(encoding="utf-8")
@@ -365,7 +365,7 @@ def test_apply_s1_falls_back_to_s2_references(env):
     )
     summary = mig.apply_plan(env, [row])
     assert summary.ok, summary.results[0].message
-    from core.learning_writes import shadow_skills_root
+    from vexis_agent.core.learning_writes import shadow_skills_root
     expected = (
         shadow_skills_root(env) / "comm-style" / "references"
         / f"migrated-{row.index:03d}.md"
@@ -561,7 +561,7 @@ def test_re_apply_s3_detects_content_drift(env):
     first = mig.apply_plan(env, [row])
     assert first.ok, first.results[0].message
 
-    from core.learning_writes import shadow_skills_root
+    from vexis_agent.core.learning_writes import shadow_skills_root
     staged = shadow_skills_root(env) / "fresh-skill" / "SKILL.md"
     drifted = staged.read_text(encoding="utf-8") + "\n# hand-edited\n"
     staged.write_text(drifted, encoding="utf-8")
@@ -636,7 +636,7 @@ def test_re_apply_s2_detects_content_drift(env):
     first = mig.apply_plan(env, [row])
     assert first.ok, first.results[0].message
 
-    from core.learning_writes import shadow_skills_root
+    from vexis_agent.core.learning_writes import shadow_skills_root
     staged = (
         shadow_skills_root(env) / "umbrella" / "references"
         / "dutch-bge-m3.md"
@@ -807,7 +807,7 @@ def test_full_pipeline_with_skip_classify(env):
     assert counts.get("PROCEDURAL_S3") == 1
     assert counts.get("IDENTITY") == 1
     # Skill staged:
-    from core.learning_writes import shadow_skills_root
+    from vexis_agent.core.learning_writes import shadow_skills_root
     assert (shadow_skills_root(env) / "time-bound-listings" / "SKILL.md").exists()
     # Queue has the identity entry with synthetic prefill:
     queue = UserCandidateStore(user_candidates_path()).list_all()

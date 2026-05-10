@@ -16,8 +16,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.commands import COMMANDS, BotCommand
-from transports.telegram import _register_commands
+from vexis_agent.core.commands import COMMANDS, BotCommand
+from vexis_agent.transports.telegram import _register_commands
 
 _COMMAND_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 

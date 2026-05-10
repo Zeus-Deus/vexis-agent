@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from core.learning_curator import LearningController
-from core.relationships.curator import RelationshipsCurator
+from vexis_agent.core.learning_curator import LearningController
+from vexis_agent.core.relationships.curator import RelationshipsCurator
 
 
 @pytest.fixture
@@ -68,7 +68,7 @@ def test_digest_renders_three_states(workspace: Path):
     # rejecting the only fact under it; slug stays open).
     _seed(curator, slug="emma", display_name="Emma", qualifier="emma",
           fact_text="single fact", session_uuid="s3")
-    from core.relationships.consent import _fact_id
+    from vexis_agent.core.relationships.consent import _fact_id
     fid = _fact_id("single fact")
     curator.candidate_store.mark_rejected("emma", fact_ids=[fid])
 

@@ -26,8 +26,8 @@ from unittest import mock
 
 import pytest
 
-from core import learning_review as lr
-from core.learning_review import (
+from vexis_agent.core import learning_review as lr
+from vexis_agent.core.learning_review import (
     LARGE_TRANSCRIPT_WARN_CHARS,
     RECURSION_ENV_VAR,
     ReviewOutput,
@@ -38,7 +38,7 @@ from core.learning_review import (
     _verify_evidence,
     run_review,
 )
-from core.transcripts import SessionMeta, TranscriptMessage
+from vexis_agent.core.transcripts import SessionMeta, TranscriptMessage
 
 
 # --------------------------------------------------------------------
@@ -81,8 +81,8 @@ def _spawn_returning(stdout: str, *, returncode: int = 0, stderr: str = ""):
     the second element is the same brain (use
     ``captured.aux_call_records()`` to inspect what was sent).
     """
-    from core.brain.base import AuxResult
-    from core.brain.null import BrainNull
+    from vexis_agent.core.brain.base import AuxResult
+    from vexis_agent.core.brain.null import BrainNull
 
     brain = BrainNull(
         aux_results=[
@@ -101,7 +101,7 @@ def _isolated_yaml_config(monkeypatch, tmp_path):
     config path at ``tmp_path / "config.yaml"`` so tests that
     explicitly write a config to the same location (like
     ``test_triage_yaml_config_overrides``) interoperate cleanly."""
-    from core import yaml_config
+    from vexis_agent.core import yaml_config
 
     monkeypatch.setattr(
         yaml_config, "_config_path", lambda: tmp_path / "config.yaml"
@@ -456,7 +456,7 @@ def test_validate_situational_target_still_rejected():
 
 
 def test_scanner_user_target_catches_religion():
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     pid = _scan_lesson_for_sensitive_content(
         "User is a Christian and prays daily.",
         "religion",
@@ -467,7 +467,7 @@ def test_scanner_user_target_catches_religion():
 
 
 def test_scanner_user_target_catches_politics():
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     pid = _scan_lesson_for_sensitive_content(
         "User leans conservative on most issues.",
         "political views",
@@ -478,7 +478,7 @@ def test_scanner_user_target_catches_politics():
 
 
 def test_scanner_user_target_catches_sexuality():
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     pid = _scan_lesson_for_sensitive_content(
         "User is bisexual and uses they/them pronouns.",
         "identity",
@@ -489,7 +489,7 @@ def test_scanner_user_target_catches_sexuality():
 
 
 def test_scanner_user_target_catches_named_third_party():
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     pid = _scan_lesson_for_sensitive_content(
         "User's girlfriend Sarah prefers Italian food.",
         "preferences",
@@ -541,7 +541,7 @@ def test_named_third_party_rejects(label, text):
     grammatical variants get rejected. These are the load-bearing
     safety checks for USER.md — failure here means a real third
     party could be promoted into the user's identity profile."""
-    from core.learning_review import _check_named_third_party
+    from vexis_agent.core.learning_review import _check_named_third_party
     result = _check_named_third_party(text)
     assert result == "user:named-third-party", (
         f"adversarial case {label!r} should reject but didn't: {text!r}"
@@ -578,7 +578,7 @@ def test_named_third_party_allows(label, text):
     are actually self-reference, organizations, technologies, or
     weekday/month tokens. The allowlist post-filter must let these
     through — false positives erode trust in the scanner."""
-    from core.learning_review import _check_named_third_party
+    from vexis_agent.core.learning_review import _check_named_third_party
     result = _check_named_third_party(text)
     assert result is None, (
         f"non-third-party case {label!r} false-positive'd: "
@@ -594,7 +594,7 @@ def test_named_third_party_allowlist_design_decision():
     false negatives (a real third party gets immortalized in
     USER.md). Add to the allowlist only when a real false positive
     is observed in production."""
-    from core.learning_review import _NON_PERSON_CAPITALIZED
+    from vexis_agent.core.learning_review import _NON_PERSON_CAPITALIZED
     # Sanity: the most-common false-positive sources are present.
     assert "Anthropic" in _NON_PERSON_CAPITALIZED
     assert "Linux" in _NON_PERSON_CAPITALIZED
@@ -617,7 +617,7 @@ def test_named_third_party_decision_user_mentioned_sarah():
     The LLM will produce another non-naming candidate next session
     if this preference is real.
     """
-    from core.learning_review import _check_named_third_party
+    from vexis_agent.core.learning_review import _check_named_third_party
     assert _check_named_third_party("User mentioned Sarah in passing") == \
         "user:named-third-party"
 
@@ -625,7 +625,7 @@ def test_named_third_party_decision_user_mentioned_sarah():
 def test_named_third_party_via_scanner_target_file_user():
     """End-to-end: an adversarial case routed through the full
     scanner with target_file=user must reject."""
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     pid = _scan_lesson_for_sensitive_content(
         "Sarah on the team uses Vim",
         "team workflow notes",
@@ -641,7 +641,7 @@ def test_named_third_party_via_scanner_target_file_memory_does_not_fire():
     USER.md. SITUATIONAL/PROCEDURAL candidates can name third
     parties in their lesson text without rejection (the LLM steers
     correctly via prompt classification)."""
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     pid = _scan_lesson_for_sensitive_content(
         "Sarah on the team uses Vim",
         "team workflow notes",
@@ -651,7 +651,7 @@ def test_named_third_party_via_scanner_target_file_memory_does_not_fire():
 
 
 def test_scanner_user_target_catches_self_harm():
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     pid = _scan_lesson_for_sensitive_content(
         "User has been suicidal in the past.",
         "wellbeing",
@@ -662,7 +662,7 @@ def test_scanner_user_target_catches_self_harm():
 
 
 def test_scanner_user_target_catches_mental_health():
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     pid = _scan_lesson_for_sensitive_content(
         "User struggles with depression.",
         "wellbeing",
@@ -677,7 +677,7 @@ def test_scanner_memory_target_skips_user_md_patterns():
     candidates — those go through the base scanner only. (Religion/
     politics in MEMORY.md is questionable but defensible — not the
     learning curator's job to police.)"""
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     # This would fire for target_file="user" — confirm it does NOT
     # fire for the default memory target.
     pid = _scan_lesson_for_sensitive_content(
@@ -691,7 +691,7 @@ def test_scanner_memory_target_skips_user_md_patterns():
 def test_scanner_user_target_still_runs_base_set():
     """USER.md scanner is layered ON TOP OF the base set — medical/
     legal/financial patterns still fire when target_file=user."""
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     pid = _scan_lesson_for_sensitive_content(
         "Recommend antibiotic dosage based on user weight.",
         "medical",
@@ -744,10 +744,10 @@ def test_validate_situational_lesson_with_third_party_passes():
 def test_render_user_candidate_queue_empty(monkeypatch, tmp_path):
     """When the queue file is empty/missing, render an explicit
     empty-state placeholder."""
-    from core.learning_review import _render_user_candidate_queue
+    from vexis_agent.core.learning_review import _render_user_candidate_queue
     queue_file = tmp_path / "user_candidates.json"
     monkeypatch.setattr(
-        "core.learning_review.user_candidates_path", lambda: queue_file
+        "vexis_agent.core.learning_review.user_candidates_path", lambda: queue_file
     )
     out = _render_user_candidate_queue()
     assert "no pending or promoted USER claims yet" in out
@@ -756,11 +756,11 @@ def test_render_user_candidate_queue_empty(monkeypatch, tmp_path):
 def test_render_user_candidate_queue_lists_pending_and_promoted(monkeypatch, tmp_path):
     """The queue rendering shows both pending and promoted claims with
     their session counts and a [promoted] marker for the latter."""
-    from core.learning_review import _render_user_candidate_queue
-    from core.user_candidates import UserCandidateStore
+    from vexis_agent.core.learning_review import _render_user_candidate_queue
+    from vexis_agent.core.user_candidates import UserCandidateStore
     queue_file = tmp_path / "user_candidates.json"
     monkeypatch.setattr(
-        "core.learning_review.user_candidates_path", lambda: queue_file
+        "vexis_agent.core.learning_review.user_candidates_path", lambda: queue_file
     )
     store = UserCandidateStore(queue_file)
     store.add_occurrence("Pending claim.", "sess-1", "ev")
@@ -779,7 +779,7 @@ def test_render_user_candidate_queue_lists_pending_and_promoted(monkeypatch, tmp
 def test_build_review_prompt_includes_user_queue_section():
     """The Day 3 prompt section must be present in the rendered
     prompt so the LLM knows about the alias path."""
-    from core.learning_review import _build_review_prompt
+    from vexis_agent.core.learning_review import _build_review_prompt
     prompt = _build_review_prompt(
         "transcript",
         user_queue_text="1. \"Existing claim.\" (1 session(s))",
@@ -792,7 +792,7 @@ def test_build_review_prompt_includes_user_queue_section():
 
 def test_build_review_prompt_v2_day3_sections_present():
     """Sanity check: all three v2 context-block markers get rendered."""
-    from core.learning_review import _build_review_prompt
+    from vexis_agent.core.learning_review import _build_review_prompt
     prompt = _build_review_prompt("x")
     assert "<skill-index>" in prompt
     assert "<existing-memory>" in prompt
@@ -1088,8 +1088,8 @@ def test_run_review_unparseable_response(tmp_path):
 
 
 def test_run_review_timeout(tmp_path):
-    from core.brain.base import BrainTimeoutError
-    from core.brain.null import BrainNull
+    from vexis_agent.core.brain.base import BrainTimeoutError
+    from vexis_agent.core.brain.null import BrainNull
 
     brain = BrainNull()
     brain.next_aux_raises(BrainTimeoutError("review timed out"))
@@ -1099,8 +1099,8 @@ def test_run_review_timeout(tmp_path):
 
 
 def test_run_review_spawn_oserror(tmp_path):
-    from core.brain.base import BrainNotInstalled
-    from core.brain.null import BrainNull
+    from vexis_agent.core.brain.base import BrainNotInstalled
+    from vexis_agent.core.brain.null import BrainNull
 
     brain = BrainNull()
     brain.next_aux_raises(BrainNotInstalled("claude not on PATH"))
@@ -1166,7 +1166,7 @@ def test_build_review_prompt_includes_anti_pattern_pairs():
 
 
 def test_sensitive_scan_clean_lesson_passes():
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     assert _scan_lesson_for_sensitive_content(
         "filter time-bound options by current time",
         "scheduled listings",
@@ -1174,7 +1174,7 @@ def test_sensitive_scan_clean_lesson_passes():
 
 
 def test_sensitive_scan_catches_medical_dosage():
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     pid = _scan_lesson_for_sensitive_content(
         "User takes 500mg of antibiotic per day; remember dosage",
         "medical reminders",
@@ -1184,7 +1184,7 @@ def test_sensitive_scan_catches_medical_dosage():
 
 
 def test_sensitive_scan_catches_legal_advice():
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     pid = _scan_lesson_for_sensitive_content(
         "When user asks about contracts, give legal advice with caveats",
         "contract review",
@@ -1194,7 +1194,7 @@ def test_sensitive_scan_catches_legal_advice():
 
 
 def test_sensitive_scan_catches_financial_advice():
-    from core.learning_review import _scan_lesson_for_sensitive_content
+    from vexis_agent.core.learning_review import _scan_lesson_for_sensitive_content
     pid = _scan_lesson_for_sensitive_content(
         "User prefers buy/sell signals on tech stocks every Monday",
         "investment advice timing",
@@ -1244,7 +1244,7 @@ def test_run_review_declines_oversized_transcript(tmp_path):
     """At >200K chars we don't even spawn the LLM; we set
     declined_too_large and return. This advances last_reviewed_at
     via the controller's success path."""
-    from core.learning_review import LEARNING_TRANSCRIPT_DECLINE_CHARS
+    from vexis_agent.core.learning_review import LEARNING_TRANSCRIPT_DECLINE_CHARS
     big_text = "x" * (LEARNING_TRANSCRIPT_DECLINE_CHARS + 100)
     msgs = [_msg("user", big_text)]
     spawn_called = {"called": False}
@@ -1269,7 +1269,7 @@ def test_run_review_declines_oversized_transcript(tmp_path):
 
 def test_run_review_just_below_decline_threshold_runs(tmp_path):
     """Right at the threshold, we still send the transcript."""
-    from core.learning_review import LEARNING_TRANSCRIPT_DECLINE_CHARS
+    from vexis_agent.core.learning_review import LEARNING_TRANSCRIPT_DECLINE_CHARS
     # Aim for transcript chars below the threshold. The formatter
     # adds overhead so we shoot well under to avoid flake.
     text = "y" * (LEARNING_TRANSCRIPT_DECLINE_CHARS - 5_000)
@@ -1288,7 +1288,7 @@ def test_run_review_just_below_decline_threshold_runs(tmp_path):
 def test_render_skill_index_empty_tree(tmp_path):
     """When no skills exist, the index renders an explicit S3-fallback
     hint rather than an empty block."""
-    from core.learning_review import _render_skill_index
+    from vexis_agent.core.learning_review import _render_skill_index
     out = _render_skill_index(tmp_path / "skills")
     assert "no skills exist yet" in out
     assert "S3" in out
@@ -1297,7 +1297,7 @@ def test_render_skill_index_empty_tree(tmp_path):
 def test_render_skill_index_lists_active_skills(tmp_path):
     """A populated tree renders one bullet per skill with the 1-line
     description from frontmatter."""
-    from core.learning_review import _render_skill_index
+    from vexis_agent.core.learning_review import _render_skill_index
     skills_root = tmp_path / "skills"
     (skills_root / "alpha-skill").mkdir(parents=True)
     (skills_root / "alpha-skill" / "SKILL.md").write_text(
@@ -1319,8 +1319,8 @@ def test_render_skill_index_marks_pinned_read_only(tmp_path):
     """Pinned skills must carry the (pinned, read-only) suffix so the
     LLM doesn't propose S1/S2 against them. They must STILL appear in
     the index so S3 collisions are avoided."""
-    from core.learning_review import _render_skill_index
-    from core.skills import PinStore
+    from vexis_agent.core.learning_review import _render_skill_index
+    from vexis_agent.core.skills import PinStore
     skills_root = tmp_path / "skills"
     (skills_root / "free-skill").mkdir(parents=True)
     (skills_root / "free-skill" / "SKILL.md").write_text(
@@ -1347,7 +1347,7 @@ def test_render_skill_index_marks_pinned_read_only(tmp_path):
 def test_build_review_prompt_explains_pinned_marker():
     """The prompt must explain what (pinned, read-only) means so the
     LLM doesn't propose patches against pinned skills."""
-    from core.learning_review import _build_review_prompt
+    from vexis_agent.core.learning_review import _build_review_prompt
     prompt = _build_review_prompt("transcript")
     assert "(pinned, read-only)" in prompt
     # The rule against patching pinned (text wraps over multiple
@@ -1360,7 +1360,7 @@ def test_build_review_prompt_explains_pinned_marker():
 
 
 def test_render_existing_memory_empty_files(tmp_path):
-    from core.learning_review import _render_existing_memory
+    from vexis_agent.core.learning_review import _render_existing_memory
     out = _render_existing_memory(tmp_path)
     assert out == "(no existing entries)"
 
@@ -1368,7 +1368,7 @@ def test_render_existing_memory_empty_files(tmp_path):
 def test_render_existing_memory_combines_live_and_shadow(tmp_path):
     """The dedup view spans both MEMORY.md and MEMORY-SHADOW.md so the
     LLM can avoid duplicating either."""
-    from core.learning_review import _render_existing_memory
+    from vexis_agent.core.learning_review import _render_existing_memory
     memdir = tmp_path / "memories"
     memdir.mkdir()
     (memdir / "MEMORY.md").write_text(
@@ -1385,7 +1385,7 @@ def test_render_existing_memory_combines_live_and_shadow(tmp_path):
 
 
 def test_check_evidence_overlap_substring_hit():
-    from core.learning_review import _check_evidence_overlap
+    from vexis_agent.core.learning_review import _check_evidence_overlap
     existing = ["[learned 2026-05-02] X\n  Evidence: filter to upcoming items only please"]
     hit, idx = _check_evidence_overlap("filter to upcoming items only please", existing)
     assert hit is True
@@ -1395,7 +1395,7 @@ def test_check_evidence_overlap_substring_hit():
 def test_check_evidence_overlap_reverse_substring_hit():
     """Bidirectional: if a new long candidate quote contains an old
     short evidence string, that's still a hit."""
-    from core.learning_review import _check_evidence_overlap
+    from vexis_agent.core.learning_review import _check_evidence_overlap
     existing = ["short stored entry"]
     # New candidate evidence is a longer message that contains the old entry verbatim.
     hit, idx = _check_evidence_overlap(
@@ -1407,7 +1407,7 @@ def test_check_evidence_overlap_reverse_substring_hit():
 
 
 def test_check_evidence_overlap_miss():
-    from core.learning_review import _check_evidence_overlap
+    from vexis_agent.core.learning_review import _check_evidence_overlap
     existing = ["completely unrelated content"]
     hit, idx = _check_evidence_overlap("the new candidate evidence", existing)
     assert hit is False
@@ -1415,7 +1415,7 @@ def test_check_evidence_overlap_miss():
 
 
 def test_check_evidence_overlap_empty_inputs():
-    from core.learning_review import _check_evidence_overlap
+    from vexis_agent.core.learning_review import _check_evidence_overlap
     assert _check_evidence_overlap("", ["x"]) == (False, None)
     assert _check_evidence_overlap("x", []) == (False, None)
 
@@ -1448,7 +1448,7 @@ def test_run_review_situational_dedup_skip(tmp_path):
 
 
 def test_build_review_prompt_substitutes_skill_index_and_memory():
-    from core.learning_review import _build_review_prompt
+    from vexis_agent.core.learning_review import _build_review_prompt
     prompt = _build_review_prompt(
         "transcript here",
         skill_index_text="- skill-foo: foo skill",
@@ -1464,7 +1464,7 @@ def test_build_review_prompt_substitutes_skill_index_and_memory():
 def test_build_review_prompt_v2_sections_present():
     """The new v2 prompt sections must be present in the rendered
     prompt — these guard against accidental section removal."""
-    from core.learning_review import _build_review_prompt
+    from vexis_agent.core.learning_review import _build_review_prompt
     prompt = _build_review_prompt("x")
     assert "Classification — required before output" in prompt
     assert "PROCEDURAL" in prompt and "IDENTITY" in prompt
@@ -1491,8 +1491,8 @@ def _spawn_sequence(*responses):
     reading ``brain.aux_call_records()`` lazily — pre-Phase-B tests
     asserted on ``calls[i]["env"][RECURSION_ENV_VAR]``; the shim
     translates that to ``aux_call_records()[i]["env_overrides"]``."""
-    from core.brain.base import AuxResult
-    from core.brain.null import BrainNull
+    from vexis_agent.core.brain.base import AuxResult
+    from vexis_agent.core.brain.null import BrainNull
 
     aux_results = []
     for item in responses:
@@ -1531,7 +1531,7 @@ def _spawn_sequence(*responses):
 
 
 def test_parse_triage_response_yes_no_garbage():
-    from core.learning_review import _parse_triage_response
+    from vexis_agent.core.learning_review import _parse_triage_response
     assert _parse_triage_response("YES") is True
     assert _parse_triage_response(" yes ") is True
     assert _parse_triage_response("Yes.") is True
@@ -1546,7 +1546,7 @@ def test_parse_triage_response_yes_no_garbage():
 
 
 def test_build_triage_prompt_has_yes_no_question():
-    from core.learning_review import _build_triage_prompt
+    from vexis_agent.core.learning_review import _build_triage_prompt
     out = _build_triage_prompt("transcript body here")
     assert "YES" in out and "NO" in out
     assert "transcript body here" in out
@@ -1672,7 +1672,7 @@ def test_triage_rate_limit_propagates(tmp_path, monkeypatch):
     assert output.nothing_to_save is False
     assert output.triage_skipped is False
     # Curator's _is_rate_limit_error must fire on this same string:
-    from core.learning_curator import _is_rate_limit_error
+    from vexis_agent.core.learning_curator import _is_rate_limit_error
     assert _is_rate_limit_error(f"error: {output.error}") is True
 
 
@@ -1692,8 +1692,8 @@ def test_triage_rate_limit_other_marker(tmp_path, monkeypatch):
 def test_triage_spawn_oserror_fails_open(tmp_path, monkeypatch):
     """Triage subprocess raises BrainError (e.g. transient OSError
     inside the brain spawn) → fall through to sonnet."""
-    from core.brain.base import AuxResult, BrainError
-    from core.brain.null import BrainNull
+    from vexis_agent.core.brain.base import AuxResult, BrainError
+    from vexis_agent.core.brain.null import BrainNull
 
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
     msgs = [_msg("user", "hi")]
@@ -1715,8 +1715,8 @@ def test_triage_spawn_oserror_fails_open(tmp_path, monkeypatch):
 
 
 def test_triage_spawn_timeout_fails_open(tmp_path, monkeypatch):
-    from core.brain.base import AuxResult, BrainTimeoutError
-    from core.brain.null import BrainNull
+    from vexis_agent.core.brain.base import AuxResult, BrainTimeoutError
+    from vexis_agent.core.brain.null import BrainNull
 
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
     msgs = [_msg("user", "hi")]
@@ -1787,7 +1787,7 @@ def test_triage_skipped_for_oversized_transcript(tmp_path, monkeypatch):
     """The size-decline gate fires BEFORE triage, so an oversized
     transcript spawns nothing — triage_result stays None."""
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
-    from core.learning_review import LEARNING_TRANSCRIPT_DECLINE_CHARS
+    from vexis_agent.core.learning_review import LEARNING_TRANSCRIPT_DECLINE_CHARS
     big_text = "x" * (LEARNING_TRANSCRIPT_DECLINE_CHARS + 100)
     msgs = [_msg("user", big_text)]
 
@@ -1805,12 +1805,12 @@ def test_triage_yaml_config_default_haiku(tmp_path):
     config file exists. yaml_config.learning_triage_enabled defaults
     to True."""
     from unittest import mock
-    from core import yaml_config
+    from vexis_agent.core import yaml_config
 
     def fake_vexis_dir() -> Path:
         return tmp_path  # empty dir → no config.yaml → defaults
 
-    with mock.patch("core.yaml_config.vexis_dir", side_effect=fake_vexis_dir):
+    with mock.patch("vexis_agent.core.yaml_config.vexis_dir", side_effect=fake_vexis_dir):
         assert yaml_config.model_learning_triage() == "haiku"
         assert yaml_config.learning_triage_enabled() is True
 
@@ -1818,7 +1818,7 @@ def test_triage_yaml_config_default_haiku(tmp_path):
 def test_triage_yaml_config_overrides(tmp_path):
     """Config file can override both the model and the feature gate."""
     from unittest import mock
-    from core import yaml_config
+    from vexis_agent.core import yaml_config
 
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
@@ -1832,6 +1832,6 @@ def test_triage_yaml_config_overrides(tmp_path):
     def fake_vexis_dir() -> Path:
         return tmp_path
 
-    with mock.patch("core.yaml_config.vexis_dir", side_effect=fake_vexis_dir):
+    with mock.patch("vexis_agent.core.yaml_config.vexis_dir", side_effect=fake_vexis_dir):
         assert yaml_config.model_learning_triage() == "sonnet"
         assert yaml_config.learning_triage_enabled() is False

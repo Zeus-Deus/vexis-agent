@@ -48,7 +48,7 @@ from pathlib import Path
 
 import pytest
 
-from core.goal_judge import (
+from vexis_agent.core.goal_judge import (
     GOAL_JUDGE_ENV_VAR,
     GOAL_JUDGE_TIMEOUT_SECONDS,
     judge_goal,

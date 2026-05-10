@@ -18,15 +18,15 @@ from pathlib import Path
 
 import pytest
 
-from core.brain import claude_code as brain_module
-from core.brain.claude_code import (
+from vexis_agent.core.brain import claude_code as brain_module
+from vexis_agent.core.brain.claude_code import (
     BrainCancelled,
     BrainError,
     BrainTimeoutError,
     ClaudeCodeBrain,
 )
-from core import paths, status as status_module
-from core.running_tasks import RunningTasks, TaskAlreadyRunning
+from vexis_agent.core import paths, status as status_module
+from vexis_agent.core.running_tasks import RunningTasks, TaskAlreadyRunning
 
 
 def _stream_json_result(text: str) -> bytes:
@@ -144,10 +144,10 @@ def patch_killpg(monkeypatch):
         if sig in (signal.SIGTERM, signal.SIGKILL):
             proc.finish(-sig)
 
-    monkeypatch.setattr("core.running_tasks.os.getpgid", _getpgid)
-    monkeypatch.setattr("core.running_tasks.os.killpg", _killpg)
-    monkeypatch.setattr("core.brain.claude_code.os.getpgid", _getpgid)
-    monkeypatch.setattr("core.brain.claude_code.os.killpg", _killpg)
+    monkeypatch.setattr("vexis_agent.core.running_tasks.os.getpgid", _getpgid)
+    monkeypatch.setattr("vexis_agent.core.running_tasks.os.killpg", _killpg)
+    monkeypatch.setattr("vexis_agent.core.brain.claude_code.os.getpgid", _getpgid)
+    monkeypatch.setattr("vexis_agent.core.brain.claude_code.os.killpg", _killpg)
     return procs
 
 

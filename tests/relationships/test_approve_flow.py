@@ -26,17 +26,17 @@ from pathlib import Path
 
 import pytest
 
-from core.relationships.candidate_store import RelationshipsCandidateStore
-from core.relationships.consent import (
+from vexis_agent.core.relationships.candidate_store import RelationshipsCandidateStore
+from vexis_agent.core.relationships.consent import (
     ConsentError,
     mint,
     verify_for_promotion,
 )
-from core.relationships.curator import (
+from vexis_agent.core.relationships.curator import (
     ApproveCandidateResult,
     RelationshipsCurator,
 )
-from core.relationships.store import (
+from vexis_agent.core.relationships.store import (
     Fact,
     Person,
     RelationshipsStore,
@@ -44,7 +44,7 @@ from core.relationships.store import (
     relationships_live_path,
     serialize_relationships_file,
 )
-from core.relationships.triggers import TriggerVerdict
+from vexis_agent.core.relationships.triggers import TriggerVerdict
 
 
 @pytest.fixture
@@ -151,7 +151,7 @@ def test_approve_with_sensitive_content_blocks(
     # Force the sensitive scanner to fire at approve time.
     # `add_live` lazy-imports `_scan_lesson_for_sensitive_content`
     # from `core.learning_review`, so we patch at that module path.
-    from core import learning_review as lr_module
+    from vexis_agent.core import learning_review as lr_module
 
     def fake_scan(text, scope, *, target_file):
         return f"medical:{target_file}"
@@ -315,7 +315,7 @@ def test_slash_pending_lists_eligible_and_below(workspace: Path):
 def test_slash_dispatch_relationships_pending(workspace: Path):
     """``/learning relationships-pending`` reaches
     LearningController and renders the queue."""
-    from core.learning_curator import LearningController
+    from vexis_agent.core.learning_curator import LearningController
     controller = LearningController.__new__(LearningController)
     curator = RelationshipsCurator(workspace=workspace)
     _seed_candidate(
@@ -331,7 +331,7 @@ def test_slash_dispatch_relationships_pending(workspace: Path):
 
 
 def test_slash_dispatch_relationships_approve(workspace: Path):
-    from core.learning_curator import LearningController
+    from vexis_agent.core.learning_curator import LearningController
     controller = LearningController.__new__(LearningController)
     curator = RelationshipsCurator(workspace=workspace)
     _seed_candidate(
@@ -347,7 +347,7 @@ def test_slash_dispatch_relationships_approve(workspace: Path):
 
 
 def test_slash_dispatch_relationships_reject(workspace: Path):
-    from core.learning_curator import LearningController
+    from vexis_agent.core.learning_curator import LearningController
     controller = LearningController.__new__(LearningController)
     curator = RelationshipsCurator(workspace=workspace)
     _seed_candidate(

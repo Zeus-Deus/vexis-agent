@@ -21,8 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from core.brain.base import AuxResult
-from core.brain.null import BrainNull
+from vexis_agent.core.brain.base import AuxResult
+from vexis_agent.core.brain.null import BrainNull
 
 
 @pytest.fixture(autouse=True)
@@ -31,7 +31,7 @@ def _isolated_yaml_config(monkeypatch, tmp_path):
     file assert on the DEFAULT tier per subsystem, so the user's
     real config (which may override e.g. ``models.coherence_judge:
     sonnet``) must not leak in."""
-    from core import yaml_config
+    from vexis_agent.core import yaml_config
     cfg_dir = tmp_path / "vexis-config"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(
@@ -47,7 +47,7 @@ def _isolated_yaml_config(monkeypatch, tmp_path):
 def test_goal_judge_routes_with_large_tier(tmp_path: Path):
     """goal_judge uses ``large`` because false-positive 'done' would
     silently stall the loop — quality outweighs cost."""
-    from core.goal_judge import GOAL_JUDGE_ENV_VAR, judge_goal
+    from vexis_agent.core.goal_judge import GOAL_JUDGE_ENV_VAR, judge_goal
 
     brain = BrainNull(
         aux_results=[
@@ -72,8 +72,8 @@ def test_goal_judge_routes_with_large_tier(tmp_path: Path):
 
 
 def test_coherence_judge_routes_with_small_tier(tmp_path: Path):
-    from core.coherence_judge import COHERENCE_JUDGE_ENV_VAR, run_coherence_judge
-    from core.transcripts import TranscriptMessage
+    from vexis_agent.core.coherence_judge import COHERENCE_JUDGE_ENV_VAR, run_coherence_judge
+    from vexis_agent.core.transcripts import TranscriptMessage
     from datetime import datetime, timezone
 
     msgs = [
@@ -115,12 +115,12 @@ def test_coherence_judge_routes_with_small_tier(tmp_path: Path):
 
 
 def test_relationships_extractor_routes_with_medium_tier(tmp_path: Path):
-    from core.relationships.candidate_store import RelationshipsCandidateStore
-    from core.relationships.extractor import (
+    from vexis_agent.core.relationships.candidate_store import RelationshipsCandidateStore
+    from vexis_agent.core.relationships.extractor import (
         EXTRACTOR_ENV_VAR,
         extract_relationships,
     )
-    from core.transcripts import TranscriptMessage
+    from vexis_agent.core.transcripts import TranscriptMessage
     from datetime import datetime, timezone
 
     cstore = RelationshipsCandidateStore(tmp_path / "candidates.json")
@@ -156,7 +156,7 @@ def test_relationships_extractor_routes_with_medium_tier(tmp_path: Path):
 
 
 def test_relationships_classifier_routes_with_tiny_tier(tmp_path: Path):
-    from core.relationships.triggers import (
+    from vexis_agent.core.relationships.triggers import (
         RELATIONSHIPS_CLASSIFIER_ENV_VAR,
         _classifier_call,
     )
@@ -193,7 +193,7 @@ def test_skill_curator_routes_with_small_tier_and_allow_tools(tmp_path: Path):
     """The skill-consolidation pass is the only consumer that passes
     ``allow_tools=True`` — it needs to invoke vexis-skill archive /
     rename / move via the brain's tool layer."""
-    from core import curator as cur
+    from vexis_agent.core import curator as cur
 
     # Seed a skill so phase2 has something to consolidate (otherwise
     # it short-circuits with "No candidates").
@@ -235,9 +235,9 @@ def test_learning_review_routes_triage_with_tiny_then_review_with_small(
     (tiny) then full review (small). When triage returns NO, the
     full review never fires (separate path tested in
     test_learning_review.py)."""
-    from core import learning_review as lr
-    from core.learning_review import RECURSION_ENV_VAR, run_review
-    from core.transcripts import SessionMeta, TranscriptMessage
+    from vexis_agent.core import learning_review as lr
+    from vexis_agent.core.learning_review import RECURSION_ENV_VAR, run_review
+    from vexis_agent.core.transcripts import SessionMeta, TranscriptMessage
     from datetime import datetime, timezone
 
     monkeypatch.setattr(lr, "learning_triage_enabled", lambda: True)
@@ -291,7 +291,7 @@ def test_brain_under_test_implements_inspection_methods(brain_under_test):
     expose the inspection-only ABC methods correctly. The deeper
     contract is in test_brain_contract.py; this test exists to pin
     the parameterised fixture itself."""
-    from core.brain.base import Brain
+    from vexis_agent.core.brain.base import Brain
 
     assert isinstance(brain_under_test, Brain)
     assert isinstance(brain_under_test.instruction_file_name(), str)

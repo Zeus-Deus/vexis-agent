@@ -26,12 +26,12 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from core.brain.null import BrainNull
-from core.handler import MessageHandler
-from core.notify import Notifier
-from core.sessions import SessionStore
-from core.web_server import DashboardConfig, WebDashboard
-from transports.web import WebChatTransport
+from vexis_agent.core.brain.null import BrainNull
+from vexis_agent.core.handler import MessageHandler
+from vexis_agent.core.notify import Notifier
+from vexis_agent.core.sessions import SessionStore
+from vexis_agent.core.web_server import DashboardConfig, WebDashboard
+from vexis_agent.transports.web import WebChatTransport
 
 
 _TOKEN = "test-token-voice-isolation-cafe"
@@ -134,10 +134,10 @@ def client(
         "voice:\n  enabled: true\n  stt:\n    provider: stub\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("core.yaml_config._config_path", lambda: cfg)
+    monkeypatch.setattr("vexis_agent.core.yaml_config._config_path", lambda: cfg)
     # Replace the route's stt_provider lookup with our canned stub.
     monkeypatch.setattr(
-        "core.web_server.stt_provider", lambda: _StubSTT(),
+        "vexis_agent.core.web_server.stt_provider", lambda: _StubSTT(),
     )
 
     dashboard._app = dashboard._build_app()  # type: ignore[attr-defined]
@@ -245,7 +245,7 @@ def test_chat_send_never_forwards_override(
         "    reasoning_level: high\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("core.yaml_config._config_path", lambda: cfg)
+    monkeypatch.setattr("vexis_agent.core.yaml_config._config_path", lambda: cfg)
 
     r = client.post(
         "/api/v1/chat/send",
@@ -328,8 +328,8 @@ def test_default_mode_full_cycle(
     vexis_root = tmp_path / "vexis"
     vexis_root.mkdir()
     cfg = vexis_root / "config.yaml"
-    monkeypatch.setattr("core.yaml_config._config_path", lambda: cfg)
-    monkeypatch.setattr("core.paths.vexis_dir", lambda: vexis_root)
+    monkeypatch.setattr("vexis_agent.core.yaml_config._config_path", lambda: cfg)
+    monkeypatch.setattr("vexis_agent.core.paths.vexis_dir", lambda: vexis_root)
 
     # 1. Set an override.
     set_resp = client.post(
@@ -393,8 +393,8 @@ def test_default_sentinel_string_is_normalised(
     vexis_root = tmp_path / "vexis"
     vexis_root.mkdir()
     cfg = vexis_root / "config.yaml"
-    monkeypatch.setattr("core.yaml_config._config_path", lambda: cfg)
-    monkeypatch.setattr("core.paths.vexis_dir", lambda: vexis_root)
+    monkeypatch.setattr("vexis_agent.core.yaml_config._config_path", lambda: cfg)
+    monkeypatch.setattr("vexis_agent.core.paths.vexis_dir", lambda: vexis_root)
     # Pre-load with a real model.
     cfg.write_text(
         "voice:\n  call_mode:\n    model: claude-haiku-4-5\n",
@@ -460,14 +460,14 @@ def test_alias_filter_strips_bare_short_names(
     the dated full IDs."""
     # Mock discovery to return a mix of full IDs + bare aliases.
     monkeypatch.setattr(
-        "core.model_discovery.discover_claude_code_models",
+        "vexis_agent.core.model_discovery.discover_claude_code_models",
         lambda: {
             "claude-haiku-4-5", "claude-opus-4-7", "claude-sonnet-4-6",
             "haiku", "opus", "sonnet",
         },
     )
     monkeypatch.setattr(
-        "core.model_discovery.discover_claude_code_capabilities",
+        "vexis_agent.core.model_discovery.discover_claude_code_capabilities",
         lambda: {},
     )
     out = WebDashboard._voice_call_mode_available_models_static("claude-code")

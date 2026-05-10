@@ -25,22 +25,22 @@ from typing import Any
 
 import pytest
 
-from core.relationships.candidate_store import RelationshipsCandidateStore
-from core.relationships.consent import _fact_id, mint
-from core.relationships.extractor import (
+from vexis_agent.core.relationships.candidate_store import RelationshipsCandidateStore
+from vexis_agent.core.relationships.consent import _fact_id, mint
+from vexis_agent.core.relationships.extractor import (
     EXTRACTOR_TIMEOUT_SECONDS,
     ExtractedFact,
     ExtractionResult,
     extract_relationships,
 )
-from core.relationships.store import (
+from vexis_agent.core.relationships.store import (
     Fact,
     Person,
     RelationshipsStore,
     relationships_live_path,
     serialize_relationships_file,
 )
-from core.transcripts import TranscriptMessage
+from vexis_agent.core.transcripts import TranscriptMessage
 
 
 def _msg(text: str, role: str = "user") -> TranscriptMessage:
@@ -58,8 +58,8 @@ def _make_spawn(stdout: str, returncode: int = 0):
     """Phase B: returns a BrainNull pre-loaded with one AuxResult.
     Name preserved for diff hygiene; variable assignment downstream
     binds the result to ``brain`` (not ``spawn``)."""
-    from core.brain.base import AuxResult
-    from core.brain.null import BrainNull
+    from vexis_agent.core.brain.base import AuxResult
+    from vexis_agent.core.brain.null import BrainNull
 
     return BrainNull(
         aux_results=[
@@ -71,8 +71,8 @@ def _make_spawn(stdout: str, returncode: int = 0):
 def _make_timeout_spawn():
     """Phase B: BrainNull configured to raise BrainTimeoutError on
     next ``spawn_aux`` call."""
-    from core.brain.base import BrainTimeoutError
-    from core.brain.null import BrainNull
+    from vexis_agent.core.brain.base import BrainTimeoutError
+    from vexis_agent.core.brain.null import BrainNull
 
     brain = BrainNull()
     brain.next_aux_raises(BrainTimeoutError(f"timed out after {EXTRACTOR_TIMEOUT_SECONDS}s"))
@@ -330,8 +330,8 @@ def test_extractor_resolves_sonnet_by_default():
     ``model_relationships_extractor()`` reads
     ``~/.vexis/config.yaml`` so we monkeypatch the read to keep
     this test independent of the user's local config."""
-    from core import yaml_config
-    from core.yaml_config import (
+    from vexis_agent.core import yaml_config
+    from vexis_agent.core.yaml_config import (
         DEFAULT_MODEL_RELATIONSHIPS_EXTRACTOR,
         model_relationships_extractor,
         resolve_model_flag,
