@@ -40,6 +40,33 @@ def test_render_user_unit_bakes_python_and_vexis_home() -> None:
     assert "Environment=VEXIS_HOME=/srv/state/vexis" in unit
 
 
+def test_render_user_unit_includes_local_bin_on_path() -> None:
+    """Daemon needs ``claude`` / ``opencode`` on PATH; systemd's
+    default user PATH (``/usr/local/sbin:/usr/local/bin:/usr/sbin:
+    /usr/bin``) does NOT include ``~/.local/bin`` where every common
+    install path drops the brain CLI.
+
+    Surfaced in v0.1.1 → v0.1.2: the dotenv fix unblocked secret
+    loading, but the daemon then crashed with ``claude CLI not found
+    on PATH``. The unit must explicitly set PATH so brain-CLI
+    discovery works without the user editing systemd config by hand.
+
+    ``%h`` is systemd's user-home specifier and resolves at unit-load
+    time, so the directive is portable across users / homedirs.
+    """
+    unit = systemd.render_user_unit(
+        python_path="/x/py", vexis_home="/y"
+    )
+    assert "Environment=PATH=" in unit, (
+        "systemd unit is missing the PATH directive — daemon will "
+        "fail to find claude / opencode on PATH."
+    )
+    assert "%h/.local/bin" in unit, (
+        "PATH directive does not include %h/.local/bin where pipx, "
+        "npm-global, and claude-installer drop the brain CLIs."
+    )
+
+
 def test_render_user_unit_includes_envfile_directive() -> None:
     """Defense-in-depth alongside core.config.load_dotenv:
     EnvironmentFile=-{home}/.env makes systemd itself populate the

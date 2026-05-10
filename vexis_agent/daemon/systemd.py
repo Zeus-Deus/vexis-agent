@@ -79,6 +79,20 @@ def render_user_unit(
         f"ExecStart={python} -m vexis_agent.cli run\n"
         f"WorkingDirectory={home}\n"
         f"Environment=VEXIS_HOME={home}\n"
+        # PATH-with-~/.local/bin: brain CLIs (claude, opencode) get
+        # installed under ``~/.local/bin/`` by every common path —
+        # npm-global, pipx, pip --user, the official claude installer.
+        # systemd's default user-unit PATH is just
+        # ``/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin``, so
+        # the daemon's ``shutil.which("claude")`` returns None and
+        # the brain assertion in core.config aborts startup.
+        # Surfaced in v0.1.1 right after the dotenv fix unblocked the
+        # daemon — same ``crash-restart-loop`` failure mode, different
+        # missing piece. ``%h`` is systemd's user-home specifier; in
+        # ``systemctl --user`` mode it expands to the invoking user's
+        # ``$HOME`` at unit-load time, so this works for any user
+        # installing under any home dir.
+        "Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin\n"
         # Defense-in-depth alongside core.config.load_dotenv: systemd
         # itself loads VEXIS_HOME/.env into the unit's environment so
         # even if the in-process dotenv path ever regresses, the
