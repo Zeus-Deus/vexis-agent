@@ -155,6 +155,25 @@ PID files, and SQLite WAL sidecars (which can produce torn restores).
 
 Secrets (`.env`, dashboard token) restore at mode 0600.
 
+### Running multiple installs (dev box + home server)
+
+Telegram only allows **one polling client per bot at a time** — if
+two installs share a bot token, only the last-connected one gets
+messages. So if you want vexis on both your dev box and a home
+server, the clean setup is:
+
+1. Create two bots in @BotFather (e.g. `zeus_vexis_bot` for prod,
+   `zeus_vexis_dev_bot` for dev). Set distinct names + icons so you
+   can tell them apart on your phone.
+2. Run `vexis-agent setup` on each machine with that machine's bot
+   token. Same `TELEGRAM_ALLOWED_USER_ID` on both (it's still you).
+3. To carry your agent's personality + memories + skills across,
+   `vexis-agent backup --include-brain-sessions` on the source
+   machine; `vexis-agent backup-restore <zip>` on the destination
+   AFTER you've run `vexis-agent setup` there. The default restore
+   skips existing files, so the destination's `.env` (with its own
+   bot token) is preserved while everything else carries over.
+
 ## Extending vexis
 
 **New tools — declare an MCP server** in `~/.vexis/mcp-servers.yaml`
