@@ -67,7 +67,12 @@ class QueuedMessage:
 
     user_id: int
     text: str
-    origin: Literal["user", "goal_continuation"] = "user"
+    origin: Literal[
+        "user",
+        "goal_continuation",
+        "scheduled_fire",
+        "schedule_command",
+    ] = "user"
 
 
 @dataclass
@@ -120,7 +125,12 @@ class RunningTasks:
         user_id: int,
         text: str,
         *,
-        origin: Literal["user", "goal_continuation"] = "user",
+        origin: Literal[
+        "user",
+        "goal_continuation",
+        "scheduled_fire",
+        "schedule_command",
+    ] = "user",
     ) -> int:
         """Append a follow-up message to the chat's queue. Should only be
         called after ``claim`` returned False. Returns the new depth.

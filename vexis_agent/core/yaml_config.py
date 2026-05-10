@@ -66,6 +66,14 @@ Canonical schema reference (every block is optional; missing file
     relationships:
       explicit_consent_enabled: false
       approval_hint_enabled: true
+
+    # ── /schedule (see docs/schedules.md) ───────────────────────
+    schedules:
+      enabled: false                # Day 1-3 dev; Day 4 flips to true
+      tick_interval_seconds: 30     # min 5, max 600
+      max_consecutive_errors: 5     # auto-pause after N enqueue errors
+      max_total: 100                # hard cap (excludes cleared)
+      max_prompt_length: 2000       # chars per schedule prompt
 """
 
 from __future__ import annotations
@@ -101,6 +109,16 @@ DEFAULT_LEARNING_MAX_ENTRIES_PER_SESSION = 2
 # ``core.goal_state.DEFAULT_MAX_TURNS``.
 DEFAULT_GOALS_ENABLED = True
 DEFAULT_GOALS_MAX_TURNS = 20
+# /schedule feature defaults. Off through Day 1-3 dev; Day 4 flips
+# DEFAULT_SCHEDULES_ENABLED to True after the eval gate (no LLM eval —
+# integration test only; see tests/test_schedule_eval.py).
+DEFAULT_SCHEDULES_ENABLED = False
+DEFAULT_SCHEDULES_TICK_INTERVAL_SECONDS = 30
+DEFAULT_SCHEDULES_MAX_CONSECUTIVE_ERRORS = 5
+DEFAULT_SCHEDULES_MAX_TOTAL = 100
+DEFAULT_SCHEDULES_MAX_PROMPT_LENGTH = 2000
+DEFAULT_SCHEDULES_TICK_MIN_SECONDS = 5
+DEFAULT_SCHEDULES_TICK_MAX_SECONDS = 600
 # /model UX feature flag. Default ON since Day 5 (the rollout
 # close after dogfood cleared). The slash command + dashboard
 # edit affordances are first-class production surfaces; the
@@ -361,6 +379,76 @@ def goals_max_turns() -> int:
     return _int_or_default(
         _section("goals").get("max_turns"),
         DEFAULT_GOALS_MAX_TURNS,
+        minimum=1,
+    )
+
+
+def schedules_enabled() -> bool:
+    """/schedule feature gate. Default OFF (Day 1-3 dev). Day 4 flips
+    ``DEFAULT_SCHEDULES_ENABLED`` to True after the eval gate. When
+    False the ScheduleManager tick loop and the /schedule slash
+    command both no-op so a user who creates schedules during dev
+    can't accidentally have them fire in production.
+
+    Setting this back to False at runtime is **dormant, not wiped** —
+    schedules.json is retained; the tick loop just stops. Re-enabling
+    resumes from stored ``next_fire_at`` (per the standard restart
+    catch-up grace window).
+    """
+    raw = _section("schedules").get("enabled", DEFAULT_SCHEDULES_ENABLED)
+    return bool(raw)
+
+
+def schedules_tick_interval_seconds() -> int:
+    """How often the ScheduleManager wakes to look for due schedules.
+
+    Default 30s, clamped to [5, 600]. 30s halves Hermes' 60s for
+    lower worst-case fire latency on a single-user box; costs nothing.
+    """
+    raw = _section("schedules").get(
+        "tick_interval_seconds", DEFAULT_SCHEDULES_TICK_INTERVAL_SECONDS
+    )
+    return _int_or_default(
+        raw,
+        DEFAULT_SCHEDULES_TICK_INTERVAL_SECONDS,
+        minimum=DEFAULT_SCHEDULES_TICK_MIN_SECONDS,
+    )
+
+
+def schedules_max_consecutive_errors() -> int:
+    """Auto-pause threshold for a schedule that keeps failing to enqueue.
+
+    After N consecutive ``RunningTasks.enqueue`` failures the manager
+    flips the schedule to ``status=paused`` with
+    ``paused_reason="auto: errors"``. User must explicitly resume to
+    re-arm it (defensive against silent loops of failures).
+    """
+    return _int_or_default(
+        _section("schedules").get("max_consecutive_errors"),
+        DEFAULT_SCHEDULES_MAX_CONSECUTIVE_ERRORS,
+        minimum=1,
+    )
+
+
+def schedules_max_total() -> int:
+    """Hard cap on non-cleared schedule rows.
+
+    Enforced by the CLI's ``create`` path, not by the store itself —
+    the store would happily write a million. Cleared schedules are
+    audit-retained and don't count.
+    """
+    return _int_or_default(
+        _section("schedules").get("max_total"),
+        DEFAULT_SCHEDULES_MAX_TOTAL,
+        minimum=1,
+    )
+
+
+def schedules_max_prompt_length() -> int:
+    """Per-schedule prompt char cap. Enforced at create time."""
+    return _int_or_default(
+        _section("schedules").get("max_prompt_length"),
+        DEFAULT_SCHEDULES_MAX_PROMPT_LENGTH,
         minimum=1,
     )
 

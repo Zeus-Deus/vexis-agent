@@ -34,6 +34,14 @@ mcp_app = typer.Typer(
 )
 app.add_typer(mcp_app, name="mcp")
 
+# /schedule feature — brain-callable CLI surface (the equivalent of
+# Hermes' cronjob MCP tool). Imported here so `vexis-agent --help`
+# pays the cost; the subcommand bodies use lazy imports for their
+# heavy deps (yaml, croniter via parser).
+from vexis_agent.cli_schedule import schedule_app  # noqa: E402
+
+app.add_typer(schedule_app, name="schedule")
+
 
 def _version_callback(value: bool) -> None:
     if value:
