@@ -185,6 +185,11 @@ The brain auto-discovers everything in `~/vexis-workspace/skills/`
 on next session — no restart needed. `vexis-skill list/view/edit/
 patch/archive` round out the surface.
 
+**Omarchy users:** [omarchy-mcp](https://github.com/Zeus-Deus/omarchy-mcp)
+ships an MCP server with semantic search over Omarchy / Arch /
+Hyprland docs. Follow its README to spin it up, then point vexis at
+it via `~/.vexis/mcp-servers.yaml`.
+
 ## Choosing your brain
 
 The default is `claude-code`. To use opencode instead, set in
