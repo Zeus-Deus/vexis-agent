@@ -21,6 +21,7 @@ dependencies = [
     "browser-use==0.12.6",
     "Pillow>=10.0",
     "questionary>=2.0",
+    "croniter>=2.0",
 ]
 
 [project.optional-dependencies]
