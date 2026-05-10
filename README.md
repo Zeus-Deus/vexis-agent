@@ -155,6 +155,44 @@ PID files, and SQLite WAL sidecars (which can produce torn restores).
 
 Secrets (`.env`, dashboard token) restore at mode 0600.
 
+## Extending vexis (MCP-as-plugin model)
+
+vexis doesn't have a bespoke plugin loader. Instead, every "plugin"
+is a standalone **MCP server** — a separate tool/binary that speaks
+the Model Context Protocol. You install it the way its docs say
+(`brew install …`, `npm install -g …`, `cargo install …`, distro
+package, …), declare it in `~/.vexis/mcp-servers.yaml`, and the
+wizard wires it into your workspace's MCP config so the brain sees
+the new tools on next spawn.
+
+A copy-pasteable starter lives at
+`vexis_agent/data/mcp-servers.example.yaml`. Example:
+
+```yaml
+# ~/.vexis/mcp-servers.yaml
+servers:
+  - name: peekaboo                # macOS desktop control
+    binary: npx
+    command: npx
+    args: ["-y", "@steipete/peekaboo"]
+  - name: playwright              # browser automation
+    binary: npx
+    command: npx
+    args: ["-y", "@playwright/mcp@latest"]
+```
+
+After editing, run `vexis-agent setup` (or just `vexis-agent service
+restart` if you've already done setup). Entries whose `binary` isn't
+on PATH get skipped silently; aspirational entries don't break
+anything.
+
+This composes cleanly with the wider Linux AI-tools ecosystem —
+the same MCP server you use with vexis works with claude-code,
+opencode, Cursor, and so on. See `CONTRIBUTING.md` for the full
+extension story and `.plans/plugin-architecture-research.md` for
+the design rationale (why MCP-as-plugin instead of a hermes-style
+Python plugin loader).
+
 ## Choosing your brain
 
 The default is `claude-code`. To use opencode instead, set in

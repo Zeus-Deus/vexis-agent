@@ -308,23 +308,105 @@ def _omarchy_kb_spec() -> Optional[dict]:
     }
 
 
-# Registry of detect-and-wire MCP servers. Each entry is a callable
+# Built-in detect-and-wire MCP servers. Each entry is a callable
 # that returns a spec dict if the server is locally usable, else None.
-# Keep this list small; users with custom MCP servers should edit
-# their workspace's .mcp.json (claude-code) or opencode.json by hand.
+# Users extend this list by dropping entries into
+# $VEXIS_HOME/mcp-servers.yaml — see _user_mcp_specs() below.
 _MCP_DETECTORS: list[Callable[[], Optional[dict]]] = [_omarchy_kb_spec]
+
+
+def _user_mcp_specs() -> list[dict]:
+    """Read user-declared MCP servers from $VEXIS_HOME/mcp-servers.yaml.
+
+    Schema (every key is optional except ``name`` + ``command``):
+
+      servers:
+        - name: peekaboo               # MCP server name (required)
+          binary: peekaboo             # presence check (optional);
+                                       # default: same as command's argv[0]
+          command: npx                 # binary to invoke (required)
+          args: ["-y", "@steipete/peekaboo"]
+          env:
+            PEEKABOO_AI_PROVIDERS: anthropic/claude-opus-4
+
+    The wizard skips entries whose ``binary`` isn't on PATH so users
+    can declare aspirational servers without having them installed
+    yet. This is the canonical "vexis plugin" mechanism; see
+    .plans/plugin-architecture-research.md for the design.
+
+    Missing file → empty list (default state). Malformed file →
+    warning + empty list (don't fail the whole wizard over YAML
+    drift).
+    """
+    path = vexis_dir() / "mcp-servers.yaml"
+    if not path.is_file():
+        return []
+    try:
+        import yaml
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:  # pragma: no cover — defensive
+        log.warning("could not parse %s: %s", path, exc)
+        return []
+    raw_servers = data.get("servers") or []
+    if not isinstance(raw_servers, list):
+        log.warning("%s: 'servers' must be a list", path)
+        return []
+    out: list[dict] = []
+    for entry in raw_servers:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        command = entry.get("command")
+        if not name or not command:
+            log.warning(
+                "%s: skipping entry missing 'name' or 'command': %r",
+                path, entry,
+            )
+            continue
+        # Presence check: prefer explicit binary field, else use the
+        # command's basename. shutil.which honours PATH; entries
+        # whose binary isn't reachable are filtered out so the
+        # workspace MCP config doesn't reference dead invocations.
+        binary = entry.get("binary") or command
+        if shutil.which(binary) is None:
+            log.info(
+                "user mcp '%s' declared but %s not on PATH; skipping",
+                name, binary,
+            )
+            continue
+        out.append({
+            "name": str(name),
+            "command": str(command),
+            "args": list(entry.get("args") or []),
+            "env": dict(entry.get("env") or {}),
+        })
+    return out
 
 
 def detect_mcp_servers() -> list[dict]:
     """Return spec dicts for every MCP server whose binary is on
-    PATH today. Empty list is a valid result and means "no
-    auto-discovery hits — the workspace MCP config will be empty
-    unless the user adds entries by hand."""
+    PATH today. Combines built-in detectors with user-declared
+    entries from $VEXIS_HOME/mcp-servers.yaml. Empty list is a
+    valid result — the workspace MCP config stays empty unless the
+    user adds entries by hand."""
     out: list[dict] = []
+    seen: set[str] = set()
     for detector in _MCP_DETECTORS:
         spec = detector()
-        if spec is not None:
+        if spec is not None and spec["name"] not in seen:
             out.append(spec)
+            seen.add(spec["name"])
+    # User entries are appended; if a user declares an entry with the
+    # same name as a built-in, the user's wins (matches the hermes
+    # convention of "later sources override earlier ones").
+    for spec in _user_mcp_specs():
+        if spec["name"] in seen:
+            # Replace built-in with user-defined. Drop the built-in
+            # entry from `out` and append the user's.
+            out = [s for s in out if s["name"] != spec["name"]]
+        out.append(spec)
+        seen.add(spec["name"])
     return out
 
 

@@ -508,6 +508,135 @@ def test_run_setup_brain_picker_default_keeps_template_kind(
     assert "kind: claude-code" in body
 
 
+def test_user_mcp_specs_empty_when_yaml_missing(
+    isolated_setup_env, monkeypatch
+) -> None:
+    """No mcp-servers.yaml → empty list (default state). The wizard
+    falls through to the built-in detectors only."""
+    assert sw._user_mcp_specs() == []
+
+
+def test_user_mcp_specs_reads_yaml_and_filters_by_path(
+    isolated_setup_env, monkeypatch
+) -> None:
+    """Entries whose binary isn't on PATH get filtered out so the
+    workspace MCP config doesn't reference dead invocations."""
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    bin_dir = isolated_setup_env / "bin"
+    bin_dir.mkdir()
+    # 'real-tool' is on PATH; 'missing-tool' isn't.
+    real = bin_dir / "real-tool"
+    real.write_text("")
+    real.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    (home / "mcp-servers.yaml").write_text(
+        "servers:\n"
+        "  - name: present\n"
+        "    command: real-tool\n"
+        "    args: ['arg1']\n"
+        "    env:\n"
+        "      X: 'y'\n"
+        "  - name: missing\n"
+        "    command: missing-tool\n",
+        encoding="utf-8",
+    )
+    specs = sw._user_mcp_specs()
+    assert len(specs) == 1
+    assert specs[0]["name"] == "present"
+    assert specs[0]["args"] == ["arg1"]
+    assert specs[0]["env"] == {"X": "y"}
+
+
+def test_user_mcp_specs_skips_malformed_entries(
+    isolated_setup_env, monkeypatch
+) -> None:
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    bin_dir = isolated_setup_env / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "ok-tool").write_text("")
+    (bin_dir / "ok-tool").chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    (home / "mcp-servers.yaml").write_text(
+        "servers:\n"
+        "  - name: missing-command\n"  # no command → dropped
+        "  - command: missing-name\n"  # no name → dropped
+        "  - name: ok\n"
+        "    command: ok-tool\n",
+        encoding="utf-8",
+    )
+    specs = sw._user_mcp_specs()
+    names = [s["name"] for s in specs]
+    assert names == ["ok"]
+
+
+def test_user_mcp_specs_swallows_yaml_errors(
+    isolated_setup_env, monkeypatch
+) -> None:
+    """Bad YAML must not crash the wizard. Returns empty list +
+    warns; the built-in detectors still run."""
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    (home / "mcp-servers.yaml").write_text(
+        "servers: [unclosed\n", encoding="utf-8"
+    )
+    assert sw._user_mcp_specs() == []
+
+
+def test_detect_mcp_servers_combines_builtin_and_user(
+    isolated_setup_env, monkeypatch
+) -> None:
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    bin_dir = isolated_setup_env / "bin"
+    bin_dir.mkdir()
+    # Both omarchy-kb (built-in) and a user-declared peekaboo are
+    # on PATH; both should land in the output.
+    (bin_dir / "omarchy-kb").write_text("")
+    (bin_dir / "omarchy-kb").chmod(0o755)
+    (bin_dir / "peekaboo").write_text("")
+    (bin_dir / "peekaboo").chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    (home / "mcp-servers.yaml").write_text(
+        "servers:\n"
+        "  - name: peekaboo\n"
+        "    command: peekaboo\n",
+        encoding="utf-8",
+    )
+    detected = sw.detect_mcp_servers()
+    names = [s["name"] for s in detected]
+    assert "omarchy-kb" in names
+    assert "peekaboo" in names
+
+
+def test_detect_mcp_servers_user_overrides_builtin(
+    isolated_setup_env, monkeypatch
+) -> None:
+    """If a user declares an entry with the same name as a built-in,
+    the user's version wins. Future-proofing for the case where a
+    user wants different env vars / args than the built-in detector
+    chose."""
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    bin_dir = isolated_setup_env / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "omarchy-kb").write_text("")
+    (bin_dir / "omarchy-kb").chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    (home / "mcp-servers.yaml").write_text(
+        "servers:\n"
+        "  - name: omarchy-kb\n"
+        "    command: omarchy-kb\n"
+        "    args: ['--user-flag']\n",
+        encoding="utf-8",
+    )
+    detected = sw.detect_mcp_servers()
+    omarchy_entries = [s for s in detected if s["name"] == "omarchy-kb"]
+    assert len(omarchy_entries) == 1, "user override didn't replace built-in"
+    assert omarchy_entries[0]["args"] == ["--user-flag"]
+
+
 def test_run_setup_skips_mcp_when_nothing_detected(
     isolated_setup_env, monkeypatch
 ) -> None:

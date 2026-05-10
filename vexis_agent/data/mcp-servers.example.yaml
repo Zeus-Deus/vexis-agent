@@ -1,0 +1,50 @@
+# vexis-agent — user-declared MCP servers.
+#
+# Copy this file to ~/.vexis/mcp-servers.yaml (or
+# $VEXIS_HOME/mcp-servers.yaml) and uncomment the entries you want
+# vexis to wire into the workspace MCP config. Then run
+# `vexis-agent setup` or `vexis-agent service restart` so the brain
+# picks them up.
+#
+# Each entry's `binary` is checked against PATH at wizard time;
+# entries whose binary isn't installed get skipped silently. Drop
+# aspirational entries here without breaking anything.
+#
+# This is vexis's plugin mechanism: every "plugin" is a standalone
+# MCP server. Install the server's binary normally (brew, npm,
+# cargo, your distro's package manager); declare it here. See
+# .plans/plugin-architecture-research.md for the design rationale.
+
+servers: []
+
+# Examples — uncomment to enable:
+#
+# servers:
+#   # Peekaboo — macOS desktop control via MCP.
+#   - name: peekaboo
+#     binary: npx                       # binary that must exist on PATH
+#     command: npx
+#     args: ["-y", "@steipete/peekaboo"]
+#     env:
+#       PEEKABOO_AI_PROVIDERS: anthropic/claude-opus-4
+#
+#   # Playwright — browser automation MCP (alternative to vexis's
+#   # built-in browser_use tools).
+#   - name: playwright
+#     binary: npx
+#     command: npx
+#     args: ["-y", "@playwright/mcp@latest"]
+#
+#   # filesystem — read-only file access for paths you whitelist.
+#   - name: filesystem
+#     binary: mcp-server-filesystem
+#     command: mcp-server-filesystem
+#     args: ["~/Documents"]
+#
+#   # A locally-installed custom MCP — example shape:
+#   - name: my-tool
+#     binary: my-tool
+#     command: my-tool
+#     args: ["--mcp"]
+#     env:
+#       MY_TOOL_KEY_FILE: ~/.config/my-tool/key

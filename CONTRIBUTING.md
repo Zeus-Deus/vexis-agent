@@ -30,6 +30,60 @@ to expect.
 - PyPI / AUR / Homebrew / Nix packaging. Distribution is curl-bash
   → pipx; alternatives are deferred until that flow is
   battle-tested.
+- Bespoke Python plugin loader (hermes-style). vexis treats
+  **MCP servers as the canonical extension mechanism** — see the
+  next section.
+
+## Extending vexis: the MCP-server-as-plugin model
+
+Want vexis to do something it doesn't do today? Don't fork
+`vexis_agent/`. Build (or install) an **MCP server** instead.
+
+Concretely:
+
+1. Pick a tool that does the thing you want — `peekaboo` for macOS
+   desktop control, `playwright-mcp` for browser automation,
+   `omarchy-kb` for Omarchy/Hyprland system docs, your own
+   purpose-built MCP server, …
+2. Install the server's binary the way its docs say (brew / npm /
+   cargo / pip / your distro's package manager). Anything that
+   ends up on PATH or as a runnable command works.
+3. Declare it in `~/.vexis/mcp-servers.yaml` (or
+   `$VEXIS_HOME/mcp-servers.yaml`):
+
+   ```yaml
+   servers:
+     - name: peekaboo
+       binary: npx                       # presence check
+       command: npx
+       args: ["-y", "@steipete/peekaboo"]
+       env:
+         PEEKABOO_AI_PROVIDERS: anthropic/claude-opus-4
+   ```
+
+4. Re-run `vexis-agent setup` (or restart the daemon). The wizard
+   detects the server, writes the matching entry into the
+   workspace MCP config (`<workspace>/.mcp.json` for claude-code,
+   `<workspace>/opencode.json` with the `vexis-` prefix for
+   opencode), and the brain auto-discovers the new tools on next
+   spawn.
+
+A copy-pasteable starter lives at `vexis_agent/data/
+mcp-servers.example.yaml`. The design rationale is in
+`.plans/plugin-architecture-research.md`: vexis is single-user, the
+MCP protocol is already the lingua franca, and bolting a hermes-style
+in-process Python plugin loader on top would be 3000 lines for
+problems vexis doesn't have.
+
+If you DO want to extend vexis at the source level — new transport,
+new brain adapter, new built-in tool — the layered architecture
+already supports that:
+
+- `vexis_agent/transports/` — drop a new module, register in
+  `transports/__init__.py`. Telegram is the reference.
+- `vexis_agent/core/brain/` — implement the `Brain` ABC.
+- `vexis_agent/tools/` — add a `*_cli.py` with a `main()` entry,
+  wire it as a console script in `pyproject.toml`'s `[project.scripts]`.
 
 ## Setup
 
