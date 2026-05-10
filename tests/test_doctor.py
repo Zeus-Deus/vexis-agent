@@ -9,6 +9,7 @@ healthy install).
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -166,6 +167,112 @@ def test_tailscale_warn_when_missing(tmp_path, monkeypatch) -> None:
     result = doc.check_tailscale()
     assert result.status is doc.Status.WARN
     assert "not installed" in result.detail
+
+
+# ── tailscale operator delegation (v0.1.4) ────────────────────────
+
+
+def _stub_tailscale(monkeypatch, tmp_path, *, prefs_json: str) -> None:
+    """Install fake `tailscale` into a tmp PATH so check_tailscale's
+    subprocess calls hit our stub. The stub serves both
+    ``tailscale status --json`` (returns minimal valid JSON, exit 0)
+    and ``tailscale debug prefs`` (returns prefs_json, exit 0).
+    Anything else exits 1 — keeps the test honest about which calls
+    we're stubbing."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "tailscale"
+    # Heredoc preserves the JSON exactly; using printf would mangle braces.
+    stub.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        '  "status --json") echo "{}"; exit 0 ;;\n'
+        '  "debug prefs") cat <<\'EOF\'\n'
+        f"{prefs_json}\n"
+        "EOF\n"
+        "  exit 0 ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+
+def test_tailscale_warn_when_operator_unset(tmp_path, monkeypatch) -> None:
+    """OperatorUser absent → /dashboard URL won't publish to the
+    tailnet. Doctor must surface this with the exact two-command
+    fix in the suggestion text."""
+    import getpass
+    _stub_tailscale(monkeypatch, tmp_path, prefs_json='{"OperatorUser": ""}')
+    result = doc.check_tailscale()
+    assert result.status is doc.Status.WARN
+    assert "operator not set" in result.detail
+    # The fix advice must include both commands so the user can
+    # paste-and-run without further research.
+    assert f"sudo tailscale set --operator={getpass.getuser()}" in result.remediation
+    assert "systemctl --user restart vexis-agent" in result.remediation
+
+
+def test_tailscale_warn_when_operator_is_different_user(
+    tmp_path, monkeypatch
+) -> None:
+    """OperatorUser set but to someone else → still broken for us.
+    Surface BOTH the wrong value and the fix."""
+    _stub_tailscale(
+        monkeypatch, tmp_path,
+        prefs_json='{"OperatorUser": "someone-else"}',
+    )
+    result = doc.check_tailscale()
+    assert result.status is doc.Status.WARN
+    assert "someone-else" in result.detail
+    assert "systemctl --user restart vexis-agent" in result.remediation
+
+
+def test_tailscale_ok_when_operator_matches(tmp_path, monkeypatch) -> None:
+    """Happy path: operator set to the current user → no warning,
+    falls through to the existing ``up + logged in`` OK."""
+    import getpass
+    user = getpass.getuser()
+    _stub_tailscale(
+        monkeypatch, tmp_path,
+        prefs_json=f'{{"OperatorUser": "{user}"}}',
+    )
+    result = doc.check_tailscale()
+    assert result.status is doc.Status.OK
+    assert "up + logged in" in result.detail
+
+
+def test_tailscale_ok_when_debug_prefs_unsupported(
+    tmp_path, monkeypatch
+) -> None:
+    """Older Tailscale versions don't have ``debug prefs``. Don't
+    nag the user about a check we can't perform — silently skip
+    and report the existing OK state."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "tailscale"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        '  "status --json") echo "{}"; exit 0 ;;\n'
+        '  *) exit 1 ;;\n'  # debug prefs returns nonzero
+        "esac\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+    result = doc.check_tailscale()
+    assert result.status is doc.Status.OK
+
+
+def test_tailscale_ok_when_debug_prefs_returns_garbage(
+    tmp_path, monkeypatch
+) -> None:
+    """debug prefs returned exit 0 but the body isn't valid JSON.
+    Don't crash the whole doctor run — silently fall through."""
+    _stub_tailscale(monkeypatch, tmp_path, prefs_json="not valid json {{{")
+    result = doc.check_tailscale()
+    assert result.status is doc.Status.OK
 
 
 def test_workspace_fail_when_missing(tmp_path, monkeypatch) -> None:

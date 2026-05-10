@@ -237,7 +237,21 @@ def check_service_installed() -> CheckResult:
 def check_tailscale() -> CheckResult:
     """Tailscale is soft — dashboard works on localhost without it. We
     surface the state so users know whether their phone can reach the
-    dashboard and whether the live-stream tools have a tunnel."""
+    dashboard and whether the live-stream tools have a tunnel.
+
+    Three failure modes:
+      * Not installed       → WARN with install link.
+      * Installed, logged out → WARN with login hint.
+      * Installed + logged in, but operator delegation missing
+        (the gotcha that cost the maintainer a debugging round-trip
+         on the first public install) → WARN with the exact two
+         commands needed to fix it. Tailscale Serve — which the
+         daemon's /dashboard URL relies on for tailnet-reachable
+         URLs — refuses to write its config without root unless
+         the operator user has been delegated. ``tailscale debug
+         prefs`` exposes ``OperatorUser`` so we can check
+         non-invasively.
+    """
     if not shutil.which("tailscale"):
         return CheckResult(
             "Tailscale",
@@ -269,7 +283,91 @@ def check_tailscale() -> CheckResult:
             "Run 'tailscale up' to log in. Without this the dashboard "
             "is localhost-only.",
         )
+
+    operator_warning = _check_tailscale_operator()
+    if operator_warning is not None:
+        return operator_warning
+
     return CheckResult("Tailscale", Status.OK, "up + logged in")
+
+
+def _check_tailscale_operator() -> CheckResult | None:
+    """Probe whether the Tailscale operator is set to the user
+    running this process.
+
+    Returns ``None`` if the check passes (caller continues with the
+    happy-path OK), or a ``CheckResult`` with the WARN + fix advice
+    if the operator delegation is missing or pointed at someone else.
+
+    Tailscale Serve — the feature the daemon uses to publish the
+    dashboard at ``https://<host>.<tailnet>.ts.net`` — refuses to
+    write its config without root, UNLESS the user has been
+    delegated as the tailscale operator via
+    ``sudo tailscale set --operator=$USER``. Without that, the
+    daemon's web_server logs a warning at boot and falls back to a
+    localhost-only dashboard URL.
+
+    This check is best-effort: if ``tailscale debug prefs`` is
+    unavailable (older Tailscale, daemon not responding) or returns
+    something we can't parse, we silently return None — better to
+    say the check passed than to bother users with a false alarm
+    when we can't actually tell.
+    """
+    import getpass
+    import json
+
+    try:
+        prefs_run = subprocess.run(
+            ["tailscale", "debug", "prefs"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if prefs_run.returncode != 0:
+        return None
+
+    try:
+        prefs = json.loads(prefs_run.stdout)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(prefs, dict):
+        return None
+
+    operator = (prefs.get("OperatorUser") or "").strip()
+    try:
+        current_user = getpass.getuser()
+    except (KeyError, OSError):
+        return None  # can't determine current user → can't compare
+
+    if operator == current_user:
+        return None
+
+    fix = (
+        "Tailscale Serve (which publishes the dashboard URL to your\n"
+        "tailnet) refuses to write its config without root unless\n"
+        "the operator user is delegated. One-time fix:\n"
+        f"  sudo tailscale set --operator={current_user}\n"
+        "  systemctl --user restart vexis-agent\n"
+        "Until you run these two commands, /dashboard returns a\n"
+        "localhost-only URL that won't resolve from your phone or\n"
+        "any other device on the tailnet."
+    )
+    if not operator:
+        return CheckResult(
+            "Tailscale",
+            Status.WARN,
+            "up, but operator not set",
+            fix,
+        )
+    return CheckResult(
+        "Tailscale",
+        Status.WARN,
+        f"operator is '{operator}', expected '{current_user}'",
+        fix,
+    )
 
 
 def check_workspace() -> CheckResult:
