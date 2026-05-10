@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# vexis-agent installer — Linux only (Hyprland-targeted, Wayland-only).
+# vexis-agent installer — Linux (the installer refuses macOS/Windows).
 #
 # Usage:
 #   curl --proto '=https' --tlsv1.2 -fsSL \
@@ -25,7 +25,7 @@
 #   2. Installs pipx (via pacman / apt / dnf / zypper, or pip --user fallback).
 #   3. pipx install --force git+https://github.com/Zeus-Deus/vexis-agent.git@<branch>
 #   4. Surfaces the soft dependencies vexis-agent needs (brain CLI,
-#      Hyprland-Wayland actuator tools, Tailscale, systemd).
+#      Wayland desktop tools, optional Tailscale, systemd).
 #   5. Auto-runs `vexis-agent setup` unless --skip-setup or piped
 #      stdin can't reach a TTY.
 #
@@ -54,8 +54,8 @@ print_banner() {
 ${MAGENTA}${BOLD}┌────────────────────────────────────────────────────────┐
 │            ⌬  vexis-agent installer                    │
 ├────────────────────────────────────────────────────────┤
-│  Telegram-bridged agent for Linux (Hyprland).          │
-│  Single-user. Hyprland/Wayland. Tailscale-friendly.    │
+│  Telegram-bridged agent for your desktop.              │
+│  Single-user. Self-hosted.                             │
 └────────────────────────────────────────────────────────┘${RESET}
 EOF
 }
@@ -149,11 +149,16 @@ if [[ "$EUID" -eq 0 ]]; then
 fi
 ok "Running as $(whoami) (non-root)"
 
-# Hyprland is a soft hint at install time — actual enforcement happens
-# at daemon start. Print a heads-up so non-Hyprland users know early.
+# Wayland is a soft hint at install time — desktop-control features
+# (screenshots, window control, voice notes) need it, but the
+# Telegram chat + brain dispatch path doesn't. Print a heads-up so
+# users on tty / X11 / headless boxes know what they will and
+# won't get without changing anything.
 if [[ "${XDG_SESSION_TYPE:-}" != "wayland" ]]; then
-    warn "Wayland session not detected (XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-unset})."
-    info "vexis-agent is Hyprland/Wayland-targeted; X11 won't work."
+    warn "No Wayland session detected (XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-unset})."
+    info "Desktop-control features (screenshots, window control, voice"
+    info "notes) need Wayland. Telegram chat + brain dispatch work fine"
+    info "without it — useful for headless / server installs."
 fi
 
 # ── version resolution ──────────────────────────────────────────────

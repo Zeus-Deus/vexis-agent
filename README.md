@@ -8,9 +8,11 @@ is the transport layer; the brain is whatever CLI you point it at.
 
 Single-user by design. Hyprland/Wayland-targeted. Tailscale-friendly.
 
-> **Linux only.** Hyprland/Wayland-targeted. macOS and Windows are
-> not supported and the installer will refuse to run on them.
-> Distros tested: Arch, Debian/Ubuntu, Fedora, openSUSE.
+> **Linux only.** macOS and Windows aren't supported (the installer
+> will refuse to run). Tested on Arch, Debian/Ubuntu, Fedora,
+> openSUSE. Desktop-control features (screenshots, window control)
+> need a Wayland session; the Telegram side works on any Linux box,
+> including headless servers.
 
 ## Install
 
