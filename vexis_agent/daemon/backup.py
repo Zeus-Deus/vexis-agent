@@ -177,22 +177,37 @@ def run_backup(
     out: Optional[Path] = None,
     workspace: Optional[Path] = None,
     home: Optional[Path] = None,
+    state: Optional[Path] = None,
     include_brain_sessions: bool = False,
 ) -> BackupResult:
-    """Bundle $VEXIS_HOME, $VEXIS_WORKSPACE, and (optionally) the
-    brain's conversation history into a zip.
+    """Bundle $VEXIS_HOME, $VEXIS_WORKSPACE, $XDG_STATE_HOME/vexis-agent,
+    and (optionally) the brain's conversation history into a zip.
 
     The archive is structured with top-level prefixes
-    (``vexis-home/``, ``vexis-workspace/``, ``brain-sessions/``) so
-    restore can reliably target each. Brain sessions are opt-in:
-    they can be large (each turn is a JSONL file for claude-code) and
-    not all users want to roundtrip past conversations.
+    (``vexis-home/``, ``vexis-workspace/``, ``vexis-state/``,
+    ``brain-sessions/``) so restore can reliably target each.
+
+    The ``vexis-state/`` prefix was added in v0.1.6 after the first
+    real migration found that the dashboard's chat-session list
+    (``session.json``) lives under ``state_dir()`` =
+    ``$XDG_STATE_HOME/vexis-agent/`` (defaults to
+    ``~/.local/state/vexis-agent/``), NOT under ``vexis_dir()``
+    (``~/.vexis/``). Pre-fix the backup walked vexis_dir + workspace
+    only, so every dev → home-server migration silently dropped the
+    dashboard's session list. Users saw "1 session" on the home
+    server (just the daemon-bootstrapped one) instead of the
+    accumulated dev list.
+
+    Brain sessions are opt-in: they can be large (each turn is a
+    JSONL file for claude-code) and not all users want to roundtrip
+    past conversations.
     """
-    from vexis_agent.core.paths import vexis_dir
+    from vexis_agent.core.paths import state_dir, vexis_dir
     from vexis_agent.setup_wizard import workspace_path as _ws_path
 
     home = home or vexis_dir()
     workspace = workspace or _ws_path()
+    state = state or state_dir()
     out_path = out or _default_archive_path()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -207,6 +222,11 @@ def run_backup(
         if workspace and workspace.exists():
             for p in _walk_for_backup(workspace):
                 arcname = Path("vexis-workspace") / p.relative_to(workspace)
+                zf.write(p, arcname)
+                file_count += 1
+        if state and state.exists():
+            for p in _walk_for_backup(state):
+                arcname = Path("vexis-state") / p.relative_to(state)
                 zf.write(p, arcname)
                 file_count += 1
         if include_brain_sessions:
@@ -238,6 +258,7 @@ class RestoreResult:
     home_dest: Path
     workspace_dest: Path
     brain_sessions_restored: int = 0
+    state_files_restored: int = 0
 
 
 def _encode_workspace_for_claude_code(workspace: Path) -> str:
@@ -255,6 +276,7 @@ def run_restore(
     *,
     workspace: Optional[Path] = None,
     home: Optional[Path] = None,
+    state: Optional[Path] = None,
     overwrite: bool = False,
     migrate: bool = False,
 ) -> RestoreResult:
@@ -298,7 +320,7 @@ def run_restore(
     Secrets get re-tightened to mode 0600 on extract because
     zipfile.open drops Unix permission bits.
     """
-    from vexis_agent.core.paths import vexis_dir
+    from vexis_agent.core.paths import state_dir, vexis_dir
     from vexis_agent.setup_wizard import workspace_path as _ws_path
 
     if not archive.exists():
@@ -306,11 +328,14 @@ def run_restore(
 
     home = home or vexis_dir()
     workspace = workspace or _ws_path()
+    state = state or state_dir()
     home.mkdir(parents=True, exist_ok=True)
     workspace.mkdir(parents=True, exist_ok=True)
+    state.mkdir(parents=True, exist_ok=True)
 
     home_count = 0
     ws_count = 0
+    state_count = 0
 
     brain_count = 0
     cc_dest = Path.home() / ".claude" / "projects"
@@ -338,6 +363,14 @@ def run_restore(
                 rel = member[len("vexis-workspace/") :]
                 dest_root = workspace
                 ws_count += 1
+            elif member.startswith("vexis-state/"):
+                # XDG state dir: dashboard chat sessions (session.json),
+                # background-task logs, daemon log. Keyed under its own
+                # prefix because state_dir() is independent of vexis_dir()
+                # — see run_backup's docstring for the v0.1.6 origin.
+                rel = member[len("vexis-state/") :]
+                dest_root = state
+                state_count += 1
             elif member.startswith("brain-sessions/claude-code/"):
                 # Re-encode the workspace prefix so dev's sessions
                 # land at the destination's actual session-dir path,
@@ -404,6 +437,7 @@ def run_restore(
         archive=archive,
         home_files_restored=home_count,
         workspace_files_restored=ws_count,
+        state_files_restored=state_count,
         home_dest=home,
         workspace_dest=workspace,
         brain_sessions_restored=brain_count,

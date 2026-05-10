@@ -13,4 +13,4 @@ holds gittable agent memory + skills. Code dir ≠ data dir — pipx
 upgrades only touch the venv.
 """
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"

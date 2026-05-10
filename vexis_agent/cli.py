@@ -344,6 +344,11 @@ def backup_restore(
         f"Restored {result.workspace_files_restored} workspace file(s) "
         f"→ {result.workspace_dest}"
     )
+    if result.state_files_restored:
+        typer.echo(
+            f"Restored {result.state_files_restored} state file(s) "
+            f"(includes dashboard chat sessions)"
+        )
     if result.brain_sessions_restored:
         typer.echo(
             f"Restored {result.brain_sessions_restored} brain-session file(s)"

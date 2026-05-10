@@ -141,8 +141,16 @@ def test_backup_handles_missing_workspace(tmp_path) -> None:
     home.mkdir()
     (home / "config.yaml").write_text("x")
     out = tmp_path / "o.zip"
+    # Pass an empty state dir explicitly so the walk doesn't pick up
+    # the developer's real ~/.local/state/vexis-agent/ contents and
+    # inflate the count past the single home file under test.
+    empty_state = tmp_path / "state"
+    empty_state.mkdir()
     result = bk.run_backup(
-        out=out, home=home, workspace=tmp_path / "no-such-workspace"
+        out=out,
+        home=home,
+        workspace=tmp_path / "no-such-workspace",
+        state=empty_state,
     )
     assert result.workspace_root is None
     assert result.file_count == 1
@@ -389,6 +397,97 @@ def test_brain_session_path_re_encoded_on_restore(tmp_path) -> None:
     assert not (
         fake_home / ".claude" / "projects" / src_encoded
     ).exists(), "sessions landed at source-encoded path; re-encoding broke"
+
+
+def test_backup_includes_state_dir_session_json(tmp_path) -> None:
+    """The dashboard's chat-session list lives at ``state_dir() /
+    'session.json'`` (XDG state home, NOT vexis_dir). Pre-v0.1.6
+    backups silently dropped the entire state dir; users migrating
+    to a new machine saw their dashboard chat history reset to a
+    single freshly-bootstrapped session.
+
+    Pin: a session.json under state_dir lands in the archive under
+    a 'vexis-state/' prefix and round-trips through restore back
+    to the destination's state_dir."""
+    home, ws = _build_fixture(tmp_path)
+    state = tmp_path / "state"
+    state.mkdir()
+    session_payload = '{"active": "demo", "sessions": {"demo": {"uuid": "abc"}}}'
+    (state / "session.json").write_text(session_payload)
+    (state / "background-logs").mkdir()
+    (state / "background-logs" / "task-001.log").write_text("running\n")
+
+    archive = tmp_path / "archive.zip"
+    bk.run_backup(out=archive, home=home, workspace=ws, state=state)
+
+    import zipfile
+    with zipfile.ZipFile(archive) as zf:
+        names = zf.namelist()
+    assert "vexis-state/session.json" in names, (
+        "session.json missing from archive — dashboard chat history "
+        "would be silently dropped on migration. v0.1.6 regression."
+    )
+    assert "vexis-state/background-logs/task-001.log" in names
+
+    # Round-trip: restore the archive into a fresh state dir and
+    # check the session.json content survives.
+    new_home = tmp_path / "home2"
+    new_ws = tmp_path / "ws2"
+    new_state = tmp_path / "state2"
+    new_home.mkdir()
+    new_ws.mkdir()
+
+    result = bk.run_restore(
+        archive,
+        home=new_home,
+        workspace=new_ws,
+        state=new_state,
+    )
+    assert result.state_files_restored >= 1
+    assert (new_state / "session.json").read_text() == session_payload
+    assert (new_state / "background-logs" / "task-001.log").exists()
+
+
+def test_migrate_replaces_dashboard_session_list(tmp_path) -> None:
+    """The whole reason the v0.1.6 fix exists: when migrating a
+    populated install onto a freshly-bootstrapped destination, the
+    daemon's first run on the destination silently writes a stub
+    session.json with one session in it. Default overlay then refused
+    to replace that stub with the source's accumulated session list,
+    silently dropping the user's dashboard chat history.
+
+    --migrate must replace the session.json so the dashboard shows
+    the full migrated list instead of just the bootstrap stub."""
+    home, ws = _build_fixture(tmp_path)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "session.json").write_text('{"sessions": {"a":1, "b":2, "c":3}}')
+
+    archive = tmp_path / "archive.zip"
+    bk.run_backup(out=archive, home=home, workspace=ws, state=state)
+
+    new_home = tmp_path / "home2"
+    new_ws = tmp_path / "ws2"
+    new_state = tmp_path / "state2"
+    new_home.mkdir()
+    new_ws.mkdir()
+    new_state.mkdir()
+    # Simulate the daemon-bootstrap stub on the destination.
+    (new_state / "session.json").write_text('{"sessions": {"stub":1}}')
+
+    bk.run_restore(
+        archive,
+        home=new_home,
+        workspace=new_ws,
+        state=new_state,
+        migrate=True,
+    )
+    body = (new_state / "session.json").read_text()
+    assert '"a":1' in body and '"b":2' in body and '"c":3' in body
+    assert '"stub"' not in body, (
+        "--migrate did not replace the stub session.json; "
+        "dashboard would still show only the bootstrap session."
+    )
 
 
 def test_encode_workspace_matches_transcripts_encoder() -> None:
