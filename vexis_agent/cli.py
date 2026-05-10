@@ -27,6 +27,13 @@ service_app = typer.Typer(
 )
 app.add_typer(service_app, name="service")
 
+mcp_app = typer.Typer(
+    name="mcp",
+    help="Manage MCP servers in ~/.vexis/mcp-servers.yaml.",
+    no_args_is_help=True,
+)
+app.add_typer(mcp_app, name="mcp")
+
 
 def _version_callback(value: bool) -> None:
     if value:
@@ -359,6 +366,151 @@ def service_logs(
     from vexis_agent.daemon.systemd import logs as _logs
 
     raise typer.Exit(_logs(follow=follow, lines=lines))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# `mcp` sub-app: thin shells around vexis_agent.daemon.mcp.
+# ──────────────────────────────────────────────────────────────────────
+
+
+@mcp_app.command("add")
+def mcp_add(
+    name: str = typer.Argument(..., help="MCP server name surfaced to the brain."),
+    command: str = typer.Option(..., "--command", "-c", help="Binary to invoke."),
+    arg: list[str] = typer.Option(
+        [],
+        "--arg",
+        "-a",
+        help="Args passed after the command (repeatable).",
+    ),
+    env: list[str] = typer.Option(
+        [],
+        "--env",
+        "-e",
+        help="KEY=VALUE per-server env (repeatable).",
+    ),
+    binary: str = typer.Option(
+        "",
+        "--binary",
+        "-b",
+        help="Override the PATH-presence check; defaults to --command.",
+    ),
+) -> None:
+    """Add (or replace) an MCP server in ~/.vexis/mcp-servers.yaml.
+
+    Auto-refreshes both per-brain native files (~/vexis-workspace/.mcp.json
+    and opencode.json) so the brain sees the new entry on next session.
+    """
+    from vexis_agent.daemon.mcp import add_server, parse_env_assignments
+
+    try:
+        env_dict = parse_env_assignments(env)
+    except ValueError as exc:
+        typer.echo(f"vexis-agent mcp add: {exc}", err=True)
+        raise typer.Exit(2)
+
+    result = add_server(
+        name=name,
+        command=command,
+        args=arg or None,
+        env=env_dict or None,
+        binary=binary or None,
+    )
+    verb = "Replaced" if result.replaced_existing else "Added"
+    typer.echo(f"{verb} '{result.name}' in {result.yaml_path}")
+    for p in result.refreshed_paths:
+        typer.echo(f"  refreshed {p}")
+
+
+@mcp_app.command("remove")
+def mcp_remove(
+    name: str = typer.Argument(..., help="MCP server name to remove."),
+) -> None:
+    """Remove an MCP server from ~/.vexis/mcp-servers.yaml.
+
+    Built-in detectors (e.g. omarchy-kb) live in vexis source and
+    can't be removed this way; ``vexis-agent mcp list`` shows which
+    are user-declared vs built-in.
+    """
+    from vexis_agent.daemon.mcp import remove_server
+
+    result = remove_server(name=name)
+    if not result.found:
+        typer.echo(
+            f"'{name}' is not in {result.yaml_path}; nothing to do.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    typer.echo(f"Removed '{result.name}' from {result.yaml_path}")
+    for p in result.refreshed_paths:
+        typer.echo(f"  refreshed {p}")
+
+
+@mcp_app.command("list")
+def mcp_list() -> None:
+    """List MCP servers vexis knows about (user-declared + built-in).
+
+    Each row shows: source (user/builtin), name, on-PATH check,
+    command line.
+    """
+    from vexis_agent.daemon.mcp import list_servers
+
+    rows = list_servers()
+    if not rows:
+        typer.echo("No MCP servers configured.")
+        typer.echo("Add one with: vexis-agent mcp add <name> --command <bin>")
+        return
+    width_name = max(len(r.name) for r in rows)
+    for r in rows:
+        marker = "✓" if r.on_path else "✗"
+        cmdline = r.command + (" " + " ".join(r.args) if r.args else "")
+        typer.echo(
+            f"  {marker} [{r.source:<7}] {r.name:<{width_name}}  {cmdline}"
+        )
+
+
+@mcp_app.command("status")
+def mcp_status() -> None:
+    """Detailed per-server status: PATH-resolvable, brain-wired in
+    each native file, full command line + env. Use this to diagnose
+    'why doesn't the brain see my MCP server' issues."""
+    from vexis_agent.daemon.mcp import status_servers
+
+    rows = status_servers()
+    if not rows:
+        typer.echo("No MCP servers configured.")
+        typer.echo("Add one with: vexis-agent mcp add <name> --command <bin>")
+        return
+
+    for s in rows:
+        e = s.entry
+        path_glyph = "✓" if e.on_path else "✗"
+        claude_glyph = "✓" if s.in_claude_native else "✗"
+        opencode_glyph = "✓" if s.in_opencode_native else "✗"
+        wired_label = "ready" if s.fully_wired else "incomplete"
+        typer.echo(f"{e.name}  [{e.source}, {wired_label}]")
+        typer.echo(f"  binary on PATH:        {path_glyph}  ({e.binary})")
+        typer.echo(f"  in claude-code native: {claude_glyph}  ({e.name} in <workspace>/.mcp.json)")
+        typer.echo(f"  in opencode native:    {opencode_glyph}  (vexis-{e.name} in <workspace>/opencode.json)")
+        cmdline = e.command + (" " + " ".join(e.args) if e.args else "")
+        typer.echo(f"  command:               {cmdline}")
+        if e.env:
+            for k, v in e.env.items():
+                typer.echo(f"  env:                   {k}={v}")
+        typer.echo()
+
+
+@mcp_app.command("refresh")
+def mcp_refresh() -> None:
+    """Rewrite both per-brain native files from the current yaml +
+    built-in detectors. Use after editing
+    ~/.vexis/mcp-servers.yaml by hand."""
+    from vexis_agent.daemon.mcp import refresh_workspace
+
+    result = refresh_workspace()
+    typer.echo(f"Refreshed {result.server_count} server(s) into:")
+    for p in result.refreshed_paths:
+        typer.echo(f"  {p}")
 
 
 if __name__ == "__main__":
