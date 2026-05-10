@@ -427,12 +427,7 @@ async def _run() -> None:
         learning=learning_curator,
         config=DashboardConfig(
             port=dashboard_port,
-            # Dashboard bundle lives at <repo>/web/dist when running from a
-            # source checkout. After Phase 2 the daemon module is at
-            # vexis_agent/main.py so the repo root is one level up.
-            # Pipx installs (where the bundle isn't shipped) get a
-            # nonexistent path; web_server logs a warning and serves 404s.
-            web_dist=Path(__file__).resolve().parent.parent / "web" / "dist",
+            web_dist=_resolve_web_dist(),
         ),
         chat=web_chat,
         # Day 5 of model UX: the canary-check helper needs to know
@@ -471,6 +466,52 @@ async def _run() -> None:
         await control_socket.stop()
         await background_tasks.shutdown()
         await browser_manager.stop()
+
+
+def _resolve_web_dist() -> Path:
+    """Locate the built dashboard frontend.
+
+    Two locations to check, in order:
+
+      1. ``vexis_agent/web_dist/`` — bundled into the wheel, ships
+         with the package. This is what pipx-installed users get.
+         Always populated by ``cp -r web/dist vexis_agent/web_dist``
+         at release time (see release skill); the path is included
+         via ``[tool.setuptools.package-data]`` in pyproject.toml.
+
+      2. ``<repo>/web/dist/`` — the source-checkout build output
+         from ``cd web && npm run build``. Used when running the
+         daemon from an editable install (``pip install -e .``)
+         where the bundled copy under site-packages would be stale
+         relative to your live frontend edits.
+
+    Falling back from (1) to (2) lets dev workflows that re-run
+    ``npm run build`` see their changes immediately, while pipx
+    users always have a working dashboard out of the box.
+
+    If neither exists (very unusual — broken install), return the
+    expected bundled path; the dashboard route will 404 and
+    web_server logs a clear warning.
+
+    Surfaced in v0.1.4 after the first public install: prior to
+    this resolver, ``main.py`` hard-coded ``web/dist`` at the repo
+    root and pipx-installed users got "frontend not built" errors
+    on every dashboard hit because the wheel didn't ship the bundle.
+    """
+    bundled = Path(__file__).resolve().parent / "web_dist"
+    if (bundled / "index.html").exists():
+        return bundled
+
+    # Source checkout: <repo>/vexis_agent/main.py → <repo>/web/dist
+    source = Path(__file__).resolve().parent.parent / "web" / "dist"
+    if (source / "index.html").exists():
+        return source
+
+    # Neither exists — return the bundled path so the eventual error
+    # ("frontend not built") points at the location we'd expect for
+    # a healthy pipx install. Source-checkout users hitting this
+    # need to run ``cd web && npm run build`` once.
+    return bundled
 
 
 def _dashboard_port_from_env() -> int:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vexis-agent"
-version = "0.1.3"
+version = "0.1.4"
 description = "Telegram bot + agent CLI bridge for controlling an Omarchy desktop from a phone."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -63,7 +63,25 @@ include = ["vexis_agent*"]
 exclude = ["tests*", "scripts*", ".plans*", "docs*", "web*"]
 
 [tool.setuptools.package-data]
-vexis_agent = ["**/*.yaml", "**/*.json", "data/*"]
+# Bundle the built dashboard frontend (web/dist/ → vexis_agent/web_dist/
+# at release time) into the wheel so pipx-installed users get a
+# working dashboard out of the box. Without this, the daemon's
+# /dashboard route 404s with "frontend not built" because pyproject's
+# packages.find excludes the top-level web/ directory and `web/dist/`
+# is gitignored anyway. The resolver in main._resolve_web_dist falls
+# back to <repo>/web/dist for editable / source-checkout installs.
+#
+# Includes the wasm + onnx assets (silero VAD, onnxruntime) which
+# are large but the dashboard's voice-call mode genuinely needs them.
+vexis_agent = [
+    "**/*.yaml",
+    "**/*.json",
+    "data/*",
+    "web_dist/index.html",
+    "web_dist/assets/*",
+    "web_dist/ort/*",
+    "web_dist/vad/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
