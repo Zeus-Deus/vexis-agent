@@ -45,6 +45,7 @@ COMMANDS: tuple[BotCommand, ...] = (
     BotCommand("curator", "Curator status / pause / resume / run / restore"),
     BotCommand("learning", "Learning curator status / pause / resume / run / audit"),
     BotCommand("goal", "Set a goal Vexis works on across turns"),
+    BotCommand("schedule", "Set reminders and recurring tasks"),
     # Subcommand grammar (status / list / set / reset / refresh / picker)
     # documented in the description rather than registered as separate
     # entries — same posture as /curator and /learning. Telegram's
