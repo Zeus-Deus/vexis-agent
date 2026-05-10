@@ -109,29 +109,43 @@ def detect_install_type(
         else Path(vexis_agent.__file__).resolve()
     )
 
-    # pipx detection: the python interpreter is inside a pipx venv. We
-    # check by prefix-match against the resolved pipx home so symlinks
-    # and the differing ``venvs/<name>/bin/python`` shape don't trip us
-    # up. The venv root is the parent of the bin/ that holds python.
+    # pipx detection. Two complementary heuristics so we catch both
+    # pipx layouts seen in the wild:
+    #
+    # (a) Prefix match on the *unresolved* absolute python path. Works
+    #     when pipx copies the python interpreter into the venv (the
+    #     happy path on most modern installs).
+    # (b) Walk up from sys.executable looking for the structural
+    #     fingerprint of a pipx venv: a directory whose parent is
+    #     ``venvs`` and whose grandparent is the pipx root. Works when
+    #     pipx symlinks the venv's python at the system interpreter
+    #     (pipx 1.12 on Arch / Debian-derivatives) — Path.resolve()
+    #     would follow that symlink out of pipx-land, so we walk the
+    #     UNRESOLVED path instead.
+    #
+    # Combining both keeps the heuristic robust without a runtime
+    # check of "is this python a symlink?" which itself can race.
     pipx_root = _pipx_home().resolve(strict=False)
-    py_resolved = py.resolve(strict=False)
-    if str(py_resolved).startswith(str(pipx_root) + os.sep):
-        # Walk up from python until we hit a directory whose parent is
-        # the pipx venvs/ directory; that's our venv.
-        venv = py_resolved
-        for _ in range(6):  # safety bound; venvs are 2-3 levels deep
-            if venv.parent.name == "venvs":
-                return InstallInfo(
-                    kind=InstallType.PIPX,
-                    python_path=py,
-                    pipx_venv=venv,
-                )
-            if venv.parent == venv:  # reached filesystem root
-                break
-            venv = venv.parent
-        # Found pipx prefix but couldn't isolate the venv — still pipx,
-        # just less precise. The CLI dispatcher only needs the kind.
-        return InstallInfo(kind=InstallType.PIPX, python_path=py)
+    py_abs = py.absolute()
+    matches_prefix = str(py_abs).startswith(str(pipx_root) + os.sep)
+
+    walk_match: Optional[Path] = None
+    candidate = py_abs
+    for _ in range(6):
+        parent = candidate.parent
+        if parent == candidate:  # reached filesystem root
+            break
+        if parent.name == "venvs" and parent.parent == pipx_root:
+            walk_match = candidate
+            break
+        candidate = parent
+
+    if matches_prefix or walk_match is not None:
+        return InstallInfo(
+            kind=InstallType.PIPX,
+            python_path=py,
+            pipx_venv=walk_match,
+        )
 
     # Editable detection: __file__ for ``vexis_agent.__init__`` lives
     # in the source tree when the package was installed with -e .

@@ -32,6 +32,31 @@ def test_detect_pipx_install(tmp_path, monkeypatch) -> None:
     assert info.pipx_venv == venv
 
 
+def test_detect_pipx_install_with_symlinked_python(tmp_path, monkeypatch) -> None:
+    """Pipx 1.12 (Arch / Debian) symlinks the venv's python to the
+    system interpreter rather than copying it. Path.resolve() would
+    follow that symlink out of pipx-land and the prefix-match
+    heuristic alone would fail. The structural-walk fallback should
+    still classify this as PIPX."""
+    pipx_root = tmp_path / "pipx"
+    venv = pipx_root / "venvs" / "vexis-agent"
+    bin_dir = venv / "bin"
+    bin_dir.mkdir(parents=True)
+    real_python = tmp_path / "system" / "bin" / "python3.14"
+    real_python.parent.mkdir(parents=True)
+    real_python.write_text("")
+    py = bin_dir / "python"
+    py.symlink_to(real_python)  # this is the pipx 1.12 layout
+
+    monkeypatch.setenv("PIPX_HOME", str(pipx_root))
+    info = upd.detect_install_type(
+        python_path=py,
+        package_file=tmp_path / "pkg" / "__init__.py",
+    )
+    assert info.kind is upd.InstallType.PIPX
+    assert info.pipx_venv == venv
+
+
 def test_detect_editable_install(tmp_path) -> None:
     """An editable install (pip install -e .) leaves the package in
     a working tree with a sibling .git directory; the detector walks
