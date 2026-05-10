@@ -79,6 +79,14 @@ def render_user_unit(
         f"ExecStart={python} -m vexis_agent.cli run\n"
         f"WorkingDirectory={home}\n"
         f"Environment=VEXIS_HOME={home}\n"
+        # Defense-in-depth alongside core.config.load_dotenv: systemd
+        # itself loads VEXIS_HOME/.env into the unit's environment so
+        # even if the in-process dotenv path ever regresses, the
+        # daemon still gets TELEGRAM_BOT_TOKEN, etc. The leading `-`
+        # makes a missing file non-fatal — a fresh box where setup
+        # hasn't run yet shouldn't fail to start the unit; the daemon
+        # can surface its own clearer error.
+        f"EnvironmentFile=-{home}/.env\n"
         "Restart=on-failure\n"
         "RestartSec=5\n"
         "StandardOutput=journal\n"

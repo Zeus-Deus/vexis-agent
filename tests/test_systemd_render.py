@@ -40,6 +40,28 @@ def test_render_user_unit_bakes_python_and_vexis_home() -> None:
     assert "Environment=VEXIS_HOME=/srv/state/vexis" in unit
 
 
+def test_render_user_unit_includes_envfile_directive() -> None:
+    """Defense-in-depth alongside core.config.load_dotenv:
+    EnvironmentFile=-{home}/.env makes systemd itself populate the
+    daemon's env from the dotenv, so even if the in-process load_dotenv
+    path ever regresses (as it did in v0.1.0 — bare load_dotenv()
+    walked up from inside the pipx venv and never reached
+    ~/.vexis/.env), the daemon still inherits TELEGRAM_BOT_TOKEN etc.
+    from systemd's environment.
+
+    The leading ``-`` makes a missing file non-fatal: a fresh box
+    where the wizard hasn't run yet shouldn't fail to start the
+    unit; the daemon's own ``_require`` raises a clearer error.
+    """
+    unit = systemd.render_user_unit(
+        python_path="/x/py", vexis_home="/srv/state/vexis"
+    )
+    assert "EnvironmentFile=-/srv/state/vexis/.env" in unit, (
+        "systemd unit is missing the EnvironmentFile directive that "
+        "guards against the v0.1.0 bare-load_dotenv regression."
+    )
+
+
 def test_render_user_unit_has_network_after_target() -> None:
     unit = systemd.render_user_unit(
         python_path="/usr/bin/python3", vexis_home="/tmp/v"
