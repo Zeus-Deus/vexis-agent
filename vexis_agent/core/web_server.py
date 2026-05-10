@@ -326,6 +326,12 @@ class WebDashboard:
         # alongside the Telegram transport so both share one
         # MessageHandler (and therefore one SessionStore + Notifier).
         self._chat = chat
+        # /schedule feature — late-attached after construction via
+        # ``attach_schedule_store`` so existing call sites don't break.
+        # Tests that don't exercise the schedules endpoints leave this
+        # None; main.py wires it from the same ScheduleStore instance
+        # the ScheduleManager uses.
+        self._schedule_store: object | None = None
         # Day 5 of model UX: the dashboard payload's
         # check_brain_kind_consistency canary needs to know what
         # brain class the daemon actually instantiated. main.py
@@ -1193,6 +1199,51 @@ class WebDashboard:
         )
         async def post_goals_clear() -> dict:
             return await self._goals_clear()
+
+        # ----- /schedule (Day 4 GET + Day 5 POST) -----
+        #
+        # Dashboard surface for the /schedule feature. Read-only
+        # enumeration + pause/resume/clear mutations; creation is
+        # NOT exposed here — schedules must be created via Telegram
+        # or the brain (which calls vexis-agent schedule create).
+        # The reason: creation flows through the brain so the
+        # echo-confirmation safety net (next_fire_at + tz back in
+        # the reply) always runs, which the dashboard can't do
+        # without an LLM round-trip.
+
+        @app.get(
+            "/api/v1/schedules",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_schedules() -> dict:
+            return await asyncio.to_thread(self._schedules_payload)
+
+        @app.post(
+            "/api/v1/schedules/{schedule_id}/pause",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_schedule_pause(schedule_id: str) -> dict:
+            return await asyncio.to_thread(
+                self._schedule_action, schedule_id, "pause"
+            )
+
+        @app.post(
+            "/api/v1/schedules/{schedule_id}/resume",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_schedule_resume(schedule_id: str) -> dict:
+            return await asyncio.to_thread(
+                self._schedule_action, schedule_id, "resume"
+            )
+
+        @app.post(
+            "/api/v1/schedules/{schedule_id}/clear",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_schedule_clear(schedule_id: str) -> dict:
+            return await asyncio.to_thread(
+                self._schedule_action, schedule_id, "clear"
+            )
 
         # ----- /api/v1/models — Day 3 of model UX -----
         # Read-only resolution table backing the dashboard's
@@ -2297,6 +2348,144 @@ class WebDashboard:
         from vexis_agent.core.goal_state import GoalStateStore
         from vexis_agent.core.paths import goals_path
         return GoalStateStore(goals_path())
+
+    # ----- /schedule payload + mutation helpers ----------------------
+
+    def attach_schedule_store(self, store) -> None:
+        """Late-attach the ScheduleStore from main.py.
+
+        Kept off the constructor signature so existing call sites
+        (tests, alternative wirings) don't break. The schedules
+        endpoints return 503 until this is called.
+        """
+        self._schedule_store = store
+
+    def _schedule_record_dict(self, state) -> dict:
+        """Serialize a ScheduleState to the dashboard JSON shape."""
+        def _iso(dt):
+            return dt.astimezone(timezone.utc).isoformat() if dt else None
+        return {
+            "id": state.id,
+            "name": state.name,
+            "chat_id": state.chat_id,
+            "schedule_display": state.schedule_display,
+            "schedule_kind": state.schedule.get("kind"),
+            "tz": state.schedule.get("tz"),
+            "prompt": state.prompt,
+            "status": state.status,
+            "next_fire_at": _iso(state.next_fire_at),
+            "last_fire_at": _iso(state.last_fire_at),
+            "last_status": state.last_status,
+            "last_error": state.last_error,
+            "consecutive_errors": state.consecutive_errors,
+            "paused_reason": state.paused_reason,
+            "created_at": _iso(state.created_at),
+            "updated_at": _iso(state.updated_at),
+        }
+
+    def _schedules_payload(self) -> dict:
+        """``{active, paused, expired, cleared, retractions_7d}``."""
+        if self._schedule_store is None:
+            return {
+                "active": [],
+                "paused": [],
+                "expired": [],
+                "cleared": [],
+                "retractions_7d": 0,
+                "enabled": False,
+            }
+        try:
+            from vexis_agent.core.yaml_config import schedules_enabled
+            enabled = schedules_enabled()
+        except Exception:
+            enabled = True
+
+        store = self._schedule_store  # type: ignore[assignment]
+        all_rows = store.list_all()  # type: ignore[attr-defined]
+        buckets: dict[str, list[dict]] = {
+            "active": [],
+            "paused": [],
+            "expired": [],
+            "cleared": [],
+        }
+        for r in all_rows:
+            bucket = buckets.get(r.status)
+            if bucket is None:
+                continue
+            bucket.append(self._schedule_record_dict(r))
+
+        # Sort active by next_fire_at asc; paused/expired/cleared by
+        # updated_at desc so most-recently-touched is first.
+        def _nfa_key(d):
+            return d.get("next_fire_at") or "9999-12-31"
+        def _updated_key(d):
+            return d.get("updated_at") or ""
+        buckets["active"].sort(key=_nfa_key)
+        buckets["paused"].sort(key=_updated_key, reverse=True)
+        buckets["expired"].sort(key=_updated_key, reverse=True)
+        buckets["cleared"].sort(key=_updated_key, reverse=True)
+
+        return {
+            **buckets,
+            "retractions_7d": 0,  # Day 5+; parse-retraction metric
+            "enabled": enabled,
+        }
+
+    def _schedule_action(self, schedule_id: str, action: str) -> dict:
+        """Dispatch a pause/resume/clear from the dashboard.
+
+        Returns the new record on success; raises HTTPException on
+        404 (unknown id) or 409 (terminal status).
+        """
+        if self._schedule_store is None:
+            from fastapi import HTTPException
+            raise HTTPException(503, "schedule store not attached")
+        store = self._schedule_store  # type: ignore[assignment]
+
+        # Resolve full id from possible prefix.
+        sid = store.resolve_id_prefix(schedule_id) or schedule_id  # type: ignore[attr-defined]
+        state = store.load(sid)  # type: ignore[attr-defined]
+        if state is None:
+            from fastapi import HTTPException
+            raise HTTPException(404, f"schedule {schedule_id} not found")
+
+        from dataclasses import replace
+        from vexis_agent.core.schedule_state import TerminalScheduleError
+        from vexis_agent.tools.schedule_tool.parser import compute_next_fire
+
+        try:
+            if action == "pause":
+                result = store.update_atomic(  # type: ignore[attr-defined]
+                    sid,
+                    lambda s: replace(
+                        s,
+                        status="paused",
+                        paused_reason="dashboard",
+                        next_fire_at=None,
+                    ),
+                )
+            elif action == "resume":
+                result = store.update_atomic(  # type: ignore[attr-defined]
+                    sid,
+                    lambda s: replace(
+                        s,
+                        status="active",
+                        paused_reason=None,
+                        next_fire_at=compute_next_fire(s.schedule, last_fire_at=None),
+                        consecutive_errors=0,
+                    ),
+                )
+            elif action == "clear":
+                store.clear(sid)  # type: ignore[attr-defined]
+                result = store.load(sid)  # type: ignore[attr-defined]
+            else:
+                from fastapi import HTTPException
+                raise HTTPException(400, f"unknown action: {action}")
+        except TerminalScheduleError as exc:
+            from fastapi import HTTPException
+            raise HTTPException(409, f"schedule already {exc.status}")
+
+        return self._schedule_record_dict(result)
 
     def _active_session_uuid(self) -> str | None:
         """Read the active session UUID via the shared SessionStore.

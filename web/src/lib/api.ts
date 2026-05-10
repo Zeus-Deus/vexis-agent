@@ -30,6 +30,8 @@ import type {
   ModelsState,
   RelationshipsCandidatesState,
   RelationshipsLiveState,
+  ScheduleRecord,
+  SchedulesState,
   SkillBody,
   SkillsState,
   StatusState,
@@ -242,6 +244,26 @@ export const api = {
     call<GoalRecord>(token, "/goals/resume", { method: "POST" }),
   clearGoal: (token: string) =>
     call<GoalRecord>(token, "/goals/clear", { method: "POST" }),
+  // ----- /schedule -----
+  schedules: (token: string) => call<SchedulesState>(token, "/schedules"),
+  pauseSchedule: (token: string, id: string) =>
+    call<ScheduleRecord>(
+      token,
+      `/schedules/${encodeURIComponent(id)}/pause`,
+      { method: "POST" },
+    ),
+  resumeSchedule: (token: string, id: string) =>
+    call<ScheduleRecord>(
+      token,
+      `/schedules/${encodeURIComponent(id)}/resume`,
+      { method: "POST" },
+    ),
+  clearSchedule: (token: string, id: string) =>
+    call<ScheduleRecord>(
+      token,
+      `/schedules/${encodeURIComponent(id)}/clear`,
+      { method: "POST" },
+    ),
   relationshipsResolveQualifier: (
     token: string,
     slug: string,

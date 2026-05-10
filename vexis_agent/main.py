@@ -455,6 +455,11 @@ async def _run() -> None:
         running_brain_kind=_kind,
     )
 
+    # Late-attach the schedule store so the dashboard /api/v1/schedules*
+    # endpoints can read/mutate it. Kept off the WebDashboard constructor
+    # for backwards compatibility with test/alternate wirings.
+    dashboard.attach_schedule_store(schedule_store)
+
     transport = TelegramTransport(
         token=config.telegram_bot_token,
         handler=handler,

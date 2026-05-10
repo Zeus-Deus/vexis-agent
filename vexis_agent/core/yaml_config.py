@@ -112,7 +112,7 @@ DEFAULT_GOALS_MAX_TURNS = 20
 # /schedule feature defaults. Off through Day 1-3 dev; Day 4 flips
 # DEFAULT_SCHEDULES_ENABLED to True after the eval gate (no LLM eval —
 # integration test only; see tests/test_schedule_eval.py).
-DEFAULT_SCHEDULES_ENABLED = False
+DEFAULT_SCHEDULES_ENABLED = True
 DEFAULT_SCHEDULES_TICK_INTERVAL_SECONDS = 30
 DEFAULT_SCHEDULES_MAX_CONSECUTIVE_ERRORS = 5
 DEFAULT_SCHEDULES_MAX_TOTAL = 100

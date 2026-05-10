@@ -453,6 +453,40 @@ export interface GoalsState {
   history: GoalRecord[];
 }
 
+// ---- /schedule dashboard tab ----------------------------------
+
+export type ScheduleStatus = "active" | "paused" | "expired" | "cleared";
+export type ScheduleLastStatus = "ok" | "error" | null;
+export type ScheduleKind = "once" | "interval" | "cron" | null;
+
+export interface ScheduleRecord {
+  id: string;
+  name: string | null;
+  chat_id: number;
+  schedule_display: string;
+  schedule_kind: ScheduleKind;
+  tz: string | null;
+  prompt: string;
+  status: ScheduleStatus;
+  next_fire_at: string | null;
+  last_fire_at: string | null;
+  last_status: ScheduleLastStatus;
+  last_error: string | null;
+  consecutive_errors: number;
+  paused_reason: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface SchedulesState {
+  active: ScheduleRecord[];
+  paused: ScheduleRecord[];
+  expired: ScheduleRecord[];
+  cleared: ScheduleRecord[];
+  retractions_7d: number;
+  enabled: boolean;
+}
+
 // ── Model UX (Day 3 read-only; Day 4 adds edit affordances) ──
 
 export type ValidationSeverity = "error" | "warning" | "info";
