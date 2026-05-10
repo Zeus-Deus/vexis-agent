@@ -276,10 +276,10 @@ function ScheduleRow({ record, pending, actions, onAction }: RowProps) {
       className="border-l-2 border-[var(--color-border)] pl-3"
       data-testid={`schedule-row-${record.id}`}
     >
-      <div className="font-data text-sm text-[var(--color-fg)]">
+      <div className="font-data text-sm text-[var(--color-fg)] break-words">
         <span className="text-[var(--color-accent)]">◷</span>{" "}
         <span className="text-[var(--color-fg-dim)]">{record.id.slice(0, 6)}</span>{" "}
-        {record.schedule_display}{" "}
+        <span className="break-all">{record.schedule_display}</span>{" "}
         {record.tz && (
           <span className="text-[var(--color-fg-dim)]">· {record.tz}</span>
         )}
@@ -311,7 +311,7 @@ function ScheduleRow({ record, pending, actions, onAction }: RowProps) {
           paused: {record.paused_reason}
         </div>
       )}
-      <div className="mt-2 flex gap-2">
+      <div className="mt-2 flex flex-wrap gap-2">
         {actions.includes("pause") && (
           <Button
             variant="ghost"
