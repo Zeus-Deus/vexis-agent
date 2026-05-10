@@ -135,6 +135,18 @@ def update(
             "(e.g. 'v0.3.0', a branch name, a sha)."
         ),
     ),
+    no_service_render: bool = typer.Option(
+        False,
+        "--no-service-render",
+        help=(
+            "Skip re-rendering the systemd unit after the pipx "
+            "install completes. Default behaviour propagates new "
+            "unit-template directives (PATH, EnvironmentFile, ...) "
+            "to existing deployments. Pass this flag if you've "
+            "hand-customized your unit file and don't want it "
+            "overwritten. Equivalent env var: VEXIS_NO_SERVICE_RENDER=1."
+        ),
+    ),
 ) -> None:
     """Pull and reinstall the latest vexis-agent.
 
@@ -145,13 +157,21 @@ def update(
     pre-release work. Pass any other ref string to pin.
 
     Detects pipx vs editable-source installs and dispatches accordingly.
-    Never touches ``~/.vexis/`` or ``~/vexis-workspace/`` — state is
-    sacrosanct (decision D7 in the packaging plan). Does NOT auto-restart
-    the service; prints a hint instead.
+    After a successful pipx install, re-renders the systemd unit if
+    one is installed, so new template features reach you without a
+    separate ``service install`` step. Never touches ``~/.vexis/`` or
+    ``~/vexis-workspace/`` — state is sacrosanct (decision D7 in the
+    packaging plan). Does NOT auto-restart the service; prints a hint
+    instead.
     """
     from vexis_agent.daemon.update import run_update
 
-    raise typer.Exit(run_update(channel=channel))
+    raise typer.Exit(
+        run_update(
+            channel=channel,
+            no_service_render=no_service_render,
+        )
+    )
 
 
 @app.command()

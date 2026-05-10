@@ -358,3 +358,123 @@ def test_update_pipx_literal_ref_pins(monkeypatch) -> None:
     code = upd._update_pipx("v0.2.0")
     assert code == 0
     assert any("@v0.2.0" in arg for arg in captured["cmd"]), captured["cmd"]
+
+
+# ── auto-render systemd unit after update (v0.1.3) ──────────────────
+
+
+def test_render_unit_skipped_when_no_unit_on_disk(
+    tmp_path, monkeypatch
+) -> None:
+    """No unit file on disk → user never ran service install. Don't
+    surprise them by suddenly creating one. Silent no-op."""
+    nonexistent = tmp_path / "no-such-unit.service"
+    monkeypatch.setattr(
+        "vexis_agent.daemon.systemd.user_unit_path", lambda: nonexistent
+    )
+    # If subprocess.run gets called, the test should fail loudly.
+    monkeypatch.setattr(
+        upd.subprocess, "run",
+        lambda *a, **kw: pytest.fail(
+            "Should not invoke subprocess when no unit is installed"
+        ),
+    )
+    upd._render_unit_if_installed()  # no exception, no subprocess call
+
+
+def test_render_unit_skipped_when_skip_flag_set(
+    tmp_path, monkeypatch
+) -> None:
+    """skip=True (CLI flag) suppresses re-render even when a unit
+    exists. Lets users with hand-customized units opt out."""
+    unit = tmp_path / "vexis-agent.service"
+    unit.write_text("# fake")
+    monkeypatch.setattr(
+        "vexis_agent.daemon.systemd.user_unit_path", lambda: unit
+    )
+    monkeypatch.setattr(
+        upd.subprocess, "run",
+        lambda *a, **kw: pytest.fail(
+            "Should not invoke subprocess when skip=True"
+        ),
+    )
+    upd._render_unit_if_installed(skip=True)
+
+
+def test_render_unit_skipped_when_env_var_set(
+    tmp_path, monkeypatch
+) -> None:
+    """VEXIS_NO_SERVICE_RENDER=1 suppresses re-render. Same
+    rationale as the CLI flag, but accessible to callers that
+    don't thread the flag through."""
+    unit = tmp_path / "vexis-agent.service"
+    unit.write_text("# fake")
+    monkeypatch.setattr(
+        "vexis_agent.daemon.systemd.user_unit_path", lambda: unit
+    )
+    monkeypatch.setenv("VEXIS_NO_SERVICE_RENDER", "1")
+    monkeypatch.setattr(
+        upd.subprocess, "run",
+        lambda *a, **kw: pytest.fail(
+            "Should not invoke subprocess when env var is set"
+        ),
+    )
+    upd._render_unit_if_installed()
+
+
+def test_render_unit_runs_subprocess_when_unit_installed(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Happy path: unit exists, no opt-out → subprocess fires
+    `vexis-agent service install` against the freshly-installed
+    venv python. Pin the exact argv so the contract with the CLI
+    sub-command (which expects `service install`) is locked in."""
+    unit = tmp_path / "vexis-agent.service"
+    unit.write_text("# fake")
+    monkeypatch.setattr(
+        "vexis_agent.daemon.systemd.user_unit_path", lambda: unit
+    )
+    monkeypatch.delenv("VEXIS_NO_SERVICE_RENDER", raising=False)
+
+    captured: dict[str, list[str]] = {}
+
+    class _Result:
+        returncode = 0
+
+    def _fake_run(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return _Result()
+
+    monkeypatch.setattr(upd.subprocess, "run", _fake_run)
+
+    upd._render_unit_if_installed()
+    cmd = captured["cmd"]
+    # Must be a python -m invocation so the subprocess starts a
+    # fresh interpreter that sees the updated code, not the stale
+    # imports the current process is running.
+    assert cmd[1:] == ["-m", "vexis_agent.cli", "service", "install"], (
+        f"Unexpected re-render command: {cmd}"
+    )
+    assert "Re-rendering systemd unit" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("falsy_value", ["", "0", "false", "FALSE", "no", "NO"])
+def test_service_render_falsy_env_values_dont_skip(
+    falsy_value, tmp_path, monkeypatch
+) -> None:
+    """Canonical falsy strings must NOT count as "skip". A user
+    who explicitly sets VEXIS_NO_SERVICE_RENDER=0 expects re-render
+    to run, not be inhibited."""
+    monkeypatch.setenv("VEXIS_NO_SERVICE_RENDER", falsy_value)
+    assert upd._service_render_disabled_via_env() is False
+
+
+@pytest.mark.parametrize("truthy_value", ["1", "true", "yes", "anything"])
+def test_service_render_truthy_env_values_skip(
+    truthy_value, monkeypatch
+) -> None:
+    """Anything other than the canonical falsy strings counts as
+    truthy — matches the pattern install.sh's _envflag uses for
+    VEXIS_DRY_RUN / VEXIS_SKIP_SETUP."""
+    monkeypatch.setenv("VEXIS_NO_SERVICE_RENDER", truthy_value)
+    assert upd._service_render_disabled_via_env() is True

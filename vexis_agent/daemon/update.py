@@ -308,19 +308,25 @@ def run_update(
     *,
     info: InstallInfo | None = None,
     snapshot: bool = True,
+    no_service_render: bool = False,
 ) -> int:
     """Run the update appropriate for this install. Returns an exit
     code (0 = success, 1 = failure / unsupported install).
 
-    Channel ``"stable"`` is the main branch; ``"dev"`` is the develop
-    branch (only meaningful for pipx installs that read from git).
-    Editable installs already have a working tree — channel is a no-op.
+    Channel semantics live on ``_update_pipx``; editable installs
+    already have a working tree, so channel is a no-op there.
 
-    Side-effects (Phase 5f):
+    Side-effects:
       * Pre-update zip of $VEXIS_HOME at $VEXIS_HOME/backups/
         pre-update-<utc>.zip (skip with snapshot=False).
       * Output mirrored to $VEXIS_HOME/logs/update.log.
       * SIGHUP ignored for the duration.
+      * After a successful pipx update, re-renders the systemd unit
+        if one is installed — propagates any new template directives
+        (PATH, EnvironmentFile, etc.) to existing deployments so
+        users don't have to remember to run ``service install`` after
+        every update. Suppress with ``no_service_render=True`` or
+        ``VEXIS_NO_SERVICE_RENDER=1``.
 
     Never restarts the service: the caller (or the user) decides when
     that's safe. Plan §6.4 invariant.
@@ -333,7 +339,9 @@ def run_update(
             _pre_update_snapshot()
 
         if info.kind is InstallType.PIPX:
-            return _update_pipx(channel)
+            return _update_pipx(
+                channel, no_service_render=no_service_render
+            )
         if info.kind is InstallType.EDITABLE:
             return _update_editable(info.source_root)  # type: ignore[arg-type]
         return _update_unknown()
@@ -396,7 +404,9 @@ def _resolve_latest_tag(repo_url: str = _UPSTREAM_URL) -> Optional[str]:
     return None
 
 
-def _update_pipx(channel: str) -> int:
+def _update_pipx(
+    channel: str, *, no_service_render: bool = False
+) -> int:
     """Re-run ``pipx install --force git+<repo>@<ref>`` to refresh
     the venv at the chosen channel.
 
@@ -413,6 +423,12 @@ def _update_pipx(channel: str) -> int:
     the same ref — meaning "upgrade" wouldn't advance from v0.1.0 to
     v0.2.0. ``pipx install --force`` with an explicitly resolved ref
     is the only verb that does what users mean by "update".
+
+    After a successful install the systemd user unit is re-rendered
+    (if one exists on disk) so new template directives reach existing
+    deployments without a separate ``service install`` step. Pass
+    ``no_service_render=True`` to skip — e.g. when the user has
+    hand-customized their unit file and doesn't want it stomped.
     """
     if shutil.which("pipx") is None:
         print(
@@ -455,8 +471,89 @@ def _update_pipx(channel: str) -> int:
             flush=True,
         )
         return 1
+    _render_unit_if_installed(skip=no_service_render)
     _print_post_update_hint()
     return 0
+
+
+def _service_render_disabled_via_env() -> bool:
+    """Read ``VEXIS_NO_SERVICE_RENDER`` with the same truthy semantics
+    install.sh uses for VEXIS_DRY_RUN / VEXIS_SKIP_SETUP. Treat any
+    non-empty value other than the canonical falsy strings as truthy.
+
+    Kept separate from the CLI flag check so callers can suppress
+    re-render via env var without threading a flag through code that
+    doesn't otherwise care about it (e.g. tests, wrappers).
+    """
+    raw = os.environ.get("VEXIS_NO_SERVICE_RENDER", "").strip()
+    if not raw:
+        return False
+    return raw not in ("0", "false", "FALSE", "no", "NO")
+
+
+def _render_unit_if_installed(*, skip: bool = False) -> None:
+    """Re-render the systemd user unit IF one is already installed.
+
+    The whole point: new releases sometimes change the unit template
+    (v0.1.1 added EnvironmentFile, v0.1.2 added PATH). Without this,
+    those changes don't reach existing installs unless the user
+    remembers to run ``vexis-agent service install`` themselves —
+    which they don't, because the post-update hint just says "restart
+    the service." This closes that gap.
+
+    Behaviour:
+      * No unit installed (manual / dev deploy) → silent no-op.
+      * ``skip=True`` (CLI flag) or ``VEXIS_NO_SERVICE_RENDER`` set
+        → silent no-op. Lets users with hand-customized units opt out.
+      * Otherwise → run ``vexis-agent service install`` in a subprocess
+        against the freshly-installed venv python.
+
+    Why a subprocess: ``pipx install --force`` replaced the libraries
+    under ``sys.executable``, but this Python process already imported
+    ``vexis_agent.daemon.systemd`` from the OLD code into memory. A
+    fresh interpreter sees the new code; reload-shenanigans don't.
+    The subprocess approach is the same pattern the editable-update
+    path already uses for ``pip install -e .``.
+
+    Failures here are logged but don't fail the overall update — the
+    pipx install itself succeeded, so the user has the new code. The
+    unit re-render is just polish; they can do it manually.
+    """
+    if skip or _service_render_disabled_via_env():
+        return
+
+    # Late import: keeps update.py importable in environments that
+    # don't have systemd plumbing (rare, but the daemon module pulls
+    # in subprocess-shelling helpers we don't need until now).
+    from vexis_agent.daemon.systemd import user_unit_path
+
+    if not user_unit_path().exists():
+        # No unit on disk → user never ran ``service install`` and
+        # presumably runs the daemon some other way. Don't surprise
+        # them by suddenly creating one.
+        return
+
+    print(
+        "Re-rendering systemd unit to pick up any new template "
+        "directives...",
+        flush=True,
+    )
+    rerender = subprocess.run(
+        [
+            str(Path(sys.executable)),
+            "-m", "vexis_agent.cli",
+            "service", "install",
+        ],
+        capture_output=False,
+        text=True,
+    )
+    if rerender.returncode != 0:
+        print(
+            f"Unit re-render exited {rerender.returncode}. The pipx "
+            "install itself succeeded — run 'vexis-agent service "
+            "install' manually if you want the new template directives.",
+            flush=True,
+        )
 
 
 def _update_editable(repo: Path) -> int:
