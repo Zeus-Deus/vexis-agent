@@ -5,6 +5,14 @@ or system pip) and dispatches the right reinstall recipe. Refuses to
 touch user state (``~/.vexis/``, ``~/vexis-workspace/``) — decision D7
 in the packaging plan: code dir ≠ data dir.
 
+Channel semantics for pipx installs (see ``_update_pipx``):
+  * ``stable`` (default) — resolve the newest semver tag from the
+    upstream remote and reinstall from there. Mirrors what
+    install.sh does on a fresh curl-bash, so install + update
+    converge on the same ref.
+  * ``dev`` — main branch tip; tracks the maintainer's last push.
+  * any other value — literal git ref, lets users pin to v0.3.0 etc.
+
 Phase 5f hardens the path against bad-luck disconnects:
   * Pre-update snapshot — a quick backup of ``~/.vexis/`` lands at
     ``~/.vexis/backups/pre-update-<utc>.zip`` before any install
@@ -37,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -51,6 +60,16 @@ from typing import Iterator, Optional
 import vexis_agent
 
 log = logging.getLogger(__name__)
+
+# Canonical upstream URL. Mirrors the GH_REPO constant in install.sh —
+# both files MUST use the same URL or "vexis-agent update" can pull
+# from a different fork than the one curl-bash installed from.
+_UPSTREAM_URL = "https://github.com/Zeus-Deus/vexis-agent.git"
+
+# Match a leading semver-ish tag (v1.2.3, v1.2.3-rc1, ...). Same regex
+# install.sh's resolve_default_version() uses, kept in sync so the two
+# code paths always pick the same "latest tag".
+_SEMVER_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+")
 
 
 class InstallType(Enum):
@@ -320,41 +339,110 @@ def run_update(
         return _update_unknown()
 
 
-def _update_pipx(channel: str) -> int:
-    """Re-run ``pipx install --force git+<repo>`` so the venv code
-    points at the latest ``main`` (or ``develop``) branch tip.
+def _resolve_latest_tag(repo_url: str = _UPSTREAM_URL) -> Optional[str]:
+    """Return the newest semver tag on ``repo_url``, or None if none.
 
-    pipx upgrade is the simpler verb but only works when the original
-    install was from PyPI; for git-source installs, ``--force`` reinstall
-    is the documented recipe. We choose the verb based on which mode the
-    user is in by trying upgrade first and falling back to the reinstall
-    on failure.
+    Mirrors install.sh's ``resolve_default_version`` so the curl-bash
+    one-liner and ``vexis-agent update`` always converge on the same
+    ref. Uses ``git ls-remote`` (no clone) so this is fast even on
+    a metered connection.
+
+    Returns None when:
+      * ``git`` isn't on PATH (rare, but the daemon doesn't depend on it).
+      * The remote has no tags yet (fresh repo before first release).
+      * ls-remote times out or errors (offline / 404 / rate-limit).
+
+    Callers fall back to ``main`` on None — same behaviour as
+    install.sh.
+    """
+    if shutil.which("git") is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "git", "ls-remote",
+                "--tags", "--refs",
+                "--sort=-v:refname",
+                repo_url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.warning("git ls-remote failed for %s: %s", repo_url, exc)
+        return None
+    if result.returncode != 0:
+        log.warning(
+            "git ls-remote exit %d for %s: %s",
+            result.returncode, repo_url, result.stderr.strip(),
+        )
+        return None
+
+    # Each line: "<sha>\trefs/tags/<tag>". --refs already strips peeled
+    # ^{} suffixes; the regex filter further drops non-semver tags
+    # (e.g. someone tagging "rc-staging" by accident).
+    for line in result.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        ref = parts[1].strip()
+        prefix = "refs/tags/"
+        if not ref.startswith(prefix):
+            continue
+        tag = ref[len(prefix):]
+        if _SEMVER_TAG_RE.match(tag):
+            return tag
+    return None
+
+
+def _update_pipx(channel: str) -> int:
+    """Re-run ``pipx install --force git+<repo>@<ref>`` to refresh
+    the venv at the chosen channel.
+
+    Channel semantics:
+      * ``stable`` (default) — latest semver tag from the remote;
+        falls back to ``main`` when the repo has no tags yet.
+      * ``dev`` — main branch tip (i.e. last push, possibly unreleased).
+      * any other value — treated as a literal git ref (branch / tag /
+        sha) so power users can pin via
+        ``vexis-agent update --channel v0.3.0``.
+
+    ``pipx upgrade`` is intentionally NOT tried first. For git-source
+    installs, pipx remembers the original install spec and re-fetches
+    the same ref — meaning "upgrade" wouldn't advance from v0.1.0 to
+    v0.2.0. ``pipx install --force`` with an explicitly resolved ref
+    is the only verb that does what users mean by "update".
     """
     if shutil.which("pipx") is None:
         print(
             "pipx not found on PATH. Install pipx and re-run "
             "'vexis-agent update', or reinstall manually:\n"
-            "  pipx install git+https://github.com/Zeus-Deus/vexis-agent.git",
+            f"  pipx install git+{_UPSTREAM_URL}",
             flush=True,
         )
         return 1
 
-    # First try: simple upgrade (works for any install that pipx
-    # already knows about).
-    upgrade = subprocess.run(
-        ["pipx", "upgrade", "vexis-agent"],
-        capture_output=True,
-        text=True,
-    )
-    if upgrade.returncode == 0:
-        _print_post_update_hint()
-        return 0
+    if channel == "stable":
+        ref = _resolve_latest_tag()
+        if ref is None:
+            print(
+                "No tagged release found on the remote — "
+                "falling back to main branch tip.",
+                flush=True,
+            )
+            ref = "main"
+        else:
+            print(f"Latest release: {ref}", flush=True)
+    elif channel == "dev":
+        ref = "main"
+    else:
+        # Power-user escape hatch: treat the channel string as a literal
+        # git ref. Lets ``--channel v0.3.0`` pin to a specific release
+        # without a separate flag.
+        ref = channel
 
-    # Fallback: force-reinstall from the configured channel.
-    branch = "main" if channel == "stable" else channel
-    repo_url = (
-        f"git+https://github.com/Zeus-Deus/vexis-agent.git@{branch}"
-    )
+    repo_url = f"git+{_UPSTREAM_URL}@{ref}"
     reinstall = subprocess.run(
         ["pipx", "install", "--force", repo_url],
         capture_output=False,
@@ -416,7 +504,7 @@ def _update_unknown() -> int:
     print(
         "Couldn't detect how vexis-agent was installed. To update manually, "
         "run one of:\n"
-        "  pipx install --force git+https://github.com/Zeus-Deus/vexis-agent.git\n"
+        f"  pipx install --force git+{_UPSTREAM_URL}\n"
         "  git -C <repo> pull && pip install -e <repo>",
         flush=True,
     )

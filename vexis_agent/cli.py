@@ -129,10 +129,20 @@ def update(
     channel: str = typer.Option(
         "stable",
         "--channel",
-        help="Update channel: 'stable' (main branch) or 'dev'.",
+        help=(
+            "Update channel: 'stable' (latest tagged release), "
+            "'dev' (main branch tip), or a literal git ref "
+            "(e.g. 'v0.3.0', a branch name, a sha)."
+        ),
     ),
 ) -> None:
     """Pull and reinstall the latest vexis-agent.
+
+    Default ``--channel stable`` resolves the newest semver tag on the
+    upstream remote so you only land on code that has been explicitly
+    released — matching what the curl-bash one-liner does on a fresh
+    install. ``--channel dev`` follows main branch tip for tracking
+    pre-release work. Pass any other ref string to pin.
 
     Detects pipx vs editable-source installs and dispatches accordingly.
     Never touches ``~/.vexis/`` or ``~/vexis-workspace/`` — state is

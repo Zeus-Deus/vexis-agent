@@ -171,3 +171,190 @@ def test_hangup_protection_restores_handler() -> None:
         assert _signal.getsignal(_signal.SIGHUP) == _signal.SIG_IGN
     # After: handler restored to whatever it was.
     assert _signal.getsignal(_signal.SIGHUP) == before
+
+
+# ── latest-tag resolution + channel dispatch ────────────────────────
+
+
+def test_resolve_latest_tag_picks_newest_semver(monkeypatch) -> None:
+    """git ls-remote with --sort=-v:refname returns tags newest-first;
+    we take the first semver-shaped line. Non-semver refs (a branch
+    accidentally tagged 'staging', etc.) must be skipped."""
+    sample = (
+        "abc123\trefs/tags/v0.3.0\n"
+        "def456\trefs/tags/v0.2.1\n"
+        "ghi789\trefs/tags/v0.1.0\n"
+    )
+
+    class _Result:
+        returncode = 0
+        stdout = sample
+        stderr = ""
+
+    monkeypatch.setattr(upd.shutil, "which", lambda _: "/usr/bin/git")
+    monkeypatch.setattr(
+        upd.subprocess, "run", lambda *a, **kw: _Result()
+    )
+    assert upd._resolve_latest_tag() == "v0.3.0"
+
+
+def test_resolve_latest_tag_skips_non_semver(monkeypatch) -> None:
+    """Stray non-semver tags at the top (e.g. 'staging', 'release-foo')
+    should be skipped — we only return semver-shaped releases so a
+    misnamed tag can't poison auto-update."""
+    sample = (
+        "aaa\trefs/tags/staging\n"
+        "bbb\trefs/tags/release-foo\n"
+        "ccc\trefs/tags/v0.2.0\n"
+    )
+
+    class _Result:
+        returncode = 0
+        stdout = sample
+        stderr = ""
+
+    monkeypatch.setattr(upd.shutil, "which", lambda _: "/usr/bin/git")
+    monkeypatch.setattr(
+        upd.subprocess, "run", lambda *a, **kw: _Result()
+    )
+    assert upd._resolve_latest_tag() == "v0.2.0"
+
+
+def test_resolve_latest_tag_returns_none_when_no_tags(monkeypatch) -> None:
+    """Fresh repo before first release: ls-remote succeeds with empty
+    output. Caller falls back to 'main'."""
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(upd.shutil, "which", lambda _: "/usr/bin/git")
+    monkeypatch.setattr(
+        upd.subprocess, "run", lambda *a, **kw: _Result()
+    )
+    assert upd._resolve_latest_tag() is None
+
+
+def test_resolve_latest_tag_returns_none_when_git_missing(monkeypatch) -> None:
+    """No git on PATH → return None so the caller falls back; never
+    raise (the daemon mustn't crash on update if git is unavailable)."""
+    monkeypatch.setattr(upd.shutil, "which", lambda _: None)
+    assert upd._resolve_latest_tag() is None
+
+
+def test_resolve_latest_tag_returns_none_on_ls_remote_error(monkeypatch) -> None:
+    """ls-remote nonzero exit (offline, 404, rate-limit) → None.
+    Caller falls back to 'main' rather than raising."""
+
+    class _Result:
+        returncode = 128
+        stdout = ""
+        stderr = "fatal: unable to access ..."
+
+    monkeypatch.setattr(upd.shutil, "which", lambda _: "/usr/bin/git")
+    monkeypatch.setattr(
+        upd.subprocess, "run", lambda *a, **kw: _Result()
+    )
+    assert upd._resolve_latest_tag() is None
+
+
+def test_update_pipx_stable_uses_resolved_tag(monkeypatch, capsys) -> None:
+    """``--channel stable`` (the default) reinstalls from the resolved
+    latest tag, not 'main'. This is the whole point of the latest-tag
+    behaviour: a home-server running ``vexis-agent update`` only lands
+    on tagged releases."""
+    monkeypatch.setattr(upd.shutil, "which", lambda _: "/usr/bin/pipx")
+    monkeypatch.setattr(upd, "_resolve_latest_tag", lambda: "v0.5.0")
+
+    captured: dict[str, list[str]] = {}
+
+    class _Reinstall:
+        returncode = 0
+
+    def _fake_run(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return _Reinstall()
+
+    monkeypatch.setattr(upd.subprocess, "run", _fake_run)
+
+    code = upd._update_pipx("stable")
+    assert code == 0
+    # The exact ref must end up in the install spec.
+    assert any("@v0.5.0" in arg for arg in captured["cmd"]), captured["cmd"]
+    out = capsys.readouterr().out
+    assert "v0.5.0" in out
+
+
+def test_update_pipx_stable_falls_back_to_main_when_no_tags(
+    monkeypatch, capsys
+) -> None:
+    """Pre-first-release repo: resolver returns None, channel=stable
+    must fall back to ``@main`` rather than emitting a broken
+    ``@None`` install spec."""
+    monkeypatch.setattr(upd.shutil, "which", lambda _: "/usr/bin/pipx")
+    monkeypatch.setattr(upd, "_resolve_latest_tag", lambda: None)
+
+    captured: dict[str, list[str]] = {}
+
+    class _Reinstall:
+        returncode = 0
+
+    def _fake_run(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return _Reinstall()
+
+    monkeypatch.setattr(upd.subprocess, "run", _fake_run)
+
+    code = upd._update_pipx("stable")
+    assert code == 0
+    assert any("@main" in arg for arg in captured["cmd"]), captured["cmd"]
+    assert "falling back to main" in capsys.readouterr().out
+
+
+def test_update_pipx_dev_uses_main(monkeypatch) -> None:
+    """``--channel dev`` is the dev-machine escape hatch: track main
+    tip even when there are tagged releases."""
+    monkeypatch.setattr(upd.shutil, "which", lambda _: "/usr/bin/pipx")
+    # Resolver wouldn't be called for dev, but stub it anyway so a
+    # regression that calls it accidentally fails loudly.
+    monkeypatch.setattr(
+        upd, "_resolve_latest_tag",
+        lambda: pytest.fail("dev channel must not call tag resolver"),
+    )
+
+    captured: dict[str, list[str]] = {}
+
+    class _Reinstall:
+        returncode = 0
+
+    def _fake_run(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return _Reinstall()
+
+    monkeypatch.setattr(upd.subprocess, "run", _fake_run)
+
+    code = upd._update_pipx("dev")
+    assert code == 0
+    assert any("@main" in arg for arg in captured["cmd"]), captured["cmd"]
+
+
+def test_update_pipx_literal_ref_pins(monkeypatch) -> None:
+    """Anything other than 'stable'/'dev' is treated as a literal ref,
+    so power users can do ``vexis-agent update --channel v0.2.0``."""
+    monkeypatch.setattr(upd.shutil, "which", lambda _: "/usr/bin/pipx")
+
+    captured: dict[str, list[str]] = {}
+
+    class _Reinstall:
+        returncode = 0
+
+    def _fake_run(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return _Reinstall()
+
+    monkeypatch.setattr(upd.subprocess, "run", _fake_run)
+
+    code = upd._update_pipx("v0.2.0")
+    assert code == 0
+    assert any("@v0.2.0" in arg for arg in captured["cmd"]), captured["cmd"]
