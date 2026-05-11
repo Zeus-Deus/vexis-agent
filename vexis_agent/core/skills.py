@@ -261,6 +261,75 @@ _INDEX_PREAMBLE = (
 )
 
 
+# Hermes-style in-session skill self-authoring guidance. Surfaced in
+# EVERY session — even an empty workspace with zero skills — so a
+# brand-new install can bootstrap its own skill library on the first
+# non-trivial task. Mirrors NousResearch/hermes-agent's
+# ``SKILLS_GUIDANCE`` constant in ``agent/prompt_builder.py:179-186``;
+# adapted to vexis's CLI surface (``vexis-skill {create,patch}``) and
+# the staging-tree review flow (writes land in ``skills/.shadow/`` and
+# go live via ``vexis-skill flip-shadow``, so the brain doesn't need
+# user approval to call ``create``/``patch`` — the gate is downstream).
+#
+# Three behaviours this block exists to drive:
+#   1. End-of-task reflection — was this 5+ tool calls / a tricky
+#      error / a workflow worth reusing? If yes, capture the shortcut
+#      as a skill BEFORE declaring done.
+#   2. Save the shortcut, not the discovery path — the body should be
+#      the cheat sheet (the JS eval, the single curl, the one
+#      dispatcher call), not the 20-click route that led there.
+#   3. Patch-on-use — if a loaded skill is wrong/incomplete/outdated,
+#      fix it with ``vexis-skill patch`` IMMEDIATELY, before
+#      continuing the task. Unmaintained skills drift; drift is worse
+#      than no skill.
+_AUTHORING_GUIDANCE = (
+    "## Skill authoring (mandatory)\n"
+    "After a non-trivial task — ≥5 tool calls, a tricky error you "
+    "had to work around, or any workflow you'd want to reuse — "
+    "capture it as a skill with `vexis-skill create` BEFORE telling "
+    "the user you're done. Skills are how you avoid re-discovering "
+    "the same solution next session.\n"
+    "\n"
+    "Save the SHORTCUT, not the discovery path. If you tried 20 "
+    "steps and then found a single `curl`, JS eval, or one-line "
+    "dispatcher call that got the same result, the skill body is "
+    "that shortcut — not the meandering route that led you to it. "
+    "Future-you wants the cheat sheet, not the journal.\n"
+    "\n"
+    "When you load a skill via `vexis-skill view` and find it "
+    "outdated, incomplete, or wrong, patch it with "
+    "`vexis-skill patch` IMMEDIATELY — don't wait to be asked. "
+    "Skills that aren't maintained become liabilities; drift is "
+    "worse than no skill at all.\n"
+    "\n"
+    "Skill writes from this CLI land in the live tree and take "
+    "effect on the user's NEXT session (the system-prompt index "
+    "is frozen for the current session — same frozen-snapshot "
+    "rule as memory). The user reviews the skill library through "
+    "the dashboard Skills tab and can archive or pin anything you "
+    "create that turns out to be a bad call. If you're unsure "
+    "whether a workflow is reusable, lean toward creating — an "
+    "unused skill costs ~one description line in the next session's "
+    "index; a missing skill costs the full re-discovery."
+)
+
+
+def build_skill_authoring_block() -> str:
+    """Hermes-style in-session skill authoring guidance.
+
+    Always returns the same non-empty string — independent of
+    workspace state. Both brain prompt builders inject this so the
+    instruction is present even when the skills index is empty
+    (chicken-and-egg: zero skills → no index → no nudge to ever
+    create one).
+
+    Pure-function on purpose: no filesystem access, no config read.
+    Caching at the brain layer (per-session UUID) reuses the same
+    bytes across turns, keeping Anthropic's prefix cache warm.
+    """
+    return _AUTHORING_GUIDANCE
+
+
 def build_skills_index_block(skills_root: Path) -> str:
     """Render the ``## Skills (mandatory)`` block. Empty when no skills."""
     metas = discover_skills(skills_root)
