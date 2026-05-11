@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -41,16 +42,43 @@ log = logging.getLogger(__name__)
 _OWNERSHIP_SENTINEL = "vexis_agent.cli safety-hook"
 
 
+def _vexis_source_root() -> Path:
+    """Return the directory containing the ``vexis_agent`` package.
+
+    safety_install.py lives at ``<root>/vexis_agent/core/safety_install.py``;
+    walking up three parents yields the dir that has ``vexis_agent/``
+    as a subdirectory. That's the right value for ``PYTHONPATH``.
+    """
+    return Path(__file__).resolve().parent.parent.parent
+
+
 def hook_command() -> str:
     """Build the shell command claude-code should run for PreToolUse.
 
-    Uses ``sys.executable`` rather than the bare ``vexis-agent``
-    console script so PATH ordering inside the spawned subprocess
-    can't accidentally pick up a different vexis install. The
-    sentinel substring (``vexis_agent.cli safety-hook``) is the
-    ownership marker the installer searches for on re-runs.
+    Two robustness measures vs the naive
+    ``{sys.executable} -m vexis_agent.cli safety-hook``:
+
+    1. ``PYTHONPATH`` prefix pointing at the source dir.
+       claude-code spawns the hook with a workspace cwd, not the
+       project dir. Editable installs that bind ``vexis_agent`` to
+       a stale or relocated path (or scenarios where the daemon's
+       ``sys.path`` differs from the spawned subprocess) would
+       otherwise fail with ``ModuleNotFoundError: No module named
+       'vexis_agent'``. For proper site-packages installs the
+       PYTHONPATH addition is a redundant no-op (the source root
+       IS site-packages and is already on sys.path) — harmless.
+    2. Both path values are ``shlex.quote()``-escaped so spaces or
+       quoting metacharacters in the install path can't break the
+       command claude-code execs via ``/bin/sh -c``.
+
+    The sentinel substring (``vexis_agent.cli safety-hook``) is the
+    ownership marker the installer searches for on re-runs — kept
+    intact across the PYTHONPATH change so existing settings.json
+    entries get updated in place rather than duplicated.
     """
-    return f"{sys.executable} -m vexis_agent.cli safety-hook"
+    python = shlex.quote(sys.executable)
+    pythonpath = shlex.quote(str(_vexis_source_root()))
+    return f"PYTHONPATH={pythonpath} {python} -m vexis_agent.cli safety-hook"
 
 
 def _read_existing(path: Path) -> dict[str, Any]:

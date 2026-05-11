@@ -66,7 +66,53 @@ def test_hook_command_uses_module_invocation() -> None:
     # `vexis-agent` invocation, the sentinel-based ownership check
     # could miss legacy entries.
     assert "-m vexis_agent.cli safety-hook" in cmd
-    assert cmd.startswith(sys.executable)
+    assert sys.executable in cmd
+
+
+def test_hook_command_carries_pythonpath() -> None:
+    """End-to-end testing surfaced a real bug: the spawned hook
+    subprocess runs with the workspace as cwd, not the project
+    dir. Without an explicit PYTHONPATH, broken editable installs
+    and pipx-isolation edge cases fail with ModuleNotFoundError.
+    Pin the fix: hook_command() must prepend a PYTHONPATH that
+    points at the dir containing vexis_agent/."""
+    cmd = hook_command()
+    assert cmd.startswith("PYTHONPATH="), (
+        "hook command must lead with PYTHONPATH= prefix — see "
+        "ModuleNotFoundError regression note in hook_command() docstring"
+    )
+    # The path immediately after PYTHONPATH= must resolve to a dir
+    # that has vexis_agent/ as a subdirectory.
+    import shlex
+
+    tokens = shlex.split(cmd)
+    env_assign = tokens[0]
+    _, _, pythonpath_value = env_assign.partition("=")
+    assert (Path(pythonpath_value) / "vexis_agent").is_dir(), (
+        f"PYTHONPATH={pythonpath_value!r} does not point at the "
+        "vexis_agent source dir"
+    )
+
+
+def test_hook_command_handles_paths_with_spaces(monkeypatch) -> None:
+    """Defensive: if vexis is installed under a path containing
+    spaces or shell metacharacters, the hook command must survive
+    ``/bin/sh -c`` parsing — shlex.quote on both python and
+    PYTHONPATH values is what makes that work."""
+    import vexis_agent.core.safety_install as si
+
+    fake_root = Path("/some/weird path/with $ chars")
+    monkeypatch.setattr(si, "_vexis_source_root", lambda: fake_root)
+    monkeypatch.setattr("sys.executable", "/another weird/path/python")
+    cmd = si.hook_command()
+    # shlex.split must round-trip the command — if not, /bin/sh -c
+    # would split it incorrectly and the hook would fail.
+    tokens = __import__("shlex").split(cmd)
+    assert tokens[0].endswith(str(fake_root))  # PYTHONPATH=<fake_root>
+    assert "/another weird/path/python" in tokens
+    assert "-m" in tokens
+    assert "vexis_agent.cli" in tokens
+    assert "safety-hook" in tokens
 
 
 # ---------- idempotency ----------
