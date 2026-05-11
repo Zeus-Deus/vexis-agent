@@ -54,6 +54,7 @@ from vexis_agent.core.memory import MemoryStore
 from vexis_agent.core.paths import memories_dir, skills_dir
 from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.core.safety import DESTRUCTIVE_PATTERNS
+from vexis_agent.core.safety_install import ensure_workspace_safety_hook
 from vexis_agent.core.sessions import SessionStore
 from vexis_agent.core.skills import build_skills_index_block
 from vexis_agent.core.status import StatusFile, extract_tool_target
@@ -348,6 +349,13 @@ class ClaudeCodeBrain(Brain):
         self._workspace = workspace
         self._session = session
         self._running_tasks = running_tasks
+        # Step 6.5: install the PreToolUse safety hook into
+        # <workspace>/.claude/settings.json before the first claude -p
+        # spawn. Idempotent + merge-friendly — see
+        # vexis_agent.core.safety_install for the contract. Failures
+        # are logged but don't raise: the daemon must come up even if
+        # hook installation fails (degraded safety > broken startup).
+        ensure_workspace_safety_hook(workspace)
         # Per-session frozen snapshot. The system prompt MUST be
         # byte-identical across all turns of one Claude session for
         # Anthropic's prefix cache to hit. We key by session UUID
@@ -427,8 +435,10 @@ class ClaudeCodeBrain(Brain):
             argv += ["--disallowedTools", *DISALLOWED_TOOLS]
         # bypassPermissions: required when running headless (-p) with tools
         # enabled. Otherwise Claude Code would try to prompt interactively
-        # for each tool use and the call would hang. Step 6.5 will add a
-        # PreToolUse hook that consults core.safety for hard enforcement.
+        # for each tool use and the call would hang. The Step 6.5
+        # PreToolUse hook (see core.safety_install + core.safety_hook) is
+        # installed at __init__ time and still fires under bypassPermissions
+        # — that's how destructive-command denials are enforced today.
         argv += ["--permission-mode", "bypassPermissions"]
         # Per-turn model override (voice call mode is the only caller
         # today; see ``voice.call_mode.model`` in ~/.vexis/config.yaml).

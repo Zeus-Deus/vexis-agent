@@ -1,7 +1,10 @@
 """Pattern-matching tripwire for destructive Bash commands.
 
-Pure: no I/O, no logging, no side effects. Built in Step 6, wired into
-PreToolUse hooks in Step 6.5.
+Pure: no I/O, no logging, no side effects. Step 6 of the safety
+system; Step 6.5 (the live PreToolUse wiring) lives in
+:mod:`vexis_agent.core.safety_hook` (verdict logic) and
+:mod:`vexis_agent.core.safety_install` (settings.json writer).
+End-user reference: ``docs/safety.md``.
 """
 
 from __future__ import annotations

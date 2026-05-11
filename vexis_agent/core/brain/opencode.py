@@ -649,6 +649,19 @@ class OpenCodeBrain(Brain):
         # prompts per agent definition shape so byte-identical
         # ``OPENCODE_CONFIG_CONTENT`` hits the cache.
         self._system_prompt_cache: dict[str, str] = {}
+        # Step 6.5: install the foreground-shell safety plugin into
+        # the workspace before the first opencode run. The plugin
+        # (vexis_agent/data/opencode_safety_plugin.mjs) gets copied
+        # to <workspace>/.vexis-opencode-safety.mjs and registered
+        # in opencode.json's plugin[] array. Idempotent + merge-
+        # friendly — see vexis_agent.core.safety_install for the
+        # contract. Failures are logged but don't raise: degraded
+        # safety beats broken startup.
+        from vexis_agent.core.safety_install import (
+            ensure_opencode_safety_plugin,
+        )
+
+        ensure_opencode_safety_plugin(workspace)
 
     # ─── foreground turn ─────────────────────────────────────────
 
