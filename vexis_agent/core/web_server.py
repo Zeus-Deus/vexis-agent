@@ -332,6 +332,11 @@ class WebDashboard:
         # None; main.py wires it from the same ScheduleStore instance
         # the ScheduleManager uses.
         self._schedule_store: object | None = None
+        # Kanban — same late-attach pattern. ``attach_kanban_store``
+        # wires the daemon's KanbanStore so the /api/v1/kanban/* and
+        # ws://api/v1/kanban/events endpoints become live. Returns
+        # 503 until attached.
+        self._kanban_store: object | None = None
         # Day 5 of model UX: the dashboard payload's
         # check_brain_kind_consistency canary needs to know what
         # brain class the daemon actually instantiated. main.py
@@ -517,6 +522,18 @@ class WebDashboard:
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="invalid or missing dashboard token",
                 )
+
+        # ── Kanban routes (REST + WS) ──────────────────────────
+        # Wired here (not inline) so web_server.py doesn't bloat
+        # further. Returns 503 from each endpoint until
+        # ``attach_kanban_store`` lands a real store from main.py.
+        from vexis_agent.core.web_kanban import register_kanban_routes
+        register_kanban_routes(
+            app,
+            store_provider=lambda: self._kanban_store,
+            require_auth_dep=_require_auth,
+            token_provider=lambda: self._token,
+        )
 
         @app.get("/api/v1/memory", dependencies=[Depends(_require_auth)])
         async def get_memory() -> dict:
@@ -2359,6 +2376,15 @@ class WebDashboard:
         endpoints return 503 until this is called.
         """
         self._schedule_store = store
+
+    def attach_kanban_store(self, store) -> None:
+        """Late-attach the KanbanStore from main.py.
+
+        Kept off the constructor signature so existing call sites
+        (tests, alternative wirings) don't break. The /api/v1/kanban/*
+        endpoints (and the WS events stream) return 503 until this
+        is called."""
+        self._kanban_store = store
 
     def _schedule_record_dict(self, state) -> dict:
         """Serialize a ScheduleState to the dashboard JSON shape."""

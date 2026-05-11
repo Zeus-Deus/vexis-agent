@@ -56,6 +56,10 @@ vexis-display = "vexis_agent.tools.display.cli:main"
 vexis-ui = "vexis_agent.tools.ui.cli:main"
 vexis-mem = "vexis_agent.tools.memory_cli:main"
 vexis-skill = "vexis_agent.tools.skills_cli:main"
+# Kanban work-queue CLI. Workers (spawned by the kanban dispatcher)
+# call this via shell to declare outcomes; humans use it for
+# inspection when they don't want to open the dashboard.
+vexis-kanban = "vexis_agent.tools.kanban.cli:main"
 vexis-stream = "vexis_agent.tools.livestream_cli:main"
 vexis-click = "vexis_agent.tools.desktop_control_cli:main_click"
 vexis-dispatch = "vexis_agent.tools.desktop_control_cli:main_dispatch"

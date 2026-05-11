@@ -545,6 +545,7 @@ class TelegramTransport:
         learning_curator: "LearningController | None" = None,
         dashboard: "WebDashboard | None" = None,
         schedule_store: "object | None" = None,  # ScheduleStore; weak-typed to avoid import cycle
+        kanban_store: "object | None" = None,  # KanbanStore; weak-typed to avoid import cycle
     ) -> None:
         self._handler = handler
         self._running_tasks = running_tasks
@@ -555,6 +556,12 @@ class TelegramTransport:
         self._learning_curator = learning_curator
         self._dashboard = dashboard
         self._schedule_store = schedule_store
+        self._kanban_store = kanban_store
+        # Wire the kanban command facade. The provider closure lets
+        # us swap kanban_store at runtime without re-wiring the handler
+        # (a future toggle could enable/disable kanban via dashboard).
+        from vexis_agent.transports.telegram_kanban import TelegramKanban
+        self._kanban = TelegramKanban(lambda: self._kanban_store)
         # Telegram bot commands can't contain hyphens, so /confirm-delete from
         # the spec becomes /confirm_delete here.
         self._pending_deletes: dict[str, datetime] = {}
@@ -605,7 +612,22 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("model", self._on_model))
         self._app.add_handler(CommandHandler("dashboard", self._on_dashboard))
         self._app.add_handler(CommandHandler("tailscale", self._on_tailscale))
+        self._app.add_handler(CommandHandler("kanban", self._on_kanban))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
+
+    async def _on_kanban(
+        self, update: "Update", ctx: "ContextTypes.DEFAULT_TYPE",
+    ) -> None:
+        """/kanban dispatcher. Auth-gated; delegates to TelegramKanban
+        which wraps the action layer."""
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /kanban from user_id=%s", user.id)
+            return
+        await self._kanban.handle(update, ctx)
 
     async def _run_relationships_hook(
         self, bot, chat_id: int, text: str
@@ -681,10 +703,16 @@ class TelegramTransport:
                 "Failed to send relationships hook reply"
             )
 
-    async def _on_text(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
         user = update.effective_user
         if msg is None or user is None or msg.text is None:
+            return
+        # Kanban pending-input capture: if the user just tapped
+        # ``[⛔ Block]`` or ``[💬 Comment]`` on a /kanban show card,
+        # this next text message IS the block reason / comment body
+        # — don't forward it to the brain.
+        if await self._kanban.maybe_capture_pending_input(update, ctx):
             return
         await self._dispatch_to_brain(msg.get_bot(), msg.chat_id, user.id, msg.text)
 
@@ -907,7 +935,7 @@ class TelegramTransport:
         )
 
     async def _on_callback(
-        self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
         query = update.callback_query
         if query is None or query.from_user is None or query.data is None:
@@ -916,6 +944,13 @@ class TelegramTransport:
         if not is_allowed(user_id, self._allowed_user_id):
             log.warning("Rejected callback from user_id=%s", user_id)
             return
+        # Kanban inline-button callbacks (e.g. ``kanban:complete:<id>``)
+        # are handled by the kanban facade — it owns its own
+        # ``query.answer()`` so we don't double-answer here.
+        if query.data.startswith("kanban:"):
+            handled = await self._kanban.handle_callback(update, ctx)
+            if handled:
+                return
         await query.answer()
         action, _, payload = query.data.partition(":")
         if action == "switch":

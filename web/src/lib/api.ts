@@ -597,6 +597,81 @@ export const api = {
     }
     return resp.blob();
   },
+
+  // ── Kanban ──────────────────────────────────────────────────
+  // Wire-compatible with /api/v1/kanban/* (core/web_kanban.py).
+  // Lanes (defaults: research, implementation, review, ops, triage,
+  // default) replace Hermes' profiles per .plans/kanban-research.md.
+  kanbanBoard: (
+    token: string,
+    opts?: { lane?: string; status?: string; archived?: boolean },
+  ) => {
+    const params = new URLSearchParams();
+    if (opts?.lane) params.set("lane", opts.lane);
+    if (opts?.status) params.set("status", opts.status);
+    if (opts?.archived) params.set("archived", "true");
+    const qs = params.toString();
+    return call<import("./types").KanbanBoardResponse>(
+      token, `/kanban/board${qs ? "?" + qs : ""}`,
+    );
+  },
+  kanbanLanes: (token: string) =>
+    call<import("./types").KanbanLanesResponse>(token, "/kanban/lanes"),
+  kanbanTask: (token: string, id: string) =>
+    call<import("./types").KanbanTaskDetailResponse>(
+      token, `/kanban/tasks/${encodeURIComponent(id)}`,
+    ),
+  kanbanCreate: (
+    token: string, body: import("./types").KanbanCreatePayload,
+  ) =>
+    call<import("./types").KanbanTask>(token, "/kanban/tasks", {
+      method: "POST", body,
+    }),
+  kanbanSetStatus: (token: string, id: string, status: string) =>
+    call<import("./types").KanbanTask>(
+      token, `/kanban/tasks/${encodeURIComponent(id)}/status`,
+      { method: "POST", body: { status } },
+    ),
+  kanbanComplete: (token: string, id: string, summary?: string) =>
+    call<import("./types").KanbanTask>(
+      token, `/kanban/tasks/${encodeURIComponent(id)}/complete`,
+      { method: "POST", body: summary ? { summary } : {} },
+    ),
+  kanbanBlock: (token: string, id: string, reason: string) =>
+    call<import("./types").KanbanTask>(
+      token, `/kanban/tasks/${encodeURIComponent(id)}/block`,
+      { method: "POST", body: { reason } },
+    ),
+  kanbanUnblock: (token: string, id: string) =>
+    call<import("./types").KanbanTask>(
+      token, `/kanban/tasks/${encodeURIComponent(id)}/unblock`,
+      { method: "POST", body: {} },
+    ),
+  kanbanArchive: (token: string, id: string) =>
+    call<{ task_id: string; archived: boolean }>(
+      token, `/kanban/tasks/${encodeURIComponent(id)}/archive`,
+      { method: "POST" },
+    ),
+  kanbanAssign: (token: string, id: string, lane: string | null) =>
+    call<import("./types").KanbanTask>(
+      token, `/kanban/tasks/${encodeURIComponent(id)}/assign`,
+      { method: "POST", body: { lane } },
+    ),
+  kanbanComment: (token: string, id: string, body: string) =>
+    call<import("./types").KanbanComment>(
+      token, `/kanban/tasks/${encodeURIComponent(id)}/comment`,
+      { method: "POST", body: { body } },
+    ),
+  kanbanLink: (token: string, parentId: string, childId: string) =>
+    call<{ parent_id: string; child_id: string }>(
+      token, "/kanban/links",
+      { method: "POST", body: { parent_id: parentId, child_id: childId } },
+    ),
+  kanbanUnlink: (token: string, parentId: string, childId: string) =>
+    call<{ parent_id: string; child_id: string }>(
+      token, "/kanban/links/delete",
+      { method: "POST", body: { parent_id: parentId, child_id: childId } },
+    ),
 };
 
 // ApproveError surfaces the typed 409 / 422 / 4xx body from the

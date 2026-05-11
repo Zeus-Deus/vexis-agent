@@ -1295,6 +1295,7 @@ class OpenCodeBrain(Brain):
         ``core.transcripts._is_curator_owned``.
         """
         from vexis_agent.core.goal_judge import GOAL_JUDGE_PROMPT_PREFIX
+        from vexis_agent.core.kanban.constants import KANBAN_WORKER_PREFIX
         from vexis_agent.core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX
 
         for msg in self.iter_messages(session_id):
@@ -1304,6 +1305,7 @@ class OpenCodeBrain(Brain):
             return (
                 text.startswith(CURATOR_REVIEW_PROMPT_PREFIX)
                 or text.startswith(GOAL_JUDGE_PROMPT_PREFIX)
+                or text.startswith(KANBAN_WORKER_PREFIX)
             )
         return False
 

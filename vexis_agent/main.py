@@ -434,6 +434,29 @@ async def _run() -> None:
         allowed_user_id=config.telegram_allowed_user_id,
     )
 
+    # Kanban (see docs/kanban.md). Multi-task durable work queue.
+    # Behind ``kanban.enabled`` (default true). The store backs a
+    # SQLite DB at ~/.vexis/kanban.db; the controller's dispatcher
+    # ticks every ``kanban.dispatch_interval_seconds`` (default 60s),
+    # claims ready tasks, and spawns workers via brain.spawn_aux.
+    # Telegram /kanban commands and the /api/v1/kanban/* dashboard
+    # routes both consume the same store; the WS event stream and
+    # Telegram notifier subscribe to the shared task_events table.
+    from vexis_agent.core.kanban.db import KanbanStore
+    from vexis_agent.core.kanban.dispatcher import KanbanController
+    from vexis_agent.core.kanban.lanes import kanban_enabled
+    kanban_store: KanbanStore | None = None
+    kanban_controller: KanbanController | None = None
+    if kanban_enabled():
+        kanban_store = KanbanStore(vexis_dir() / "kanban.db")
+        kanban_controller = KanbanController(
+            store=kanban_store,
+            brain=brain,
+            workspace=workspace,
+        )
+    else:
+        log.info("kanban: disabled via config (kanban.enabled=false)")
+
     # Web chat bridges the dashboard chat UI to the same MessageHandler
     # the Telegram transport uses. Sharing the handler means both
     # transports see the same SessionStore and Notifier — slash commands
@@ -473,6 +496,10 @@ async def _run() -> None:
     # endpoints can read/mutate it. Kept off the WebDashboard constructor
     # for backwards compatibility with test/alternate wirings.
     dashboard.attach_schedule_store(schedule_store)
+    # Same pattern for kanban — the dashboard's /api/v1/kanban/* and
+    # WS /api/v1/kanban/events return 503 until the store lands.
+    if kanban_store is not None:
+        dashboard.attach_kanban_store(kanban_store)
 
     transport = TelegramTransport(
         token=config.telegram_bot_token,
@@ -485,6 +512,7 @@ async def _run() -> None:
         learning_curator=learning_curator,
         dashboard=dashboard,
         schedule_store=schedule_store,
+        kanban_store=kanban_store,
     )
 
     log.info("Vexis-Agent starting")
@@ -493,9 +521,15 @@ async def _run() -> None:
     curator.start(asyncio.get_running_loop())
     learning_curator.start(asyncio.get_running_loop())
     schedule_manager.start(asyncio.get_running_loop())
+    if kanban_controller is not None:
+        kanban_controller.start(asyncio.get_running_loop())
     try:
         await transport.run()
     finally:
+        if kanban_controller is not None:
+            await kanban_controller.stop()
+        if kanban_store is not None:
+            kanban_store.close()
         schedule_manager.stop()
         learning_curator.stop()
         curator.stop()

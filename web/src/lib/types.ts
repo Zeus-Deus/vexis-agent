@@ -794,3 +794,125 @@ export interface VoiceSettingsResponse extends VoiceSettings {
   ok: true;
   backup_path: string | null;
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Kanban — multi-task durable work queue.
+// Schema mirrors core/kanban/db.py. Wire-compatible with the
+// /api/v1/kanban/* REST endpoints in core/web_kanban.py.
+// ────────────────────────────────────────────────────────────────────
+
+export type KanbanStatus =
+  | "triage"
+  | "todo"
+  | "ready"
+  | "in_progress"
+  | "blocked"
+  | "done"
+  | "archived";
+
+export interface KanbanTask {
+  id: string;
+  title: string;
+  body: string | null;
+  lane: string | null;
+  status: KanbanStatus;
+  priority: number;
+  created_by: string | null;
+  created_at: number;
+  started_at: number | null;
+  completed_at: number | null;
+  workspace_kind: string;
+  workspace_path: string | null;
+  claim_lock: string | null;
+  claim_expires: number | null;
+  consecutive_failures: number;
+  worker_pid: number | null;
+  last_failure_error: string | null;
+  max_runtime_seconds: number | null;
+  last_heartbeat_at: number | null;
+  current_run_id: number | null;
+  skills: string[];
+  max_retries: number | null;
+}
+
+export interface KanbanComment {
+  id: number;
+  task_id: string;
+  author: string;
+  body: string;
+  created_at: number;
+}
+
+export interface KanbanRun {
+  id: number;
+  task_id: string;
+  lane: string | null;
+  status: string;
+  claim_lock: string | null;
+  claim_expires: number | null;
+  worker_pid: number | null;
+  max_runtime_seconds: number | null;
+  last_heartbeat_at: number | null;
+  started_at: number;
+  ended_at: number | null;
+  outcome: string | null;
+  summary: string | null;
+  metadata: Record<string, unknown> | null;
+  error: string | null;
+}
+
+export interface KanbanEvent {
+  id: number;
+  task_id: string;
+  run_id: number | null;
+  kind: string;
+  payload: Record<string, unknown> | null;
+  created_at: number;
+}
+
+export interface KanbanLane {
+  name: string;
+  tier: string | null;
+  skills: string[];
+  system_prompt: string;
+  description: string;
+}
+
+export interface KanbanBoardSummary {
+  triage?: number;
+  todo?: number;
+  ready?: number;
+  in_progress?: number;
+  blocked?: number;
+  done?: number;
+}
+
+export interface KanbanBoardResponse {
+  summary: KanbanBoardSummary;
+  tasks: KanbanTask[];
+}
+
+export interface KanbanLanesResponse {
+  lanes: KanbanLane[];
+}
+
+export interface KanbanTaskDetailResponse {
+  task: KanbanTask;
+  parents: string[];
+  children: string[];
+  comments: KanbanComment[];
+  runs: KanbanRun[];
+  events: KanbanEvent[];
+}
+
+export interface KanbanCreatePayload {
+  title: string;
+  body?: string;
+  lane?: string | null;
+  status?: KanbanStatus;
+  priority?: number;
+  parents?: string[];
+  workspace_path?: string;
+  max_runtime_seconds?: number;
+  skills?: string[];
+}
