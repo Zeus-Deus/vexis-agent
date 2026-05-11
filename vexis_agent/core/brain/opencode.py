@@ -649,6 +649,15 @@ class OpenCodeBrain(Brain):
         # prompts per agent definition shape so byte-identical
         # ``OPENCODE_CONFIG_CONTENT`` hits the cache.
         self._system_prompt_cache: dict[str, str] = {}
+        # NOTE: Step 6.5 hard-enforcement is NOT wired for opencode
+        # yet — see docs/safety.md. The aux config built by
+        # ``_OPENCODE_CONFIG_CONTENT`` (judges, extractors) already
+        # denies shell entirely via ``permission.shell = "deny"``,
+        # so the hot path with hard-enforcement gaps is foreground
+        # turns. Soft prompting via SOUL.md/CLAUDE.md still applies
+        # in the interim. Wiring a local opencode plugin
+        # (``permission.ask`` → regex → ``status: "deny"``) is the
+        # planned follow-up.
 
     # ─── foreground turn ─────────────────────────────────────────
 

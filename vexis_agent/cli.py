@@ -611,5 +611,59 @@ def mcp_refresh() -> None:
         typer.echo(f"  {p}")
 
 
+# Step 6.5 — Claude Code PreToolUse hook entry point. Installed into
+# <workspace>/.claude/settings.json by vexis_agent.core.safety_install
+# at daemon startup. Reads a hook payload from stdin and prints the
+# deny-shape JSON when the Bash command matches a destructive pattern;
+# otherwise prints nothing. Fail-open on every error path — a broken
+# hook must never block the brain entirely.
+@app.command("safety-hook", hidden=True)
+def safety_hook() -> None:
+    """Internal: PreToolUse hook called by claude-code.
+
+    Not for direct user invocation. See
+    :mod:`vexis_agent.core.safety_hook` for the wire protocol.
+    """
+    import json
+
+    from vexis_agent.core.safety_hook import payload_verdict
+
+    # Cap stdin to a sane size so a runaway tool_input can't OOM us.
+    # 256 KiB is comfortably larger than any plausible bash command
+    # but small enough that a hostile input can't exhaust memory.
+    _MAX_STDIN = 256 * 1024
+    try:
+        raw = sys.stdin.read(_MAX_STDIN + 1)
+    except Exception as exc:
+        sys.stderr.write(f"safety-hook: stdin read failed: {exc}\n")
+        raise typer.Exit(code=0)
+
+    if len(raw) > _MAX_STDIN:
+        sys.stderr.write(
+            f"safety-hook: stdin exceeds {_MAX_STDIN} bytes — allowing.\n"
+        )
+        raise typer.Exit(code=0)
+
+    try:
+        payload = json.loads(raw) if raw.strip() else None
+    except json.JSONDecodeError as exc:
+        sys.stderr.write(f"safety-hook: invalid JSON on stdin: {exc}\n")
+        raise typer.Exit(code=0)
+
+    try:
+        verdict = payload_verdict(payload)
+    except Exception as exc:  # pragma: no cover — defensive
+        sys.stderr.write(f"safety-hook: verdict raised: {exc}\n")
+        raise typer.Exit(code=0)
+
+    if verdict is None:
+        # Silent allow — claude-code falls through to normal flow.
+        raise typer.Exit(code=0)
+
+    sys.stdout.write(json.dumps(verdict))
+    sys.stdout.flush()
+    raise typer.Exit(code=0)
+
+
 if __name__ == "__main__":
     app()
