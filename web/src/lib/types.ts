@@ -111,6 +111,12 @@ export interface BackgroundTaskSummary {
   exit_code: number | null;
   pid: number | null;
   log_path: string;
+  // Build-and-test loop wiring (see docs/build-and-test-loop.md). Both
+  // fields are optional on the wire so the dashboard keeps rendering
+  // pre-v3e task snapshots without explicit defaults.
+  sandbox_enabled?: boolean;
+  verify_checks_path?: string | null;
+  verify_summary?: string | null;
 }
 
 export interface LogLine {

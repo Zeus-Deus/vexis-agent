@@ -34,6 +34,11 @@ from enum import Enum
 from pathlib import Path
 
 from vexis_agent.core.paths import state_dir
+from vexis_agent.core.sandbox_runner import (
+    SandboxRunner,
+    SandboxVerifyResult,
+    should_sandbox,
+)
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +96,14 @@ class BackgroundTask:
     # running task, we mark this so the watcher can suppress the
     # success/failure notification it would otherwise fire.
     cancelled_marker: bool = field(default=False, repr=False)
+    # Build-and-test loop wiring. ``sandbox_enabled`` records the final
+    # decision (heuristic-default OR explicit caller choice) at spawn
+    # time so the watcher can match start↔stop without re-running the
+    # heuristic. ``verify_checks_path`` is the path to a YAML file the
+    # agent dropped during the task; verify runs once the agent exits.
+    sandbox_enabled: bool = field(default=False)
+    verify_checks_path: str | None = field(default=None)
+    verify_summary: str | None = field(default=None)
 
     def to_summary(self) -> dict:
         return {
@@ -102,6 +115,9 @@ class BackgroundTask:
             "exit_code": self.exit_code,
             "pid": self.pid,
             "log_path": str(self.log_path),
+            "sandbox_enabled": self.sandbox_enabled,
+            "verify_checks_path": self.verify_checks_path,
+            "verify_summary": self.verify_summary,
         }
 
 
@@ -126,6 +142,7 @@ class BackgroundTasks:
         max_concurrent: int = DEFAULT_MAX_CONCURRENT,
         log_dir: Path | None = None,
         state_file: Path | None = None,
+        sandbox_runner: SandboxRunner | None = None,
     ) -> None:
         self._workspace = workspace
         self._system_prompt_provider = system_prompt_provider
@@ -137,6 +154,13 @@ class BackgroundTasks:
         self._watchers: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
         self._log_dir.mkdir(parents=True, exist_ok=True)
+        # ``None`` falls back to the real CLI runner; tests inject a
+        # FakeSandboxRunner. We never construct one *lazily* — that would
+        # let the heuristic flip "sandbox=True" on a host that has no
+        # Docker, silently producing a task that can't start. The daemon
+        # is responsible for handing in a runner only when the host
+        # actually has docker + vexis-sandbox available.
+        self._sandbox = sandbox_runner
 
     # ----- public configuration -----
 
@@ -212,9 +236,50 @@ class BackgroundTasks:
 
     # ----- spawn / cancel -----
 
-    async def spawn(self, chat_id: int, name: str, prompt: str) -> BackgroundTask:
-        """Spawn a new background task. Raises on validation/limit/conflict."""
+    async def spawn(
+        self,
+        chat_id: int,
+        name: str,
+        prompt: str,
+        *,
+        sandbox: bool | None = None,
+        verify_checks: str | None = None,
+    ) -> BackgroundTask:
+        """Spawn a new background task. Raises on validation/limit/conflict.
+
+        ``sandbox`` controls whether the task runs against a Docker
+        sandbox (see :mod:`vexis_agent.core.sandbox_runner`). ``None``
+        defers to the per-prompt heuristic — build-or-test prompts opt
+        in, pure research prompts opt out. The decision is recorded on
+        the task so the watcher can match start↔stop. If sandbox routing
+        is requested but no runner is wired in, we fall back to direct
+        execution and warn — the caller's task still runs.
+
+        ``verify_checks`` is the path (inside the workspace) to a YAML
+        check spec. When set AND sandbox is enabled, the watcher invokes
+        ``vexis-verify run <name>`` after the agent process exits and
+        flips the task to FAILED if any check fails.
+        """
         self.validate_name(name)
+        # Final sandbox decision: explicit > heuristic > availability check.
+        if sandbox is None:
+            sandbox = should_sandbox(prompt)
+        if sandbox and self._sandbox is None:
+            log.warning(
+                "Sandbox requested for task '%s' but no SandboxRunner is "
+                "wired in; falling back to direct execution.",
+                name,
+            )
+            sandbox = False
+        if verify_checks and not sandbox:
+            # Verify only makes sense inside a sandbox; if the caller
+            # asked for one without the other, we keep them honest.
+            log.warning(
+                "Task '%s' specified --verify but sandbox is off; "
+                "ignoring verify path.",
+                name,
+            )
+            verify_checks = None
         async with self._lock:
             running = self.running_count()
             if running >= self._max_concurrent:
@@ -235,6 +300,8 @@ class BackgroundTasks:
                 spawned_at=_utcnow(),
                 log_path=self._log_dir / f"{name}.log",
                 status=TaskStatus.PENDING,
+                sandbox_enabled=sandbox,
+                verify_checks_path=verify_checks,
             )
             # Replace any stale finished record under the same name so the
             # new spawn owns the slot. The log file is appended to, not
@@ -287,6 +354,23 @@ class BackgroundTasks:
     # ----- spawn helpers -----
 
     async def _launch(self, task: BackgroundTask) -> asyncio.subprocess.Process:
+        # Sandbox boot — happens *before* we kick off claude -p so the
+        # agent's first turn already sees a running sandbox. A failure
+        # here surfaces to the caller (and bubbles to spawn() which
+        # pulls the placeholder task), so the user sees the docker error
+        # at /bg spawn time rather than a silently broken task.
+        if task.sandbox_enabled and self._sandbox is not None:
+            start_res = await self._sandbox.start(task.name)
+            if not start_res.ok:
+                raise BackgroundTaskError(
+                    f"Sandbox start failed for '{task.name}': "
+                    f"{start_res.error or 'unknown error'}"
+                )
+
+        system_prompt = self._system_prompt_provider()
+        if task.sandbox_enabled:
+            system_prompt = system_prompt + "\n\n" + _sandbox_prompt_addendum(task)
+
         argv = [
             "claude",
             "-p",
@@ -295,16 +379,23 @@ class BackgroundTasks:
             "stream-json",
             "--verbose",  # required by stream-json
             "--append-system-prompt",
-            self._system_prompt_provider(),
+            system_prompt,
             "--permission-mode",
             "bypassPermissions",
         ]
         env = {**os.environ, "VEXIS_CHAT_ID": str(task.chat_id)}
+        if task.sandbox_enabled:
+            # Let the agent's tools (`vexis-sandbox exec`, future
+            # `vexis-display`/`vexis-ui`) discover the right task-id
+            # without having to parse it from the system prompt.
+            env["VEXIS_SANDBOX_TASK_ID"] = task.name
         log_fh = task.log_path.open("ab", buffering=0)
         try:
             log_fh.write(
                 f"# vexis-bg task '{task.name}' spawned "
-                f"{task.spawned_at.isoformat()} chat={task.chat_id}\n"
+                f"{task.spawned_at.isoformat()} chat={task.chat_id} "
+                f"sandbox={task.sandbox_enabled} "
+                f"verify={task.verify_checks_path!r}\n"
                 f"# prompt: {task.prompt!r}\n".encode()
             )
             proc = await asyncio.create_subprocess_exec(
@@ -331,23 +422,61 @@ class BackgroundTasks:
         except asyncio.CancelledError:
             log.info("Watcher for '%s' cancelled (daemon shutdown)", task.name)
             raise
+
+        # Post-claim verification. Only runs if the agent exited cleanly
+        # AND the caller wired a checks path AND we have a sandbox runner.
+        # On verify failure we flip the task to FAILED *before* taking
+        # the lock-protected status update so the user-visible status is
+        # consistent with the verify_summary that lands in the notification.
+        verify_result: SandboxVerifyResult | None = None
+        if (
+            rc == 0
+            and task.sandbox_enabled
+            and task.verify_checks_path
+            and self._sandbox is not None
+            and not task.cancelled_marker
+        ):
+            try:
+                verify_result = await self._sandbox.verify(
+                    task.name, task.verify_checks_path
+                )
+            except Exception:
+                # The runner already maps subprocess errors to ok=False
+                # results; if a bug still escapes we don't want to
+                # poison the watcher.
+                log.exception("Verify failed for task '%s'", task.name)
+                verify_result = None
+
         async with self._lock:
             task.exit_code = rc
             task.finished_at = _utcnow()
             already_cancelled = task.cancelled_marker
             if not already_cancelled:
-                task.status = TaskStatus.FINISHED if rc == 0 else TaskStatus.FAILED
+                if verify_result is not None:
+                    task.verify_summary = verify_result.summary
+                    if verify_result.all_passed and rc == 0:
+                        task.status = TaskStatus.FINISHED
+                    else:
+                        # Verify failure dominates exit code: a clean
+                        # claude exit that doesn't satisfy the checks is
+                        # still a failure for the user.
+                        task.status = TaskStatus.FAILED
+                else:
+                    task.status = TaskStatus.FINISHED if rc == 0 else TaskStatus.FAILED
             self._persist()
+
+        # Sandbox teardown — always, even on cancel/failure, so we don't
+        # leak containers. Best-effort; we log on error but don't fail.
+        if task.sandbox_enabled and self._sandbox is not None:
+            try:
+                await self._sandbox.stop(task.name)
+            except Exception:
+                log.exception("Sandbox stop failed for task '%s'", task.name)
+
         try:
             if already_cancelled:
                 return
-            if rc == 0:
-                msg = f"✅ Background task `{task.name}` finished. Want details?"
-            else:
-                msg = (
-                    f"❌ Background task `{task.name}` failed (exit {rc}). "
-                    "Want me to look at the log?"
-                )
+            msg = _completion_message(task, rc, verify_result)
             await self._maybe_notify(task.chat_id, msg)
         finally:
             self._watchers.pop(task.name, None)
@@ -414,19 +543,28 @@ class BackgroundTasks:
         limitation). Because we spawn with ``start_new_session=True``
         the subprocesses would otherwise outlive the daemon as
         orphans, so we actively SIGTERM/SIGKILL each process group.
-        The watchers are then cancelled so we don't leak Tasks.
+        The watchers are then cancelled so we don't leak Tasks. Any
+        sandbox containers attached to live tasks are also stopped —
+        otherwise we'd leak a Docker container per daemon restart.
         """
         async with self._lock:
-            running_pids = [
-                t.pid
+            running_tasks = [
+                t
                 for t in self._tasks.values()
                 if t.status == TaskStatus.RUNNING and t.pid is not None
             ]
-        for pid in running_pids:
+        for task in running_tasks:
             try:
-                await _kill_with_escalation(pid, KILL_GRACE_SECONDS)
+                await _kill_with_escalation(task.pid, KILL_GRACE_SECONDS)
             except Exception:
-                log.exception("shutdown kill failed for pid=%s", pid)
+                log.exception("shutdown kill failed for pid=%s", task.pid)
+            if task.sandbox_enabled and self._sandbox is not None:
+                try:
+                    await self._sandbox.stop(task.name)
+                except Exception:
+                    log.exception(
+                        "sandbox stop on shutdown failed for task '%s'", task.name
+                    )
         watchers = list(self._watchers.values())
         for w in watchers:
             w.cancel()
@@ -448,6 +586,60 @@ class BackgroundTasks:
             tmp.replace(self._state_file)
         except OSError:
             log.exception("Failed to persist background task state")
+
+
+def _sandbox_prompt_addendum(task: BackgroundTask) -> str:
+    """Brief system-prompt insert telling the agent which sandbox it's
+    running in and how to use it. Kept terse on purpose — long system
+    prompts blow the model's first-turn token budget."""
+    lines = [
+        "## Build-and-test sandbox",
+        "",
+        f"You are running inside vexis-bg task '{task.name}' with a "
+        f"dedicated Docker sandbox. All filesystem mutations, builds, "
+        f"and test runs must go through:",
+        "",
+        f"    vexis-sandbox exec {task.name} -- <command...>",
+        "",
+        "The container has /workspace mounted from the host workspace "
+        "and /scratch for ephemeral outputs. State persists across exec "
+        "calls within this task.",
+    ]
+    if task.verify_checks_path:
+        lines += [
+            "",
+            f"When you believe the task is done, ensure the YAML check "
+            f"spec at '{task.verify_checks_path}' covers the acceptance "
+            f"criteria — the daemon runs `vexis-verify run {task.name} "
+            f"--checks {task.verify_checks_path}` after you exit, and "
+            f"any failing check flips this task to FAILED.",
+        ]
+    return "\n".join(lines)
+
+
+def _completion_message(
+    task: BackgroundTask,
+    rc: int,
+    verify_result: SandboxVerifyResult | None,
+) -> str:
+    """Compose the user-facing finished-message. Mirrors the original
+    success/failure phrasing so existing Telegram-side regex / hint
+    code doesn't have to change, but appends a verify summary when
+    relevant so the user knows whether checks passed."""
+    if rc == 0 and (verify_result is None or verify_result.all_passed):
+        base = f"✅ Background task `{task.name}` finished."
+        if verify_result is not None:
+            base += f" Checks: {verify_result.summary}."
+        return base + " Want details?"
+    if verify_result is not None and not verify_result.all_passed:
+        return (
+            f"❌ Background task `{task.name}` failed at verify: "
+            f"{verify_result.summary}. Want me to look at the log?"
+        )
+    return (
+        f"❌ Background task `{task.name}` failed (exit {rc}). "
+        "Want me to look at the log?"
+    )
 
 
 def _pid_alive(pid: int) -> bool:

@@ -213,6 +213,23 @@ function BackgroundCard({
         <p className="mt-1 font-data text-[10.5px] text-[var(--color-fg-dim)] truncate">
           {task.log_path}
         </p>
+        {(task.sandbox_enabled || task.verify_summary) && (
+          <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 font-data text-[10.5px]">
+            {task.sandbox_enabled && (
+              <span className="text-[var(--color-fg-dim)]">
+                ⊞ sandbox
+                {task.verify_checks_path
+                  ? ` + verify (${task.verify_checks_path})`
+                  : ""}
+              </span>
+            )}
+            {task.verify_summary && (
+              <span className="text-[var(--color-fg-2)]">
+                checks: {task.verify_summary}
+              </span>
+            )}
+          </div>
+        )}
       </div>
     </Card>
   );

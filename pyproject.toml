@@ -49,6 +49,11 @@ vexis-agent = "vexis_agent.cli:app"
 vexis-bg = "vexis_agent.tools.background_cli:main"
 vexis-browse = "vexis_agent.tools.browser_cli:main"
 vexis-desktop = "vexis_agent.tools.desktop_cli:main"
+# Build-and-test loop primitives — see `.plans/agent-research.md`.
+vexis-sandbox = "vexis_agent.tools.sandbox.cli:main"
+vexis-verify = "vexis_agent.tools.verify.cli:main"
+vexis-display = "vexis_agent.tools.display.cli:main"
+vexis-ui = "vexis_agent.tools.ui.cli:main"
 vexis-mem = "vexis_agent.tools.memory_cli:main"
 vexis-skill = "vexis_agent.tools.skills_cli:main"
 vexis-stream = "vexis_agent.tools.livestream_cli:main"
@@ -91,9 +96,12 @@ testpaths = ["tests"]
 # the wheel — see [tool.setuptools.packages.find].exclude — but the
 # eval + dev-setup tests import from it directly).
 pythonpath = ["."]
-addopts = "-q -m 'not eval and not brain_smoke and not brain_smoke_opencode'"
+addopts = "-q -m 'not eval and not brain_smoke and not brain_smoke_opencode and not sandbox_docker and not display_real and not ui_real'"
 markers = [
     "eval: integration eval that calls real claude -p (cost/network); opt-in via -m eval",
     "brain_smoke: real-binary claude-code smoke (cost/network); opt-in via -m brain_smoke",
     "brain_smoke_opencode: real-binary opencode smoke (cost/network); opt-in via -m brain_smoke_opencode",
+    "sandbox_docker: integration test against real Docker daemon; opt-in via -m sandbox_docker",
+    "display_real: integration test that spawns a real Xvfb / headless compositor; opt-in via -m display_real",
+    "ui_real: integration test that hits a live AT-SPI bus; opt-in via -m ui_real",
 ]

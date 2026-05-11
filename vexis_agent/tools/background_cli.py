@@ -101,11 +101,23 @@ def _print_result_or_exit(resp: dict) -> int:
     return 0
 
 
-def _cmd_spawn(name: str, prompt: str) -> int:
+def _cmd_spawn(
+    name: str,
+    prompt: str,
+    *,
+    sandbox: bool | None,
+    verify_checks: str | None,
+) -> int:
     chat_id = _resolve_chat_id()
-    return _print_result_or_exit(
-        _send("bg_spawn", {"chat_id": chat_id, "name": name, "prompt": prompt})
-    )
+    args: dict = {"chat_id": chat_id, "name": name, "prompt": prompt}
+    # Only forward sandbox/verify when set so the daemon's default
+    # (heuristic-based) path stays the implicit fast path. The dispatch
+    # layer treats absent keys as "use defaults."
+    if sandbox is not None:
+        args["sandbox"] = sandbox
+    if verify_checks:
+        args["verify_checks"] = verify_checks
+    return _print_result_or_exit(_send("bg_spawn", args))
 
 
 def _cmd_status(name: str | None) -> int:
@@ -138,6 +150,33 @@ def main() -> int:
     sp = sub.add_parser("spawn", help="Spawn a new background task.")
     sp.add_argument("name", help="kebab-case task name (3-30 chars).")
     sp.add_argument("prompt", help="Prompt to feed claude -p.")
+    # Build-and-test loop wiring (Component 2). Default behaviour is
+    # heuristic: build/test-flavoured prompts auto-sandbox, research/text
+    # prompts do not. Explicit flags override the heuristic both ways.
+    sandbox_group = sp.add_mutually_exclusive_group()
+    sandbox_group.add_argument(
+        "--sandbox",
+        dest="sandbox",
+        action="store_true",
+        default=None,
+        help="Force-route this task through a vexis-sandbox container.",
+    )
+    sandbox_group.add_argument(
+        "--no-sandbox",
+        dest="sandbox",
+        action="store_false",
+        default=None,
+        help="Force direct execution even if the prompt looks like a build task.",
+    )
+    sp.add_argument(
+        "--verify",
+        dest="verify_checks",
+        default=None,
+        help=(
+            "Path (inside the workspace) to a checks YAML; vexis-verify "
+            "runs it after the agent exits. Implies --sandbox."
+        ),
+    )
 
     st = sub.add_parser("status", help="Show one or all task summaries.")
     st.add_argument("--name", default=None, help="Limit output to this task.")
@@ -151,7 +190,18 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.cmd == "spawn":
-        return _cmd_spawn(args.name, args.prompt)
+        # --verify implies --sandbox; making this an automatic upgrade
+        # rather than a parser error keeps the common case ergonomic
+        # (the verify pre-script doesn't have to know about sandboxing).
+        sandbox = args.sandbox
+        if args.verify_checks and sandbox is None:
+            sandbox = True
+        return _cmd_spawn(
+            args.name,
+            args.prompt,
+            sandbox=sandbox,
+            verify_checks=args.verify_checks,
+        )
     if args.cmd == "status":
         return _cmd_status(args.name)
     if args.cmd == "cancel":

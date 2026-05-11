@@ -313,9 +313,23 @@ async def _run() -> None:
     # the PTB application once Telegram is initialised). Same instance,
     # two roles — that's how notifications and brain context stay in sync.
     notifier = Notifier()
+    # Sandbox routing is opt-in per task but the runner is wired in
+    # unconditionally whenever Docker + the CLI are present; absent
+    # those, BackgroundTasks falls back to direct execution and warns.
+    from vexis_agent.core.sandbox_runner import SandboxRunner
+
+    sandbox_runner: SandboxRunner | None = None
+    if SandboxRunner.is_available():
+        sandbox_runner = SandboxRunner()
+    else:
+        log.info(
+            "vexis-sandbox CLI / docker not detected; background tasks "
+            "will run without sandbox isolation."
+        )
     background_tasks = BackgroundTasks(
         workspace=workspace,
         system_prompt_provider=lambda: build_system_prompt(workspace),
+        sandbox_runner=sandbox_runner,
     )
     browser_manager = get_browser_manager()
     browser_tools = BrowserTools(browser_manager, workspace)
@@ -580,8 +594,28 @@ def _build_dispatch(bg: BackgroundTasks, browser: BrowserTools):
                     "error": f"bad spawn args: {exc}",
                     "kind": "BadRequest",
                 }
+            # Optional fields; absent → defaults are applied inside
+            # bg.spawn (heuristic-based sandbox decision, no verify).
+            raw_sandbox = args.get("sandbox")
+            sandbox: bool | None
+            if raw_sandbox is None:
+                sandbox = None
+            else:
+                sandbox = bool(raw_sandbox)
+            verify_checks_raw = args.get("verify_checks")
+            verify_checks = (
+                str(verify_checks_raw)
+                if isinstance(verify_checks_raw, str) and verify_checks_raw
+                else None
+            )
             try:
-                task = await bg.spawn(chat_id, name, prompt)
+                task = await bg.spawn(
+                    chat_id,
+                    name,
+                    prompt,
+                    sandbox=sandbox,
+                    verify_checks=verify_checks,
+                )
             except (
                 BackgroundTaskLimitReached,
                 NameAlreadyInUse,
@@ -599,6 +633,8 @@ def _build_dispatch(bg: BackgroundTasks, browser: BrowserTools):
                     "spawned_at": task.spawned_at.isoformat(),
                     "pid": task.pid,
                     "log_path": str(task.log_path),
+                    "sandbox_enabled": task.sandbox_enabled,
+                    "verify_checks_path": task.verify_checks_path,
                 },
             }
         if op == "bg_cancel":
