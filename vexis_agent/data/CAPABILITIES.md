@@ -511,7 +511,8 @@ memory.
 
 After solving a non-trivial recurring class of problem (5+ tool
 calls, or a workflow you'd want to reuse, or a fix the user
-corrected you on), write it down:
+corrected you on), write it down — BEFORE telling the user you're
+done. The reflex is "did this take real work? then capture it."
 
     cat > /tmp/new-skill.md <<'EOF'
     ---
@@ -524,11 +525,22 @@ corrected you on), write it down:
     EOF
     vexis-skill create <name> --content-file /tmp/new-skill.md
 
+**Save the shortcut, not the discovery path.** If you tried 20 steps
+and then found a single `curl`, a JS eval, or a one-line dispatcher
+call that got the same result, the skill body is THAT shortcut —
+not the meandering route you took to find it. Future-you wants the
+cheat sheet, not the journal.
+
 After creating, the skill won't appear in your `<available_skills>`
 block until next session — same frozen-snapshot rule as memory. The
 skill IS on disk and visible to `vexis-skill list` immediately.
 
 ### Modifying an existing skill
+
+When you load a skill via `vexis-skill view` and find it outdated,
+incomplete, or wrong, patch it **immediately — don't wait to be
+asked**. Skills that aren't maintained become liabilities; drift
+is worse than no skill at all.
 
     vexis-skill patch <name> --old-string "OLD" --new-string "NEW"
     vexis-skill edit <name> --content-file /tmp/full-rewrite.md

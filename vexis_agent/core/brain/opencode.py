@@ -281,6 +281,15 @@ def _build_system_prompt_for_workspace(workspace: Path) -> str:
     if capabilities:
         parts.append(capabilities)
 
+    # Hermes-style skill self-authoring guidance — same call site
+    # claude-code uses. opencode emits its own ``<available_skills>``
+    # block downstream, so we still need this authoring block here:
+    # opencode's auto-discovery only tells the brain WHICH skills
+    # exist; it doesn't tell the brain WHEN to create or patch one.
+    from vexis_agent.core.skills import build_skill_authoring_block
+
+    parts.append(build_skill_authoring_block())
+
     memory_store = MemoryStore(memories_dir(workspace))
     mem_block = memory_store.format_for_system_prompt("memory")
     if mem_block:

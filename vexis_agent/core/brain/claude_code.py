@@ -56,7 +56,10 @@ from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.core.safety import DESTRUCTIVE_PATTERNS
 from vexis_agent.core.safety_install import ensure_workspace_safety_hook
 from vexis_agent.core.sessions import SessionStore
-from vexis_agent.core.skills import build_skills_index_block
+from vexis_agent.core.skills import (
+    build_skill_authoring_block,
+    build_skills_index_block,
+)
 from vexis_agent.core.status import StatusFile, extract_tool_target
 
 # Re-export the exception types so existing import sites
@@ -250,6 +253,14 @@ def build_system_prompt(workspace: Path) -> str:
     parts: list[str] = [soul]
     if capabilities:
         parts.append(capabilities)
+
+    # Hermes-style in-session skill self-authoring guidance. Injected
+    # AFTER capabilities and BEFORE memory/user/relationships so it
+    # sits with the other "how to work" rules. Always non-empty —
+    # exists specifically to drive bootstrap from zero skills, where
+    # ``build_skills_index_block`` returns ""  and would otherwise
+    # leave the brain with no nudge to ever create one.
+    parts.append(build_skill_authoring_block())
 
     # Memory blocks — agent notes first, user profile second. Empty
     # blocks return None and are dropped here.
