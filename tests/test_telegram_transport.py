@@ -209,6 +209,13 @@ def _make_transport(handler: _FakeHandler, allowed_user_id: int) -> TelegramTran
     # Defaulted to None so the relationships hook short-circuits
     # and these legacy tests stay focused on drain/pickup behavior.
     t._learning_curator = None  # type: ignore[attr-defined]
+    # Streaming defaults OFF in this helper so the legacy drain
+    # tests keep exercising the buffered ``handler.handle`` path
+    # (they assert against ``_FakeHandler.calls``, which streaming
+    # doesn't populate). Streaming-specific tests build their own
+    # transport with ``_streaming_enabled = True``.
+    t._streaming_enabled = False  # type: ignore[attr-defined]
+    t._streaming_min_interval = 1.0  # type: ignore[attr-defined]
     return t
 
 
