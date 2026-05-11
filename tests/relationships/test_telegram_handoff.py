@@ -320,6 +320,13 @@ def _make_transport_with_curator(
     t._allowed_user_id = allowed_user_id  # type: ignore[attr-defined]
     t._running_tasks = RunningTasks()  # type: ignore[attr-defined]
     t._learning_curator = _FakeLearningController(relationships)  # type: ignore[attr-defined]
+    # Streaming defaults OFF in this fixture so the relationships
+    # handoff tests stay on the buffered ``handler.handle`` path
+    # (which is what their _OrderingHandler exercises). Streaming
+    # would route through ``handler.stream`` instead and these
+    # tests don't model that surface.
+    t._streaming_enabled = False  # type: ignore[attr-defined]
+    t._streaming_min_interval = 1.0  # type: ignore[attr-defined]
     return t
 
 

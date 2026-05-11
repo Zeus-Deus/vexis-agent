@@ -74,6 +74,20 @@ Canonical schema reference (every block is optional; missing file
       max_consecutive_errors: 5     # auto-pause after N enqueue errors
       max_total: 100                # hard cap (excludes cleared)
       max_prompt_length: 2000       # chars per schedule prompt
+
+    # ── telegram (see docs/telegram-streaming.md) ───────────────
+    telegram:
+      streaming_enabled: true       # incremental edit_message_text
+                                    # while the brain generates;
+                                    # false falls back to one
+                                    # buffered send at done time
+      streaming_min_interval_seconds: 1.0
+                                    # min seconds between successive
+                                    # edit_message_text calls in a
+                                    # single chat. Clamped to
+                                    # [0.5, 5.0]. Telegram's edits
+                                    # bucket is ~6/sec bot-wide; 1s
+                                    # per chat keeps us well under.
 """
 
 from __future__ import annotations
@@ -1159,3 +1173,86 @@ def chat_attachments_allowed_mimes() -> frozenset[str]:
         return _DEFAULT_ATTACHMENT_MIMES
     cleaned = {s.strip() for s in raw if isinstance(s, str) and s.strip()}
     return frozenset(cleaned) if cleaned else _DEFAULT_ATTACHMENT_MIMES
+
+
+# ──────────────────────────────────────────────────────────────────
+# Telegram transport (streaming reply path)
+#
+# Default-on incremental edit_message_text streaming for the
+# Telegram transport's brain replies. Disable with
+# ``telegram.streaming_enabled: false`` to fall back to the
+# pre-streaming behaviour (one buffered send at done time).
+# See docs/telegram-streaming.md for the full operator reference
+# (rate-limit math, screenshot ordering caveat, error semantics).
+# ──────────────────────────────────────────────────────────────────
+
+
+DEFAULT_TELEGRAM_STREAMING_ENABLED: bool = True
+DEFAULT_TELEGRAM_STREAMING_MIN_INTERVAL_SECONDS: float = 1.0
+# Hard floor: Telegram's per-chat write budget is ~1 msg/sec; going
+# below 0.5s edits in the same chat starts attracting 429s with
+# retry_after windows that defeat the point of streaming.
+_TELEGRAM_STREAMING_MIN_INTERVAL_FLOOR: float = 0.5
+# Hard ceiling: a 5s edit cadence is already barely "streaming" —
+# anything slower and the user might as well wait for the buffered
+# send. Past 5s we cap rather than honouring the value, on the
+# assumption it's a typo.
+_TELEGRAM_STREAMING_MIN_INTERVAL_CEILING: float = 5.0
+
+
+def telegram_streaming_enabled() -> bool:
+    """Whether the Telegram transport streams brain replies via
+    incremental ``edit_message_text`` calls.
+
+    Default True. Flip to False in ``~/.vexis/config.yaml`` under
+    ``telegram.streaming_enabled`` to fall back to the buffered
+    pre-streaming path (one ``send_message`` per chunk after the
+    brain finishes). The buffered path is the safety valve when
+    streaming misbehaves on a given chat — same flag-flip pattern
+    every other v3 feature uses.
+    """
+    raw = _section("telegram").get(
+        "streaming_enabled", DEFAULT_TELEGRAM_STREAMING_ENABLED,
+    )
+    return bool(raw)
+
+
+def telegram_streaming_min_interval_seconds() -> float:
+    """Minimum wall-clock seconds between successive
+    ``edit_message_text`` calls for a single chat during streaming.
+
+    Default 1.0s. Clamped to ``[0.5, 5.0]`` — values outside this
+    band fall back to the default with a warning. Telegram's edit
+    bucket is ~6 edits/sec bot-wide and ~1 message/sec per chat;
+    one edit per chat per second is the safe rule that keeps us
+    well under both even with the chat in flight on a tight chunk
+    cadence (every 1-2 tokens). Too-fast values trigger 429s with
+    multi-second retry windows that defeat the point of streaming
+    in the first place.
+    """
+    raw = _section("telegram").get(
+        "streaming_min_interval_seconds",
+        DEFAULT_TELEGRAM_STREAMING_MIN_INTERVAL_SECONDS,
+    )
+    if isinstance(raw, bool):
+        # bool is an int subclass — refuse it to avoid silently
+        # accepting `streaming_min_interval_seconds: true` as 1.0.
+        return DEFAULT_TELEGRAM_STREAMING_MIN_INTERVAL_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_TELEGRAM_STREAMING_MIN_INTERVAL_SECONDS
+    if (
+        value < _TELEGRAM_STREAMING_MIN_INTERVAL_FLOOR
+        or value > _TELEGRAM_STREAMING_MIN_INTERVAL_CEILING
+    ):
+        log.warning(
+            "telegram.streaming_min_interval_seconds=%r out of range "
+            "[%.1f, %.1f]; using default %.1f",
+            value,
+            _TELEGRAM_STREAMING_MIN_INTERVAL_FLOOR,
+            _TELEGRAM_STREAMING_MIN_INTERVAL_CEILING,
+            DEFAULT_TELEGRAM_STREAMING_MIN_INTERVAL_SECONDS,
+        )
+        return DEFAULT_TELEGRAM_STREAMING_MIN_INTERVAL_SECONDS
+    return value

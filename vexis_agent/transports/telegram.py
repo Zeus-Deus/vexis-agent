@@ -43,6 +43,10 @@ from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.core.sessions import SessionInfo
 from vexis_agent.core.status import StatusSnapshot, cleanup_all as cleanup_status_files, read_status
 from vexis_agent.core.web_server import WebDashboard
+from vexis_agent.core.yaml_config import (
+    telegram_streaming_enabled,
+    telegram_streaming_min_interval_seconds,
+)
 from vexis_agent.tools.desktop import CaptureError, capture_desktop
 from vexis_agent.tools.voxtype import TranscriptionEmpty, TranscriptionError, transcribe_audio
 
@@ -50,6 +54,16 @@ log = logging.getLogger(__name__)
 
 _TYPING_REFRESH_SECONDS = 4
 _MAX_CHUNK = 4000
+# Streaming reply path. Telegram's hard message ceiling is 4096
+# chars; we leave 296 chars of headroom so the rollover boundary
+# search (paragraph break → line break → hard cut) has room to
+# pick a clean break without overflowing.
+_STREAMING_ROLLOVER_THRESHOLD = 3800
+# Initial bubble shown to the user immediately so they know the
+# brain heard them. Telegram refuses to edit-to-empty-string, so
+# this same character is the safe fallback whenever an edit would
+# otherwise blank the bubble.
+_STREAMING_PLACEHOLDER = "…"
 _VOICE_ECHO_PREFIX = "🎙️ "
 _VOICE_BRAIN_TAG = "[transcribed voice memo] "
 _PICKING_UP_PREFIX = "Picking up: "
@@ -329,6 +343,33 @@ def split_for_telegram(text: str, max_len: int = _MAX_CHUNK) -> list[str]:
     return [text[i : i + max_len] for i in range(0, len(text), max_len)]
 
 
+def _split_at_streaming_boundary(
+    text: str, threshold: int,
+) -> tuple[str, str]:
+    """Pick a clean rollover boundary for streaming.
+
+    Returns ``(head, tail)`` where ``head`` is the text to leave
+    in the active message and ``tail`` is the remainder that
+    seeds the next message. Preference order: paragraph break
+    (``\\n\\n``), then line break (``\\n``), then a hard cut at
+    ``threshold``. Operates only on the slice up to ``threshold``
+    so we never put more than that in ``head``.
+
+    Why a separate helper from :func:`split_for_telegram`: that
+    one returns a *list* of chunks for batch sending. The
+    streaming path needs a single bisection because the tail
+    keeps growing as more deltas arrive.
+    """
+    if len(text) <= threshold:
+        return text, ""
+    window = text[:threshold]
+    for sep in ("\n\n", "\n"):
+        idx = window.rfind(sep)
+        if idx > 0:
+            return text[:idx], text[idx + len(sep):]
+    return text[:threshold], text[threshold:]
+
+
 def _build_button_rows(
     sessions: list[SessionInfo], action: str, *, skip_active: bool
 ) -> tuple[list[list[InlineKeyboardButton]], bool]:
@@ -526,6 +567,14 @@ class TelegramTransport:
         # callback_data budget. Dies on daemon restart — user
         # re-issues /model set <sub> and starts a fresh picker.
         self._picker_pending: dict[tuple[int, int], dict] = {}
+        # Streaming reply config (see docs/telegram-streaming.md).
+        # Read once at startup to avoid hot-path disk reads on every
+        # turn — the rest of vexis follows the same pattern for
+        # transport-level flags. Toggling at runtime requires daemon
+        # restart, same as ``brain.kind``. See yaml_config for the
+        # rate-limit math behind the default 1.0s edit cadence.
+        self._streaming_enabled = telegram_streaming_enabled()
+        self._streaming_min_interval = telegram_streaming_min_interval_seconds()
         # concurrent_updates(True) is load-bearing for /cancel: PTB's default
         # serializes every update through one task, so a /cancel sent while
         # a brain call is in flight queues behind it for up to 30 minutes
@@ -720,20 +769,9 @@ class TelegramTransport:
             # helper handles all error / cursor-collision cases
             # internally; the drain proceeds to the brain regardless.
             await self._run_relationships_hook(bot, chat_id, text)
-            try:
-                reply = await self._handler.handle(user_id, chat_id, text)
-            except Exception:
-                log.exception(
-                    "Drain turn raised unexpectedly for chat %s", chat_id
-                )
-                reply = _DRAIN_TURN_BROKE
-            if reply is not None:
-                try:
-                    await self._send_brain_reply(bot, chat_id, reply)
-                except Exception:
-                    log.exception(
-                        "Failed to send brain reply for chat %s", chat_id
-                    )
+            reply = await self._dispatch_brain_turn(
+                bot, chat_id, user_id, text,
+            )
             # /goal post-turn hook: for chats with an active standing
             # goal, judge whether the reply satisfies the goal and
             # (if not + under budget) enqueue a continuation. No-op
@@ -3193,6 +3231,379 @@ class TelegramTransport:
                 await msg.reply_photo(photo=fh, caption=result.summary or None)
         finally:
             result.image_path.unlink(missing_ok=True)
+
+    async def _dispatch_brain_turn(
+        self, bot, chat_id: int, user_id: int, text: str,
+    ) -> str | None:
+        """One brain turn for the drain loop.
+
+        Routes to either the buffered (``handler.handle`` →
+        ``_send_brain_reply``) or the streaming
+        (``handler.stream`` → ``_send_brain_reply_streaming``)
+        path based on ``self._streaming_enabled``. Returns the
+        final assistant text so :meth:`_run_goal_hook` can judge
+        the turn — or :data:`_DRAIN_TURN_BROKE` on an unexpected
+        exception in either path so the goal judge sees the same
+        "broken turn" string the user sees.
+
+        Both paths preserve the historical "send-error swallow"
+        semantics: a Telegram-side send/edit failure logs but
+        doesn't propagate, so a single broken delivery doesn't
+        kill the drain loop's queued follow-ups.
+
+        ``getattr`` fallback on ``_streaming_enabled`` keeps the
+        dispatcher safe under tests that build the transport via
+        ``TelegramTransport.__new__`` to bypass the PTB
+        Application wiring — most of those fixtures don't model
+        streaming, so default-OFF gives them the legacy buffered
+        behaviour without forcing every fixture to be touched
+        every time a new transport-level flag lands.
+        """
+        if not getattr(self, "_streaming_enabled", False):
+            try:
+                reply = await self._handler.handle(user_id, chat_id, text)
+            except Exception:
+                log.exception(
+                    "Drain turn raised unexpectedly for chat %s", chat_id,
+                )
+                reply = _DRAIN_TURN_BROKE
+            if reply is not None:
+                try:
+                    await self._send_brain_reply(bot, chat_id, reply)
+                except Exception:
+                    log.exception(
+                        "Failed to send brain reply for chat %s", chat_id,
+                    )
+            return reply
+
+        try:
+            reply = await self._send_brain_reply_streaming(
+                bot, chat_id, user_id, text,
+            )
+        except Exception:
+            log.exception(
+                "Streaming drain turn raised unexpectedly for chat %s", chat_id,
+            )
+            try:
+                await bot.send_message(
+                    chat_id=chat_id, text=_DRAIN_TURN_BROKE, parse_mode=None,
+                )
+            except Exception:
+                log.exception(
+                    "Failed to send broken-turn ack for chat %s", chat_id,
+                )
+            reply = _DRAIN_TURN_BROKE
+        return reply
+
+    async def _send_brain_reply_streaming(
+        self, bot, chat_id: int, user_id: int, text: str,
+    ) -> str | None:
+        """Stream the brain's reply via incremental edit_message_text.
+
+        Lifecycle for one turn:
+          1. Send a placeholder ``…`` message so the user sees an
+             immediate ack while the brain spins up.
+          2. Iterate ``handler.stream(...)`` events:
+             - ``("chunk", str)`` — accumulate; on a throttled
+               cadence (``self._streaming_min_interval`` per chat,
+               default 1.0s) edit the active message with the
+               accumulated text. When the active message would
+               exceed :data:`_STREAMING_ROLLOVER_THRESHOLD` chars,
+               finalize it on a paragraph/line boundary and start
+               a fresh placeholder for the remainder.
+             - ``("tool", dict)`` — currently dropped on the
+               Telegram side; ``/status`` already exposes per-turn
+               tool activity and adding inline tool lines would
+               compete with the streamed text for the same edit
+               budget. Web dashboard renders these inline because
+               it has a separate UI lane for them.
+             - ``("done", str)`` — canonical final text. Final-
+               flush + screenshot extraction happens here.
+             - ``("error", dict | None)`` — replace the active
+               message with the user-facing error message
+               (cancelled = silent — the /cancel handler already
+               replied) and return the error string so the goal
+               hook records "broken turn" semantics consistently
+               with the buffered path.
+          3. At done: extract screenshot paths from the full text;
+             if any were found, edit the active message with the
+             cleaned tail (so the path token isn't visible in the
+             final state) then send each screenshot as a separate
+             photo/document message AFTER the text. This is a UX
+             change from the buffered path (which sent photos
+             BEFORE text) — documented in
+             ``docs/telegram-streaming.md``.
+
+        Returns the full accumulated text (canonical from the
+        ``done`` event when it fires; otherwise the locally
+        accumulated copy as a fallback). Returns the error message
+        string on the error path. Returns None only when the brain
+        produced literally zero output AND no error fired —
+        defensive against future stream sources that close cleanly
+        with nothing to show.
+        """
+        # 1. Placeholder bubble. Doubles as the first ack so the
+        #    user sees a reaction inside ~200ms, even if the brain
+        #    takes 20s to emit its first delta.
+        placeholder = await bot.send_message(
+            chat_id=chat_id, text=_STREAMING_PLACEHOLDER, parse_mode=None,
+        )
+        message_id = placeholder.message_id
+        # ``current_buffer``: text in the message identified by
+        # ``message_id`` right now (before any rollover, equal to
+        # ``full_text``; after rollover, equal to the suffix since
+        # the last rollover boundary).
+        current_buffer = ""
+        # ``last_edited``: the text we most recently *successfully*
+        # asked Telegram to render in ``message_id``. Used to skip
+        # no-op edits — Telegram returns 400 "message is not
+        # modified" on identical-text edits, which would burn the
+        # rate-limit budget for nothing.
+        last_edited = ""
+        # ``full_text``: total text across all messages. Authority
+        # for screenshot extraction at done time AND the return
+        # value forwarded to the goal hook.
+        full_text = ""
+        last_edit_at = 0.0
+        loop = asyncio.get_event_loop()
+        error_payload: dict | None = None
+
+        def _update_active_message(text: str) -> tuple[str, str]:
+            """Closure-free helper to compute the next edit shape.
+            Returns (text_to_render, text_recorded_as_last_edited)."""
+            return text, text
+
+        async for event in self._handler.stream(user_id, chat_id, text):
+            kind, payload = event
+            if kind == "chunk":
+                if not isinstance(payload, str) or not payload:
+                    continue
+                current_buffer += payload
+                full_text += payload
+
+                # Rollover before throttling: if the active message
+                # has grown past the threshold, seal it on a clean
+                # boundary and start a new bubble for the rest.
+                # Doing this BEFORE the throttle check ensures we
+                # never edit a message past the 4096 ceiling even
+                # on a single oversized chunk.
+                if len(current_buffer) > _STREAMING_ROLLOVER_THRESHOLD:
+                    head, tail = _split_at_streaming_boundary(
+                        current_buffer, _STREAMING_ROLLOVER_THRESHOLD,
+                    )
+                    if head and head != last_edited:
+                        try:
+                            await bot.edit_message_text(
+                                chat_id=chat_id,
+                                message_id=message_id,
+                                text=head,
+                                parse_mode=None,
+                            )
+                        except Exception:
+                            log.debug(
+                                "rollover-finalize edit failed for chat %s",
+                                chat_id, exc_info=True,
+                            )
+                    try:
+                        new_msg = await bot.send_message(
+                            chat_id=chat_id,
+                            text=tail or _STREAMING_PLACEHOLDER,
+                            parse_mode=None,
+                        )
+                    except Exception:
+                        log.exception(
+                            "Failed to start rollover message for chat %s",
+                            chat_id,
+                        )
+                        # Stop streaming; let the brain stream
+                        # finish in the background but stop trying
+                        # to edit. Return what we have so the goal
+                        # hook still runs.
+                        return full_text or None
+                    message_id = new_msg.message_id
+                    current_buffer = tail
+                    last_edited = tail or _STREAMING_PLACEHOLDER
+                    last_edit_at = loop.time()
+                    continue
+
+                # Throttle check. The first chunk should never wait
+                # — the user has been staring at "…" since the
+                # placeholder went out — so we bypass the throttle
+                # when ``last_edit_at == 0``.
+                now = loop.time()
+                if (
+                    last_edit_at != 0.0
+                    and (now - last_edit_at) < self._streaming_min_interval
+                ):
+                    continue
+                if current_buffer == last_edited:
+                    continue
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=current_buffer,
+                        parse_mode=None,
+                    )
+                except Exception:
+                    # Throttled-edit failures (429s, transient
+                    # network) log at debug — the next chunk will
+                    # retry, and the final-flush at done time is
+                    # the safety net for the user-visible result.
+                    log.debug(
+                        "throttled streaming edit failed for chat %s",
+                        chat_id, exc_info=True,
+                    )
+                else:
+                    last_edited = current_buffer
+                    last_edit_at = now
+            elif kind == "tool":
+                # Reserved for a future Telegram surface; see
+                # docstring for why it's currently dropped.
+                continue
+            elif kind == "done":
+                if isinstance(payload, str):
+                    # Canonical full text from the handler — prefer
+                    # this over our locally-accumulated copy
+                    # because the handler has the final word on
+                    # what counts as the reply (e.g. trims, empty-
+                    # response substitution).
+                    full_text = payload
+                break
+            elif kind == "error":
+                error_payload = payload if isinstance(payload, dict) else None
+                break
+
+        # Error path. The web dashboard maps each code to a
+        # specific UI affordance; on Telegram we just render the
+        # message text (or stay silent for ``cancelled``, which is
+        # the user-initiated /cancel — the cancel handler already
+        # replied "Cancelled, sir").
+        if error_payload is not None:
+            err_msg = (error_payload.get("message") or "").strip()
+            if not err_msg:
+                # Cancelled: leave the placeholder in place rather
+                # than blanking it (Telegram refuses empty-string
+                # edits anyway). The /cancel handler is the source
+                # of truth for the user-visible cancel ack.
+                return ""
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=err_msg,
+                    parse_mode=None,
+                )
+            except Exception:
+                log.debug(
+                    "error-state edit failed for chat %s",
+                    chat_id, exc_info=True,
+                )
+                # Edit failed — fall back to a fresh send so the
+                # user still sees what went wrong.
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id, text=err_msg, parse_mode=None,
+                    )
+                except Exception:
+                    log.exception(
+                        "Failed to surface streaming error for chat %s",
+                        chat_id,
+                    )
+            return err_msg
+
+        # Done path — final flush. Three sub-cases.
+        paths, cleaned = _extract_screenshot_paths(full_text)
+        cleaned = cleaned.strip()
+        if not cleaned and not paths:
+            # Brain produced nothing useful. Replace placeholder
+            # with the standard empty-response marker so the user
+            # gets the same UX as the buffered path.
+            from vexis_agent.core.handler import _EMPTY_RESPONSE  # local: avoid import cycle
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=_EMPTY_RESPONSE,
+                    parse_mode=None,
+                )
+            except Exception:
+                log.debug(
+                    "empty-response edit failed for chat %s",
+                    chat_id, exc_info=True,
+                )
+            return _EMPTY_RESPONSE
+
+        if not paths:
+            # No paths to strip — just make sure the active
+            # message reflects the final state of ``current_buffer``
+            # (the throttle may have skipped the last chunk).
+            target = current_buffer.rstrip()
+            if target and target != last_edited:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=target,
+                        parse_mode=None,
+                    )
+                except Exception:
+                    log.debug(
+                        "final-flush edit failed for chat %s",
+                        chat_id, exc_info=True,
+                    )
+            return full_text
+
+        # Paths present. Strategy: edit the active message with
+        # the cleaned tail (so the path token isn't left visible
+        # in the bubble) then send each photo as a follow-up
+        # message. We can't retroactively strip paths from earlier
+        # rolled-over messages — but in practice paths land at the
+        # tail of a turn (the "I just took a screenshot at ..."
+        # pattern), so a single tail-edit covers the common case.
+        chunks = split_for_telegram(cleaned) if cleaned else []
+        if chunks:
+            tail_chunk = chunks[-1]
+            if tail_chunk != last_edited:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=tail_chunk,
+                        parse_mode=None,
+                    )
+                except Exception:
+                    log.debug(
+                        "final-cleaned edit failed for chat %s",
+                        chat_id, exc_info=True,
+                    )
+        for path in paths:
+            ephemeral = _is_ephemeral_screenshot(path)
+            try:
+                if not path.is_file():
+                    log.warning(
+                        "Brain referenced missing screenshot %s", path,
+                    )
+                    continue
+                oversize = _photo_too_large_for_telegram(path)
+                with path.open("rb") as fh:
+                    if oversize:
+                        log.info(
+                            "Sending %s as document (exceeds Telegram "
+                            "photo dimension cap)", path.name,
+                        )
+                        await bot.send_document(
+                            chat_id=chat_id, document=fh,
+                            filename=path.name,
+                        )
+                    else:
+                        await bot.send_photo(chat_id=chat_id, photo=fh)
+            except Exception:
+                log.exception("Failed to forward screenshot %s", path)
+            finally:
+                if ephemeral:
+                    path.unlink(missing_ok=True)
+        return full_text
 
     async def _send_brain_reply(self, bot, chat_id: int, reply: str) -> None:
         """Send a brain response, extracting and forwarding any screenshot
