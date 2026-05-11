@@ -16,14 +16,15 @@ Two-layer model:
 
 ## Wiring
 
-Three pieces:
+| Module | Role | Brain |
+| --- | --- | --- |
+| `core.safety` | Pure regex tripwire (Step 6). Source of truth for destructive patterns. | both |
+| `core.safety_hook` | Pure payload-→-verdict logic for the claude-code CLI subcommand. | claude-code |
+| `core.safety_install` | Atomic + idempotent writers for both brain config files. | both |
+| `cli safety-hook` subcommand | Subprocess Claude Code spawns for each Bash invocation. | claude-code |
+| `data/opencode_safety_plugin.mjs` | ESM plugin loaded by opencode at startup. Hooks `tool.execute.before` on the `bash` tool. | opencode |
 
-| Module | Role |
-| --- | --- |
-| `core.safety` | Pure regex tripwire. Step 6 — was already built before Step 6.5 landed. |
-| `core.safety_hook` | Pure payload-→-verdict logic for the hook entry point. |
-| `core.safety_install` | Atomic + idempotent writer for `<workspace>/.claude/settings.json`. |
-| `cli safety-hook` subcommand | The actual process Claude Code spawns for each Bash invocation. |
+### Claude Code path
 
 At daemon startup `BrainClaudeCode.__init__` calls
 `ensure_workspace_safety_hook(workspace)`, which:
@@ -38,6 +39,55 @@ At daemon startup `BrainClaudeCode.__init__` calls
 User-owned keys in `settings.json` are preserved verbatim. User
 hooks for other tools, other PreToolUse matcher groups, and
 sibling entries inside the Bash group are all left alone.
+
+### OpenCode path
+
+At daemon startup `OpenCodeBrain.__init__` calls
+`ensure_opencode_safety_plugin(workspace)`, which:
+
+1. Copies `vexis_agent/data/opencode_safety_plugin.mjs` to
+   `<workspace>/.vexis-opencode-safety.mjs` (overwrites only if
+   the shipped version differs from disk).
+2. Merges the relative path `./.vexis-opencode-safety.mjs` into
+   `<workspace>/opencode.json`'s `plugin: [...]` array. Existing
+   user-owned plugin entries are preserved; ours is matched by
+   filename sentinel and updated in place rather than duplicated.
+   Both bare-string (`"./x.mjs"`) and tuple-shaped
+   (`["./x.mjs", {opts}]`) plugin entries are supported.
+
+The plugin exports `tool.execute.before` and only acts when
+`input.tool === "bash"`. For destructive commands it rewrites
+`output.args.command` to a benign-but-failing shim
+(`printf 'BLOCKED …' >&2; exit 1`) so the bash tool mechanically
+runs to completion with a non-zero exit + stderr explanation. The
+model receives the failure in its tool_result and learns it was
+blocked.
+
+The regex set in the plugin is hand-mirrored from `core/safety.py`.
+Drift is caught by `tests/test_safety_opencode_plugin_parity.py`,
+which runs both regex sets against an identical fixture list and
+asserts byte-for-byte verdict agreement. Add a pattern to
+`core/safety.py` without updating the plugin → that test fails.
+
+#### Why `tool.execute.before` and not `permission.ask`
+
+OpenCode's shell tool calls `ctx.ask({permission: "bash", patterns: [...]})`
+which would let a `permission.ask` plugin hook override the verdict
+to `"deny"`. But Vexis spawns opencode with
+`--dangerously-skip-permissions`, and the CLI auto-replies `"once"`
+to every permission event at `run.ts:548` — short-circuiting plugins
+that depend on the ask flow. `tool.execute.before` fires
+unconditionally, giving us the raw args, so it's the surface that
+actually works under our spawn flags.
+
+#### Why command rewriting and not throwing
+
+`plugin.trigger` wraps hooks in `Effect.promise` (see
+`packages/opencode/src/plugin/index.ts:266`). A thrown promise
+rejection becomes an effect die-defect — fatal to the whole turn,
+not a graceful tool-call block. Mutating the command keeps the
+tool execution succeeding mechanically while delivering a clear
+failure the model handles as a tool error.
 
 ## Wire protocol
 
@@ -120,34 +170,12 @@ What it does NOT catch (by design):
 | Brain | Hard enforcement (Step 6.5) | Soft enforcement (CLAUDE.md) |
 | --- | --- | --- |
 | `claude-code` (default) | **Yes** — PreToolUse hook | Yes |
-| `opencode` (opt-in) | **No — follow-up** (see below) | Yes |
+| `opencode` (opt-in) — foreground | **Yes** — `tool.execute.before` plugin | Yes |
+| `opencode` (opt-in) — aux spawns | **Yes** — `permission.shell = "deny"` in `_OPENCODE_CONFIG_CONTENT` (already, pre-Step-6.5) | Yes |
 | `null` (test fake) | N/A — no real tool calls | N/A |
-
-OpenCode's hook surface is structurally different from Claude
-Code's: plugins are TypeScript modules running in Bun, not
-subprocesses reading stdin. The right surface is the
-`permission.ask` plugin hook, which can override the
-permission verdict to `"deny"` for a given tool call. The plan:
-
-1. Ship a small TS plugin under `vexis_agent/data/` (analogous to
-   how `CAPABILITIES.md` is shipped as workspace content).
-2. Have `safety_install` (or a sibling installer) write the plugin
-   path into `<workspace>/opencode.json`'s `plugin: [...]` array
-   alongside the existing `agent.*.permission` merger.
-3. The plugin either reimplements the regex set in TypeScript
-   (faster, no Python dep at hook time) OR shells out to
-   `python -m vexis_agent.cli safety-hook` (single source of
-   truth at the cost of a Python startup per call).
-
-Until that lands, **opencode foreground turns rely on soft
-prompting only**. The auxiliary spawn path (judges, extractors)
-already denies shell entirely via the existing
-`permission.shell = "deny"` ruleset Vexis writes in
-`_OPENCODE_CONFIG_CONTENT`, so the gap is foreground-only.
 
 ## Future work (not in Step 6.5)
 
-* **OpenCode plugin** — see the table above.
 * **Override channel.** The user has no way to say "yes really, run
   this destructive command" from Telegram today. The brain has to
   relay the deny and tell the user to run it from their own shell.

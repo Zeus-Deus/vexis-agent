@@ -1,27 +1,25 @@
-"""Workspace ``.claude/settings.json`` writer for the Step 6.5 safety hook.
+"""Workspace settings writers for the Step 6.5 safety hook.
 
-Wires :mod:`vexis_agent.core.safety_hook` into Claude Code's
-PreToolUse hook system by ensuring an entry exists in the workspace's
-``.claude/settings.json``. Idempotent + merge-friendly: any unrelated
-keys, user hooks, or other matcher groups are preserved verbatim.
+Two installers, one per brain:
+
+* :func:`ensure_workspace_safety_hook` — claude-code path. Writes
+  the PreToolUse hook entry into ``<workspace>/.claude/settings.json``.
+* :func:`ensure_opencode_safety_plugin` — opencode path. Copies
+  the shipped ``opencode_safety_plugin.mjs`` into the workspace
+  and merges its path into ``<workspace>/opencode.json``'s
+  ``plugin: []`` array.
+
+Both are idempotent + merge-friendly: any unrelated keys, user
+hooks, or user-owned plugin entries are preserved verbatim.
 
 Lifecycle
 ---------
-* Called from ``BrainClaudeCode.__init__`` at daemon startup.
-* Writes ``<workspace>/.claude/settings.json``.
-* Workspace-scoped is intentional: claude-code reads the workspace
-  settings.json on every ``-p`` spawn (the daemon's per-turn entry
-  point), so the hook applies to every brain turn, including aux
-  subprocesses (curator, goal judge) which share ``cwd``.
-* Vexis owns this file's PreToolUse-Bash entry but nothing else.
-  User-added hooks for other tools, or for non-Bash matchers, are
-  left alone.
-
-Why not ``~/.claude/settings.json``?
-  Because that's the per-user file claude-code itself reads outside
-  Vexis. Writing there would pollute other claude-code sessions
-  (e.g. a user manually running ``claude`` from a different cwd).
-  Workspace-scoped keeps the blast radius limited to Vexis turns.
+* Each installer is called from the matching ``Brain.__init__``
+  at daemon startup.
+* Writes are workspace-scoped, not user-global — limiting blast
+  radius to vexis turns and keeping standalone ``claude`` /
+  ``opencode`` invocations unaffected.
+* Vexis owns its sentinel-marked entries but nothing else.
 """
 
 from __future__ import annotations
@@ -184,5 +182,151 @@ def ensure_workspace_safety_hook(workspace: Path) -> bool:
         log.warning(
             "safety_install: failed to install PreToolUse hook at %s: %s",
             path, exc,
+        )
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────
+# OpenCode path
+# ──────────────────────────────────────────────────────────────────
+
+# Filename of the plugin copy that lives in the workspace. The
+# dot-prefix keeps it out of casual ``ls`` output without making
+# it actually hidden from opencode's loader (relative paths are
+# resolved cwd-relative, dot-prefix doesn't change resolution).
+_OPENCODE_PLUGIN_FILENAME = ".vexis-opencode-safety.mjs"
+
+# Name of the source file shipped under vexis_agent/data/. Read via
+# importlib.resources so pipx-installed users (no source checkout)
+# can also resolve it.
+_OPENCODE_PLUGIN_DATA_NAME = "opencode_safety_plugin.mjs"
+
+# Substring used to identify our entry inside opencode.json's
+# ``plugin: [...]`` array. The filename itself is the sentinel —
+# stable across machines and across vexis upgrades.
+_OPENCODE_PLUGIN_SENTINEL = "vexis-opencode-safety"
+
+
+def _read_plugin_source() -> str:
+    """Read the shipped plugin file. Raises FileNotFoundError if the
+    package was built without ``data/*`` — that would mean the wheel
+    is broken and the daemon should surface it loudly."""
+    from vexis_agent.data import read_text  # local import — keeps cli.py light
+
+    text = read_text(_OPENCODE_PLUGIN_DATA_NAME)
+    if text is None:
+        raise FileNotFoundError(
+            f"shipped plugin {_OPENCODE_PLUGIN_DATA_NAME!r} not found in "
+            "vexis_agent.data — wheel may be malformed"
+        )
+    return text
+
+
+def _merge_opencode_plugin(
+    settings: dict[str, Any], plugin_path: str,
+) -> dict[str, Any]:
+    """Return a new opencode.json dict with our plugin entry ensured.
+
+    Plugin entries can be either a bare string (path) or a
+    ``[path, options]`` tuple (per @opencode-ai/plugin's Config
+    type). We accept both shapes when inspecting existing entries
+    and always emit the bare-string form for ours."""
+    out = json.loads(json.dumps(settings))  # cheap deep-copy
+
+    plugin_list = out.get("plugin")
+    if not isinstance(plugin_list, list):
+        plugin_list = []
+        out["plugin"] = plugin_list
+
+    def _entry_path(entry: Any) -> str | None:
+        if isinstance(entry, str):
+            return entry
+        if isinstance(entry, list) and entry and isinstance(entry[0], str):
+            return entry[0]
+        return None
+
+    found = False
+    for i, entry in enumerate(plugin_list):
+        path_str = _entry_path(entry)
+        if path_str is not None and _OPENCODE_PLUGIN_SENTINEL in path_str:
+            # Update in place — preserve options tuple shape if user
+            # wrapped ours for some reason.
+            if isinstance(entry, list):
+                plugin_list[i] = [plugin_path, *entry[1:]]
+            else:
+                plugin_list[i] = plugin_path
+            found = True
+            break
+    if not found:
+        plugin_list.append(plugin_path)
+
+    return out
+
+
+def ensure_opencode_safety_plugin(workspace: Path) -> bool:
+    """Install Step 6.5 hard enforcement for opencode foreground turns.
+
+    Two-part write — both are atomic + idempotent:
+      1. Copy ``opencode_safety_plugin.mjs`` from package data to
+         ``<workspace>/.vexis-opencode-safety.mjs``. Overwrites if
+         the shipped version differs from on-disk (so vexis upgrades
+         propagate fresh regex sets).
+      2. Add ``./.vexis-opencode-safety.mjs`` to opencode.json's
+         ``plugin: []`` array. Existing user-owned plugin entries
+         are preserved; ours is matched by filename sentinel and
+         updated in place rather than duplicated.
+
+    Returns ``True`` if anything on disk changed. Failures are
+    logged + swallowed — see :func:`ensure_workspace_safety_hook`
+    for the fail-open rationale.
+
+    Note: aux opencode spawns (curator, goal judge, extractors)
+    don't go through this installer's wrap — they're already
+    blanket-denied for shell via the ``permission.shell = "deny"``
+    ruleset in ``_OPENCODE_CONFIG_CONTENT``. The plugin runs there
+    too (opencode loads it from opencode.json regardless of agent
+    mode) but its hook just sees no Bash calls to inspect.
+    """
+    changed = False
+    plugin_file = workspace / _OPENCODE_PLUGIN_FILENAME
+    settings_file = workspace / "opencode.json"
+    plugin_relpath = f"./{_OPENCODE_PLUGIN_FILENAME}"
+
+    try:
+        # ── Step 1: write the plugin file.
+        new_source = _read_plugin_source()
+        try:
+            old_source = plugin_file.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            old_source = None
+        if old_source != new_source:
+            _atomic_write(plugin_file, new_source)
+            log.info(
+                "safety_install: wrote opencode safety plugin to %s",
+                plugin_file,
+            )
+            changed = True
+
+        # ── Step 2: merge the plugin path into opencode.json.
+        existing = _read_existing(settings_file)
+        merged = _merge_opencode_plugin(existing, plugin_relpath)
+        new_text = json.dumps(merged, indent=2, sort_keys=False) + "\n"
+        try:
+            old_text = settings_file.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            old_text = None
+        if old_text != new_text:
+            _atomic_write(settings_file, new_text)
+            log.info(
+                "safety_install: added opencode safety plugin to %s",
+                settings_file,
+            )
+            changed = True
+
+        return changed
+    except Exception as exc:  # pragma: no cover — defensive
+        log.warning(
+            "safety_install: failed to install opencode safety plugin "
+            "at %s: %s", workspace, exc,
         )
         return False
