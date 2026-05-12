@@ -35,7 +35,32 @@ commit + push if the file changed. Report back a one-line summary.
 
 ## Algorithm
 
-1. **Clone upstream into a temp dir:**
+1. **Cheap-check first — skip if upstream skill paths haven't changed.**
+   Hermes ships frequent commits to non-skill files; pulling on every
+   schedule fire would waste tokens 90%+ of the time. Hit GitHub's
+   tree API to get just the SHAs of the directories we care about:
+   ```bash
+   curl -s https://api.github.com/repos/NousResearch/hermes-agent/git/trees/main \
+     | jq '.tree[] | select(.path == "skills" or .path == "optional-skills") | {path, sha}'
+   ```
+   Returns two `{path, sha}` rows. Compare against the
+   `source_tree_shas` field in the existing
+   `~/projects/vexis-agent-site/src/content/community-skills.json`:
+   - If the file doesn't exist OR `source_tree_shas` is missing →
+     proceed (first-ever run, no baseline to compare).
+   - If both stored SHAs match the live ones → exit clean. Report:
+     `skill-sync: no upstream skill changes (skills@<short-sha>,
+     optional@<short-sha>), exit clean`.
+   - If either SHA differs → proceed to step 2.
+
+   Why this catches everything: index-cache changes (Anthropic /
+   Marketplace adding entries) live INSIDE `skills/`, so its tree SHA
+   moves whenever any descendant file changes.
+
+   No GitHub auth needed (public repo, 1 call/day, well under the
+   60/hr unauthenticated limit).
+
+2. **Clone upstream into a temp dir:**
    ```
    git clone --depth 1 --branch main \
      https://github.com/NousResearch/hermes-agent.git "$WORKDIR/upstream"
@@ -43,7 +68,7 @@ commit + push if the file changed. Report back a one-line summary.
    Bail with a clear error if `upstream/skills/` is missing — that's
    an upstream layout change that needs human attention.
 
-2. **Walk + parse SKILL.md files** under `upstream/skills/` and
+3. **Walk + parse SKILL.md files** under `upstream/skills/` and
    `upstream/optional-skills/`. For each:
    - Read the YAML frontmatter (between the first two `---` lines).
    - Extract `name` and `description` (strings, both required).
@@ -60,7 +85,7 @@ commit + push if the file changed. Report back a one-line summary.
      (Vexis's install path rewrites blob → raw automatically.)
    - Set `source` to `"Hermes Agent"`.
 
-3. **Walk + parse index-cache JSONs** under
+4. **Walk + parse index-cache JSONs** under
    `upstream/skills/index-cache/`. SKIP `lobehub_index.json` (different
    schema — agent personas, not installable). SKIP files whose JSON
    parses to an empty array. For the remaining files, the filename
@@ -89,7 +114,8 @@ commit + push if the file changed. Report back a one-line summary.
 5. **Sort deterministically:** by `(tier, source, category, name)` so
    the JSON diff is stable across runs.
 
-6. **Compose the manifest** with a `generated_at` timestamp and the
+6. **Compose the manifest** with a `generated_at` timestamp, the
+   `source_tree_shas` block (the SHAs you fetched in step 1), and the
    sorted `skills` array (see Output schema below).
 
 7. **Write only if something actually changed.** Read the existing
@@ -97,6 +123,9 @@ commit + push if the file changed. Report back a one-line summary.
    against the old one. If identical, write the file with the OLD
    `generated_at` so `git diff --quiet` is true and you exit clean
    without committing. If different, stamp the current UTC time.
+   The `source_tree_shas` block is always updated to the live values
+   (otherwise the cheap-check in step 1 would never short-circuit on
+   the next fire).
 
 8. **Commit + push if `git diff` is non-empty.** Commit message:
    `skill-sync: refresh catalog (<count> skills)`. Then
@@ -106,8 +135,9 @@ commit + push if the file changed. Report back a one-line summary.
 
 9. **Report back one line** to chat with the totals: total count, the
    per-source breakdown, and the diff vs the prior run
-   (added/removed/changed). On the no-op path: `catalog already up to
-   date (<count> skills)`.
+   (added/removed/changed). On the step-1 no-op path: `no upstream
+   skill changes (<short-shas>), exit clean`. On the step-7 no-op
+   path: `catalog already up to date (<count> skills)`.
 
 ## Output schema (target file)
 
@@ -116,6 +146,10 @@ commit + push if the file changed. Report back a one-line summary.
 ```json
 {
   "generated_at": "2026-01-01T00:00:00Z",
+  "source_tree_shas": {
+    "skills": "abc123def4567890…",
+    "optional-skills": "789def0123456abc…"
+  },
   "skills": [
     {
       "name": "apple-notes",
