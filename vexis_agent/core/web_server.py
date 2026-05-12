@@ -692,6 +692,53 @@ class WebDashboard:
                 "message": op.message,
             }
 
+        @app.post(
+            "/api/v1/skills/install",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_skill_install(body: dict = Body(...)) -> dict:
+            """Install a skill from a URL or local path.
+
+            Wraps ``core.skill_install.install_skill`` with the
+            dashboard auth gate. Body shape: ``{source: str,
+            name?: str (override), overwrite?: bool}``. Returns
+            the InstallResult fields (name, path, provenance) on
+            success; 400 on validation failures, 409 on
+            already-installed (without overwrite).
+            """
+            source = (body.get("source") or "").strip()
+            if not source:
+                raise HTTPException(400, detail={
+                    "field": "source",
+                    "error": "URL or local path required",
+                })
+            name_override = body.get("name") or None
+            overwrite = bool(body.get("overwrite"))
+            from vexis_agent.core.skill_install import install_skill
+            root = skills_dir(self._workspace)
+            # Run on a thread so the urllib fetch doesn't block the
+            # event loop. install_skill caps at 256 KiB + 15s
+            # timeout so the worst case is bounded.
+            result = await asyncio.to_thread(
+                install_skill, root, source,
+                name_override=name_override, overwrite=overwrite,
+            )
+            if not result.ok:
+                # Distinguish "already installed" → 409 from generic
+                # validation → 400 so the UI can render a different
+                # affordance ("install anyway" toggle on conflict).
+                code = 409 if "already installed" in result.message else 400
+                raise HTTPException(code, detail={"error": result.message})
+            return {
+                "ok": True,
+                "name": result.name,
+                "path": str(result.path) if result.path else None,
+                "provenance": (
+                    result.provenance.to_dict() if result.provenance else None
+                ),
+                "message": result.message,
+            }
+
         @app.delete(
             "/api/v1/skills/{name}",
             dependencies=[Depends(_require_auth)],

@@ -304,6 +304,92 @@ def test_delete_missing_skill(client):
 # ──────────────────────────────────────────────────────────────────
 
 
+# ──────────────────────────────────────────────────────────────────
+# Install from URL / local path
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_install_unauthorized_returns_401(client):
+    r = client.post("/api/v1/skills/install", json={"source": "x"})
+    assert r.status_code == 401
+
+
+def test_install_400_on_missing_source(client):
+    r = client.post(
+        "/api/v1/skills/install", headers=_auth(), json={},
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"]["field"] == "source"
+
+
+def test_install_from_local_file(client, dashboard, tmp_path):
+    """Drop a SKILL.md on disk + install it via the endpoint.
+    Verifies the install lands at workspace/skills/installed/<name>/
+    with a provenance record."""
+    src = tmp_path / "external-skill.md"
+    src.write_text(
+        "---\nname: external-via-dashboard\n"
+        "description: A test skill installed via the dashboard endpoint.\n---\n"
+        "body content\n",
+        encoding="utf-8",
+    )
+    r = client.post(
+        "/api/v1/skills/install",
+        headers=_auth(),
+        json={"source": str(src)},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["name"] == "external-via-dashboard"
+    assert body["provenance"]["source_kind"] == "file"
+    # Verify on disk.
+    target = (
+        dashboard._workspace / "skills" / "installed"
+        / "external-via-dashboard" / "SKILL.md"
+    )
+    assert target.is_file()
+
+
+def test_install_400_on_bad_skill_md(client, tmp_path):
+    src = tmp_path / "broken.md"
+    src.write_text("no frontmatter here", encoding="utf-8")
+    r = client.post(
+        "/api/v1/skills/install",
+        headers=_auth(),
+        json={"source": str(src)},
+    )
+    assert r.status_code == 400
+
+
+def test_install_409_on_duplicate(client, dashboard, tmp_path):
+    src = tmp_path / "dup.md"
+    src.write_text(
+        "---\nname: dup-skill\ndescription: dup test\n---\nbody\n",
+        encoding="utf-8",
+    )
+    # First install succeeds.
+    r = client.post(
+        "/api/v1/skills/install",
+        headers=_auth(),
+        json={"source": str(src)},
+    )
+    assert r.status_code == 200
+    # Second without overwrite → 409.
+    r = client.post(
+        "/api/v1/skills/install",
+        headers=_auth(),
+        json={"source": str(src)},
+    )
+    assert r.status_code == 409
+    # With overwrite → 200.
+    r = client.post(
+        "/api/v1/skills/install",
+        headers=_auth(),
+        json={"source": str(src), "overwrite": True},
+    )
+    assert r.status_code == 200
+
+
 def test_full_lifecycle(client, dashboard):
     # Create
     r = client.post(

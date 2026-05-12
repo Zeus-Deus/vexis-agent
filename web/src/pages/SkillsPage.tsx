@@ -35,6 +35,13 @@ type ModalMode =
   | { kind: "edit"; name: string }
   | null;
 
+// Install-from-URL is its own simpler modal — just a URL input +
+// optional override flags. Distinct from ModalMode because the
+// editor's form fields don't apply.
+type InstallModalState =
+  | { open: true; conflictName: string | null }
+  | { open: false };
+
 export function SkillsPage({ token, onAuthFail }: SkillsPageProps) {
   const [state, setState] = useState<SkillsState | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -42,6 +49,7 @@ export function SkillsPage({ token, onAuthFail }: SkillsPageProps) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [pendingByName, setPendingByName] = useState<Record<string, string>>({});
   const [modal, setModal] = useState<ModalMode>(null);
+  const [installModal, setInstallModal] = useState<InstallModalState>({ open: false });
 
   const refresh = useCallback(async () => {
     try {
@@ -201,10 +209,17 @@ export function SkillsPage({ token, onAuthFail }: SkillsPageProps) {
         <Section
           title="Active skills"
           trailing={
-            <div className="flex items-baseline gap-3">
+            <div className="flex items-baseline gap-3 flex-wrap">
               <span className="font-data text-[11px] text-[var(--color-fg-dim)]">
                 {state.active.length} total · {state.active.filter((s) => s.pinned).length} pinned
               </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setInstallModal({ open: true, conflictName: null })}
+              >
+                ↓ Install
+              </Button>
               <Button
                 variant="primary"
                 size="sm"
@@ -286,6 +301,18 @@ export function SkillsPage({ token, onAuthFail }: SkillsPageProps) {
           }
           onClose={() => setModal(null)}
           onSaved={handleModalSaved}
+          onAuthFail={onAuthFail}
+        />
+      )}
+
+      {installModal.open && (
+        <InstallSkillModal
+          token={token}
+          onClose={() => setInstallModal({ open: false })}
+          onInstalled={async () => {
+            setInstallModal({ open: false });
+            await refresh();
+          }}
           onAuthFail={onAuthFail}
         />
       )}
@@ -847,6 +874,190 @@ function SkillEditorModal({
     </div>
   );
 }
+
+// ──────────────────────────────────────────────────────────────────
+// InstallSkillModal — paste a URL, install
+// ──────────────────────────────────────────────────────────────────
+
+interface InstallSkillModalProps {
+  token: string;
+  onClose: () => void;
+  onInstalled: () => Promise<void> | void;
+  onAuthFail: () => void;
+}
+
+/** Tiny URL-input modal for ``vexis-skill install <url>`` from the
+ *  dashboard. Posts to /api/v1/skills/install with the given source
+ *  (URL or local path). On 409 (already-installed) shows an
+ *  "Overwrite" toggle; on 400 surfaces the server error inline.
+ *
+ *  Supports https/http URLs + local filesystem paths (the same set
+ *  ``install_skill`` accepts on the backend). The placeholder shows
+ *  both shapes so the user knows.
+ */
+function InstallSkillModal({
+  token,
+  onClose,
+  onInstalled,
+  onAuthFail,
+}: InstallSkillModalProps) {
+  const [source, setSource] = useState("");
+  const [overwrite, setOverwrite] = useState(false);
+  const [conflictDetected, setConflictDetected] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [serverError, setServerError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+
+  // Esc closes (parity with the create modal).
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape" && !busy) onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, busy]);
+
+  const formValid = source.trim().length > 0;
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!formValid || busy) return;
+    setBusy(true);
+    setServerError(null);
+    setSuccess(null);
+    try {
+      const result = await api.installSkill(token, {
+        source: source.trim(),
+        overwrite,
+      });
+      setSuccess(`Installed: ${result.name}`);
+      // Brief flash of the success line before closing — gives the
+      // user visual confirmation the install landed before the
+      // modal disappears.
+      setTimeout(() => onInstalled(), 600);
+    } catch (exc) {
+      if (exc instanceof ApiError && exc.status === 401) {
+        onAuthFail();
+        return;
+      }
+      let message = exc instanceof Error ? exc.message : String(exc);
+      // Unwrap the FastAPI {detail: {error: "..."}} envelope.
+      try {
+        const parsed = JSON.parse(message);
+        if (parsed?.detail?.error) message = parsed.detail.error;
+      } catch {
+        // not JSON, use raw
+      }
+      // 409 → enable overwrite checkbox so the user can retry.
+      if (exc instanceof ApiError && exc.status === 409) {
+        setConflictDetected(true);
+      }
+      setServerError(message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-40 bg-[var(--color-base)]/80 backdrop-blur-sm flex items-start justify-center pt-12 px-3 sm:px-6 overflow-y-auto"
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !busy) onClose();
+      }}
+    >
+      <div
+        className="hairline bg-[var(--color-surface)] w-full max-w-lg flex flex-col"
+        role="dialog"
+        aria-modal="true"
+      >
+        <header className="px-5 py-3 border-b border-[var(--color-border)] flex items-baseline gap-3">
+          <span className="font-data text-[10px] uppercase tracking-widest text-[var(--color-fg-dim)]">
+            install skill from url
+          </span>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            className="ml-auto font-data text-[14px] text-[var(--color-fg-dim)] hover:text-[var(--color-fg)] disabled:opacity-50"
+            aria-label="close"
+          >
+            ✕
+          </button>
+        </header>
+
+        <form onSubmit={onSubmit} className="px-5 py-4 space-y-4">
+          {serverError && (
+            <div className="hairline border-[var(--color-error)]/40 bg-[var(--color-error)]/[0.06] px-3 py-2 text-[12px] text-[var(--color-error)] font-data">
+              {serverError}
+            </div>
+          )}
+          {success && (
+            <div className="hairline border-[var(--color-accent)]/40 bg-[var(--color-accent)]/[0.06] px-3 py-2 text-[12px] text-[var(--color-accent)] font-data">
+              ✓ {success}
+            </div>
+          )}
+
+          <Field label="Source URL or path" hint="https / http / local filesystem">
+            <input
+              value={source}
+              onChange={(e) => setSource(e.target.value)}
+              placeholder="https://example.com/skills/some-skill/SKILL.md"
+              className={inputClass(false) + " font-data text-[12.5px]"}
+              autoFocus
+            />
+            <p className="mt-1 font-data text-[10px] text-[var(--color-fg-dim)] leading-relaxed">
+              Skills install into{" "}
+              <code className="text-[var(--color-fg-2)]">
+                &lt;workspace&gt;/skills/installed/&lt;name&gt;/
+              </code>{" "}
+              with a provenance record. Read-only after install (uninstall
+              + re-install to update).
+            </p>
+          </Field>
+
+          {conflictDetected && (
+            <label className="flex items-baseline gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={overwrite}
+                onChange={(e) => setOverwrite(e.target.checked)}
+                className="size-4 accent-[var(--color-accent)]"
+              />
+              <span className="text-sm text-[var(--color-fg)]">Overwrite existing</span>
+              <span className="font-data text-[10px] text-[var(--color-fg-dim)]">
+                a skill by this name is already installed
+              </span>
+            </label>
+          )}
+
+          <div className="flex items-center gap-2 pt-3 border-t border-[var(--color-border)] -mx-5 px-5">
+            <Button
+              variant="primary"
+              size="sm"
+              type="submit"
+              disabled={!formValid || busy || !!success}
+              loading={busy}
+            >
+              {success ? "Installed" : "Install"}
+            </Button>
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={busy}
+              className="font-data text-[10px] uppercase tracking-widest text-[var(--color-fg-dim)] hover:text-[var(--color-fg-2)] disabled:opacity-50"
+            >
+              cancel
+            </button>
+            <span className="ml-auto font-data text-[10px] text-[var(--color-fg-dim)] hidden sm:inline">
+              esc to close
+            </span>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 
 function inputClass(hasError: boolean): string {
   return classNames(

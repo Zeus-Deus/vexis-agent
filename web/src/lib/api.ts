@@ -185,6 +185,23 @@ export const api = {
       `/skills/${encodeURIComponent(name)}`,
       { method: "DELETE" },
     ),
+  installSkill: (
+    token: string,
+    body: { source: string; name?: string; overwrite?: boolean },
+  ) =>
+    call<{
+      ok: boolean;
+      name: string;
+      path: string | null;
+      provenance: {
+        source: string;
+        source_kind: string;
+        sha256: string;
+        bytes_fetched: number;
+        installed_at: string;
+      } | null;
+      message: string;
+    }>(token, "/skills/install", { method: "POST", body }),
   curator: (token: string) => call<CuratorState>(token, "/curator"),
   curatorRun: (token: string, folder: string) =>
     call<CuratorRunDetail>(
