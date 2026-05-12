@@ -56,17 +56,6 @@ bump for per-feature bloat.
 - Audit before changing. Read the relevant module fully before editing.
 - Eval runs (`scripts/eval_learning.py`) are expensive (~50 LLM calls per run). Only invoke when prompts or fixtures change. Treat as a release gate, not a CI step.
 
-## Reference repos (clone to /tmp when needed)
-- `NousResearch/hermes-agent` — peek at gateway, skills, memory patterns. Never bulk-copy.
-
-## Build order
-1. Telegram ↔ agent CLI bridge.
-2. User-ID auth check.
-3. Voice (voxtype whisper model).
-4. tailnet-serve + omarchy-kb tools.
-5. Screenshot tool (read-only).
-6. Input tool + safety scaffolding.
-
 ## Invariants
 
 Cross-feature contracts. Read these before touching any feature
@@ -74,10 +63,10 @@ section — violating them is breaking the codebase.
 
 - **Content-prefix is the canonical recursion-guard filter.**
   `list_eligible_sessions` skips JSONLs whose first user message
-  starts with `CURATOR_REVIEW_PROMPT_PREFIX`. Env vars set on
-  aux spawns (`VEXIS_CURATOR=1`, `VEXIS_GOAL_JUDGE=1`, etc.)
-  are forensic markers for audit logs only; no curator path
-  reads them for filtering.
+  starts with `CURATOR_REVIEW_PROMPT_PREFIX`, `GOAL_JUDGE_PROMPT_PREFIX`,
+  or `KANBAN_WORKER_PREFIX`. Env vars set on aux spawns
+  (`VEXIS_CURATOR=1`, `VEXIS_GOAL_JUDGE=1`, `VEXIS_KANBAN=1`,
+  etc.) are forensic markers for audit logs only.
 - **Aux subsystems route through `brain.spawn_aux`.** Never
   shell out directly. Tier choice is subsystem-owned (caller
   passes `model_tier="small"`); tier→native translation is
@@ -91,18 +80,16 @@ section — violating them is breaking the codebase.
   dashboard surfaces a canary warning when on-disk diverges
   from the running brain.
 - **Validator vocabulary is shared.** The `suggested_fix` copy
-  the model validator emits (rule 4 / rule 6) is the same
-  string the dashboard refusal toast renders AND the same
-  string `BrainModelNotFoundError.suggested_fix` carries when
-  the spawn-site backstop fires. Single source of truth at
-  `core.model_validator` template constants. Drift = test
-  failure.
+  the model validator emits is the same string the dashboard
+  refusal toast renders AND the string
+  `BrainModelNotFoundError.suggested_fix` carries on the spawn-
+  site backstop. Single source at `core.model_validator`. Drift
+  = test failure.
 - **Comment-preservation backup is on-disk-state-triggered.**
-  `backup_if_commented` runs when the current
-  `~/.vexis/config.yaml` has YAML comments — not when an
-  in-memory "backed up this session?" flag says first edit.
-  The flag pattern destroys comments after daemon restart;
-  the on-disk trigger is self-managing.
+  `backup_if_commented` runs when `~/.vexis/config.yaml` has
+  YAML comments — not when an in-memory flag says first edit.
+  Flag pattern destroys comments after daemon restart; on-disk
+  trigger is self-managing.
 
 ## Model selection
 
@@ -155,8 +142,7 @@ NEAR_MISS_REVIEW (soft annotation), INCOHERENT (hard
 **Advisory-only — never blocks a write.**
 
 **Pointers:** `docs/learning-curator-runbook.md#coherence-curator-v3a`
-(five surfaces + verdict shapes) ·
-`.plans/coherence-curator-research.md`.
+· `.plans/coherence-curator-research.md`.
 
 ## Relationships (v3c)
 
@@ -186,35 +172,49 @@ whether the goal is satisfied; if not and the budget remains,
 Vexis enqueues a continuation through the same per-chat FIFO
 real user messages use.
 
-Subcommands: `/goal status` · `/goal pause` (soft; in-flight
-turn finishes; queue drained) · `/goal resume` (resets
-`turns_used`) · `/goal clear`. `/cancel` while active flips to
-paused with `paused_reason="user-cancelled"`. Budget defaults
-to 20 turns (`goals.max_turns`); disable entirely via
+Subcommands: `/goal status|pause|resume|clear`. `/cancel` while
+active flips to paused with `paused_reason="user-cancelled"`.
+Budget defaults to 20 turns (`goals.max_turns`); disable via
 `goals.enabled: false`.
 
-**Pointers:** `docs/goals.md` (grammar, soft-pause semantics,
-prompt-cache invariant, eval-gate cost ceiling) ·
-`.plans/goal-command-research.md`.
+**Pointers:** `docs/goals.md` · `.plans/goal-command-research.md`.
+
+## Kanban (v3e)
+
+Multi-task work queue at `~/.vexis/kanban.db`. `/kanban add
+"<title>"` (Telegram) or the dashboard quick-add files a task;
+the dispatcher claims ready tasks (parents done) and spawns one
+worker per task via `brain.spawn_aux`. Bounded by
+`max_concurrent_workers` (default 2 — respects brain rate limit).
+
+Six columns: triage → todo → ready → in_progress → blocked →
+done. Parent-child links block promotion until parents reach
+done. Per-task circuit breaker auto-blocks after `failure_limit`
+consecutive failures (default 3).
+
+Lanes (vexis's lightweight replacement for upstream profiles):
+each task carries a `lane` name. A lane = `(system_prompt,
+skills, tier_override)`. Same brain, different hat. Defaults:
+`research` / `implementation` / `review` / `ops` / `triage`.
+Override per-lane under `kanban.lanes:` in `~/.vexis/config.yaml`.
+
+Telegram + dashboard are co-equal subscribers to one event bus
+(`task_events`). `/goal` is parallel, not nested — the dashboard
+renders active goals in a read-only goal-pad sidebar.
+
+**Pointers:** `docs/kanban.md` (commands, board layout,
+notification policy) · `.plans/kanban-research.md` (design lock).
 
 ## Brain abstraction (Phase C)
 
 Vexis runs on top of an agent CLI selected at startup by
 `brain.kind` in `~/.vexis/config.yaml`. Three implementations
-ship; all satisfy the `core.brain.Brain` ABC so the rest of
-vexis doesn't care which is running.
+satisfy the `core.brain.Brain` ABC: `claude-code` (default,
+sessions in `~/.claude/projects/<encoded-cwd>/`), `opencode`
+(opt-in, sessions in `~/.local/share/opencode/opencode.db`),
+and `null` (test fake). Brain switching and per-subsystem
+assignment are first-class UX surfaces; YAML-edit-and-restart
+still supported but no longer required.
 
-- **`claude-code` (default)** — sessions in
-  `~/.claude/projects/<encoded-cwd>/`.
-- **`opencode` (opt-in)** — sessions in
-  `~/.local/share/opencode/opencode.db`.
-- **`null`** — `BrainNull`, the test fake.
-
-Brain switching and per-subsystem assignment are first-class
-UX surfaces (post Day 5 of model-management research); the
-YAML-edit-and-restart workflow remains supported but is no
-longer required.
-
-**Pointers:** `docs/brains.md` (per-brain reference) ·
-`docs/migration.md` · `docs/model-ux.md` (slash + dashboard) ·
-`docs/dogfood-checklist.md` (12 manual flows).
+**Pointers:** `docs/brains.md` · `docs/migration.md` ·
+`docs/model-ux.md` · `docs/dogfood-checklist.md`.

@@ -79,12 +79,26 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
 
 @dataclass(frozen=True)
 class SkillMeta:
-    """Parsed SKILL.md metadata. ``body`` is the markdown after frontmatter."""
+    """Parsed SKILL.md metadata. ``body`` is the markdown after frontmatter.
+
+    ``source`` is one of ``"workspace"`` (user/curator-authored, in
+    ``<workspace>/skills/``) or ``"bundled"`` (shipped with vexis,
+    read-only, lives under ``vexis_agent/_bundled_skills/``). Defaults
+    to ``"workspace"`` so callers that pre-date the bundled-skills
+    work behave unchanged. Bundled skills are auto-pinned: the
+    curator and the CLI refuse delete/patch/archive on them. Users
+    can override a bundled skill by creating one with the same name
+    under their workspace — the workspace copy wins on collision.
+    ``source_path`` is the directory containing this skill's
+    SKILL.md, kept for telemetry / audit purposes.
+    """
 
     name: str
     description: str
     body: str
     raw_frontmatter: dict[str, Any] = field(default_factory=dict)
+    source: str = "workspace"
+    source_path: Path | None = None
 
 
 def _parse_frontmatter(content: str) -> tuple[dict[str, Any], str] | None:
@@ -111,12 +125,21 @@ def _parse_frontmatter(content: str) -> tuple[dict[str, Any], str] | None:
     return parsed, body
 
 
-def parse_skill_md(content: str) -> SkillMeta | None:
+def parse_skill_md(
+    content: str,
+    *,
+    source: str = "workspace",
+    source_path: Path | None = None,
+) -> SkillMeta | None:
     """Parse a SKILL.md string. Returns None if the file is malformed.
 
     Index discovery uses None to mean "skip silently" — a single broken
     SKILL.md should not blow up the whole session. Create-time
     validation does its own stricter check via ``validate_skill_md``.
+
+    ``source`` and ``source_path`` flow into the returned SkillMeta so
+    downstream callers (CLI, curator, dashboard) can distinguish
+    bundled skills from workspace ones without re-walking the disk.
     """
     parsed = _parse_frontmatter(content)
     if parsed is None:
@@ -133,6 +156,8 @@ def parse_skill_md(content: str) -> SkillMeta | None:
         description=description.strip(),
         body=body,
         raw_frontmatter=fm,
+        source=source,
+        source_path=source_path,
     )
 
 
@@ -218,8 +243,34 @@ def iter_skill_dirs(skills_root: Path) -> Iterator[Path]:
 
 
 def discover_skills(skills_root: Path) -> list[SkillMeta]:
-    """Parse every SKILL.md under ``skills_root``. Malformed files are
-    silently skipped (logged at debug). Returns metas sorted by name."""
+    """Parse every SKILL.md under ``skills_root``. Single-root variant
+    kept for back-compat — every existing caller passes one path.
+
+    Malformed files are silently skipped (logged at debug). Returns
+    metas sorted by name. ``source`` is hard-coded to ``"workspace"``
+    here because this entry point doesn't know the root's role; new
+    callers that want bundled skills merged in should use
+    :func:`discover_skills_with_bundled` instead.
+    """
+    return _discover_one_root(skills_root, source="workspace")
+
+
+def _discover_one_root(skills_root: Path, *, source: str) -> list[SkillMeta]:
+    """Walk one root and parse every SKILL.md. Tags each meta with the
+    given ``source`` so multi-root callers can distinguish them later.
+
+    Within a workspace root, individual skills may further be tagged
+    as ``"installed"`` if their directory contains a ``.provenance.json``
+    sidecar — those skills came from ``vexis-skill install`` and are
+    treated as read-only by the curator + write-op paths. The override
+    happens here (not at the parse_skill_md call site) because only
+    the discovery walk knows whether a skill_dir is in the install
+    subtree.
+    """
+    # Lazy import to avoid a circular dependency: skill_install
+    # imports from core.skills (UsageStore, parse_skill_md, etc).
+    from vexis_agent.core.skill_install import is_installed_skill_dir
+
     metas: list[SkillMeta] = []
     seen_names: set[str] = set()
     for skill_dir in iter_skill_dirs(skills_root):
@@ -229,7 +280,16 @@ def discover_skills(skills_root: Path) -> list[SkillMeta]:
         except OSError as exc:
             log.debug("Skipping unreadable %s: %s", skill_md, exc)
             continue
-        meta = parse_skill_md(content)
+        # Refine source: workspace skills with provenance are
+        # actually installed-from-external. Bundled-source skills
+        # never have provenance markers (they ship from the package),
+        # so the check is workspace-only.
+        effective_source = source
+        if source == "workspace" and is_installed_skill_dir(skill_dir):
+            effective_source = "installed"
+        meta = parse_skill_md(
+            content, source=effective_source, source_path=skill_dir,
+        )
         if meta is None:
             log.debug("Skipping malformed skill at %s", skill_md)
             continue
@@ -243,7 +303,65 @@ def discover_skills(skills_root: Path) -> list[SkillMeta]:
             continue
         seen_names.add(meta.name)
         metas.append(meta)
-    return sorted(metas, key=lambda m: m.name)
+    return metas
+
+
+def bundled_skills_root() -> Path | None:
+    """Resolve the bundled-skills root.
+
+    Resolution order (matches the dashboard ``_resolve_web_dist``
+    pattern in ``main.py``):
+
+      1. ``$VEXIS_BUNDLED_SKILLS`` env override (deb/AUR packagers
+         relocate the path; tests point it at a fixture dir).
+      2. ``vexis_agent/_bundled_skills/`` shipped with the wheel
+         (resolved relative to this file). This is what pipx-
+         installed users get.
+      3. ``<repo>/vexis_agent/_bundled_skills/`` source-checkout
+         fallback (handled by case 2 already since editable installs
+         keep the same relative layout).
+
+    Returns ``None`` if the directory doesn't exist — callers must
+    tolerate this since older installs may not ship the dir.
+    """
+    env = os.environ.get("VEXIS_BUNDLED_SKILLS")
+    if env:
+        p = Path(env).expanduser()
+        return p if p.is_dir() else None
+    here = Path(__file__).resolve().parent.parent  # vexis_agent/
+    bundled = here / "_bundled_skills"
+    return bundled if bundled.is_dir() else None
+
+
+def discover_skills_with_bundled(workspace_skills_root: Path) -> list[SkillMeta]:
+    """Discover skills from BOTH the workspace and the bundled root,
+    with the workspace winning on name collision. Returns metas
+    sorted by name with ``source`` tagged on each.
+
+    Use this from session-start prompt assembly so the brain sees
+    every skill that's available — bundled defaults plus user/curator
+    additions. The single-root :func:`discover_skills` is kept for
+    callers that intentionally want only one root (CLI ops on the
+    workspace root, telemetry sweeps that ignore bundled).
+
+    Order matters: workspace first (so its names win on collision),
+    bundled second (provides defaults that user can override).
+    """
+    workspace_metas = _discover_one_root(workspace_skills_root, source="workspace")
+    workspace_names = {m.name for m in workspace_metas}
+    bundled_root = bundled_skills_root()
+    bundled_metas: list[SkillMeta] = []
+    if bundled_root is not None:
+        for meta in _discover_one_root(bundled_root, source="bundled"):
+            if meta.name in workspace_names:
+                # User intentionally overrode this bundled skill — log
+                # once at debug so override is observable but not noisy.
+                log.debug(
+                    "bundled skill %r shadowed by workspace copy", meta.name,
+                )
+                continue
+            bundled_metas.append(meta)
+    return sorted(workspace_metas + bundled_metas, key=lambda m: m.name)
 
 
 # --------------------------------------------------------------------
@@ -261,10 +379,10 @@ _INDEX_PREAMBLE = (
 )
 
 
-# Hermes-style in-session skill self-authoring guidance. Surfaced in
+# agent-platform-style in-session skill self-authoring guidance. Surfaced in
 # EVERY session — even an empty workspace with zero skills — so a
 # brand-new install can bootstrap its own skill library on the first
-# non-trivial task. Mirrors NousResearch/hermes-agent's
+# non-trivial task. Mirrors an upstream agent platform's
 # ``SKILLS_GUIDANCE`` constant in ``agent/prompt_builder.py:179-186``;
 # adapted to vexis's CLI surface (``vexis-skill {create,patch}``) and
 # the staging-tree review flow (writes land in ``skills/.shadow/`` and
@@ -315,7 +433,7 @@ _AUTHORING_GUIDANCE = (
 
 
 def build_skill_authoring_block() -> str:
-    """Hermes-style in-session skill authoring guidance.
+    """agent-platform-style in-session skill authoring guidance.
 
     Always returns the same non-empty string — independent of
     workspace state. Both brain prompt builders inject this so the
@@ -331,8 +449,15 @@ def build_skill_authoring_block() -> str:
 
 
 def build_skills_index_block(skills_root: Path) -> str:
-    """Render the ``## Skills (mandatory)`` block. Empty when no skills."""
-    metas = discover_skills(skills_root)
+    """Render the ``## Skills (mandatory)`` block. Empty when no skills.
+
+    Reads from the workspace AND the bundled root so the brain sees
+    every available skill at session start. Bundled rows carry a
+    ``[bundled]`` tag in the index so the brain (and a human reading
+    the prompt) can tell defaults from user-authored ones — bundled
+    skills are read-only and patching them is a no-op the CLI rejects.
+    """
+    metas = discover_skills_with_bundled(skills_root)
     if not metas:
         return ""
     lines = ["<available_skills>"]
@@ -343,7 +468,13 @@ def build_skills_index_block(skills_root: Path) -> str:
         desc = meta.description
         if len(desc) > MAX_DESCRIPTION_LENGTH:
             desc = desc[: MAX_DESCRIPTION_LENGTH - 1] + "…"
-        lines.append(f"- {meta.name}: {desc}")
+        if meta.source == "bundled":
+            suffix = " [bundled]"
+        elif meta.source == "installed":
+            suffix = " [installed]"
+        else:
+            suffix = ""
+        lines.append(f"- {meta.name}{suffix}: {desc}")
     lines.append("</available_skills>")
     return f"{_INDEX_PREAMBLE}\n\n" + "\n".join(lines)
 
@@ -442,7 +573,7 @@ class UsageStore:
         def _m(r: dict[str, Any]) -> None:
             r["view_count"] = int(r.get("view_count", 0)) + 1
             r["last_viewed_at"] = _utc_now_iso()
-            # Per Hermes: viewing == using. Keeps the curator's stale
+            # Per upstream: viewing == using. Keeps the curator's stale
             # timer correct without requiring two distinct call paths.
             r["use_count"] = int(r.get("use_count", 0)) + 1
             r["last_used_at"] = _utc_now_iso()
@@ -540,7 +671,13 @@ class OpResult:
 
 
 def _find_skill_dir(skills_root: Path, name: str) -> Path | None:
-    """Locate the directory whose SKILL.md has ``name`` in its frontmatter."""
+    """Locate the directory whose SKILL.md has ``name`` in its frontmatter.
+
+    Workspace-only — returns None for bundled skills. Use
+    :func:`_find_skill_dir_with_source` when bundled discovery matters
+    (read paths). Mutation paths still use this function so they
+    refuse to touch bundled.
+    """
     for skill_dir in iter_skill_dirs(skills_root):
         try:
             content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
@@ -552,18 +689,142 @@ def _find_skill_dir(skills_root: Path, name: str) -> Path | None:
     return None
 
 
+def _bundled_read_only_message(name: str) -> str:
+    """Standard error copy for write ops attempted on a bundled skill.
+
+    Workers and the curator both hit this path; one shared string
+    keeps the UX consistent and gives the brain an actionable hint
+    (fork into the workspace to override). Single source of truth so
+    a phrasing change doesn't drift between create/edit/patch/delete.
+    """
+    return (
+        f"Skill '{name}' is bundled with vexis (read-only). To override "
+        f"it, create a workspace skill with the same name: it will "
+        f"shadow the bundled one in the index. Do NOT edit the bundled "
+        f"copy directly — it ships with the package."
+    )
+
+
+def _exists_in_bundled(name: str) -> bool:
+    """True if a skill by this name lives in the bundled root.
+
+    Cheap walk; the bundled tree is small (single-digit skill count
+    expected). Used by write paths to swap the misleading "No skill
+    named X" error for the actionable read-only message above.
+    """
+    bundled_root = bundled_skills_root()
+    if bundled_root is None:
+        return False
+    return _find_skill_dir(bundled_root, name) is not None
+
+
+def _installed_read_only_message(name: str) -> str:
+    """Standard error copy for write ops attempted on an installed skill.
+
+    Same protection class as bundled — installed skills came from
+    ``vexis-skill install`` and carry a provenance marker. Mutating
+    them would silently desync from the upstream source. The action
+    the user wants is either ``vexis-skill uninstall`` then re-install,
+    or fork into a workspace-authored copy.
+    """
+    return (
+        f"Skill '{name}' was installed from an external source "
+        f"(read-only). To modify it, either fork it into a workspace "
+        f"skill with a different name, or uninstall ('vexis-skill "
+        f"uninstall {name}') and re-create as workspace-authored."
+    )
+
+
+def _exists_in_installed(skills_root: Path, name: str) -> bool:
+    """True if a skill by this name lives under ``installed/`` AND
+    carries a provenance marker. Workspace path; cheap walk."""
+    from vexis_agent.core.skill_install import (
+        INSTALLED_DIR_NAME,
+        is_installed_skill_dir,
+    )
+    candidate = skills_root / INSTALLED_DIR_NAME / name
+    return is_installed_skill_dir(candidate)
+
+
+def _resolve_writable_or_error(
+    skills_root: Path, name: str,
+) -> tuple[Path | None, OpResult | None]:
+    """Locate a writable workspace skill dir, OR return an OpResult error.
+
+    Centralises the "exists in workspace (writable)? in bundled? in
+    installed? not at all?" decision tree every write op needs.
+    Returns:
+
+      * ``(path, None)`` — writable workspace skill found, caller may
+        proceed.
+      * ``(None, OpResult(False, msg))`` — caller should return the
+        OpResult unchanged (read-only-because-bundled,
+        read-only-because-installed, or genuinely missing).
+    """
+    skill_dir = _find_skill_dir(skills_root, name)
+    if skill_dir is not None:
+        # Even if it's in workspace_root, the install layer may have
+        # dropped a provenance marker — refuse mutation in that case.
+        from vexis_agent.core.skill_install import is_installed_skill_dir
+        if is_installed_skill_dir(skill_dir):
+            return (None, OpResult(False, _installed_read_only_message(name)))
+        return (skill_dir, None)
+    if _exists_in_bundled(name):
+        return (None, OpResult(False, _bundled_read_only_message(name)))
+    if _exists_in_installed(skills_root, name):
+        return (None, OpResult(False, _installed_read_only_message(name)))
+    return (None, OpResult(False, f"No skill named '{name}'."))
+
+
+def _find_skill_dir_with_source(
+    skills_root: Path, name: str,
+) -> tuple[Path, str] | None:
+    """Locate a skill in either the workspace or the bundled root.
+
+    Returns ``(path, source)`` where source is ``"workspace"`` or
+    ``"bundled"``. Workspace wins on collision (same precedence as
+    :func:`discover_skills_with_bundled`). Returns ``None`` if the
+    name doesn't resolve in either root.
+
+    Used by read operations (``view_skill``) so the brain can pull
+    bundled-skill bodies into context. Write operations must
+    continue using :func:`_find_skill_dir` so they fail loud on a
+    bundled name (which is the right error: "this skill is read-only,
+    fork it into the workspace if you want to edit").
+    """
+    ws_dir = _find_skill_dir(skills_root, name)
+    if ws_dir is not None:
+        return (ws_dir, "workspace")
+    bundled_root = bundled_skills_root()
+    if bundled_root is None:
+        return None
+    bundled_dir = _find_skill_dir(bundled_root, name)
+    if bundled_dir is not None:
+        return (bundled_dir, "bundled")
+    return None
+
+
 def view_skill(
     skills_root: Path, name: str, file_path: str | None = None
 ) -> OpResult:
     """Read SKILL.md or a supporting file. Bumps view+use telemetry on
     success. Per the design contract, viewing == using — the agent
-    pulled this into context to act on it."""
+    pulled this into context to act on it.
+
+    Resolves in BOTH the workspace AND the bundled root so the brain
+    can load default skills shipped with vexis. Telemetry is recorded
+    in the workspace's ``.usage.json`` regardless of source — bundled
+    skills are still tracked, just invisible to the workspace's
+    sidecar (we want one place for usage stats, and the workspace
+    is the user's source of truth for everything stateful).
+    """
     name_err = validate_skill_name(name)
     if name_err:
         return OpResult(False, name_err)
-    skill_dir = _find_skill_dir(skills_root, name)
-    if skill_dir is None:
+    found = _find_skill_dir_with_source(skills_root, name)
+    if found is None:
         return OpResult(False, f"No skill named '{name}'.")
+    skill_dir, _source = found
 
     if file_path is None:
         target = skill_dir / "SKILL.md"
@@ -674,9 +935,13 @@ def edit_skill(skills_root: Path, name: str, content: str) -> OpResult:
         return OpResult(
             False, f"frontmatter name must remain '{name}' across edits."
         )
-    skill_dir = _find_skill_dir(skills_root, name)
-    if skill_dir is None:
-        return OpResult(False, f"No skill named '{name}'.")
+    # Routes through the centralised resolver so installed +
+    # bundled skills get the right "this is read-only" error
+    # instead of the misleading "no skill named X."
+    skill_dir, err_result = _resolve_writable_or_error(skills_root, name)
+    if err_result is not None:
+        return err_result
+    assert skill_dir is not None  # _resolve_writable_or_error contract
 
     skill_md = skill_dir / "SKILL.md"
     try:
@@ -764,9 +1029,12 @@ def delete_skill(skills_root: Path, name: str) -> OpResult:
             False,
             f"Skill '{name}' is pinned. Ask the user to /unpin {name} first.",
         )
-    skill_dir = _find_skill_dir(skills_root, name)
-    if skill_dir is None:
-        return OpResult(False, f"No skill named '{name}'.")
+    # Routes through the centralised resolver so installed +
+    # bundled skills get the right read-only error.
+    skill_dir, err_result = _resolve_writable_or_error(skills_root, name)
+    if err_result is not None:
+        return err_result
+    assert skill_dir is not None
     parent = skill_dir.parent
     try:
         shutil.rmtree(skill_dir)

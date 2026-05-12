@@ -119,7 +119,7 @@ DEFAULT_LEARNING_MAX_ENTRIES_PER_SESSION = 2
 # ``docs/goals.md`` for thresholds + how to re-run). Disable via
 # ``goals.enabled: false`` in ``~/.vexis/config.yaml`` to silence
 # the slash command and the post-turn hook without code changes.
-# 20-turn budget mirrors Hermes (`hermes_cli/config.py`) and matches
+# 20-turn budget mirrors the upstream pattern and matches
 # ``core.goal_state.DEFAULT_MAX_TURNS``.
 DEFAULT_GOALS_ENABLED = True
 DEFAULT_GOALS_MAX_TURNS = 20
@@ -416,7 +416,7 @@ def schedules_enabled() -> bool:
 def schedules_tick_interval_seconds() -> int:
     """How often the ScheduleManager wakes to look for due schedules.
 
-    Default 30s, clamped to [5, 600]. 30s halves Hermes' 60s for
+    Default 30s, clamped to [5, 600]. 30s halves the upstream 60s for
     lower worst-case fire latency on a single-user box; costs nothing.
     """
     raw = _section("schedules").get(

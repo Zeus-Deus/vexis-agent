@@ -8,7 +8,7 @@ the list end-to-end.
 A pass on all 12 for both brains is the gate for declaring Phase C
 done. Steps 11 and 12 are non-negotiable: if the recursion guard
 fails on opencode, the curator would loop on its own aux outputs the
-moment learning is enabled (same failure mode as the May 2026 hermes
+moment learning is enabled (same failure mode as the May 2026 upstream
 fanout bug). If a flow is fragile on one brain but solid on the
 other, document the limitation in `docs/brains.md` and decide
 whether to fix or punt per-flow.

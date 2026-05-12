@@ -1,13 +1,13 @@
-"""Hermes-style in-session skill self-authoring guidance.
+"""agent-platform-style in-session skill self-authoring guidance.
 
 These tests pin the invariants that drive the
-``hermes-agent-learning`` feature: every brain's system prompt must
+``in-session skill authoring`` feature: every brain's system prompt must
 carry the authoring nudge ("after a non-trivial task, save a
 skill"; "patch outdated skills on use") regardless of skill count,
 so a brand-new install with zero skills still bootstraps its own
 library on the first real task.
 
-Mirrors the NousResearch/hermes-agent ``SKILLS_GUIDANCE`` injection
+Mirrors the an upstream agent platform ``SKILLS_GUIDANCE`` injection
 in ``agent/prompt_builder.py:179-186``, adapted to vexis's
 ``vexis-skill`` CLI surface and shadow-tree review flow.
 
@@ -38,7 +38,7 @@ from vexis_agent.core.skills import build_skill_authoring_block
 
 # ──────────────────────────────────────────────────────────────────
 # Key phrases the authoring block MUST surface. Drift here is the
-# loudest possible signal that someone gutted the Hermes-style
+# loudest possible signal that someone gutted the agent-platform-style
 # behaviour — they show up in every system prompt the daemon sends,
 # so a deletion regression is one PR review away from shipping to
 # all users.
@@ -52,7 +52,7 @@ _REQUIRED_PHRASES = [
     # The CLI verbs the brain needs to actually act.
     "vexis-skill create",
     "vexis-skill patch",
-    # The "don't wait" imperative — the Hermes phrasing we copied.
+    # The "don't wait" imperative — the canonical phrasing.
     "don't wait to be asked",
     # The shortcut-vs-discovery distinction (the part that drives
     # the JS-eval-beats-clicking outcome from Kyle Jeong's demo).
@@ -268,7 +268,7 @@ def test_capabilities_md_carries_patch_on_use_imperative():
 
 def test_capabilities_md_carries_save_the_shortcut_hint():
     """The shortcut-vs-discovery distinction is the punchline of
-    the Hermes browser demo (102s → 35s, 23 turns → 8 turns). It
+    the upstream browser demo (102s → 35s, 23 turns → 8 turns). It
     must be present in CAPABILITIES.md so even a brain that
     skipped the authoring block on a long-context turn still has
     the rule available when it goes looking."""

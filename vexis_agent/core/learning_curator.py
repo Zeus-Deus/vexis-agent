@@ -2839,7 +2839,7 @@ class LearningController:
         # ----- Tier distribution (audit A2 deferred-fix instrument) -----
         # Aggregate by_tier counts from run.json across the last N
         # ticks. Surfaces "did S1 actually get picked, or is it stuck
-        # at 0?" — the metric the v2-hermes-verification audit named
+        # at 0?" — the metric the v2-verification audit named
         # as the signal for whether the deferred two-pass-review fix
         # is needed. If S1 stays at 0 over a soak week, the LLM is
         # systematically falling back to S2/S3 because it can't see
@@ -2876,7 +2876,7 @@ class LearningController:
                 if s1 == 0 and s_total >= 5:
                     lines.append(
                         f"  ⚠ S1 at 0 across {s_total} procedural writes — "
-                        f"see v2-hermes-verification.md A2 (LLM cannot see "
+                        f"see v2-verification.md A2 (LLM cannot see "
                         f"SKILL.md bodies; consider two-pass review)."
                     )
 
@@ -3021,7 +3021,7 @@ class LearningController:
         no run.json schema change required.
 
         Used by ``_audit_text`` to surface the S1/S2/S3/MEM/USER
-        distribution; specifically named in v2-hermes-verification.md
+        distribution; specifically named in v2-verification.md
         as the metric for whether the deferred A2 fix becomes
         v3 follow-up (S1 stuck at 0 → two-pass-review needed).
         """

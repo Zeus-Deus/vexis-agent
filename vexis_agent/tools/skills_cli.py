@@ -44,6 +44,11 @@ from vexis_agent.core.learning_writes import (
     list_staged_skills,
 )
 from vexis_agent.core.paths import skills_dir, workspace_dir
+from vexis_agent.core.skill_install import (
+    InstallResult,
+    install_skill,
+    uninstall_skill,
+)
 from vexis_agent.core.skills import (
     OpResult,
     archive_skill,
@@ -60,7 +65,13 @@ from vexis_agent.core.skills import (
 )
 
 CURATOR_ENV_VAR = "VEXIS_CURATOR"
-CURATOR_BLOCKED_VERBS: frozenset[str] = frozenset({"delete", "remove-file"})
+# Verbs the curator's spawned process is hard-refused from running.
+# ``install`` + ``uninstall`` join the list because side-loading
+# external content from inside the curator loop is exactly the kind
+# of supply-chain footgun we don't want.
+CURATOR_BLOCKED_VERBS: frozenset[str] = frozenset({
+    "delete", "remove-file", "install", "uninstall",
+})
 
 
 def _is_curator_context() -> bool:
@@ -217,6 +228,34 @@ def _cmd_flip_shadow(only_skill: str | None, dry_run: bool) -> int:
     return 0 if payload["success"] else 1
 
 
+def _cmd_install(source: str, name_override: str | None, overwrite: bool) -> int:
+    """Wire ``install_skill`` to the CLI's JSON-result emission shape.
+
+    Source can be an https/http URL pointing at a SKILL.md, or a
+    local filesystem path to either a SKILL.md file or a directory
+    containing one. ``--name`` overrides the frontmatter name.
+    ``--overwrite`` replaces an existing installed skill of the same
+    name; otherwise re-install fails loud.
+    """
+    result = install_skill(
+        _root(), source,
+        name_override=name_override, overwrite=overwrite,
+    )
+    payload: dict = {"success": result.ok, "message": result.message}
+    if result.name:
+        payload["name"] = result.name
+    if result.path:
+        payload["path"] = str(result.path)
+    if result.provenance:
+        payload["provenance"] = result.provenance.to_dict()
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0 if result.ok else 1
+
+
+def _cmd_uninstall(name: str) -> int:
+    return _emit(uninstall_skill(_root(), name))
+
+
 def _cmd_list_staged() -> int:
     """Inspect the staging tree without flipping. Pairs with
     flip-shadow's --dry-run mode but suitable for separate audit
@@ -326,6 +365,36 @@ def main() -> int:
         help="Inspect the staging tree contents (no live-tree changes)",
     )
 
+    p_install = sub.add_parser(
+        "install",
+        help="Install a skill from a URL or local path "
+             "(drops into <workspace>/skills/installed/<name>/)",
+    )
+    p_install.add_argument(
+        "source",
+        help="https/http URL pointing at a SKILL.md, "
+             "OR a local filesystem path to a SKILL.md or skill dir",
+    )
+    p_install.add_argument(
+        "--name",
+        dest="name_override",
+        default=None,
+        help="Override the frontmatter name (advanced)",
+    )
+    p_install.add_argument(
+        "--overwrite",
+        dest="overwrite",
+        action="store_true",
+        default=False,
+        help="Replace an existing installed skill of the same name",
+    )
+
+    p_uninstall = sub.add_parser(
+        "uninstall",
+        help="Remove a previously-installed skill",
+    )
+    p_uninstall.add_argument("name")
+
     args = parser.parse_args()
 
     if _is_curator_context() and args.cmd in CURATOR_BLOCKED_VERBS:
@@ -372,6 +441,10 @@ def main() -> int:
         return _cmd_flip_shadow(args.flip_skill, args.flip_dry_run)
     if args.cmd == "list-staged":
         return _cmd_list_staged()
+    if args.cmd == "install":
+        return _cmd_install(args.source, args.name_override, args.overwrite)
+    if args.cmd == "uninstall":
+        return _cmd_uninstall(args.name)
     return 2
 
 

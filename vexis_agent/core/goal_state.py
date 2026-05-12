@@ -64,7 +64,7 @@ class TerminalGoalError(Exception):
 # Constants
 # ──────────────────────────────────────────────────────────────────
 
-# Default turn ceiling. Mirrors Hermes (`hermes_cli/goals.py:46`) and
+# Default turn ceiling. Mirrors the upstream pattern and
 # the §3 design. The brain (and judge) consume budget; a runaway loop
 # burns at most this many turns before auto-pausing.
 DEFAULT_MAX_TURNS = 20
@@ -73,15 +73,15 @@ DEFAULT_MAX_TURNS = 20
 # non-JSON prose, or schema-shaped JSON missing the ``done`` key) the
 # manager auto-pauses with a config-pointer message. Transport / spawn
 # / non-zero-exit errors do NOT count toward this — those are transient
-# and fail-open silently. Mirrors Hermes
-# (``hermes_cli/goals.py:DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES``); the
+# and fail-open silently. Mirrors the upstream pattern
+# (`the upstream pattern`); the
 # guard exists because a misconfigured ``goal_judge`` tier (small/tiny,
 # or a model that doesn't follow strict JSON) would otherwise burn the
 # whole 20-turn budget producing identical "judge reply was not JSON"
 # log lines before the budget backstop fires.
 DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 
-# Allowed status enum. Mirrors Hermes ``GoalState.status``.
+# Allowed status enum. Mirrors the upstream pattern ``GoalState.status``.
 _VALID_STATUSES: frozenset[str] = frozenset({
     "active", "paused", "done", "cleared",
 })
@@ -377,7 +377,7 @@ class GoalStateStore:
     def clear(self, session_uuid: str) -> None:
         """Mark a session's goal as cleared. Does NOT delete the row.
 
-        Mirrors Hermes (`hermes_cli/goals.py:198-204`) — keep cleared
+        Mirrors the upstream pattern — keep cleared
         records around for audit. A future Day 4+ sweep can drop very
         old cleared records.
         """

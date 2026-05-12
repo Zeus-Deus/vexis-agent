@@ -2,7 +2,7 @@
 
 A schedule is a user-defined cron / interval / one-shot job whose
 prompt fires into the chat FIFO when due. State persists at
-``~/.vexis/schedules.json`` keyed by 12-char id, mirroring Hermes
+``~/.vexis/schedules.json`` keyed by 12-char id, mirroring upstream
 (`cron/jobs.py:43-65, 401-447`) on storage shape and
 :class:`core.goal_state.GoalStateStore` on locking semantics.
 
@@ -129,7 +129,7 @@ def _parse_iso(value: Any) -> datetime | None:
 
 
 def new_schedule_id() -> str:
-    """Generate a fresh 12-char hex id. Mirrors Hermes' uuid4().hex[:12]."""
+    """Generate a fresh 12-char hex id. Mirrors the upstream pattern uuid4().hex[:12]."""
     return uuid.uuid4().hex[:12]
 
 
@@ -140,9 +140,9 @@ def new_schedule_id() -> str:
 
 @dataclass
 class ScheduleState:
-    """One scheduled job. Mirror of Hermes ``jobs.json`` row, slimmed.
+    """One scheduled job. Mirror of upstream ``jobs.json`` row, slimmed.
 
-    Hermes fields we DROPPED (out of scope for v1):
+    upstream fields we DROPPED (out of scope for v1):
       * ``skills`` / ``model`` / ``provider`` / ``base_url`` — vexis is
         single-brain per daemon; per-schedule model override deferred.
       * ``script`` / ``no_agent`` / ``context_from`` / ``enabled_toolsets``
@@ -150,7 +150,7 @@ class ScheduleState:
         the existing chat.
       * ``deliver`` — vexis has one delivery target (the chat), so the
         field is implicit.
-      * ``repeat`` — Hermes' "fire N times then stop" is one-shot's
+      * ``repeat`` — the upstream "fire N times then stop" is one-shot's
         natural fall-out plus recurring's natural infinite; the in-
         between case isn't worth the dataclass field for v1.
 

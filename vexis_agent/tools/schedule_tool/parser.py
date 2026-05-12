@@ -1,13 +1,13 @@
 """Schedule expression parser — brain-tool-internal, never user-facing.
 
-Ports Hermes' ``cron/jobs.py:parse_schedule`` (`cron/jobs.py:124-270`) and
+Ports the upstream ``cron/jobs.py:parse_schedule`` (`cron/jobs.py:124-270`) and
 ``compute_next_run`` (`:351-394`) into a vexis-shaped module. The
 slash command does NOT import this — the slash command dispatches
 the user's raw text into the brain FIFO and lets the brain decide
 what cron expression to call ``schedule_create`` with. This parser
 validates what the *brain* produces; it never sees raw user text.
 
-Four accepted input shapes (mirroring Hermes):
+Four accepted input shapes (mirroring upstream):
 
   * ``30m`` / ``2h`` / ``1d`` → one-shot from now
   * ``every 30m`` / ``every 2h`` → recurring interval
@@ -43,12 +43,12 @@ log = logging.getLogger(__name__)
 # Constants
 # ──────────────────────────────────────────────────────────────────
 
-# Match Hermes (`cron/jobs.py:46`) — one-shot jobs scheduled more than
+# Match upstream (`cron/jobs.py:46`) — one-shot jobs scheduled more than
 # 2 minutes ago at first-tick time fast-forward / expire rather than
 # fire. Anything within 2 minutes still fires once.
 DEFAULT_ONESHOT_GRACE_SECONDS = 120
 
-# Mirror Hermes (`cron/jobs.py:326-327`). Grace window is
+# Mirror upstream (`cron/jobs.py:326-327`). Grace window is
 # ``min(max(period/2, 120), 7200)`` — half the schedule period clamped
 # to [2 min, 2 hr]. Daily jobs missed by ≤2 hours catch up; very
 # frequent jobs fast-forward quickly.
@@ -343,7 +343,7 @@ def compute_next_fire(
 
     ``schedule`` is the dict produced by :func:`parse_schedule`.
     ``last_fire_at`` is the last fire time, used to anchor recurring
-    schedules across restarts (mirrors Hermes `cron/jobs.py:383-389`).
+    schedules across restarts (standard cron-job-id pattern).
 
     Returns ``None`` for:
       * One-shot schedules that have already fired.
@@ -419,11 +419,11 @@ def compute_next_fire(
 def compute_grace_seconds(schedule: dict[str, Any]) -> int:
     """How late a schedule can be and still catch up vs. fast-forward.
 
-    Mirrors Hermes (`cron/jobs.py:319-348`). Returns
+    Mirrors the upstream pattern (`cron/jobs.py:319-348`). Returns
     ``min(max(period/2, MIN_GRACE_SECONDS), MAX_GRACE_SECONDS)``.
 
     One-shot schedules get :data:`DEFAULT_ONESHOT_GRACE_SECONDS`
-    regardless of period (Hermes' rule).
+    regardless of period (the upstream rule).
     """
     kind = schedule.get("kind")
 

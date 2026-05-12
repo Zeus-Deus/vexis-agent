@@ -216,6 +216,7 @@ def _is_curator_owned(jsonl_path: Path) -> bool:
     """
     from vexis_agent.core.learning_review import CURATOR_REVIEW_PROMPT_PREFIX
     from vexis_agent.core.goal_judge import GOAL_JUDGE_PROMPT_PREFIX
+    from vexis_agent.core.kanban.constants import KANBAN_WORKER_PREFIX
 
     for msg in iter_messages(jsonl_path):
         if msg.role != "user":
@@ -224,6 +225,7 @@ def _is_curator_owned(jsonl_path: Path) -> bool:
         return (
             text.startswith(CURATOR_REVIEW_PROMPT_PREFIX)
             or text.startswith(GOAL_JUDGE_PROMPT_PREFIX)
+            or text.startswith(KANBAN_WORKER_PREFIX)
         )
     return False
 

@@ -7,7 +7,7 @@ queue (`core.running_tasks.RunningTasks.enqueue`) with
 ``origin="scheduled_fire"`` so the brain processes them like any
 other user message — same prompt cache, same post-turn hooks.
 
-At-most-once execution guarantee (mirrors Hermes
+At-most-once execution guarantee (mirrors the upstream pattern
 `cron/scheduler.py:1476-1477` and the openclaw ``runningAtMs``
 pattern): :meth:`_fire_one` advances ``next_fire_at`` to the next
 future slot **before** calling enqueue. A crash between advance and
@@ -404,7 +404,7 @@ class ScheduleManager:
         the schedule looks healthy.
 
         Returns the number of markers cleared. Does NOT recompute
-        next_fire_at — the missed fire is genuinely missed (Hermes'
+        next_fire_at — the missed fire is genuinely missed (the upstream
         rule).
         """
         if now is None:

@@ -82,7 +82,7 @@ def test_set_rejects_empty_text(store: GoalStateStore) -> None:
 
 def test_set_rejects_when_already_active(store: GoalStateStore) -> None:
     """A goal already active or paused for the session blocks a new
-    /goal <text>. Hermes' equivalent rejects via the slash handler;
+    /goal <text>. the upstream equivalent rejects via the slash handler;
     we surface a typed exception so the transport renders the right
     string."""
     mgr = _mgr(store)
@@ -174,7 +174,7 @@ def test_mark_done_writes_status(store: GoalStateStore) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────
-# Persistence across managers (Hermes' load-bearing invariant)
+# Persistence across managers (the upstream load-bearing invariant)
 # ──────────────────────────────────────────────────────────────────
 
 
@@ -597,7 +597,7 @@ def test_continuation_prompt_starts_with_verbatim_prefix(
 # any model that doesn't follow strict JSON) used to burn the entire
 # 20-turn budget producing identical "judge reply was not JSON" log
 # lines before the budget backstop fired. The guard ported here from
-# Hermes (``hermes_cli/goals.py:DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES``)
+# upstream (`the upstream pattern`)
 # auto-pauses after 3 consecutive parse failures with a config-pointer
 # message. Tests below pin:
 #
@@ -639,7 +639,7 @@ def test_evaluate_auto_pauses_after_three_parse_failures(
     paused with a config-pointer message; no continuation is enqueued.
 
     Pins the exact threshold matching
-    ``DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES`` (=3). Mirrors hermes'
+    ``DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES`` (=3). Mirrors upstream'
     `test_auto_pause_after_three_consecutive_parse_failures`."""
     from vexis_agent.core.goal_state import DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES
 
@@ -801,7 +801,7 @@ def test_resume_does_not_reset_parse_failure_counter(
     store: GoalStateStore,
 ) -> None:
     """``/goal resume`` resets ``turns_used`` to 0 but does NOT reset
-    ``consecutive_parse_failures``. Matches hermes' intentional
+    ``consecutive_parse_failures``. Matches upstream' intentional
     choice: if the user resumes without actually fixing the
     ``goal_judge`` config, the very first post-resume parse failure
     (counter going from 3 → 4 → still ≥ threshold) re-pauses

@@ -9,6 +9,7 @@ import { BrowserPage } from "./pages/BrowserPage";
 import { LearningPage } from "./pages/LearningPage";
 import { TailscalePage } from "./pages/TailscalePage";
 import { GoalsPage } from "./pages/GoalsPage";
+import { KanbanPage } from "./pages/KanbanPage";
 import { SchedulesPage } from "./pages/SchedulesPage";
 import { ModelsPage } from "./pages/ModelsPage";
 import { ChatPage } from "./pages/ChatPage";
@@ -23,6 +24,7 @@ type TabId =
   | "browser"
   | "learning"
   | "goals"
+  | "kanban"
   | "schedules"
   | "models"
   | "voice"
@@ -40,6 +42,7 @@ const TABS: TabDef[] = [
   { id: "browser", label: "Browser", glyph: "◐" },
   { id: "learning", label: "Learning", glyph: "▲" },
   { id: "goals", label: "Goals", glyph: "⊙" },
+  { id: "kanban", label: "Kanban", glyph: "▦" },
   { id: "schedules", label: "Schedules", glyph: "◷" },
   { id: "models", label: "Models", glyph: "⊕" },
   { id: "voice", label: "Voice", glyph: "◉" },
@@ -55,6 +58,7 @@ const HASH_TO_TAB: Record<string, TabId> = {
   "#browser": "browser",
   "#learning": "learning",
   "#goals": "goals",
+  "#kanban": "kanban",
   "#schedules": "schedules",
   "#models": "models",
   "#voice": "voice",
@@ -146,6 +150,9 @@ export function App() {
         )}
         {tab === "goals" && (
           <GoalsPage token={token} onAuthFail={handleAuthFail} />
+        )}
+        {tab === "kanban" && (
+          <KanbanPage token={token} onAuthFail={handleAuthFail} />
         )}
         {tab === "schedules" && (
           <SchedulesPage token={token} onAuthFail={handleAuthFail} />

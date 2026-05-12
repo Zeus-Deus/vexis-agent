@@ -132,7 +132,12 @@ def test_index_block_lists_active_skills(tmp_path: Path):
     assert "- second:" in block
 
 
-def test_index_empty_when_no_skills(tmp_path: Path):
+def test_index_empty_when_no_skills(tmp_path: Path, monkeypatch):
+    """Index is empty only when BOTH the workspace AND the bundled root
+    have no skills. Point ``$VEXIS_BUNDLED_SKILLS`` at an empty dir so
+    the always-present in-package bundled skills (kanban-orchestrator
+    etc) don't leak into this test."""
+    monkeypatch.setenv("VEXIS_BUNDLED_SKILLS", str(tmp_path / "no-bundled"))
     assert build_skills_index_block(tmp_path) == ""
 
 

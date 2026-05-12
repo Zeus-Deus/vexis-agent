@@ -11,7 +11,7 @@ default suite skips this file entirely (see ``pyproject.toml``
   b. Clear-continue — partial deliverable, judge MUST return continue.
   c. Unachievable→done — refusal-worthy goal, brain explains why
      it can't proceed; judge MUST return done with the block as
-     the reason (Hermes' system-prompt rule explicitly maps
+     the reason (the upstream system-prompt rule explicitly maps
      unachievable / blocked / needs-user-input → DONE).
   d. Ambiguous→continue (advisory) — partially satisfied; expected
      verdict is continue but ambiguity is real, so we LOG the

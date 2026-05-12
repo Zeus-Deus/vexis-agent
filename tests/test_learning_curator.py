@@ -1149,7 +1149,7 @@ def test_audit_text_surfaces_recent_dedup_count(env, monkeypatch):
 #
 # /learning audit aggregates by_tier counts from run.json across the
 # last N ticks so we can see "did S1 actually get picked or stay at
-# 0?" — the metric the v2-hermes-verification audit named as the
+# 0?" — the metric the v2-verification audit named as the
 # trigger for deferring A2 (LLM cannot read SKILL.md bodies → S1
 # patches systematically lose to S2/S3 fallback).
 # --------------------------------------------------------------------
@@ -1247,7 +1247,7 @@ def test_audit_text_flags_s1_zero_when_procedural_volume_is_high(env, monkeypatc
     )._audit_text()
     assert "S1 at 0" in audit
     assert "two-pass review" in audit
-    assert "v2-hermes-verification" in audit
+    assert "v2-verification" in audit
 
 
 def test_audit_text_does_not_flag_s1_zero_when_volume_is_low(env, monkeypatch):

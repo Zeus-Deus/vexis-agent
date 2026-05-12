@@ -7,7 +7,7 @@ decides whether the goal is done; if not, Vexis enqueues a
 continuation prompt and keeps going until it is, you pause it, or
 the turn budget runs out.
 
-This is the "Ralph loop" port from Hermes / Codex CLI 0.128.0,
+This is the "Ralph loop" port from the upstream / Codex CLI 0.128.0,
 adapted to Vexis's Telegram + `claude -p` shape.
 
 ## Commands
@@ -23,7 +23,7 @@ adapted to Vexis's Telegram + `claude -p` shape.
 Quick examples:
 
 ```
-/goal port the goal command from Hermes to Vexis
+/goal port the goal command to Vexis
 /goal status
 /goal pause
 /goal resume
@@ -35,7 +35,7 @@ Quick examples:
 When Vexis sets a goal:
 
 ```
-⊙ Goal set (20-turn budget): port the goal command from Hermes to Vexis
+⊙ Goal set (20-turn budget): port the goal command to Vexis
 I'll keep working until the goal is done, you pause/clear it, or the
 budget is exhausted.
 Controls: /goal status · /goal pause · /goal resume · /goal clear
@@ -54,7 +54,7 @@ Then the brain runs, replies, the judge fires, and either:
 
 ```
 Working for 14s. used Bash; 1 tool used.
-⊙ Goal (3/20 turns): port the goal command from Hermes to Vexis
+⊙ Goal (3/20 turns): port the goal command to Vexis
 ```
 
 ## Pause vs. cancel — what the difference means
