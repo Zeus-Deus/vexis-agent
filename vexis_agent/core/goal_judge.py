@@ -54,10 +54,10 @@ log = logging.getLogger(__name__)
 
 # Hard wall on a single judge call. Sonnet typically returns in a
 # few seconds for a ~6 KB prompt; 30 s is comfortable headroom.
-# Mirrors Hermes' `goals.py:DEFAULT_JUDGE_TIMEOUT = 30.0`.
+# Matches the typical ``DEFAULT_JUDGE_TIMEOUT = 30.0`` upstream value.
 GOAL_JUDGE_TIMEOUT_SECONDS = 30
 
-# Truncation caps from Hermes (`goals.py:48-49,304-307`). The goal is
+# Truncation caps from upstream (`goals.py:48-49,304-307`). The goal is
 # usually a short sentence; the assistant response can be arbitrarily
 # long, so we trim it before sending to the judge.
 _GOAL_MAX_CHARS = 2_000

@@ -10,7 +10,7 @@ covers the REST + WS contract programmatically. This harness gives
 the human (or codemux browser) a populated board to interact with.
 
 Usage:
-    cd /home/zeus/.codemux/worktrees/vexis-agent/research-hermes-kanban
+    cd /home/zeus/.codemux/worktrees/vexis-agent/research-upstream-kanban
     /home/zeus/miniconda3/envs/vexis-agent_env/bin/python scripts/e2e_kanban_dashboard.py
 """
 

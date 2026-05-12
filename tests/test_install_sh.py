@@ -198,7 +198,7 @@ def test_install_sh_help_documents_skip_setup() -> None:
 
 def test_install_sh_dry_run_includes_banner_and_section_headers(tmp_path) -> None:
     """Banner + section markers should render in --dry-run mode so
-    the user sees what hermes-style installers do."""
+    the user sees what agent-platform-style installers do."""
     env = _empty_path_env(tmp_path)
     result = subprocess.run(
         ["bash", str(INSTALL_SH), "--dry-run"],

@@ -30,7 +30,7 @@ done**. `ready → in_progress` happens when the dispatcher claims a
 task and starts a worker run. Workers flip `in_progress → done` by
 calling `kanban_complete`, or `→ blocked` by calling `kanban_block`.
 
-**Lane.** vexis's lightweight replacement for Hermes profiles. A
+**Lane.** vexis's lightweight replacement for upstream profiles. A
 lane is `(system_prompt_slice, skills, tier_override)` — same brain,
 different hat. Defaults bundled in code: `research`,
 `implementation`, `review`, `ops`, `triage`, `default`. Override

@@ -7,7 +7,7 @@ if any check fails, the task is bounced back to the agent's queue
 with the failure summary as the next-turn observation, so the
 loop can iterate.
 
-This is the analogue of Hermes's ``compute_reward()`` hook in
+This is the analogue of the upstream's ``compute_reward()`` hook in
 ``environments/tool_context.py``, adapted to Vexis's per-task
 sandbox pattern.
 """

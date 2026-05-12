@@ -25,7 +25,7 @@ Threat scanning runs on every ``add`` and the new content of every
 ``replace``. Memory entries land in the system prompt of every future
 session — a single injection payload that lands here is permanent.
 The pattern list is small and biased toward jailbreak phrases, lifted
-verbatim from Hermes (12 regex + invisible-unicode guard).
+verbatim from upstream (12 regex + invisible-unicode guard).
 
 Frozen-snapshot pattern (in core/brain/claude_code.py):
 At session start the brain captures ``format_for_system_prompt(...)``
@@ -63,7 +63,7 @@ _SEPARATOR = "═" * 46
 # delimiter, easy to grep, survives copy-paste.
 ENTRY_DELIMITER = "\n§\n"
 
-# 12 patterns lifted from Hermes verbatim (see /tmp/hermes-research-v2.md
+# 12 patterns lifted from upstream verbatim (see /tmp/upstream-research-v2.md
 # Part A2e). These catch low-effort jailbreak / exfil payloads in
 # memory writes. High-effort attacks should be defended elsewhere; this
 # is cheap insurance against the most common failure mode.
@@ -319,7 +319,7 @@ class MemoryStore:
         with self._lock_for(target):
             entries = _read_entries(self._path(target))
             if content in entries:
-                # Hermes pattern: success, not error. Model sees "yes
+                # upstream pattern: success, not error. Model sees "yes
                 # that's saved" and moves on — duplicates are a no-op,
                 # not a programming error.
                 return MemorySuccess(

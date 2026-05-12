@@ -6,10 +6,10 @@ clear / mark_done / evaluate_after_turn / next_continuation_prompt.
 Persistence flows through :class:`core.goal_state.GoalStateStore`;
 the auxiliary judge call is :func:`core.goal_judge.judge_goal`.
 
-Mirrors Hermes' ``hermes_cli/goals.py:340-523`` 1:1 with two adaptations:
+Mirrors upstream goal-loop prior-art 1:1 with two adaptations:
 
   * Persistence is `GoalStateStore` (single-file fcntl + atomic
-    rename) instead of Hermes' ``SessionDB.state_meta`` SQLite table.
+    rename) instead of the upstream ``SessionDB.state_meta`` SQLite table.
   * The judge is a `claude -p` subprocess call (Vexis' aux model
     pattern) instead of an OpenAI-compatible client.
 
@@ -24,7 +24,7 @@ Design invariants (from `.plans/goal-command-research.md`):
     proper error message rather than a silent no-op.
   * `evaluate_after_turn` increments ``turns_used`` BEFORE asking the
     judge — both real user turns and goal continuations consume
-    budget (matches Hermes; documented in §1 of the research doc as
+    budget (matches upstream; documented in §1 of the research doc as
     a surprise worth flagging).
   * The verdict ``"skipped"`` is folded into the continue branch
     (turn IS counted, continuation IS enqueued). The brain turn that
@@ -63,8 +63,8 @@ log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────
-# Continuation prompt template — verbatim from Hermes
-# (`hermes_cli/goals.py:52-58`) per `.plans/goal-command-research.md` §3.
+# Continuation prompt template — verbatim from upstream
+# per `.plans/goal-command-research.md` §3.
 # ──────────────────────────────────────────────────────────────────
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -76,7 +76,7 @@ CONTINUATION_PROMPT_TEMPLATE = (
 )
 
 
-# Status-line glyphs lifted from Hermes — the actual user-facing
+# Status-line glyphs lifted from upstream — the actual user-facing
 # strings live in :meth:`GoalManager.status_line` so a future skin
 # (ASCII-only deployments) can rewrite them without touching the
 # state machine.
@@ -252,7 +252,7 @@ class GoalManager:
 
         The reset is deliberate — without it, a goal paused at the
         budget ceiling would re-pause after a single turn on resume
-        (Hermes does the same; `.plans/goal-command-research.md` §4
+        (upstream does the same; `.plans/goal-command-research.md` §4
         adopts the behaviour). No-op when no goal is set.
 
         Same reload-under-lock contract as :meth:`pause`: raises
@@ -351,8 +351,8 @@ class GoalManager:
 
         # Count the brain turn that just finished — this is what
         # consumed budget, regardless of whether the judge says done
-        # or continue or skipped (defensive). Mirrors Hermes
-        # (`hermes_cli/goals.py:472-474`).
+        # or continue or skipped (defensive). Mirrors the upstream pattern
+        #.
         state.turns_used += 1
         state.last_turn_at = datetime.now(timezone.utc)
 
@@ -369,8 +369,8 @@ class GoalManager:
         # Track consecutive judge parse failures. Reset on any usable
         # reply, including transport / spawn errors (parse_failed=False)
         # so a flaky brain doesn't trip the auto-pause meant for bad
-        # judge models. Mirrors Hermes
-        # (`hermes_cli/goals.py:493-505`). The reset happens before the
+        # judge models. Mirrors the upstream pattern
+        #. The reset happens before the
         # done branch so a "done" verdict that follows a stretch of
         # parse failures doesn't leave a stale counter on the row.
         if parse_failed:

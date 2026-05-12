@@ -1,13 +1,13 @@
 """Kanban storage layer — SQLite WAL, single-user.
 
-Adapted from Hermes' ``hermes_cli/kanban_db.py`` with the following
+Adapted from upstream prior-art with the following
 trims (per ``.plans/kanban-research.md`` §3):
 
   * Drop ``tenant`` (single-user; multi-tenant was the only justification).
   * Drop ``idempotency_key`` and its index (no external dedup need yet).
   * Drop ``kanban_notify_subs`` table (single Telegram chat; notification
     policy is in-process — see ``notifier.py``).
-  * Drop ``workflow_template_id`` / ``current_step_key`` (Hermes v2 stubs,
+  * Drop ``workflow_template_id`` / ``current_step_key`` (upstream v2 stubs,
     unused even there).
   * Rename ``assignee`` → ``lane`` (matches our terminology).
   * Drop ``profile`` from ``task_runs`` (single-brain; lane is the worker
@@ -434,7 +434,7 @@ def _now() -> int:
 def _new_task_id() -> str:
     """Short slug task id. UUID4 first 8 chars is plenty for a
     single-user board (collision probability ≈ 1 in 4 billion at
-    100 tasks). Hermes uses full UUIDs but they're awful to type
+    100 tasks). upstream uses full UUIDs but they're awful to type
     in Telegram (``/kanban show <id>``) so we trade collision
     risk for typability.
     """

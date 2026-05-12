@@ -254,7 +254,7 @@ def build_system_prompt(workspace: Path) -> str:
     if capabilities:
         parts.append(capabilities)
 
-    # Hermes-style in-session skill self-authoring guidance. Injected
+    # agent-platform-style in-session skill self-authoring guidance. Injected
     # AFTER capabilities and BEFORE memory/user/relationships so it
     # sits with the other "how to work" rules. Always non-empty —
     # exists specifically to drive bootstrap from zero skills, where

@@ -14,7 +14,8 @@ on first paint.
 Reuses existing primitives directly:
   * ``MemoryStore``     for memory entries + budget rendering
   * ``PinStore``        for skill pin state
-  * ``discover_skills`` / ``list_active_reports`` / ``archived_skill_names``
+  * ``discover_skills_with_bundled`` / ``list_active_reports`` /
+    ``archived_skill_names``
   * ``UsageStore``      for per-skill telemetry
   * ``CuratorController.run_now()`` for force-run (shares the busy lock)
   * ``BackgroundTasks.status_summary()`` for the status page
@@ -66,7 +67,8 @@ from vexis_agent.core.skills import (
     PinStore,
     UsageStore,
     archived_skill_names,
-    discover_skills,
+    discover_skills_with_bundled,
+    bundled_skills_root,
     iter_skill_dirs,
     parse_skill_md,
     restore_skill,
@@ -2054,44 +2056,73 @@ class WebDashboard:
         pinned = set(PinStore(root).list())
         usage = UsageStore(root).load()
 
-        # Build a name→relative-category lookup so the dashboard can show
-        # which folder a skill lives in. discover_skills() throws away the
-        # category since the brain index doesn't need it; we want it.
+        # Build name → category lookup across BOTH the workspace and
+        # bundled roots so the dashboard can render the folder and tag
+        # the source. discover_skills_with_bundled() returns merged
+        # metas (workspace wins on collision); we walk each root
+        # independently here to keep category resolution accurate
+        # regardless of which root the skill came from.
         category_for: dict[str, str] = {}
         path_for: dict[str, str] = {}
-        for skill_dir in iter_skill_dirs(root):
-            try:
-                content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
-            except OSError:
+        bundled_root = bundled_skills_root()
+        for source_root in (root, bundled_root):
+            if source_root is None:
                 continue
-            meta = parse_skill_md(content)
-            if meta is None:
-                continue
-            try:
-                rel = skill_dir.relative_to(root).parts
-            except ValueError:
-                rel = ()
-            category_for[meta.name] = "/".join(rel[:-1]) if len(rel) > 1 else ""
-            path_for[meta.name] = str(skill_dir)
+            for skill_dir in iter_skill_dirs(source_root):
+                try:
+                    content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                meta = parse_skill_md(content)
+                if meta is None:
+                    continue
+                # Workspace was iterated first — only fill in if the
+                # name hasn't been claimed yet so workspace category /
+                # path wins on collision.
+                if meta.name in category_for:
+                    continue
+                try:
+                    rel = skill_dir.relative_to(source_root).parts
+                except ValueError:
+                    rel = ()
+                category_for[meta.name] = "/".join(rel[:-1]) if len(rel) > 1 else ""
+                path_for[meta.name] = str(skill_dir)
+
+        # Lazy import to keep web_server importable without the
+        # install layer (some test fixtures don't construct it).
+        from vexis_agent.core.skill_install import load_provenance
 
         active: list[dict] = []
-        for meta in discover_skills(root):
+        for meta in discover_skills_with_bundled(root):
             rec = usage.get(meta.name) or {}
-            active.append(
-                {
-                    "name": meta.name,
-                    "description": meta.description,
-                    "category": category_for.get(meta.name, ""),
-                    "state": rec.get("state") or "active",
-                    "view_count": int(rec.get("view_count") or 0),
-                    "use_count": int(rec.get("use_count") or 0),
-                    "patch_count": int(rec.get("patch_count") or 0),
-                    "last_used_at": rec.get("last_used_at"),
-                    "created_at": rec.get("created_at"),
-                    "pinned": meta.name in pinned,
-                    "path": path_for.get(meta.name, ""),
-                }
+            # Both bundled AND installed skills are auto-pinned in
+            # the UX sense (curator + CLI refuse mutations); flag
+            # them on the wire so the dashboard renders the right
+            # badge + suppresses Pin/Unpin.
+            is_protected = (
+                meta.source == "bundled" or meta.source == "installed"
             )
+            row: dict = {
+                "name": meta.name,
+                "description": meta.description,
+                "category": category_for.get(meta.name, ""),
+                "state": rec.get("state") or "active",
+                "view_count": int(rec.get("view_count") or 0),
+                "use_count": int(rec.get("use_count") or 0),
+                "patch_count": int(rec.get("patch_count") or 0),
+                "last_used_at": rec.get("last_used_at"),
+                "created_at": rec.get("created_at"),
+                "pinned": meta.name in pinned or is_protected,
+                "source": meta.source,
+                "path": path_for.get(meta.name, ""),
+            }
+            # Include provenance for installed skills so the dashboard
+            # can render the source URL chip.
+            if meta.source == "installed" and meta.source_path is not None:
+                prov = load_provenance(meta.source_path)
+                if prov is not None:
+                    row["provenance"] = prov.to_dict()
+            active.append(row)
 
         archived: list[dict] = []
         for name in archived_skill_names(root):
@@ -2107,27 +2138,37 @@ class WebDashboard:
         return {"active": active, "archived": archived}
 
     def _skill_body(self, name: str) -> dict | None:
+        # Look in BOTH roots so the dashboard can render bundled-skill
+        # bodies when the user clicks one. Workspace wins on collision.
         root = skills_dir(self._workspace)
-        for skill_dir in iter_skill_dirs(root):
-            try:
-                content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
-            except OSError:
+        bundled_root = bundled_skills_root()
+        for source, source_root in (
+            ("workspace", root),
+            ("bundled", bundled_root),
+        ):
+            if source_root is None:
                 continue
-            meta = parse_skill_md(content)
-            if meta is None or meta.name != name:
-                continue
-            try:
-                rel = skill_dir.relative_to(root).parts
-            except ValueError:
-                rel = ()
-            return {
-                "name": meta.name,
-                "description": meta.description,
-                "category": "/".join(rel[:-1]) if len(rel) > 1 else "",
-                "body": meta.body,
-                "path": str(skill_dir / "SKILL.md"),
-                "frontmatter": meta.raw_frontmatter,
-            }
+            for skill_dir in iter_skill_dirs(source_root):
+                try:
+                    content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                meta = parse_skill_md(content, source=source)
+                if meta is None or meta.name != name:
+                    continue
+                try:
+                    rel = skill_dir.relative_to(source_root).parts
+                except ValueError:
+                    rel = ()
+                return {
+                    "name": meta.name,
+                    "description": meta.description,
+                    "category": "/".join(rel[:-1]) if len(rel) > 1 else "",
+                    "body": meta.body,
+                    "path": str(skill_dir / "SKILL.md"),
+                    "frontmatter": meta.raw_frontmatter,
+                    "source": source,
+                }
         return None
 
     def _curator_payload(self) -> dict:

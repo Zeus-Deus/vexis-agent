@@ -281,7 +281,7 @@ def _build_system_prompt_for_workspace(workspace: Path) -> str:
     if capabilities:
         parts.append(capabilities)
 
-    # Hermes-style skill self-authoring guidance — same call site
+    # agent-platform-style skill self-authoring guidance — same call site
     # claude-code uses. opencode emits its own ``<available_skills>``
     # block downstream, so we still need this authoring block here:
     # opencode's auto-discovery only tells the brain WHICH skills

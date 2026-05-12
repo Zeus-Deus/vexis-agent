@@ -73,16 +73,22 @@ include = ["vexis_agent*"]
 exclude = ["tests*", "scripts*", ".plans*", "docs*", "web*"]
 
 [tool.setuptools.package-data]
-# Bundle the built dashboard frontend (web/dist/ → vexis_agent/web_dist/
-# at release time) into the wheel so pipx-installed users get a
-# working dashboard out of the box. Without this, the daemon's
-# /dashboard route 404s with "frontend not built" because pyproject's
-# packages.find excludes the top-level web/ directory and `web/dist/`
-# is gitignored anyway. The resolver in main._resolve_web_dist falls
-# back to <repo>/web/dist for editable / source-checkout installs.
-#
-# Includes the wasm + onnx assets (silero VAD, onnxruntime) which
-# are large but the dashboard's voice-call mode genuinely needs them.
+# Patterns shipped under vexis_agent/* in the wheel. Two notable
+# bundles:
+#   * web_dist/  — built dashboard frontend (npm run build output);
+#     gitignored as web/dist, copied to vexis_agent/web_dist/ at
+#     release time. main._resolve_web_dist falls back to
+#     <repo>/web/dist for editable / source-checkout installs.
+#     Includes the wasm + onnx assets (silero VAD, onnxruntime)
+#     which are large but the dashboard's voice-call mode genuinely
+#     needs them.
+#   * _bundled_skills/  — SKILL.md files vexis ships with so a
+#     fresh install has the kanban orchestrator + worker playbooks,
+#     etc. Discovered at runtime via core.skills.bundled_skills_root()
+#     and merged into the brain's <available_skills> index alongside
+#     user/curator-authored skills under <workspace>/skills/. The
+#     resolver also accepts $VEXIS_BUNDLED_SKILLS for distro packagers
+#     that relocate the data dir.
 vexis_agent = [
     "**/*.yaml",
     "**/*.json",
@@ -91,6 +97,8 @@ vexis_agent = [
     "web_dist/assets/*",
     "web_dist/ort/*",
     "web_dist/vad/*",
+    "_bundled_skills/**/*.md",
+    "_bundled_skills/**/*.json",
 ]
 
 [tool.pytest.ini_options]

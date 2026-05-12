@@ -76,10 +76,16 @@ def _auth_headers() -> dict:
 # ──────────────────────────────────────────────────────────────────
 
 
-def test_skills_endpoint_empty_workspace(client: TestClient):
-    """Fresh install: zero skills. Endpoint must 200 with empty
-    arrays, not 500 or 404 — the dashboard must render the "no
-    skills yet" empty state, which means the API has to succeed."""
+def test_skills_endpoint_empty_workspace(client: TestClient, monkeypatch, tmp_path):
+    """Fresh install with zero workspace skills AND no bundled root.
+    Endpoint must 200 with empty arrays, not 500 or 404 — the
+    dashboard must render the "no skills yet" empty state, which
+    means the API has to succeed.
+
+    Point ``$VEXIS_BUNDLED_SKILLS`` at an empty dir so the always-
+    present in-package bundled skills (kanban-orchestrator etc) don't
+    leak into this fresh-install assertion."""
+    monkeypatch.setenv("VEXIS_BUNDLED_SKILLS", str(tmp_path / "no-bundled"))
     r = client.get("/api/v1/skills", headers=_auth_headers())
     assert r.status_code == 200
     body = r.json()
@@ -101,7 +107,7 @@ def test_skills_endpoint_surfaces_a_brain_created_skill(
     ``create_skill``), and the new skill appears on the dashboard's
     Skills tab the user is staring at.
 
-    This is the contract the Hermes tweet describes: agent saves
+    This is the contract the upstream design describes: agent saves
     a workflow → workflow is reusable next time. We don't run a
     full session here, just simulate the brain's CLI call and
     confirm the API picks it up.

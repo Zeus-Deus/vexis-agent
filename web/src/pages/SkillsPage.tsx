@@ -222,7 +222,12 @@ function SkillRow({
             {skill.name}
           </span>
           <StateBadge state={skill.state} />
-          {skill.pinned && (
+          {skill.source === "bundled" && (
+            <Badge tone="accent" glyph="◇">
+              bundled
+            </Badge>
+          )}
+          {skill.pinned && skill.source !== "bundled" && (
             <Badge tone="accent" glyph="◉">
               pinned
             </Badge>
@@ -247,17 +252,34 @@ function SkillRow({
       {expanded && (
         <div className="border-t border-[var(--color-border)] bg-[var(--color-base)]/40">
           <div className="px-4 py-3 flex items-center gap-2 border-b border-[var(--color-border)]">
-            <Button
-              size="sm"
-              variant={skill.pinned ? "ghost" : "primary"}
-              onClick={(e) => {
-                e.stopPropagation();
-                onPinToggle();
-              }}
-              loading={pending === "pin"}
-            >
-              {skill.pinned ? "Unpin" : "Pin"}
-            </Button>
+            {skill.source === "bundled" ? (
+              // Bundled skills are read-only — the curator and CLI both
+              // refuse to mutate them; rendering Pin/Unpin would be a
+              // lie. Show a labeled chip instead so the user
+              // understands why no actions are available, and give
+              // them the override hint.
+              <span
+                className="font-data text-[10.5px] uppercase tracking-widest text-[var(--color-fg-dim)] hairline px-2 py-1"
+                title={
+                  "This skill ships with vexis (read-only). To override, " +
+                  "create a workspace skill with the same name."
+                }
+              >
+                read-only · ships with vexis
+              </span>
+            ) : (
+              <Button
+                size="sm"
+                variant={skill.pinned ? "ghost" : "primary"}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onPinToggle();
+                }}
+                loading={pending === "pin"}
+              >
+                {skill.pinned ? "Unpin" : "Pin"}
+              </Button>
+            )}
             <span className="font-data text-[10.5px] text-[var(--color-fg-dim)] truncate">
               {skill.path}
             </span>

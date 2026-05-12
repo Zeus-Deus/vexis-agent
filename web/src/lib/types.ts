@@ -26,6 +26,11 @@ export interface ActiveSkill {
   last_used_at: string | null;
   created_at: string | null;
   pinned: boolean;
+  // "workspace" — user/curator-authored under <workspace>/skills/.
+  // "bundled" — shipped with vexis under vexis_agent/_bundled_skills/;
+  //             read-only (write ops refused). Bundled skills also have
+  //             pinned=true so existing pin UX paths work.
+  source?: "workspace" | "bundled";
   path: string;
 }
 

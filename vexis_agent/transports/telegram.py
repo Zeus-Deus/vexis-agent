@@ -1486,7 +1486,7 @@ class TelegramTransport:
 
     # ────────────────────────────────────────────────────────────────
     # /goal — persistent cross-turn goals (Ralph-style loop, port of
-    # Hermes' /goal). Source of truth: `.plans/goal-command-research.md`.
+    # the upstream /goal). Source of truth: `.plans/goal-command-research.md`.
     # ────────────────────────────────────────────────────────────────
 
     def _build_goal_manager(self, session_uuid: str):

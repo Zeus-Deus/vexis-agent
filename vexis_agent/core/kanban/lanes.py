@@ -1,4 +1,4 @@
-"""Lanes — vexis's lightweight replacement for Hermes profiles.
+"""Lanes — vexis's lightweight replacement for upstream profiles.
 
 A **lane** is the worker-type discriminator for a kanban task. It is
 NOT a separate identity — same brain, same memory, same learning
@@ -7,7 +7,7 @@ that tell the dispatcher how to spawn a worker for a task assigned
 to that lane.
 
 See ``.plans/kanban-research.md`` §4 for the design rationale (why
-lanes ≠ Hermes profiles).
+lanes ≠ upstream profiles).
 
 User config under ``kanban.lanes:`` in ``~/.vexis/config.yaml``
 overrides defaults or adds new lanes. Built-in lanes are bundled

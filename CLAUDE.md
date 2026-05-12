@@ -192,7 +192,7 @@ done. Parent-child links block promotion until parents reach
 done. Per-task circuit breaker auto-blocks after `failure_limit`
 consecutive failures (default 3).
 
-Lanes (vexis's lightweight replacement for Hermes profiles):
+Lanes (vexis's lightweight replacement for upstream profiles):
 each task carries a `lane` name. A lane = `(system_prompt,
 skills, tier_override)`. Same brain, different hat. Defaults:
 `research` / `implementation` / `review` / `ops` / `triage`.

@@ -601,7 +601,7 @@ export const api = {
   // ── Kanban ──────────────────────────────────────────────────
   // Wire-compatible with /api/v1/kanban/* (core/web_kanban.py).
   // Lanes (defaults: research, implementation, review, ops, triage,
-  // default) replace Hermes' profiles per .plans/kanban-research.md.
+  // default) replace the upstream profiles per .plans/kanban-research.md.
   kanbanBoard: (
     token: string,
     opts?: { lane?: string; status?: string; archived?: boolean },

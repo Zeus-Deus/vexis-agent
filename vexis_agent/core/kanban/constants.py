@@ -130,7 +130,7 @@ ENV_VAR_KANBAN = "VEXIS_KANBAN"  # set to "1" on every worker spawn
 # Defaults — overridable via ``kanban:`` in ~/.vexis/config.yaml
 # ──────────────────────────────────────────────────────────────────
 
-# Dispatcher tick cadence. Hermes uses 60s; faster polling helps
+# Dispatcher tick cadence. 60s is a common default; faster polling helps
 # responsiveness but burns no real cost — SQLite reads are cheap.
 DEFAULT_DISPATCH_INTERVAL_SECONDS = 60
 

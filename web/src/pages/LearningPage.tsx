@@ -281,7 +281,7 @@ function DistributionPanel({
             {distribution.a2_watch && (
               <p className="mt-2 font-data text-[10.5px] text-[var(--color-warn)]">
                 ⚠ S1 at 0 across procedural writes — see
-                v2-hermes-verification.md A2.
+                v2-verification.md A2.
               </p>
             )}
           </div>
