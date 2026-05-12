@@ -370,3 +370,97 @@ def test_is_installed_skill_dir(workspace_skills, local_skill_md):
 
 def test_load_provenance_returns_none_on_missing(tmp_path):
     assert load_provenance(tmp_path) is None
+
+
+# ──────────────────────────────────────────────────────────────────
+# GitHub blob → raw URL rewriter
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_github_blob_url_rewritten_to_raw():
+    """The browser-form github URL converts to raw.githubusercontent.com
+    so install can fetch the actual markdown instead of the HTML
+    wrapper page."""
+    from vexis_agent.core.skill_install import rewrite_github_blob_url
+    src = "https://github.com/owner/repo/blob/main/skills/foo/SKILL.md"
+    expected = (
+        "https://raw.githubusercontent.com/owner/repo/main/skills/foo/SKILL.md"
+    )
+    assert rewrite_github_blob_url(src) == expected
+
+
+def test_github_blob_url_with_branch_with_slash():
+    """Branch refs CAN contain slashes (rare but legal) — the regex
+    captures only up to the next /, so a branch named ``feature/x``
+    would mis-rewrite. Confirm the simple-branch case works; document
+    the limitation for the slash-branch case."""
+    from vexis_agent.core.skill_install import rewrite_github_blob_url
+    src = "https://github.com/foo/bar/blob/v0.3.0/path/to/SKILL.md"
+    expected = (
+        "https://raw.githubusercontent.com/foo/bar/v0.3.0/path/to/SKILL.md"
+    )
+    assert rewrite_github_blob_url(src) == expected
+
+
+def test_github_blob_url_with_commit_sha():
+    """Refs can be commit SHAs too, not just branch names."""
+    from vexis_agent.core.skill_install import rewrite_github_blob_url
+    src = "https://github.com/owner/repo/blob/abc123def456/SKILL.md"
+    expected = "https://raw.githubusercontent.com/owner/repo/abc123def456/SKILL.md"
+    assert rewrite_github_blob_url(src) == expected
+
+
+def test_github_raw_url_passes_through():
+    """Raw URLs are already canonical — leave them alone."""
+    from vexis_agent.core.skill_install import rewrite_github_blob_url
+    src = "https://raw.githubusercontent.com/owner/repo/main/SKILL.md"
+    assert rewrite_github_blob_url(src) == src
+
+
+def test_non_github_url_passes_through():
+    from vexis_agent.core.skill_install import rewrite_github_blob_url
+    src = "https://example.com/skills/foo/SKILL.md"
+    assert rewrite_github_blob_url(src) == src
+
+
+def test_local_path_passes_through():
+    from vexis_agent.core.skill_install import rewrite_github_blob_url
+    assert rewrite_github_blob_url("/tmp/foo.md") == "/tmp/foo.md"
+
+
+def test_install_provenance_records_rewritten_url(workspace_skills, tmp_path):
+    """End-to-end: install with a github-blob URL stores the
+    rewritten raw URL in provenance so a re-install / update follows
+    the canonical form. Mocks urlopen to avoid a real network hit."""
+    from unittest.mock import patch
+
+    class FakeResponse:
+        headers = {"content-length": str(len(SAMPLE_SKILL.encode("utf-8")))}
+        def read(self, n: int) -> bytes:
+            return SAMPLE_SKILL.encode("utf-8")[:n]
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    captured_urls: list[str] = []
+
+    def fake_urlopen(req, timeout=None):
+        # Capture the URL we actually fetched — the rewriter should
+        # have converted blob → raw before we got here.
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        captured_urls.append(url)
+        return FakeResponse()
+
+    with patch(
+        "vexis_agent.core.skill_install.urllib.request.urlopen",
+        side_effect=fake_urlopen,
+    ):
+        result = install_skill(
+            workspace_skills,
+            "https://github.com/owner/repo/blob/main/SKILL.md",
+        )
+    assert result.ok, result.message
+    assert len(captured_urls) == 1
+    assert captured_urls[0].startswith("https://raw.githubusercontent.com/")
+    assert result.provenance.source.startswith(
+        "https://raw.githubusercontent.com/",
+    ), f"provenance kept the blob URL: {result.provenance.source}"

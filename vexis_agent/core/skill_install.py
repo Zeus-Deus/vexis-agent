@@ -136,17 +136,59 @@ class InstallResult:
 # --------------------------------------------------------------------
 
 
+# Match a GitHub browser-blob URL so we can rewrite it to the raw
+# form. The browser URL serves an HTML wrapper around the file, not
+# the file itself — pasting it directly into ``install`` would fail
+# at the SKILL.md frontmatter check. Pre-converting is the friendliest
+# UX since most users paste from their address bar, not the raw URL.
+#
+# Supported shape:
+#   https://github.com/<owner>/<repo>/blob/<ref>/<path...>
+# Converted to:
+#   https://raw.githubusercontent.com/<owner>/<repo>/<ref>/<path...>
+#
+# ``ref`` can be a branch, tag, or commit SHA. ``path`` is anything
+# remaining (we don't validate it ends in .md — install does that).
+import re as _re
+
+_GITHUB_BLOB_RE = _re.compile(
+    r"^https?://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)$",
+)
+
+
+def _maybe_rewrite_github_blob(source: str) -> str:
+    """Rewrite a github.com/.../blob/... URL to raw.githubusercontent.com.
+
+    Returns the rewritten URL when the pattern matches, otherwise the
+    input unchanged. Single-pass — no chained rewrites. The
+    ``provenance.source`` field stores the **rewritten** URL so a
+    re-install / update follows the same canonical form, not the
+    original blob link.
+    """
+    m = _GITHUB_BLOB_RE.match(source)
+    if m is None:
+        return source
+    owner, repo, ref, path = m.groups()
+    return (
+        f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}"
+    )
+
+
 def _classify_source(source: str) -> tuple[str, str]:
     """Return ``(kind, canonical)`` for the source string.
 
     ``kind`` is one of ``"https"``, ``"http"``, ``"file"``.
     ``canonical`` is the cleaned-up source string written to
-    provenance — URLs are kept as-given (no normalisation),
-    filesystem paths are absolutised + symlink-resolved.
+    provenance — URLs get the github-blob → raw rewrite applied so
+    re-install follows the same canonical form. Filesystem paths
+    are absolutised + symlink-resolved.
     """
     if source.startswith(("https://", "http://")):
-        kind = "https" if source.startswith("https://") else "http"
-        return (kind, source)
+        # Apply the github-blob → raw rewrite BEFORE choosing the
+        # https/http kind — the rewritten URL is always https.
+        rewritten = _maybe_rewrite_github_blob(source)
+        kind = "https" if rewritten.startswith("https://") else "http"
+        return (kind, rewritten)
     # Treat as filesystem path. Expand ~ and resolve absolutely so
     # provenance carries a stable reference even if the user's CWD
     # changes between install and re-install.
@@ -433,5 +475,13 @@ __all__ = [
     "install_skill",
     "is_installed_skill_dir",
     "load_provenance",
+    "rewrite_github_blob_url",
     "uninstall_skill",
 ]
+
+
+# Public alias of the internal rewriter so callers (tests, future
+# CLI helpers, dashboard preview) can use the same canonicalisation.
+def rewrite_github_blob_url(source: str) -> str:
+    """Public alias of :func:`_maybe_rewrite_github_blob`."""
+    return _maybe_rewrite_github_blob(source)
