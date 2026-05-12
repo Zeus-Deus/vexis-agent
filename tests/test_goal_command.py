@@ -185,6 +185,16 @@ def transport(goals_file: Path) -> TelegramTransport:
     # mid-flight. ``__new__`` skips ``__init__`` so we mirror the
     # one field the kickoff path reads.
     t._background_dispatch_tasks = set()  # type: ignore[attr-defined]
+    # ``_on_text`` runs the kanban pending-input capture before any
+    # /goal-related logic; without a stub it would AttributeError on
+    # ``self._kanban`` (``__new__`` skips ``__init__``). These tests
+    # never set up a real kanban pending input, so a no-op stub that
+    # always returns False is the minimum wiring needed.
+    class _NoopKanban:
+        async def maybe_capture_pending_input(self, *_a, **_kw) -> bool:
+            return False
+
+    t._kanban = _NoopKanban()  # type: ignore[attr-defined]
     return t
 
 
