@@ -30,7 +30,7 @@ export interface ActiveSkill {
   // "bundled" — shipped with vexis under vexis_agent/_bundled_skills/;
   //             read-only (write ops refused). Bundled skills also have
   //             pinned=true so existing pin UX paths work.
-  source?: "workspace" | "bundled";
+  source?: "workspace" | "bundled" | "installed";
   path: string;
 }
 

@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -67,11 +67,16 @@ from vexis_agent.core.skills import (
     PinStore,
     UsageStore,
     archived_skill_names,
-    discover_skills_with_bundled,
     bundled_skills_root,
+    create_skill,
+    delete_skill,
+    discover_skills_with_bundled,
+    edit_skill,
     iter_skill_dirs,
     parse_skill_md,
     restore_skill,
+    validate_skill_md,
+    validate_skill_name,
 )
 from vexis_agent.core.subprocess import run as run_subprocess
 from vexis_agent.core import tailscale as tailscale_mod
@@ -498,7 +503,7 @@ class WebDashboard:
                 "http://127.0.0.1:5173",
             ],
             allow_credentials=False,
-            allow_methods=["GET", "POST"],
+            allow_methods=["GET", "POST", "PUT", "DELETE"],
             allow_headers=["Authorization", "Content-Type"],
         )
 
@@ -589,6 +594,130 @@ class WebDashboard:
             if not op.ok:
                 raise HTTPException(400, op.message)
             return {"ok": True, "message": op.message, "extra": op.extra}
+
+        # ── User-facing CRUD on workspace skills ──────────────────
+        # The dashboard's "+ New skill" / Edit / Delete affordances
+        # all hit these endpoints. Bundled + installed skills are
+        # protected upstream by core.skills' resolver — these
+        # routes will return the right "read-only" message if the
+        # user tries to mutate one. ``protect=true`` on create
+        # auto-pins the new skill so the curator can't touch it.
+
+        @app.post("/api/v1/skills", dependencies=[Depends(_require_auth)])
+        async def post_skill_create(body: dict = Body(...)) -> dict:
+            name = (body.get("name") or "").strip()
+            content = body.get("content") or ""
+            category_raw = body.get("category")
+            protect = bool(body.get("protect"))
+            category: str | None
+            if isinstance(category_raw, str) and category_raw.strip():
+                category = category_raw.strip()
+            else:
+                category = None
+            # Pre-validate to give the caller a tighter 400 with the
+            # specific field that's wrong, rather than the generic
+            # "could not parse" you'd get from the create_skill body.
+            name_err = validate_skill_name(name)
+            if name_err:
+                raise HTTPException(400, detail={
+                    "field": "name", "error": name_err,
+                })
+            md_err = validate_skill_md(content)
+            if md_err:
+                raise HTTPException(400, detail={
+                    "field": "content", "error": md_err,
+                })
+            root = skills_dir(self._workspace)
+            op = create_skill(root, name, content, category=category)
+            if not op.ok:
+                raise HTTPException(400, detail={"error": op.message})
+            # Auto-pin if requested. Best-effort — pin failure shouldn't
+            # un-create the skill, so we record the partial success in
+            # the response rather than rolling back.
+            pinned = False
+            if protect:
+                try:
+                    PinStore(root).pin(name)
+                    pinned = True
+                except Exception:
+                    log.exception("auto-pin after create failed for %s", name)
+            return {
+                "ok": True,
+                "name": name,
+                "category": category or "",
+                "pinned": pinned,
+                "message": op.message,
+            }
+
+        @app.put(
+            "/api/v1/skills/{name}",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def put_skill_edit(
+            name: str, body: dict = Body(...),
+        ) -> dict:
+            content = body.get("content") or ""
+            md_err = validate_skill_md(content)
+            if md_err:
+                raise HTTPException(400, detail={
+                    "field": "content", "error": md_err,
+                })
+            # The dashboard is the user. If they want to edit a
+            # pinned skill, they've already accepted the prompt the
+            # UI showed them ("temporarily unpin to save?"). Honour
+            # the unpin via an opt-in body flag so the same endpoint
+            # also serves callers (e.g. the brain-side pin guard
+            # path) that should NOT be allowed to unpin.
+            unpin_during_edit = bool(body.get("force_unpin"))
+            root = skills_dir(self._workspace)
+            pin_store = PinStore(root)
+            was_pinned = pin_store.is_pinned(name)
+            if was_pinned and unpin_during_edit:
+                pin_store.unpin(name)
+            try:
+                op = edit_skill(root, name, content)
+            finally:
+                # Re-pin if we temporarily unpinned, regardless of
+                # whether the edit succeeded — the user's protection
+                # intent shouldn't get reset by a transient write
+                # failure.
+                if was_pinned and unpin_during_edit:
+                    pin_store.pin(name)
+            if not op.ok:
+                raise HTTPException(400, detail={"error": op.message})
+            return {
+                "ok": True,
+                "name": name,
+                "pinned": was_pinned,
+                "message": op.message,
+            }
+
+        @app.delete(
+            "/api/v1/skills/{name}",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def delete_skill_route(name: str) -> dict:
+            # Same unpin-while-deleting opt-in as the edit path.
+            # Distinct flag names so a future ``force=true`` general
+            # override doesn't sweep both paths into one looser
+            # semantic.
+            root = skills_dir(self._workspace)
+            pin_store = PinStore(root)
+            if pin_store.is_pinned(name):
+                # Dashboard always has to explicitly unpin first —
+                # the delete path doesn't auto-bypass because delete
+                # is destructive.
+                raise HTTPException(409, detail={
+                    "error": (
+                        f"Skill '{name}' is pinned. Unpin first if you "
+                        f"really want to delete it."
+                    ),
+                    "kind": "Pinned",
+                })
+            op = delete_skill(root, name)
+            if not op.ok:
+                raise HTTPException(400, detail={"error": op.message})
+            return {"ok": True, "name": name, "message": op.message}
 
         @app.get("/api/v1/curator", dependencies=[Depends(_require_auth)])
         async def get_curator() -> dict:

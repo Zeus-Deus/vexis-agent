@@ -55,7 +55,7 @@ export class TokenInvalidError extends ApiError {
 }
 
 interface FetchOptions {
-  method?: "GET" | "POST";
+  method?: "GET" | "POST" | "PUT" | "DELETE";
   body?: unknown;
   // AbortSignal lets callers cancel an in-flight request when the
   // component unmounts or the user navigates away. The fetch
@@ -150,6 +150,40 @@ export const api = {
       token,
       `/skills/${encodeURIComponent(name)}/restore`,
       { method: "POST" },
+    ),
+  // ── Skill CRUD (workspace skills only — bundled / installed are
+  //    refused upstream by core/skills.py with a clear error). ──
+  createSkill: (
+    token: string,
+    body: {
+      name: string;
+      content: string;
+      category?: string;
+      protect?: boolean;
+    },
+  ) =>
+    call<{
+      ok: boolean;
+      name: string;
+      category: string;
+      pinned: boolean;
+      message: string;
+    }>(token, "/skills", { method: "POST", body }),
+  editSkill: (
+    token: string,
+    name: string,
+    body: { content: string; force_unpin?: boolean },
+  ) =>
+    call<{ ok: boolean; name: string; pinned: boolean; message: string }>(
+      token,
+      `/skills/${encodeURIComponent(name)}`,
+      { method: "PUT", body },
+    ),
+  deleteSkill: (token: string, name: string) =>
+    call<{ ok: boolean; name: string; message: string }>(
+      token,
+      `/skills/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
     ),
   curator: (token: string) => call<CuratorState>(token, "/curator"),
   curatorRun: (token: string, folder: string) =>
