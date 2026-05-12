@@ -127,14 +127,22 @@ def schedules_off(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def transport(store: ScheduleStore) -> TelegramTransport:
-    """Bare-bones transport with the minimum wiring /schedule needs."""
+    """Bare-bones transport with the minimum wiring /schedule needs.
+
+    Mocks ``_dispatch_to_brain`` because the create-path now spawns
+    that call via ``_spawn_background_dispatch`` — both the no-drain
+    and drain-busy branches funnel through it. The mock lets us
+    assert on the (bot, chat_id, user_id, synthetic, queue_origin)
+    arguments without booting a real brain.
+    """
     t = TelegramTransport.__new__(TelegramTransport)
     t._allowed_user_id = _USER  # type: ignore[attr-defined]
     t._running_tasks = RunningTasks()  # type: ignore[attr-defined]
     t._schedule_store = store  # type: ignore[attr-defined]
-    # The create-path calls _dispatch_to_brain only when no drain
-    # is active; we don't want to invoke the real brain in tests,
-    # so mock it. The enqueue branch (drain active) does not call it.
+    # Track in-flight background-dispatch tasks (introduced when /goal
+    # kickoff stopped blocking the PTB handler; /schedule now uses
+    # the same path).
+    t._background_dispatch_tasks = set()  # type: ignore[attr-defined]
     t._dispatch_to_brain = mock.AsyncMock()  # type: ignore[attr-defined]
     return t
 
@@ -302,17 +310,25 @@ def test_create_path_acks_then_dispatches_via_drain(
     transport, schedules_on
 ):
     """`/schedule remind me every 30m to stretch` →
-    ack reply + synthetic message dispatched to brain.
+    ack reply + synthetic message dispatched to brain via the
+    background-dispatch spawn (so the PTB handler returns promptly).
     """
     upd, _bot, msg = _update("/schedule remind me every 30m to stretch")
-    asyncio.run(transport._on_schedule(
-        upd, _ctx("remind", "me", "every", "30m", "to", "stretch")
-    ))
+
+    async def _run_and_drain() -> None:
+        await transport._on_schedule(
+            upd, _ctx("remind", "me", "every", "30m", "to", "stretch")
+        )
+        # The dispatch is now spawned as a background task; flush so
+        # the mock observes the call before we assert on it.
+        await transport.flush_background_dispatch()
+
+    asyncio.run(_run_and_drain())
 
     # First reply is the ack.
     assert msg.replies[0] == _SCHEDULE_ACK
 
-    # No drain was active so claim succeeded → _dispatch_to_brain called.
+    # Dispatch was spawned and ran exactly once.
     assert transport._dispatch_to_brain.await_count == 1
     args = transport._dispatch_to_brain.await_args
     assert args is not None
@@ -322,33 +338,94 @@ def test_create_path_acks_then_dispatches_via_drain(
     assert user_id == _USER
     assert synthetic.startswith("[user invoked /schedule]\n")
     assert "remind me every 30m to stretch" in synthetic
+    # The kwarg is what lets the enqueue (drain-busy branch) tag the
+    # message correctly.
+    assert args.kwargs == {"queue_origin": "schedule_command"}
 
 
 def test_create_path_enqueues_when_drain_active(
     transport, schedules_on
 ):
-    """When drain is already active for the chat, the create text is
-    enqueued (not dispatched) so it waits its turn behind the
-    in-flight message.
+    """When drain is already active for the chat, the spawned dispatch
+    still calls ``_dispatch_to_brain`` — but its internal claim() fails
+    and it falls back to enqueue (with the ``queue_origin`` kwarg
+    forwarded). Production keeps the same "Schedule queued behind
+    the current turn" semantics.
+
+    The mock for ``_dispatch_to_brain`` doesn't actually exercise the
+    inner enqueue path; that's covered by the dedicated
+    test_telegram_transport.py drain tests. Here we just pin that the
+    handler hands off correctly with the right origin.
     """
     # Pre-claim the drain so claim() returns False.
     asyncio.run(transport._running_tasks.claim(_CHAT))
 
     upd, _bot, msg = _update("/schedule every weekday at 9am do standup")
-    asyncio.run(transport._on_schedule(
-        upd, _ctx("every", "weekday", "at", "9am", "do", "standup")
-    ))
 
-    # _dispatch_to_brain was NOT called (drain busy).
-    assert transport._dispatch_to_brain.await_count == 0
+    async def _run_and_drain() -> None:
+        await transport._on_schedule(
+            upd, _ctx("every", "weekday", "at", "9am", "do", "standup")
+        )
+        await transport.flush_background_dispatch()
 
-    # Message was enqueued with origin="schedule_command".
-    state = transport._running_tasks._chats[_CHAT]
-    assert len(state.queue) == 1
-    qm = state.queue[0]
-    assert qm.origin == "schedule_command"
-    assert qm.text.startswith("[user invoked /schedule]\n")
-    assert "every weekday at 9am do standup" in qm.text
+    asyncio.run(_run_and_drain())
+
+    # Ack happened.
+    assert msg.replies[0] == _SCHEDULE_ACK
+    # Dispatch was spawned (drain busy doesn't skip the spawn — the
+    # spawn's internal enqueue handles that case).
+    assert transport._dispatch_to_brain.await_count == 1
+    args = transport._dispatch_to_brain.await_args
+    assert args is not None
+    bot_arg, chat_id, user_id, synthetic = args.args
+    assert chat_id == _CHAT
+    assert synthetic.startswith("[user invoked /schedule]\n")
+    assert "every weekday at 9am do standup" in synthetic
+    # The schedule_command origin must survive the round trip — it's
+    # the tag that lets goal preemption skip schedule prompts.
+    assert args.kwargs == {"queue_origin": "schedule_command"}
+
+
+def test_schedule_kickoff_returns_before_brain_completes(
+    transport, schedules_on
+):
+    """Regression pin for "/schedule blocks the chat".
+
+    ``_on_schedule`` MUST return as soon as the ack is sent; the
+    brain dispatch must run in the background. We make the mock slow
+    and assert ``_on_schedule`` finishes in well under that delay.
+    """
+    delay_event = asyncio.Event()
+
+    async def _slow_dispatch(*_args, **_kwargs):
+        # Park here forever (until released by the test) so that any
+        # accidental inline await on _dispatch_to_brain inside
+        # _on_schedule would visibly hang.
+        await delay_event.wait()
+
+    transport._dispatch_to_brain = mock.AsyncMock(side_effect=_slow_dispatch)
+
+    upd, _bot, _msg = _update("/schedule remind me to ship")
+
+    async def _assert_non_blocking() -> None:
+        # 1 second is generous — the handler should return in
+        # microseconds. TimeoutError here means it's blocking.
+        await asyncio.wait_for(
+            transport._on_schedule(
+                upd, _ctx("remind", "me", "to", "ship")
+            ),
+            timeout=1.0,
+        )
+        # The spawn must be in flight, not yet completed.
+        assert transport._background_dispatch_tasks, (
+            "_on_schedule returned but no background task was tracked — "
+            "the dispatch was likely awaited inline"
+        )
+        # Release the mock and flush so the test exits cleanly.
+        delay_event.set()
+        await transport.flush_background_dispatch()
+
+    asyncio.run(_assert_non_blocking())
 
 
 def test_create_path_empty_after_subcommand_check(transport, schedules_on):

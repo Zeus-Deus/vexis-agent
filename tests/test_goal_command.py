@@ -180,6 +180,11 @@ def transport(goals_file: Path) -> TelegramTransport:
     t._allowed_user_id = _USER  # type: ignore[attr-defined]
     t._running_tasks = RunningTasks()  # type: ignore[attr-defined]
     t._learning_curator = None  # type: ignore[attr-defined]
+    # /goal kickoff is now spawned as a background task; the
+    # transport tracks the handle so asyncio doesn't GC it
+    # mid-flight. ``__new__`` skips ``__init__`` so we mirror the
+    # one field the kickoff path reads.
+    t._background_dispatch_tasks = set()  # type: ignore[attr-defined]
     return t
 
 
@@ -388,7 +393,12 @@ def test_goal_text_kicks_off_first_turn(
 ) -> None:
     """/goal <text> with no drain active: writes state, sends the
     kickoff confirmation, then dispatches the goal text to the brain
-    via the same path a user message would take."""
+    via the same path a user message would take.
+
+    The dispatch now runs in a tracked background task — the test
+    flushes ``_background_dispatch_tasks`` after ``_on_goal`` returns
+    so the brain-call assertion can observe the spawned turn.
+    """
     # Stub the goal hook so the brain reply doesn't trigger a real
     # judge call. Without this the kickoff turn would call
     # judge_goal which would try to spawn ``claude -p``.
@@ -398,7 +408,16 @@ def test_goal_text_kicks_off_first_turn(
     monkeypatch.setattr(transport, "_run_goal_hook", _no_hook)
 
     upd, _bot, msg = _update("/goal port the goal command to vexis")
-    asyncio.run(transport._on_goal(upd, _ctx("port", "the", "goal", "command", "to", "vexis")))
+
+    async def _run_and_drain() -> None:
+        await transport._on_goal(
+            upd, _ctx("port", "the", "goal", "command", "to", "vexis")
+        )
+        # The kickoff dispatch is now a background task; flush it
+        # before asserting on brain calls.
+        await transport.flush_background_dispatch()
+
+    asyncio.run(_run_and_drain())
 
     # State persisted.
     store = GoalStateStore(goals_file)
@@ -413,6 +432,273 @@ def test_goal_text_kicks_off_first_turn(
     handler: _FakeHandler = transport._handler  # type: ignore[assignment]
     assert handler.calls
     assert handler.calls[0][2] == "port the goal command to vexis"
+
+
+def test_goal_kickoff_returns_before_brain_completes(
+    transport: TelegramTransport,
+    goals_on: None,
+    goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression pin for the "/goal blocks the chat" bug.
+
+    `_on_goal` MUST return as soon as the kickoff ack is sent; it
+    must NOT await the kickoff dispatch. We test that by giving the
+    fake handler a slow-running `handle()` and asserting the
+    `_on_goal` coroutine completes while the dispatch is still
+    in-flight — measured by:
+
+      1. ``_background_dispatch_tasks`` contains the spawned task,
+      2. the task has not yet finished,
+      3. the brain handler has not yet been called.
+
+    Without the background-task spawn the await would block here
+    for the full handle delay, making all three checks fail.
+    """
+    started_event = asyncio.Event()
+    release_event = asyncio.Event()
+
+    class _BlockingHandler(_FakeHandler):
+        async def handle(self, user_id: int, chat_id: int, text: str) -> str | None:
+            started_event.set()
+            await release_event.wait()
+            self.calls.append((user_id, chat_id, text))
+            return self.reply
+
+    blocking_handler = _BlockingHandler()
+    transport._handler = blocking_handler  # type: ignore[attr-defined]
+
+    # Stub the goal hook — we only care about the kickoff path here.
+    async def _no_hook(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(transport, "_run_goal_hook", _no_hook)
+
+    upd, _bot, _msg = _update("/goal ship the rocket")
+
+    async def _assert_non_blocking() -> None:
+        # _on_goal must return promptly even though the brain
+        # handle() is blocked. asyncio.wait_for raises TimeoutError
+        # on regression — that is the failure signal we want.
+        await asyncio.wait_for(
+            transport._on_goal(upd, _ctx("ship", "the", "rocket")),
+            timeout=1.0,
+        )
+        # The spawned dispatch should be in the tracking set and
+        # in-flight (or at least past claim, awaiting handle).
+        assert transport._background_dispatch_tasks, (
+            "kickoff did not spawn a background task — the dispatch "
+            "was likely awaited inline and the chat is now blocked"
+        )
+        # Wait for the brain handle to actually start (so we know
+        # the dispatch reached the brain-call site and is parked on
+        # release_event), then verify no calls landed yet.
+        await asyncio.wait_for(started_event.wait(), timeout=1.0)
+        assert blocking_handler.calls == [], (
+            "brain handle returned before release_event — "
+            "test fake is wrong, not the production code"
+        )
+        # Release the brain and let the background task complete so
+        # the test exits cleanly. Failure to flush would leave a
+        # pending task at asyncio.run shutdown and emit a noisy
+        # warning that masks the real assertion failure (if any).
+        release_event.set()
+        await transport.flush_background_dispatch()
+        assert blocking_handler.calls, (
+            "kickoff task ran but never reached brain.handle — "
+            "the background task crashed before dispatching"
+        )
+
+    asyncio.run(_assert_non_blocking())
+
+
+def test_user_message_preempts_pending_goal_continuation(
+    transport: TelegramTransport,
+    goals_on: None,
+    goals_file: Path,
+) -> None:
+    """When a goal continuation is already sitting in the queue and a
+    real user message lands, the continuation must be dropped so the
+    user's message runs next instead of behind the continuation.
+
+    The user's message still has to wait for the in-flight brain turn
+    to complete (we can't preempt mid-turn without ``/cancel``), but
+    capping the wait at "current turn only" — instead of "current
+    turn + N queued continuations" — is the latency improvement
+    that makes the chat feel responsive during a goal loop.
+
+    The post-turn hook re-enqueues a continuation after the user's
+    turn finishes (tested separately in
+    ``test_hook_dedupes_existing_continuation_on_enqueue``).
+    """
+    # Seed: drain claimed by a notional in-flight turn, one
+    # continuation queued ahead.
+    async def seed() -> None:
+        await transport._running_tasks.claim(_CHAT)
+        await transport._running_tasks.enqueue(
+            _CHAT, _USER, "old continuation prompt",
+            origin="goal_continuation",
+        )
+        # Also enqueue an unrelated user message that must survive
+        # the preemption (only goal_continuation items get dropped).
+        await transport._running_tasks.enqueue(
+            _CHAT, _USER, "earlier user message", origin="user",
+        )
+
+    asyncio.run(seed())
+
+    # User types a new message — _on_text fires preemption.
+    upd, _bot, _msg = _update("urgent: what time is it")
+
+    async def _exercise() -> None:
+        await transport._on_text(upd, _FakeCtx())
+
+    asyncio.run(_exercise())
+
+    # The continuation is gone; the earlier user message and the new
+    # one survive in arrival order.
+    state = transport._running_tasks._chats[_CHAT]
+    texts = [m.text for m in state.queue]
+    origins = [m.origin for m in state.queue]
+    assert "old continuation prompt" not in texts
+    assert texts == ["earlier user message", "urgent: what time is it"]
+    assert origins == ["user", "user"]
+
+
+def test_hook_dedupes_existing_continuation_on_enqueue(
+    transport: TelegramTransport,
+    goals_on: None,
+    goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_run_goal_hook`` must drop any pre-existing goal_continuation
+    before enqueuing a new one. Without this, a stretch of user turns
+    (each fires the post-turn hook → each appends a continuation)
+    leaves a backlog of identical continuation prompts that the drain
+    burns through once the user stops typing.
+
+    Hermes' invariant: at most ONE continuation queued at a time.
+    """
+    # Seed an active goal and an existing continuation in the queue.
+    store = GoalStateStore(goals_file)
+    mgr = GoalManager(
+        session_uuid=_SESSION, workspace=Path("/tmp"), store=store
+    )
+    mgr.set("complete the rocket")
+
+    async def seed() -> None:
+        await transport._running_tasks.claim(_CHAT)
+        await transport._running_tasks.enqueue(
+            _CHAT, _USER, "stale continuation A",
+            origin="goal_continuation",
+        )
+        await transport._running_tasks.enqueue(
+            _CHAT, _USER, "stale continuation B",
+            origin="goal_continuation",
+        )
+
+    asyncio.run(seed())
+
+    # Stub evaluate_after_turn so the hook reaches the enqueue branch
+    # without spawning a real judge.
+    async def _fake_evaluate(self, last_response, brain):  # noqa: ARG001
+        return {
+            "status": "active",
+            "should_continue": True,
+            "continuation_prompt": "fresh continuation",
+            "verdict": "continue",
+            "reason": "judge says keep going",
+            "message": "",  # suppress chat status line
+        }
+
+    monkeypatch.setattr(GoalManager, "evaluate_after_turn", _fake_evaluate)
+
+    class _FakeBot:
+        async def send_message(self, **_kw):
+            return None
+
+    # Run the hook directly.
+    asyncio.run(transport._run_goal_hook(_FakeBot(), _CHAT, "reply text"))
+
+    state = transport._running_tasks._chats[_CHAT]
+    texts = [m.text for m in state.queue]
+    origins = [m.origin for m in state.queue]
+    # Both stale continuations dropped; exactly one fresh one queued.
+    assert texts == ["fresh continuation"]
+    assert origins == ["goal_continuation"]
+
+
+def test_goal_kickoff_drains_subsequent_user_messages(
+    transport: TelegramTransport,
+    goals_on: None,
+    goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While the kickoff dispatch runs, a regular `_on_text` message
+    must FIFO-enqueue (not block) and run after the kickoff turn.
+
+    This is the FIFO interleaving guarantee that makes "chat is
+    responsive during a goal" actually true: real user messages
+    sit behind the goal in the same per-chat deque, exactly like
+    goal continuations do, and the drain picks them up in arrival
+    order. Mirrors Hermes' single-FIFO behaviour described in
+    `.plans/goal-command-research.md`.
+    """
+    started_event = asyncio.Event()
+    release_event = asyncio.Event()
+
+    class _BlockingHandler(_FakeHandler):
+        async def handle(self, user_id: int, chat_id: int, text: str) -> str | None:
+            # The first call (kickoff) blocks. Subsequent calls
+            # (the queued user message) run as soon as the drain
+            # reaches them — they do NOT re-block.
+            if not self.calls and not started_event.is_set():
+                started_event.set()
+                await release_event.wait()
+            self.calls.append((user_id, chat_id, text))
+            return self.reply
+
+    blocking_handler = _BlockingHandler()
+    transport._handler = blocking_handler  # type: ignore[attr-defined]
+
+    async def _no_hook(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(transport, "_run_goal_hook", _no_hook)
+
+    goal_upd, _gbot, _gmsg = _update("/goal ship rockets")
+    text_upd, _tbot, _tmsg = _update("hey can you also water plants")
+
+    async def _exercise() -> None:
+        # Kick off the goal — returns immediately, dispatch is
+        # parked inside blocking_handler.handle waiting on
+        # release_event.
+        await transport._on_goal(goal_upd, _ctx("ship", "rockets"))
+        await asyncio.wait_for(started_event.wait(), timeout=1.0)
+
+        # User sends a regular message while the goal is "running".
+        # _on_text → _dispatch_to_brain → claim() fails (the
+        # kickoff task owns the drain) → enqueue. Returns quickly.
+        await asyncio.wait_for(
+            transport._on_text(text_upd, _FakeCtx()),
+            timeout=1.0,
+        )
+        assert transport._running_tasks.queue_depth(_CHAT) == 1, (
+            "user message during goal kickoff should sit in the "
+            "per-chat FIFO, not block the handler"
+        )
+
+        # Release the kickoff turn. The drain pops the queued user
+        # message and runs it as a second turn.
+        release_event.set()
+        await transport.flush_background_dispatch()
+
+    asyncio.run(_exercise())
+
+    # Both turns ran, in arrival order.
+    assert len(blocking_handler.calls) == 2
+    assert blocking_handler.calls[0][2] == "ship rockets"
+    assert blocking_handler.calls[1][2] == "hey can you also water plants"
 
 
 # ──────────────────────────────────────────────────────────────────

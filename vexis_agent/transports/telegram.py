@@ -575,6 +575,15 @@ class TelegramTransport:
         # rate-limit math behind the default 1.0s edit cadence.
         self._streaming_enabled = telegram_streaming_enabled()
         self._streaming_min_interval = telegram_streaming_min_interval_seconds()
+        # Tasks for kickoffs we deliberately do NOT await in the PTB
+        # handler (today: /goal kickoff). Without a strong reference
+        # asyncio will GC a still-running fire-and-forget task and
+        # the drain dies silently mid-flight — see CPython issue
+        # gh-91887 and PEP 484 docs on ``asyncio.create_task``.
+        # ``_spawn_background_dispatch`` adds entries here and a
+        # done-callback prunes them; ``flush_background_dispatch``
+        # is the test-side drain.
+        self._background_dispatch_tasks: set[asyncio.Task] = set()
         # concurrent_updates(True) is load-bearing for /cancel: PTB's default
         # serializes every update through one task, so a /cancel sent while
         # a brain call is in flight queues behind it for up to 30 minutes
@@ -686,10 +695,20 @@ class TelegramTransport:
         user = update.effective_user
         if msg is None or user is None or msg.text is None:
             return
+        # Preempt any pending goal continuations so the user's message
+        # runs after the current in-flight turn — not behind a backlog
+        # of continuations that the post-turn hook enqueued.
+        await self._preempt_goal_continuations(msg.chat_id)
         await self._dispatch_to_brain(msg.get_bot(), msg.chat_id, user.id, msg.text)
 
     async def _dispatch_to_brain(
-        self, bot, chat_id: int, user_id: int, text: str
+        self,
+        bot,
+        chat_id: int,
+        user_id: int,
+        text: str,
+        *,
+        queue_origin: str = "user",
     ) -> None:
         """Submit a message to the brain.
 
@@ -697,6 +716,13 @@ class TelegramTransport:
         appended to its queue silently — the user gets a "Picking up:"
         ack when the drain reaches it. Otherwise we claim the chat and
         run the drain loop ourselves until the queue is empty.
+
+        ``queue_origin`` is the tag applied to the message when the
+        chat is already claimed and we fall back to enqueue. Default
+        ``"user"`` covers all real-user message paths; ``/schedule``
+        passes ``"schedule_command"`` so its synthetic prompt is
+        distinguishable in the queue (and survives /goal pause's
+        ``goal_continuation``-only predicate).
 
         v3b Day 3a moved the relationships hook from this pre-claim
         position into ``_drain_chat`` so the hook fires sequentially
@@ -708,7 +734,9 @@ class TelegramTransport:
             return
 
         if not await self._running_tasks.claim(chat_id):
-            await self._running_tasks.enqueue(chat_id, user_id, text)
+            await self._running_tasks.enqueue(
+                chat_id, user_id, text, origin=queue_origin,  # type: ignore[arg-type]
+            )
             return
 
         typing_task = asyncio.create_task(self._keep_typing(bot, chat_id))
@@ -727,6 +755,119 @@ class TelegramTransport:
             # force_release_drain is a no-op when the drain released
             # cleanly, and logs at warning level when it had to force.
             await self._running_tasks.force_release_drain(chat_id)
+
+    def _spawn_background_dispatch(
+        self,
+        bot,
+        chat_id: int,
+        user_id: int,
+        text: str,
+        *,
+        label: str,
+        queue_origin: str = "user",
+    ) -> asyncio.Task:
+        """Fire ``_dispatch_to_brain`` in a tracked background task.
+
+        Used by `/goal <text>` and `/schedule <text>` kickoffs so the
+        PTB command handler returns immediately after the ack reply,
+        instead of being held for the duration of the entire drain
+        (kickoff turn + any continuations enqueued post-turn). The
+        user can keep sending messages while the brain works;
+        subsequent messages still hit ``_dispatch_to_brain``, find
+        the chat claimed by the spawned drain, and FIFO-enqueue
+        behind it — identical semantics to Hermes' goal kickoff path
+        (``gateway/run.py:_handle_goal_command`` → ``_enqueue_fifo``
+        → existing drain).
+
+        The task is added to ``self._background_dispatch_tasks`` for
+        the lifetime of the dispatch — without that strong reference
+        asyncio is allowed to GC a still-running task. A done-callback
+        prunes the set and logs any exception (asyncio's default
+        unhandled-exception path only fires at GC time, which can be
+        seconds-to-minutes after the failure).
+
+        ``label`` is a short tag ("goal_kickoff", "schedule_kickoff",
+        etc.) used purely for log lines — diagnostic, not semantic.
+        ``queue_origin`` is forwarded to ``_dispatch_to_brain`` so the
+        synthetic text gets tagged correctly when the chat is already
+        claimed and we fall back to enqueue.
+        """
+        task = asyncio.create_task(
+            self._dispatch_to_brain(
+                bot, chat_id, user_id, text, queue_origin=queue_origin,
+            ),
+            name=f"vexis-bg-dispatch-{label}-{chat_id}",
+        )
+        self._background_dispatch_tasks.add(task)
+
+        def _on_done(t: asyncio.Task, *, _label: str = label) -> None:
+            self._background_dispatch_tasks.discard(t)
+            if t.cancelled():
+                log.info("background dispatch '%s' cancelled", _label)
+                return
+            exc = t.exception()
+            if exc is not None:
+                log.error(
+                    "background dispatch '%s' raised: %r", _label, exc,
+                    exc_info=exc,
+                )
+
+        task.add_done_callback(_on_done)
+        return task
+
+    async def _preempt_goal_continuations(self, chat_id: int) -> int:
+        """Drop any queued ``goal_continuation`` messages for ``chat_id``.
+
+        Called BEFORE every real-user dispatch (``_on_text``,
+        ``_on_voice``, ``_on_photo``) so a user message arriving
+        during an active goal loop runs immediately after the
+        current in-flight turn — not behind a stack of goal
+        continuations the post-turn hook already enqueued.
+
+        Without preemption, a user message landing between the
+        hook's enqueue and the drain's next ``pop_or_release`` sits
+        behind 1+ continuations. With ``_run_goal_hook``'s dedup
+        (drop-before-enqueue, see that method) the worst case is one
+        continuation in the queue at a time, so the latency cost is
+        ~1 brain turn. With preemption it's ~0 (user runs as soon as
+        the current turn — whatever it is — completes).
+
+        The post-turn hook re-enqueues a continuation after the
+        user's turn finishes, so the goal naturally resumes once the
+        user stops typing. No state mutation on the goal itself —
+        ``turns_used`` still accumulates per the existing accounting
+        rules; this is pure queue management.
+
+        No-op when the chat has no queue state or no continuations
+        are queued. Cheap to call unconditionally — the lock contention
+        on an empty queue is trivial in the single-user deployment.
+
+        Returns the number of continuations dropped, for logging /
+        tests.
+        """
+        return await self._running_tasks.drop_messages_matching(
+            chat_id,
+            lambda m: m.origin == "goal_continuation",
+        )
+
+    async def flush_background_dispatch(self) -> None:
+        """Await every in-flight background-dispatch task.
+
+        Test-only entry point: production code never calls this
+        (the whole point of the spawn is to NOT block the handler).
+        Tests that exercise the kickoff and then assert on brain
+        calls / queue state need a way to wait for the spawned
+        drain to finish — calling ``asyncio.run`` on a coroutine
+        that doesn't await its scheduled tasks would let
+        ``asyncio.run`` tear the loop down with the task pending.
+        """
+        # Snapshot the set: the done-callback mutates it during
+        # gather, which would raise "set changed size during
+        # iteration" if we passed the live set directly.
+        pending = list(self._background_dispatch_tasks)
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
 
     async def _drain_chat(
         self, bot, chat_id: int, user_id: int, first_text: str
@@ -1202,6 +1343,9 @@ class TelegramTransport:
 
         if transcription is None:
             return
+        # Preempt any pending goal continuations so a voice message
+        # gets the same chat-feels-responsive guarantee as typed input.
+        await self._preempt_goal_continuations(chat_id)
         await self._dispatch_to_brain(
             bot, chat_id, user.id, f"{_VOICE_BRAIN_TAG}{transcription}"
         )
@@ -1226,6 +1370,9 @@ class TelegramTransport:
         tg_file = await photo.get_file()
         await tg_file.download_to_drive(custom_path=image_path)
         synthetic = _format_incoming_image_message(image_path, msg.caption)
+        # Preempt any pending goal continuations — photo turn should
+        # run after the current in-flight turn, not behind continuations.
+        await self._preempt_goal_continuations(chat_id)
         await self._dispatch_to_brain(bot, chat_id, user.id, synthetic)
 
     async def _on_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1627,8 +1774,24 @@ class TelegramTransport:
         # message would take. The text fed to the brain is just the
         # goal text — the continuation prompt template only applies
         # to subsequent turns.
-        await self._dispatch_to_brain(
-            msg.get_bot(), msg.chat_id, user.id, goal_text
+        #
+        # CRITICAL: the dispatch runs in a background task on purpose.
+        # A goal loop can chain dozens of turns over many minutes, and
+        # awaiting the dispatch inline would hold the PTB command
+        # handler for the entire duration — any message the user
+        # typed in the meantime would sit silent until /cancel.
+        # Spawning lets the handler return after the kickoff ack
+        # while the drain continues to run; subsequent user messages
+        # still hit ``_dispatch_to_brain``, find the chat claimed,
+        # and FIFO-enqueue alongside goal continuations (matching
+        # Hermes' ``gateway/run.py:_handle_goal_command`` →
+        # ``_enqueue_fifo`` pattern).
+        self._spawn_background_dispatch(
+            msg.get_bot(),
+            msg.chat_id,
+            user.id,
+            goal_text,
+            label="goal_kickoff",
         )
 
     async def _on_schedule(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1730,25 +1893,25 @@ class TelegramTransport:
         # response takes longer.
         await msg.reply_text(_SCHEDULE_ACK)
 
-        # If a drain is already active for this chat, enqueue;
-        # otherwise claim and dispatch. Mirrors the message-dispatch
-        # flow used by user-typed messages.
-        if await self._running_tasks.claim(msg.chat_id):
-            try:
-                await self._dispatch_to_brain(
-                    msg.get_bot(), msg.chat_id, user.id, synthetic
-                )
-            finally:
-                # Drain release happens inside _dispatch_to_brain's
-                # post-turn loop; nothing further needed here.
-                pass
-        else:
-            await self._running_tasks.enqueue(
-                chat_id=msg.chat_id,
-                user_id=user.id,
-                text=synthetic,
-                origin="schedule_command",
-            )
+        # Dispatch to the brain in a background task so the PTB handler
+        # returns immediately after the ack. ``_dispatch_to_brain``
+        # internally claims the chat (if no drain is active) or
+        # enqueues with ``queue_origin="schedule_command"`` (if one is)
+        # — both paths preserve the chat-not-blocked-while-brain-thinks
+        # property the /goal kickoff fix established. The previous
+        # outer-claim + inline-await pattern double-claimed the slot
+        # (the inner ``_dispatch_to_brain.claim()`` returned False
+        # because we already owned it) and then enqueued with the
+        # default ``user`` origin instead of ``schedule_command`` — a
+        # latent bug that the test fixture's AsyncMock masked.
+        self._spawn_background_dispatch(
+            msg.get_bot(),
+            msg.chat_id,
+            user.id,
+            synthetic,
+            label="schedule_kickoff",
+            queue_origin="schedule_command",
+        )
 
     def _render_schedule_list(self) -> str:
         """Render the active+paused schedule list as Telegram-friendly text."""
@@ -3144,6 +3307,19 @@ class TelegramTransport:
         if not prompt:
             return
         try:
+            # Dedup: drop any stale goal_continuation already in the
+            # queue before enqueuing the next one. The hook runs after
+            # EVERY turn (user, voice, photo, continuation) — without
+            # this, a stretch of user turns each appends a fresh
+            # continuation while the previous ones sit unprocessed,
+            # so the user "catches up" to a backlog of identical
+            # continuation prompts once they stop typing. The continuation
+            # text is deterministic (same goal → same prompt), so
+            # dropping older copies costs nothing.
+            await self._running_tasks.drop_messages_matching(
+                chat_id,
+                lambda m: m.origin == "goal_continuation",
+            )
             await self._running_tasks.enqueue(
                 chat_id,
                 self._allowed_user_id,
