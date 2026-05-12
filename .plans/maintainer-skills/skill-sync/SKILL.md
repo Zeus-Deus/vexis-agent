@@ -1,3 +1,21 @@
+> **Maintainer-only skill.** This SKILL.md lives under `.plans/`,
+> NOT `_bundled_skills/`, because it pushes to the maintainer's
+> own vexis-agent-site repo (Zeus-Deus/vexis-agent-site) and
+> hardcodes maintainer-specific paths. It is not useful to anyone
+> else and is intentionally kept out of the v0.4+ ship.
+>
+> **How to install on your home agent:**
+> 1. Open the dashboard → Skills tab → New Skill
+> 2. Name: `skill-sync`
+> 3. Paste everything from the `---` line below to the end of
+>    this file as the body
+> 4. Save → click the row → Pin (so the curator never touches it)
+> 5. Schedule via Telegram:
+>    `/schedule every day at 2:30am run the skill-sync skill`
+>
+> Smoke-test once before scheduling:
+> "Run the skill-sync skill once. Report counts + any errors."
+
 ---
 name: skill-sync
 description: Nightly job that scrapes upstream skill catalogs (Hermes Agent built-in + optional skills), normalises their metadata, writes a JSON catalog into the vexis-agent-site repo, commits + pushes (which triggers the GHA deploy), and reports a one-line summary back to chat. Load this when the user asks to refresh the public skills catalog, when scheduling a recurring catalog refresh, or when investigating why the public Skills page is stale.
@@ -64,14 +82,20 @@ Defaults shown; override only if the user has explicitly asked.
 
 | Knob | Default | Notes |
 |---|---|---|
-| Source repo | `https://github.com/NousResearch/hermes-agent` | The upstream Hermes Agent source — has both built-in and optional skills. |
+| Source repo | `https://github.com/NousResearch/hermes-agent` | The upstream Hermes Agent source — has both built-in (87) and optional (79) skills, ~166 total. |
 | Source branch | `main` | |
-| Built-in path | `skills/` | First tier on the catalog (rendered as `optional` in vexis-agent-site terminology because vexis "bundled" is reserved for vexis's own kanban-* skills). |
-| Optional path | `optional-skills/` | Second tier; rendered as `community`. |
+| Built-in path | `skills/` | 87 skills. Rendered as `optional` in vexis-agent-site (vexis's `bundled` tier is reserved for vexis-authored skills like kanban-*). |
+| Optional path | `optional-skills/` | 79 skills. Rendered as `community`. |
 | Site repo | `~/projects/vexis-agent-site` | |
 | Output JSON | `src/content/community-skills.json` (relative to site repo) | |
 | Commit message prefix | `skill-sync:` | |
 | Max skills per source | 1000 | Safety cap; flag if exceeded. |
+
+**Out of scope for v1:** the 521 community skills (Anthropic 16 +
+LobeHub 505) live in separate registries Hermes pulls in
+dynamically. They're NOT in the hermes-agent repo. Adding them
+needs new source endpoints — defer until the loop with the 166 is
+proven solid.
 
 ## Algorithm — concrete steps
 
@@ -225,11 +249,11 @@ git push origin main
 
 After successful push (or no-op), report a single line to chat:
 
-> skill-sync: 167 skills from Hermes Agent (12 added, 3 removed, 0 changed). Site deploy in flight.
+> skill-sync: 166 skills from Hermes Agent (12 added, 3 removed, 0 changed). Site deploy in flight.
 
 If it was a no-op:
 
-> skill-sync: catalog already up to date (167 skills, last refreshed 2026-05-12T02:30:01Z).
+> skill-sync: catalog already up to date (166 skills, last refreshed 2026-05-12T02:30:01Z).
 
 If it failed at any step, report the step and the error message.
 
