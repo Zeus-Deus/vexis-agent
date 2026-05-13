@@ -30,9 +30,19 @@ import asyncio
 import logging
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from vexis_agent.core.running_tasks import RunningTasks
+
+
+# Signature of a transport-provided dispatch callback. Async, kwargs-only.
+# When set on the manager, scheduled fires route through this instead of
+# raw ``running_tasks.enqueue`` — the transport's implementation goes
+# through ``claim() ? drain : enqueue``, which is what guarantees a drain
+# loop actually runs the synthetic prompt. Without this hop, fires at
+# idle wall-clock time (the 2:30 AM case) strand in the FIFO until a real
+# user message wakes a fresh claim — the bug fixed in this commit.
+DispatchFn = Callable[..., Awaitable[bool]]
 from vexis_agent.core.schedule_state import (
     DEFAULT_STUCK_RUN_TTL_SECONDS,
     ScheduleState,
@@ -89,6 +99,7 @@ class ScheduleManager:
         max_consecutive_errors_fn=None,
         enabled_fn=None,
         stuck_run_ttl_seconds: int = DEFAULT_STUCK_RUN_TTL_SECONDS,
+        dispatch_fn: DispatchFn | None = None,
     ) -> None:
         """Construct the manager. Does not spawn the thread — call
         :meth:`start` on the event loop.
@@ -132,6 +143,23 @@ class ScheduleManager:
         # Tracks "did we already do the boot-time sweep?" so we don't
         # repeat it on every tick.
         self._booted = False
+
+        # Optional transport-provided dispatch callback (see DispatchFn
+        # docstring above). Late-bindable via ``set_dispatch_fn`` because
+        # the Telegram transport is constructed AFTER ScheduleManager in
+        # main.py — by the time the first tick runs we want this wired.
+        self._dispatch_fn: DispatchFn | None = dispatch_fn
+
+    def set_dispatch_fn(self, fn: DispatchFn | None) -> None:
+        """Late-bind the dispatch callback after construction.
+
+        Called by ``main.py`` once the Telegram transport exists, since
+        the transport's ``dispatch_scheduled_fire`` method is what makes
+        scheduled fires go through the claim/drain protocol instead of
+        stranding in the FIFO. Pass ``None`` to revert to the legacy
+        raw-enqueue path (tests, alternate wirings).
+        """
+        self._dispatch_fn = fn
 
     # ----- lifecycle -------------------------------------------------
 
@@ -337,8 +365,26 @@ class ScheduleManager:
             raise
 
     def _enqueue_synthetic(self, *, chat_id: int, text: str) -> bool:
-        """Schedule the enqueue on the asyncio loop. Returns True on
+        """Schedule the fire onto the asyncio loop. Returns True on
         success.
+
+        Two paths:
+
+        * ``self._dispatch_fn`` is set (production wiring) — call it.
+          The transport's implementation goes through
+          ``_dispatch_to_brain`` which does ``claim() ? drain : enqueue``,
+          guaranteeing a drain loop actually consumes the prompt. This
+          is the correct path for scheduled fires at idle wall-clock
+          time (2:30 AM): without it, the prompt would land in the FIFO
+          with no drain owner and sit there until a real user message
+          woke a fresh claim. That was the v0.4.0 bug this branch fixes.
+
+        * ``self._dispatch_fn`` is None (test fixtures, alternate
+          wirings) — fall back to raw ``running_tasks.enqueue``. Same
+          stranding hazard as before, but tests don't exercise an
+          end-to-end drain so it's fine for them; the
+          ``test_dispatch_fn_routes_through_transport`` regression test
+          covers the production path.
 
         Catches all exceptions so a transport-side failure (loop
         closed, RunningTasks not initialized) doesn't kill the
@@ -351,6 +397,34 @@ class ScheduleManager:
                 chat_id,
             )
             return False
+
+        if self._dispatch_fn is not None:
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._dispatch_fn(
+                        chat_id=chat_id,
+                        user_id=self._user_id,
+                        text=text,
+                    ),
+                    self._loop,
+                )
+                # 5s is generous — the dispatch_fn just spawns a
+                # background task (asyncio.create_task) and returns;
+                # it does NOT await the brain turn.
+                return bool(future.result(timeout=5.0))
+            except Exception as exc:
+                log.warning(
+                    "ScheduleManager dispatch_fn failed for chat=%d: %s",
+                    chat_id,
+                    exc,
+                )
+                return False
+
+        # Legacy raw-enqueue path. Reached only when no dispatch_fn is
+        # wired (tests, alt wirings). Note: this path WILL strand the
+        # prompt if no drain is currently active — see the docstring's
+        # 2:30 AM warning. main.py always wires dispatch_fn for the
+        # Telegram transport.
         try:
             future = asyncio.run_coroutine_threadsafe(
                 self._running_tasks.enqueue(
@@ -485,6 +559,7 @@ def _record_fire(
 
 
 __all__ = [
+    "DispatchFn",
     "MIN_REFIRE_GAP_SECONDS",
     "ScheduleManager",
 ]

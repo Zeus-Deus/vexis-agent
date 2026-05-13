@@ -515,6 +515,15 @@ async def _run() -> None:
         kanban_store=kanban_store,
     )
 
+    # Wire the dispatch callback so ScheduleManager fires route through
+    # the transport's ``claim() ? drain : enqueue`` protocol instead of
+    # raw FIFO enqueue. Without this, a fire at idle wall-clock time
+    # (2:30 AM) strands the prompt in the deque until the next real
+    # user message wakes a fresh claim — the v0.4.0 bug. The transport
+    # exists by here; ScheduleManager.start() hasn't been called yet,
+    # so the very first tick sees the dispatch_fn wired.
+    schedule_manager.set_dispatch_fn(transport.dispatch_scheduled_fire)
+
     log.info("Vexis-Agent starting")
     await control_socket.start()
     await dashboard.start()

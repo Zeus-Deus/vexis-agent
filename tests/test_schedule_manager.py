@@ -634,3 +634,159 @@ def test_stop_joins_thread(tmp_path):
         assert manager._thread is None
     finally:
         loop.close()
+
+
+# ──────────────────────────────────────────────────────────────────
+# dispatch_fn — regression for the v0.4.0 stranded-fire bug
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_dispatch_fn_routes_through_transport(tmp_path):
+    """When ``dispatch_fn`` is wired (production path via main.py),
+    ``_enqueue_synthetic`` calls it instead of the raw
+    ``running_tasks.enqueue`` path.
+
+    Regression for v0.4.0 where scheduled fires stranded in the FIFO
+    at idle wall-clock time (2:30 AM scenario) because raw enqueue
+    didn't trigger a drain claim. The Telegram transport's
+    ``dispatch_scheduled_fire`` goes through
+    ``_spawn_background_dispatch`` → ``_dispatch_to_brain`` which does
+    ``claim() ? drain : enqueue`` — so when the chat is idle (the
+    overnight case) the fire claims the drain itself and a drain loop
+    consumes the prompt immediately.
+    """
+    store = ScheduleStore(tmp_path / "schedules.json")
+    now = datetime(2026, 5, 10, 12, 0, tzinfo=timezone.utc)
+    _make_active_schedule(
+        store=store,
+        id="disp123abc456",
+        next_fire_at=now - timedelta(seconds=1),
+    )
+
+    fake = _FakeRunningTasks()
+
+    # Spin up a real asyncio loop in a thread so the manager's
+    # ``run_coroutine_threadsafe`` call can actually execute the
+    # dispatch_fn coroutine — the existing fixtures sidestep this
+    # by patching _enqueue_synthetic entirely, but here we want to
+    # exercise the real _enqueue_synthetic dispatch branch.
+    loop_ready = threading.Event()
+    loop_holder: list = []
+
+    def _loop_thread() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop_holder.append(loop)
+        loop_ready.set()
+        try:
+            loop.run_forever()
+        finally:
+            loop.close()
+
+    thr = threading.Thread(target=_loop_thread, daemon=True)
+    thr.start()
+    assert loop_ready.wait(timeout=2.0), "loop thread failed to start"
+    loop = loop_holder[0]
+
+    try:
+        captured: list[dict] = []
+
+        async def fake_dispatch(*, chat_id: int, user_id: int, text: str) -> bool:
+            captured.append(
+                {"chat_id": chat_id, "user_id": user_id, "text": text}
+            )
+            return True
+
+        manager = ScheduleManager(
+            store,
+            running_tasks=fake,  # type: ignore[arg-type]
+            allowed_user_id=999,
+            enabled_fn=lambda: True,
+            tick_interval_seconds_fn=lambda: 30,
+            max_consecutive_errors_fn=lambda: 5,
+        )
+        manager._loop = loop
+        manager.set_dispatch_fn(fake_dispatch)
+
+        fired = manager._run_once(now=now)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thr.join(timeout=2.0)
+
+    assert fired == 1
+    assert len(captured) == 1, (
+        f"dispatch_fn should be called exactly once, got {captured!r}"
+    )
+    assert captured[0]["chat_id"] == 12345
+    assert captured[0]["user_id"] == 999
+    assert "test prompt" in captured[0]["text"]
+    # The legacy raw-enqueue path was NOT taken — this is the
+    # invariant that prevents the 2:30 AM bug regressing.
+    assert fake.calls == [], (
+        f"running_tasks.enqueue should NOT be called when dispatch_fn "
+        f"is wired; got {fake.calls!r}"
+    )
+
+
+def test_dispatch_fn_failure_counts_as_enqueue_error(tmp_path):
+    """A dispatch_fn that raises should be treated as an enqueue
+    failure — increments ``consecutive_errors`` exactly like the
+    legacy path. Same observable behaviour as raw-enqueue failure
+    (test_enqueue_failure_increments_consecutive_errors) so the
+    auto-pause-at-threshold safety net still applies in the new path.
+    """
+    store = ScheduleStore(tmp_path / "schedules.json")
+    now = datetime(2026, 5, 10, 12, 0, tzinfo=timezone.utc)
+    state = _make_active_schedule(
+        store=store,
+        id="disperr1abcde",
+        next_fire_at=now - timedelta(seconds=1),
+    )
+
+    fake = _FakeRunningTasks()
+
+    loop_ready = threading.Event()
+    loop_holder: list = []
+
+    def _loop_thread() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop_holder.append(loop)
+        loop_ready.set()
+        try:
+            loop.run_forever()
+        finally:
+            loop.close()
+
+    thr = threading.Thread(target=_loop_thread, daemon=True)
+    thr.start()
+    assert loop_ready.wait(timeout=2.0)
+    loop = loop_holder[0]
+
+    try:
+        async def crashy_dispatch(*, chat_id: int, user_id: int, text: str) -> bool:
+            raise RuntimeError("simulated dispatch failure")
+
+        manager = ScheduleManager(
+            store,
+            running_tasks=fake,  # type: ignore[arg-type]
+            allowed_user_id=999,
+            enabled_fn=lambda: True,
+            tick_interval_seconds_fn=lambda: 30,
+            max_consecutive_errors_fn=lambda: 5,
+        )
+        manager._loop = loop
+        manager.set_dispatch_fn(crashy_dispatch)
+
+        fired = manager._run_once(now=now)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thr.join(timeout=2.0)
+
+    # _fire_one returns False on enqueue failure; ``fired`` counts
+    # successes only.
+    assert fired == 0
+    reloaded = store.load(state.id)
+    assert reloaded is not None
+    assert reloaded.consecutive_errors == 1
+    assert reloaded.last_status == "error"

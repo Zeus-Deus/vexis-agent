@@ -843,6 +843,58 @@ class TelegramTransport:
         task.add_done_callback(_on_done)
         return task
 
+    async def dispatch_scheduled_fire(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        text: str,
+    ) -> bool:
+        """Entry point for ``ScheduleManager`` fires.
+
+        Wired into ``ScheduleManager.set_dispatch_fn`` at startup so
+        scheduled fires route through ``_spawn_background_dispatch`` →
+        ``_dispatch_to_brain``, which does ``claim() ? drain : enqueue``.
+        Without this hop, a fire at idle wall-clock time (e.g. 02:30
+        CEST) would only call ``running_tasks.enqueue`` — landing the
+        prompt in the FIFO with no drain owner — and the prompt would
+        sit there until a real user message woke a fresh claim. That
+        was the v0.4.0 bug:
+
+            02:30:00  Enqueued message ... origin=scheduled_fire
+            ...
+            14:56:05  Claimed drain for chat ... (user typed something)
+            15:02:00  Popped queued message  ← stranded 02:30 fire runs
+
+        Tagging with ``queue_origin="scheduled_fire"`` keeps the message
+        distinguishable from user / goal_continuation / schedule_command
+        in the queue (e.g. ``/goal pause``'s drop predicate only targets
+        goal_continuation, so scheduled fires survive a goal pause).
+
+        Returns True when the dispatch task was spawned. False on
+        failure to spawn — the manager increments ``consecutive_errors``
+        and auto-pauses at threshold. Note: True does NOT mean the
+        brain turn completed; the brain runs in the background and
+        replies through the normal ``_drain_chat`` reply mechanism.
+        """
+        try:
+            self._spawn_background_dispatch(
+                self._app.bot,
+                chat_id,
+                user_id,
+                text,
+                label="schedule_fire",
+                queue_origin="scheduled_fire",
+            )
+            return True
+        except Exception as exc:
+            log.warning(
+                "dispatch_scheduled_fire failed for chat=%d: %s",
+                chat_id,
+                exc,
+            )
+            return False
+
     async def _preempt_goal_continuations(self, chat_id: int) -> int:
         """Drop any queued ``goal_continuation`` messages for ``chat_id``.
 
