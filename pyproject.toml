@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vexis-agent"
-version = "0.4.0"
+version = "0.4.1"
 description = "Telegram bot + agent CLI bridge for controlling an Omarchy desktop from a phone."
 readme = "README.md"
 requires-python = ">=3.11"
