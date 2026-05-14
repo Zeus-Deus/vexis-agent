@@ -1661,18 +1661,34 @@ class LearningController:
     ) -> None:
         self._workspace = workspace
         self._notifier = notifier
-        # Phase B: the brain is the aux-spawn surface for the
-        # coherence judge, learning review, and relationships
-        # extractor. Production threads the real brain in via
-        # ``main.py``; tests that don't reach the spawn path can
-        # leave it ``None`` (the controller falls back to
-        # ``BrainNull()`` lazily when a real spawn is needed —
-        # which only happens if the test forgot to mock out the
-        # downstream functions). Required-kwarg in production
-        # call sites; default-None for test ergonomics.
-        from vexis_agent.core.brain.null import BrainNull
+        # The brain is two things to the curator: the aux-spawn
+        # surface (coherence judge, learning review, relationships
+        # extractor) AND the session-enumeration surface that the
+        # eligibility scan walks (``iter_session_metas``) and reads
+        # transcripts through (``iter_messages``). Production threads
+        # the real brain in via ``main.py``.
+        #
+        # When a test omits ``brain``, default to a ``ClaudeCodeBrain``
+        # bound to this workspace — the curator's historical behaviour
+        # is exactly claude-code's (glob ``~/.claude/projects`` JSONLs),
+        # so tests that seed JSONL files and don't thread a brain still
+        # get scanned correctly. Tests that exercise the real aux-spawn
+        # pipeline pass an explicit ``BrainNull(aux_results=...)``;
+        # opencode-parity tests pass an explicit ``OpenCodeBrain``.
+        if brain is not None:
+            self._brain: Brain = brain
+        else:
+            from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+            from vexis_agent.core.running_tasks import RunningTasks
+            from vexis_agent.core.sessions import SessionStore
 
-        self._brain: Brain = brain or BrainNull()
+            self._brain = ClaudeCodeBrain(
+                workspace=workspace,
+                session=SessionStore(
+                    workspace / ".vexis-curator-sessions.json"
+                ),
+                running_tasks=RunningTasks(),
+            )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._busy_per_session: set[str] = set()
@@ -1842,13 +1858,19 @@ class LearningController:
             idle_threshold=idle_threshold,
             now=started_at,
             spawned_by_curator=spawned_union,
-            # Phase B: route the recursion guard through the brain
-            # abstraction so a future opencode brain can filter
-            # SQL-row-stored sessions with the same content-prefix
-            # check. ClaudeCodeBrain.is_brain_owned_session delegates
-            # to the existing core.transcripts._is_curator_owned, so
-            # behaviour is unchanged today.
+            # Route the recursion guard through the brain abstraction
+            # so the opencode brain filters SQL-row-stored sessions
+            # with the same content-prefix check. ClaudeCodeBrain
+            # delegates to core.transcripts._is_curator_owned, so
+            # claude-code behaviour is unchanged.
             is_brain_owned=self._brain.is_brain_owned_session,
+            # Enumerate sessions through the brain too: claude-code
+            # globs ~/.claude/projects JSONLs, opencode reads
+            # opencode.db. ClaudeCodeBrain.iter_session_metas
+            # delegates to the same iter_session_metas(workspace)
+            # glob the None-fallback uses, so claude-code output is
+            # byte-identical.
+            session_metas=self._brain.iter_session_metas(),
         )
         result.eligible = [m.session_uuid for m in candidates]
 

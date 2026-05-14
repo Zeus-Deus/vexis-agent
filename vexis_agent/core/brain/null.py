@@ -49,12 +49,22 @@ class BrainNull(Brain):
         responses: list[str] | None = None,
         aux_results: list[AuxResult] | None = None,
         system_prompt: str = "[null brain] system prompt",
+        transcript_workspace: Path | None = None,
     ) -> None:
         # Queue of responses; ``respond()`` consumes from the head.
         # Once exhausted, returns "" (the default empty reply).
         self._responses: list[str] = list(responses or [])
         self._aux_results: list[AuxResult] = list(aux_results or [])
         self._system_prompt = system_prompt
+        # When set, the transcript-readback methods front a real
+        # claude-code-style session store at this workspace (delegating
+        # to ``core.transcripts``) instead of yielding empty. Lets a
+        # test seed JSONL session files AND keep BrainNull's
+        # deterministic aux-spawn behaviour — the combination the
+        # learning curator's "real review" integration tests need.
+        # Default ``None`` keeps the zero-dependency empty behaviour
+        # every other test relies on.
+        self._transcript_workspace: Path | None = transcript_workspace
         # Pending exception for the next ``respond()`` call. ``None``
         # means no injection — proceed normally.
         self._pending_exc: BrainError | None = None
@@ -198,12 +208,35 @@ class BrainNull(Brain):
         return self._session_token
 
     def iter_session_metas(self) -> Iterator[Any]:
-        return iter(())
+        if self._transcript_workspace is None:
+            return iter(())
+        from vexis_agent.core.transcripts import (
+            iter_session_metas as _iter_session_metas,
+        )
+        return _iter_session_metas(self._transcript_workspace)
 
     def iter_messages(self, session_id: str) -> Iterator[Any]:
+        if self._transcript_workspace is None:
+            return iter(())
+        from vexis_agent.core.transcripts import (
+            iter_messages as _iter_messages,
+            iter_session_metas as _iter_session_metas,
+        )
+        for meta in _iter_session_metas(self._transcript_workspace):
+            if meta.session_uuid == session_id and meta.jsonl_path is not None:
+                return _iter_messages(meta.jsonl_path)
         return iter(())
 
     def is_brain_owned_session(self, session_id: str) -> bool:
+        if self._transcript_workspace is None:
+            return False
+        from vexis_agent.core.transcripts import (
+            _is_curator_owned,
+            iter_session_metas as _iter_session_metas,
+        )
+        for meta in _iter_session_metas(self._transcript_workspace):
+            if meta.session_uuid == session_id and meta.jsonl_path is not None:
+                return _is_curator_owned(meta.jsonl_path)
         return False
 
     def write_mcp_config(self, servers: list[McpServerSpec]) -> Path:

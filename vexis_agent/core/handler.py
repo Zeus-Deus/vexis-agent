@@ -13,7 +13,6 @@ from vexis_agent.core.notify import ContextNote, Notifier
 from vexis_agent.core.paths import skills_dir
 from vexis_agent.core.sessions import SessionInfo, SessionStore
 from vexis_agent.core.skills import PinStore, archived_skill_names
-from vexis_agent.core.transcripts import claude_session_jsonl_dir, iter_messages
 
 log = logging.getLogger(__name__)
 
@@ -490,24 +489,22 @@ class MessageHandler:
         return self._sessions.get()
 
     def next_user_turn_index(self, session_uuid: str) -> int:
-        """Predict the user-turn ordinal that ``claude -p`` will write
-        next for ``session_uuid``.
+        """Predict the user-turn ordinal the brain will write next for
+        ``session_uuid``.
 
-        Reads ``<encoded-cwd>/<session_uuid>.jsonl`` and counts
-        user-role lines via ``iter_messages`` (which already skips
-        sidechain + non-conversational types). Returns ``count + 1``.
-        Returns 1 when the JSONL doesn't exist (first turn of a
-        never-initialised session) or the workspace isn't configured
-        on the handler (test fixtures).
+        Routes through ``brain.iter_messages`` so it stays brain-
+        agnostic — claude-code resolves the session JSONL, opencode
+        reads ``opencode.db``. Counts user-role turns (the brain
+        readers already skip sidechain + non-conversational types) and
+        returns ``count + 1``. An empty iterator — a never-initialised
+        session, or BrainNull in test fixtures — yields 1, matching the
+        old file-not-found behaviour. Also returns 1 when the workspace
+        isn't configured on the handler (test fixtures).
         """
         if self._workspace is None:
             return 1
-        pdir = claude_session_jsonl_dir(self._workspace)
-        jsonl = pdir / f"{session_uuid}.jsonl"
-        if not jsonl.exists():
-            return 1
         n = 0
-        for msg in iter_messages(jsonl):
+        for msg in self._brain.iter_messages(session_uuid):
             if msg.role == "user":
                 n += 1
         return n + 1
@@ -518,8 +515,8 @@ class MessageHandler:
         Computes ``proposed = next_user_turn_index(session_uuid)`` and
         compares against the cursor. Returns the proposed index and
         bumps the cursor when ``proposed > last``; returns ``None``
-        when the JSONL hasn't advanced past the last mint (the
-        ``claude -p`` no-write edge — see scoping doc §3.1).
+        when the transcript hasn't advanced past the last mint (the
+        brain no-write edge — see scoping doc §3.1).
 
         Wrapped in ``_cursor_lock`` so the read-modify-write is
         atomic w.r.t. concurrent callers. The drain loop already

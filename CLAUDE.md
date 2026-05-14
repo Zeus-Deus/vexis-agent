@@ -90,6 +90,10 @@ section — violating them is breaking the codebase.
   YAML comments — not when an in-memory flag says first edit.
   Flag pattern destroys comments after daemon restart; on-disk
   trigger is self-managing.
+- **Transcript reads route through `brain.iter_messages()`.**
+  Only `core/transcripts.py` + `core/brain/claude_code.py` may
+  touch `claude_session_jsonl_dir`; opencode has no JSONL
+  (sessions live in `opencode.db`). Guarded by `test_brain_parity`.
 
 ## Model selection
 

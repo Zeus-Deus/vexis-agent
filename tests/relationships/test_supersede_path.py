@@ -19,13 +19,14 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
+from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.opencode import OpenCodeBrain
 from vexis_agent.core.coherence_judge import CoherenceVerdict
 from vexis_agent.core.relationships.consent import (
     ConsentError,
@@ -42,18 +43,39 @@ from vexis_agent.core.relationships.store import (
     serialize_relationships_file,
 )
 from vexis_agent.core.relationships.triggers import TriggerVerdict
-from vexis_agent.core.transcripts import claude_session_jsonl_dir
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
+
+from tests._brain_seed import seed_transcript
 
 
-@pytest.fixture
-def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+@pytest.fixture(params=["claude_code", "opencode"])
+def brain(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    """A real brain (claude-code or opencode) on tmp paths — the
+    curator reads source turns through ``brain.iter_messages``."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: home))
     ws = tmp_path / "ws"
     ws.mkdir(parents=True, exist_ok=True)
-    return ws
+    session = SessionStore(tmp_path / "sessions.json")
+    if request.param == "claude_code":
+        return ClaudeCodeBrain(
+            workspace=ws, session=session, running_tasks=RunningTasks()
+        )
+    return OpenCodeBrain(
+        workspace=ws, session=session, running_tasks=RunningTasks()
+    )
+
+
+@pytest.fixture
+def workspace(brain: Any) -> Path:
+    return brain._workspace
 
 
 def _stub_classifier(verdict: TriggerVerdict):
@@ -91,19 +113,11 @@ def _seed_live_with_sarah(workspace: Path) -> None:
     )
 
 
-def _stage_source_jsonl(
-    workspace: Path, session_uuid: str, user_text: str
-) -> None:
-    pdir = claude_session_jsonl_dir(workspace)
-    pdir.mkdir(parents=True, exist_ok=True)
-    path = pdir / f"{session_uuid}.jsonl"
-    line = json.dumps({
-        "type": "user",
-        "uuid": "u-1",
-        "timestamp": "2026-05-04T12:00:00Z",
-        "message": {"role": "user", "content": user_text},
-    })
-    path.write_text(line + "\n", encoding="utf-8")
+def _seed_source(brain: Any, session_uuid: str, user_text: str) -> None:
+    """Seed a one-user-turn transcript at ``session_uuid`` so the
+    curator's source-turn loader reads it back — JSONL for
+    claude-code, opencode.db rows for opencode."""
+    seed_transcript(brain, session_uuid, [("user", user_text)])
 
 
 # ---------------------------------------------------------------- consent
@@ -288,11 +302,11 @@ def test_store_supersede_uses_archive_first_atomic_rename(
 # ---------------------------------------------------------------- curator
 
 
-def test_curator_supersede_executes_synchronously(workspace: Path):
+def test_curator_supersede_executes_synchronously(
+    brain: Any, workspace: Path
+):
     _seed_live_with_sarah(workspace)
-    _stage_source_jsonl(
-        workspace, "sess-sup", "actually Sarah loves classical now",
-    )
+    _seed_source(brain, "sess-sup", "actually Sarah loves classical now")
     classifier_verdict = TriggerVerdict(
         verdict="SUPERSEDE",
         person_name="Sarah",
@@ -302,6 +316,7 @@ def test_curator_supersede_executes_synchronously(workspace: Path):
     )
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
         coherence_judge=lambda *a, **kw: CoherenceVerdict.coherent(),
     )
@@ -332,7 +347,9 @@ def test_curator_supersede_executes_synchronously(workspace: Path):
     assert curator.counters["supersede_executed"] == 1
 
 
-def test_curator_supersede_missing_returns_friendly_no_op(workspace: Path):
+def test_curator_supersede_missing_returns_friendly_no_op(
+    brain: Any, workspace: Path
+):
     classifier_verdict = TriggerVerdict(
         verdict="SUPERSEDE",
         person_name="Sarah",
@@ -341,6 +358,7 @@ def test_curator_supersede_missing_returns_friendly_no_op(workspace: Path):
     )
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
     )
     res = asyncio.run(
@@ -358,7 +376,9 @@ def test_curator_supersede_missing_returns_friendly_no_op(workspace: Path):
     assert not relationships_archive_path(workspace).exists()
 
 
-def test_curator_supersede_blocks_on_sensitive_pattern(workspace: Path):
+def test_curator_supersede_blocks_on_sensitive_pattern(
+    brain: Any, workspace: Path
+):
     _seed_live_with_sarah(workspace)
     classifier_verdict = TriggerVerdict(
         verdict="SUPERSEDE",
@@ -368,6 +388,7 @@ def test_curator_supersede_blocks_on_sensitive_pattern(workspace: Path):
     )
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
         coherence_judge=lambda *a, **kw: CoherenceVerdict.coherent(),
     )
@@ -389,11 +410,11 @@ def test_curator_supersede_blocks_on_sensitive_pattern(workspace: Path):
     assert curator.counters["supersede_blocked_sensitive"] == 1
 
 
-def test_curator_supersede_blocks_on_coherence_incoherent(workspace: Path):
+def test_curator_supersede_blocks_on_coherence_incoherent(
+    brain: Any, workspace: Path
+):
     _seed_live_with_sarah(workspace)
-    _stage_source_jsonl(
-        workspace, "sess-sup", "actually Sarah loves classical now",
-    )
+    _seed_source(brain, "sess-sup", "actually Sarah loves classical now")
     classifier_verdict = TriggerVerdict(
         verdict="SUPERSEDE",
         person_name="Sarah",
@@ -402,6 +423,7 @@ def test_curator_supersede_blocks_on_coherence_incoherent(workspace: Path):
     )
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
         coherence_judge=lambda *a, **kw: CoherenceVerdict.incoherent(
             reason="ungrounded", explanation="...",
@@ -423,7 +445,9 @@ def test_curator_supersede_blocks_on_coherence_incoherent(workspace: Path):
     assert curator.counters["supersede_blocked_coherence"] == 1
 
 
-def test_curator_supersede_skips_judge_when_source_unloadable(workspace: Path):
+def test_curator_supersede_skips_judge_when_source_unloadable(
+    brain: Any, workspace: Path
+):
     """Coherence judge is advisory-skipped (not blocking) when the
     source turn isn't loadable. SUPERSEDE proceeds."""
     _seed_live_with_sarah(workspace)
@@ -436,6 +460,7 @@ def test_curator_supersede_skips_judge_when_source_unloadable(workspace: Path):
     judge = MagicMock()
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
         coherence_judge=judge,
     )

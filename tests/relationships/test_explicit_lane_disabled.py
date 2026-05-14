@@ -32,6 +32,12 @@ class _FakeBrain:
     async def respond(self, message: str, chat_id: int) -> str:
         return "brain-reply"
 
+    def iter_messages(self, session_id: str):
+        # No transcript in this fixture — the turn-index accessors
+        # treat an empty iterator as a never-initialised session
+        # (next_user_turn_index → 1). Brain-agnostic by construction.
+        return iter(())
+
 
 class _FakeSessionStore:
     def __init__(self, uuid: str = "real-session"):

@@ -769,3 +769,47 @@ def test_spawn_aux_explicit_cwd_overrides_workspace(
     other.mkdir()
     asyncio.run(brain.spawn_aux("p", cwd=other))
     assert captured["cwd"] == str(other)
+
+
+def test_spawn_aux_model_not_found_raises_structured_error(
+    brain: OpenCodeBrain, monkeypatch
+):
+    """opencode's ``--format json`` mode exits 0 even on a bad model
+    — the diagnostic is a typed ``error`` event in the stream. The
+    most common cause is a legacy claude-code-style raw alias
+    (``sonnet``) in config that opencode can't resolve. spawn_aux
+    must surface this as a structured ``BrainModelNotFoundError``
+    carrying the provider/model-shape fix, not a silent empty reply.
+    """
+    from vexis_agent.core.brain.base import BrainModelNotFoundError
+
+    class _CP:
+        # opencode 1.14's observed bad-model event shape.
+        stdout = (
+            b'{"type": "error", "error": {"name": "UnknownError", '
+            b'"data": {"message": "Model not found: '
+            b'anthropic/claude-haiku-3-5/."}}}\n'
+        )
+        stderr = b""
+        returncode = 0
+
+    def _fake_run(argv, **kwargs):
+        return _CP()
+
+    monkeypatch.setattr(
+        "vexis_agent.core.brain.opencode.subprocess.run", _fake_run
+    )
+    with pytest.raises(BrainModelNotFoundError) as exc_info:
+        asyncio.run(
+            brain.spawn_aux(
+                "p", model_tier="small", subsystem="coherence_judge"
+            )
+        )
+    err = exc_info.value
+    assert err.brain_kind == "opencode"
+    assert err.subsystem == "coherence_judge"
+    # The tier resolved to a provider/model id before the spawn —
+    # that id is what the error carries back.
+    assert err.model_id == "anthropic/claude-haiku-3-5"
+    # The fix copy steers the user toward the provider/model shape.
+    assert err.suggested_fix

@@ -250,6 +250,142 @@ def test_check_brain_cli_null_no_binary() -> None:
     assert bc.binary == ""
 
 
+# ── opencode auth probe ───────────────────────────────────────────
+
+
+# Real ``opencode auth list`` output (opencode 1.14) — a box-drawn
+# list with ANSI colour codes and ``●`` provider rows.
+_OPENCODE_AUTH_LIST_AUTHED = (
+    "\x1b[0m\n"
+    "┌  Credentials \x1b[90m~/.local/share/opencode/auth.json\n"
+    "│\n"
+    "●  GitHub Copilot \x1b[90moauth\n"
+    "│\n"
+    "●  Anthropic \x1b[90moauth\n"
+)
+_OPENCODE_AUTH_LIST_EMPTY = (
+    "\x1b[0m\n"
+    "┌  Credentials \x1b[90m~/.local/share/opencode/auth.json\n"
+    "│\n"
+)
+
+
+def _fake_run_factory(stdout: str, returncode: int = 0):
+    def _fake_run(*_a, **_kw):
+        import subprocess as _sp
+        return _sp.CompletedProcess(
+            args=["opencode", "auth", "list"],
+            returncode=returncode,
+            stdout=stdout,
+            stderr="",
+        )
+    return _fake_run
+
+
+def test_check_opencode_auth_parses_provider_rows(monkeypatch) -> None:
+    monkeypatch.setattr(sw.shutil, "which", lambda _b: "/usr/bin/opencode")
+    monkeypatch.setattr(
+        sw.subprocess, "run",
+        _fake_run_factory(_OPENCODE_AUTH_LIST_AUTHED),
+    )
+    res = sw.check_opencode_auth()
+    assert res.probed is True
+    assert res.authed is True
+    # ANSI stripped, ``●`` markers counted, names extracted.
+    assert "GitHub Copilot" in res.providers[0]
+    assert any("Anthropic" in p for p in res.providers)
+
+
+def test_check_opencode_auth_no_providers(monkeypatch) -> None:
+    monkeypatch.setattr(sw.shutil, "which", lambda _b: "/usr/bin/opencode")
+    monkeypatch.setattr(
+        sw.subprocess, "run",
+        _fake_run_factory(_OPENCODE_AUTH_LIST_EMPTY),
+    )
+    res = sw.check_opencode_auth()
+    assert res.probed is True
+    assert res.authed is False
+    assert res.providers == ()
+
+
+def test_check_opencode_auth_binary_missing(monkeypatch) -> None:
+    monkeypatch.setattr(sw.shutil, "which", lambda _b: None)
+    res = sw.check_opencode_auth()
+    assert res.probed is False
+    assert res.authed is False
+
+
+def test_check_opencode_auth_nonzero_exit_is_not_probed(monkeypatch) -> None:
+    monkeypatch.setattr(sw.shutil, "which", lambda _b: "/usr/bin/opencode")
+    monkeypatch.setattr(
+        sw.subprocess, "run",
+        _fake_run_factory("", returncode=1),
+    )
+    res = sw.check_opencode_auth()
+    assert res.probed is False
+
+
+def test_run_setup_opencode_warns_when_unauthed(
+    isolated_setup_env, monkeypatch, capsys
+) -> None:
+    """Picking opencode with no provider logged in surfaces actionable
+    auth guidance during setup — and never blocks it."""
+    monkeypatch.setattr(
+        sw, "check_brain_cli",
+        lambda _k: sw.BrainCheck(
+            kind="opencode", binary="opencode", found=True, install_hint="",
+        ),
+    )
+    monkeypatch.setattr(
+        sw, "check_opencode_auth",
+        lambda: sw.OpenCodeAuthCheck(probed=True, authed=False, providers=()),
+    )
+    result = sw.run_setup(
+        prompt=_canned_prompts({"token": "x", "user ID": "1"}),
+        install_service=False,
+        require_interactive=False,
+        print_banner=False,
+        brain_kind_override="opencode",
+    )
+    out = capsys.readouterr().out
+    # Auth guidance + the provider/model-shape note both surfaced.
+    assert "no provider logged in" in out
+    assert "opencode auth login" in out
+    assert "provider/model" in out
+    # Setup still completed.
+    assert result.config_path.exists()
+
+
+def test_run_setup_opencode_silent_on_auth_when_authed(
+    isolated_setup_env, monkeypatch, capsys
+) -> None:
+    """When a provider is logged in the wizard confirms it rather than
+    nagging — but still prints the model-id shape reminder."""
+    monkeypatch.setattr(
+        sw, "check_brain_cli",
+        lambda _k: sw.BrainCheck(
+            kind="opencode", binary="opencode", found=True, install_hint="",
+        ),
+    )
+    monkeypatch.setattr(
+        sw, "check_opencode_auth",
+        lambda: sw.OpenCodeAuthCheck(
+            probed=True, authed=True, providers=("Anthropic oauth",),
+        ),
+    )
+    sw.run_setup(
+        prompt=_canned_prompts({"token": "x", "user ID": "1"}),
+        install_service=False,
+        require_interactive=False,
+        print_banner=False,
+        brain_kind_override="opencode",
+    )
+    out = capsys.readouterr().out
+    assert "opencode auth: Anthropic oauth" in out
+    assert "no provider logged in" not in out
+    assert "provider/model" in out
+
+
 def test_workspace_path_honors_env(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("VEXIS_WORKSPACE", str(tmp_path / "ws"))
     assert sw.workspace_path() == tmp_path / "ws"

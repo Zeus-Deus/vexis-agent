@@ -231,6 +231,72 @@ def check_brain_cli(kind: str) -> BrainCheck:
     )
 
 
+@dataclass(frozen=True)
+class OpenCodeAuthCheck:
+    """Result of probing ``opencode auth list`` during setup.
+
+    ``probed`` is False when the check couldn't run at all (binary
+    missing, timeout) — the wizard then stays silent on auth rather
+    than guessing. ``authed`` is True when at least one provider is
+    configured; ``providers`` carries their display names for the
+    wizard's confirmation line.
+    """
+
+    probed: bool
+    authed: bool
+    providers: tuple[str, ...]
+
+
+_ANSI_RE = None  # lazily compiled in _strip_ansi
+
+
+def _strip_ansi(text: str) -> str:
+    global _ANSI_RE
+    if _ANSI_RE is None:
+        import re
+        _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+    return _ANSI_RE.sub("", text)
+
+
+def check_opencode_auth() -> OpenCodeAuthCheck:
+    """Probe ``opencode auth list`` for configured providers.
+
+    OpenCode stores provider credentials in
+    ``~/.local/share/opencode/auth.json`` and lists them as
+    ``●  <Provider Name> <type>`` rows. We count those rows (after
+    stripping the CLI's ANSI colour codes). Best-effort — a missing
+    binary, non-zero exit, or timeout yields ``probed=False`` and the
+    wizard simply skips the auth hint rather than blocking setup.
+    """
+    if shutil.which("opencode") is None:
+        return OpenCodeAuthCheck(probed=False, authed=False, providers=())
+    try:
+        result = subprocess.run(
+            ["opencode", "auth", "list"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+            text=True,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return OpenCodeAuthCheck(probed=False, authed=False, providers=())
+    if result.returncode != 0:
+        return OpenCodeAuthCheck(probed=False, authed=False, providers=())
+    providers: list[str] = []
+    for raw_line in (result.stdout or "").splitlines():
+        line = _strip_ansi(raw_line).strip()
+        if line.startswith("●"):
+            name = line.lstrip("●").strip()
+            if name:
+                providers.append(name)
+    return OpenCodeAuthCheck(
+        probed=True,
+        authed=bool(providers),
+        providers=tuple(providers),
+    )
+
+
 # ── Workspace setup ────────────────────────────────────────────────
 
 
@@ -796,6 +862,38 @@ def run_setup(
         warn(
             "daemon will refuse to start until the brain CLI is reachable. "
             "Install it, then re-run 'vexis-agent setup' or 'vexis-agent doctor'."
+        )
+
+    # opencode-specific: provider auth + model-id shape guidance.
+    # The binary being on PATH says nothing about whether any
+    # provider is logged in — and opencode needs ``provider/model``
+    # model ids in config, not the bare ``sonnet``/``opus`` aliases
+    # claude-code accepts. Surface both now instead of letting the
+    # daemon error out on the first turn. Guidance only — never
+    # blocks setup (mirrors the binary-missing soft-fail above).
+    if brain_kind == "opencode" and bc.found:
+        auth = check_opencode_auth()
+        if not auth.probed:
+            warn(
+                "couldn't verify opencode provider auth — run "
+                "'opencode auth list' to check. You need at least one "
+                "provider logged in: 'opencode auth login anthropic' "
+                "(or openai-codex / github-copilot / etc.)."
+            )
+        elif auth.authed:
+            ok(f"opencode auth: {', '.join(auth.providers)}")
+        else:
+            warn(
+                "opencode has no provider logged in. Run "
+                "'opencode auth login anthropic' (or openai-codex / "
+                "github-copilot / any provider opencode supports) "
+                "before starting the daemon."
+            )
+        info(
+            "opencode needs 'provider/model' model ids in "
+            "~/.vexis/config.yaml (e.g. anthropic/claude-sonnet-4) — "
+            "the bare 'sonnet'/'opus' aliases are claude-code-only. "
+            "See docs/migration.md."
         )
 
     # ── 4. Workspace setup ────────────────────────────────────────
