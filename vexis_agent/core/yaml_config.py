@@ -1109,6 +1109,97 @@ def voice_tts_binary() -> str | None:
 
 
 # ──────────────────────────────────────────────────────────────────
+# Computer use — per-feature model selection
+#
+# Mirrors voice call mode: an opt-in, per-feature model override that
+# only bites when the foreground turn is actually doing computer-use
+# work (the handler gates on recent ``vexis-ui`` activity — see
+# ``core.computer_use``). Everything stays on the brain's account
+# default until the user opts in via the dashboard's Computer Use tab.
+#
+# Two layers:
+#   * ``computer_use.model`` — a pinned model for computer-use turns.
+#   * ``computer_use.dynamic`` — the Codex-style trick: when the last
+#     AT-SPI snapshot was a *rich* textual tree (no screenshot
+#     fallback, ``element_count`` over the threshold), the turn can
+#     run on a faster model because no vision is needed.
+#
+# Same null/empty/``default`` sentinels as voice for the model and
+# reasoning knobs. ``DEFAULT_COMPUTER_USE_MIN_ELEMENTS`` is the
+# richness floor; the dashboard surfaces it as a number input.
+# ──────────────────────────────────────────────────────────────────
+
+DEFAULT_COMPUTER_USE_MIN_ELEMENTS: int = 5
+
+
+def _cu_model_knob(section: dict[str, Any], key: str) -> str | None:
+    """Shared null/empty/``default`` sentinel coercion for the
+    computer_use model + reasoning_level string knobs."""
+    raw = section.get(key)
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned or cleaned.lower() == "default":
+        return None
+    return cleaned
+
+
+def computer_use_model() -> str | None:
+    """Pinned per-turn model override for computer-use turns. ``None``
+    (unset, or sentinel ``default``) means "use the brain's account
+    default" — same as Telegram and the text-chat tab.
+
+    The dashboard's Computer Use tab is the canonical writer:
+
+        computer_use:
+          model: claude-haiku-4-5     # any model id the brain accepts
+          reasoning_level: medium     # only when the model supports it
+    """
+    return _cu_model_knob(_section("computer_use"), "model")
+
+
+def computer_use_reasoning_level() -> str | None:
+    """Per-turn reasoning effort paired with :func:`computer_use_model`.
+    ``None`` means "no flag — let the model use its default reasoning".
+    """
+    return _cu_model_knob(_section("computer_use"), "reasoning_level")
+
+
+def _cu_dynamic_section() -> dict[str, Any]:
+    section = _section("computer_use").get("dynamic", {})
+    return section if isinstance(section, dict) else {}
+
+
+def computer_use_dynamic_enabled() -> bool:
+    """True iff ``computer_use.dynamic.enabled`` is true. Default false
+    — the dynamic fast-model switch is strictly opt-in."""
+    return _cu_dynamic_section().get("enabled") is True
+
+
+def computer_use_dynamic_model() -> str | None:
+    """The fast model used when the last AT-SPI snapshot was a rich
+    textual tree (no screenshot needed). ``None`` falls back to
+    :func:`computer_use_model` (then the brain default)."""
+    return _cu_model_knob(_cu_dynamic_section(), "model")
+
+
+def computer_use_dynamic_reasoning_level() -> str | None:
+    """Reasoning effort paired with :func:`computer_use_dynamic_model`."""
+    return _cu_model_knob(_cu_dynamic_section(), "reasoning_level")
+
+
+def computer_use_dynamic_min_elements() -> int:
+    """Richness floor: a snapshot counts as "rich enough to skip
+    vision" only when its indexed ``element_count`` is at least this.
+    Default :data:`DEFAULT_COMPUTER_USE_MIN_ELEMENTS`."""
+    return _int_or_default(
+        _cu_dynamic_section().get("min_elements"),
+        DEFAULT_COMPUTER_USE_MIN_ELEMENTS,
+        minimum=1,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
 # Chat attachments (file/image upload — phase 2)
 #
 # Lives under ``chat.attachments.*`` so the rest of ``chat.*`` stays

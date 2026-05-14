@@ -14,6 +14,7 @@ import { SchedulesPage } from "./pages/SchedulesPage";
 import { ModelsPage } from "./pages/ModelsPage";
 import { ChatPage } from "./pages/ChatPage";
 import { VoicePage } from "./pages/VoicePage";
+import { ComputerUsePage } from "./pages/ComputerUsePage";
 
 type TabId =
   | "chat"
@@ -28,6 +29,7 @@ type TabId =
   | "schedules"
   | "models"
   | "voice"
+  | "computer-use"
   | "tailscale";
 
 const TABS: TabDef[] = [
@@ -46,6 +48,7 @@ const TABS: TabDef[] = [
   { id: "schedules", label: "Schedules", glyph: "◷" },
   { id: "models", label: "Models", glyph: "⊕" },
   { id: "voice", label: "Voice", glyph: "◉" },
+  { id: "computer-use", label: "Computer Use", glyph: "▣" },
   { id: "tailscale", label: "Tailscale", glyph: "◈" },
 ];
 
@@ -62,6 +65,7 @@ const HASH_TO_TAB: Record<string, TabId> = {
   "#schedules": "schedules",
   "#models": "models",
   "#voice": "voice",
+  "#computer-use": "computer-use",
   "#tailscale": "tailscale",
 };
 
@@ -162,6 +166,9 @@ export function App() {
         )}
         {tab === "voice" && (
           <VoicePage token={token} onAuthFail={handleAuthFail} />
+        )}
+        {tab === "computer-use" && (
+          <ComputerUsePage token={token} onAuthFail={handleAuthFail} />
         )}
         {tab === "tailscale" && (
           <TailscalePage token={token} onAuthFail={handleAuthFail} />
