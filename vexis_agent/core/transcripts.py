@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -238,8 +238,9 @@ def list_eligible_sessions(
     now: datetime,
     spawned_by_curator: set[str] | None = None,
     is_brain_owned: "Callable[[str], bool] | None" = None,
+    session_metas: "Iterable[SessionMeta] | None" = None,
 ) -> list[SessionMeta]:
-    """Filter ``iter_session_metas`` down to sessions that need review.
+    """Filter the workspace's sessions down to those that need review.
 
     A session is eligible when:
       - ``last_message_timestamp`` is not None,
@@ -264,17 +265,29 @@ def list_eligible_sessions(
     Phase B: ``is_brain_owned`` is an optional callable injected by
     the caller (production: ``brain.is_brain_owned_session``). When
     provided, the recursion guard goes through the brain abstraction
-    so a future ``BrainOpenCode`` can filter SQL-row-stored sessions
-    via the same content-prefix check. When ``None`` (legacy / test
-    callers without a brain reference), falls back to the
-    file-system-based ``_is_curator_owned`` against
-    ``meta.jsonl_path`` — preserves byte-identical behaviour for the
-    hundreds of test sites that don't thread a brain through.
+    so ``BrainOpenCode`` can filter SQL-row-stored sessions via the
+    same content-prefix check. When ``None`` (legacy / test callers
+    without a brain reference), falls back to the file-system-based
+    ``_is_curator_owned`` against ``meta.jsonl_path``.
+
+    ``session_metas`` is the brain-agnostic counterpart for session
+    *enumeration*: production passes ``brain.iter_session_metas()``
+    so opencode workspaces (no JSONL files — sessions live in
+    ``opencode.db``) are scanned correctly. When ``None``, falls back
+    to the claude-code-specific ``iter_session_metas(workspace)``
+    glob — byte-identical for the hundreds of test sites that don't
+    thread a brain through, and identical output for the claude-code
+    brain (whose ``iter_session_metas`` delegates to that same glob).
     """
     spawned = spawned_by_curator or set()
     epoch = datetime.min.replace(tzinfo=timezone.utc)
     out: list[SessionMeta] = []
-    for meta in iter_session_metas(workspace):
+    metas = (
+        session_metas
+        if session_metas is not None
+        else iter_session_metas(workspace)
+    )
+    for meta in metas:
         if meta.last_message_timestamp is None:
             continue
         if meta.session_uuid in spawned:

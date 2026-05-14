@@ -81,11 +81,7 @@ from vexis_agent.core.relationships.triggers import (
     derive_slug_with_disambiguation,
     detect as relationships_detect,
 )
-from vexis_agent.core.transcripts import (
-    TranscriptMessage,
-    claude_session_jsonl_dir,
-    iter_messages,
-)
+from vexis_agent.core.transcripts import TranscriptMessage
 
 log = logging.getLogger(__name__)
 
@@ -197,19 +193,21 @@ def _short_session(session_uuid: str) -> str:
 
 
 def _load_source_turn(
-    workspace: Path, session_uuid: str, turn_index: int
+    brain: "Brain", session_uuid: str, turn_index: int
 ) -> tuple[TranscriptMessage | None, list[TranscriptMessage]]:
     """Return (the user turn at ``turn_index``, full message list).
 
     ``turn_index`` is 1-indexed across user-role messages only
-    (mirrors how the dryrun and turn-level entry count). On
-    file-not-found or no matching turn, returns (None, []).
+    (mirrors how the dryrun and turn-level entry count). Reads via
+    ``brain.iter_messages`` so it stays brain-agnostic — claude-code
+    resolves the session JSONL, opencode reads ``opencode.db``. On an
+    empty transcript (unknown session, or BrainNull) or no matching
+    turn, returns (None, messages) — (None, []) when the transcript
+    is empty.
     """
-    pdir = claude_session_jsonl_dir(workspace)
-    jsonl = pdir / f"{session_uuid}.jsonl"
-    if not jsonl.exists():
+    messages = list(brain.iter_messages(session_uuid))
+    if not messages:
         return None, []
-    messages = list(iter_messages(jsonl))
     user_count = 0
     for msg in messages:
         if msg.role == "user":
@@ -858,7 +856,7 @@ class RelationshipsCurator:
         loadable (treated as advisory-skip — SUPERSEDE proceeds).
         """
         source_msg, messages = _load_source_turn(
-            self._workspace, session_uuid, turn_index,
+            self._brain, session_uuid, turn_index,
         )
         if source_msg is None:
             log.info(
@@ -1578,7 +1576,7 @@ class RelationshipsCurator:
 
         # 2. Coherence judge with scope="relationships".
         source_msg, messages = _load_source_turn(
-            self._workspace,
+            self._brain,
             person.source_session,
             person.source_turn_index or 0,
         )
@@ -1716,7 +1714,7 @@ class RelationshipsCurator:
     async def _recover_one(self, person: Person) -> RecoveryResult:
         slug = person.slug
         source_msg, _messages = _load_source_turn(
-            self._workspace,
+            self._brain,
             person.source_session,
             person.source_turn_index or 0,
         )

@@ -11,16 +11,24 @@ Covers:
   classifier verdict mismatches → drop with REPORT.md row.
 - DELETE wired in 3a (covered in test_delete_path.py).
 - SUPERSEDE raises NotImplementedError per 3a scope.
+
+Brain parity: every flow runs against BOTH real brains (claude-code
+JSONL + opencode SQLite) via the ``brain`` fixture. The curator's
+source-turn loader (``_load_source_turn``) routes through
+``brain.iter_messages`` — this suite is the regression guard that it
+never reads ``claude_session_jsonl_dir`` directly again.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.opencode import OpenCodeBrain
 from vexis_agent.core.coherence_judge import CoherenceVerdict
 from vexis_agent.core.relationships.curator import RelationshipsCurator
 from vexis_agent.core.relationships.store import (
@@ -32,18 +40,41 @@ from vexis_agent.core.relationships.store import (
     relationships_shadow_path,
 )
 from vexis_agent.core.relationships.triggers import TriggerVerdict
-from vexis_agent.core.transcripts import claude_session_jsonl_dir
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
+
+from tests._brain_seed import seed_transcript
 
 
-@pytest.fixture
-def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+@pytest.fixture(params=["claude_code", "opencode"])
+def brain(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    """A real brain (claude-code or opencode) on tmp paths. The
+    curator reads source turns through ``brain.iter_messages``;
+    ``seed_transcript`` lays those turns down in whatever store the
+    brain reads."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: home))
     ws = tmp_path / "ws"
     ws.mkdir(parents=True, exist_ok=True)
-    return ws
+    session = SessionStore(tmp_path / "sessions.json")
+    if request.param == "claude_code":
+        return ClaudeCodeBrain(
+            workspace=ws, session=session, running_tasks=RunningTasks()
+        )
+    return OpenCodeBrain(
+        workspace=ws, session=session, running_tasks=RunningTasks()
+    )
+
+
+@pytest.fixture
+def workspace(brain: Any) -> Path:
+    return brain._workspace
 
 
 def _stub_classifier(verdict: TriggerVerdict):
@@ -64,20 +95,11 @@ def _stub_judge(verdict: CoherenceVerdict):
     return _judge
 
 
-def _stage_source_jsonl(workspace: Path, session_uuid: str, user_text: str) -> None:
-    """Write a synthetic JSONL with one user message at the
-    expected (session_uuid).jsonl path so restart-recovery can
-    load the source turn."""
-    pdir = claude_session_jsonl_dir(workspace)
-    pdir.mkdir(parents=True, exist_ok=True)
-    path = pdir / f"{session_uuid}.jsonl"
-    line = json.dumps({
-        "type": "user",
-        "uuid": "u-1",
-        "timestamp": "2026-05-04T12:00:00Z",
-        "message": {"role": "user", "content": user_text},
-    })
-    path.write_text(line + "\n", encoding="utf-8")
+def _seed_source(brain: Any, session_uuid: str, user_text: str) -> None:
+    """Seed a one-user-turn transcript at ``session_uuid`` so the
+    curator's source-turn loader can read it back — JSONL for
+    claude-code, opencode.db rows for opencode."""
+    seed_transcript(brain, session_uuid, [("user", user_text)])
 
 
 # --------------------------------------------------------------------
@@ -85,7 +107,7 @@ def _stage_source_jsonl(workspace: Path, session_uuid: str, user_text: str) -> N
 # --------------------------------------------------------------------
 
 
-def test_turn_level_add_mints_token_and_stages(workspace: Path):
+def test_turn_level_add_mints_token_and_stages(brain: Any, workspace: Path):
     classifier_verdict = TriggerVerdict(
         verdict="ADD",
         person_name="Sarah",
@@ -96,6 +118,7 @@ def test_turn_level_add_mints_token_and_stages(workspace: Path):
     )
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
     )
     res = asyncio.run(
@@ -125,7 +148,7 @@ def test_turn_level_add_mints_token_and_stages(workspace: Path):
     assert len(shadow_people[0].facts) == 1
 
 
-def test_turn_level_multi_fact_under_one_token(workspace: Path):
+def test_turn_level_multi_fact_under_one_token(brain: Any, workspace: Path):
     """Research doc §3.4 cardinality: 'remember Sarah likes mystery
     novels and is allergic to peanuts' = 1 token, 2 facts."""
     classifier_verdict = TriggerVerdict(
@@ -138,6 +161,7 @@ def test_turn_level_multi_fact_under_one_token(workspace: Path):
     )
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
     )
     res = asyncio.run(
@@ -161,10 +185,11 @@ def test_turn_level_multi_fact_under_one_token(workspace: Path):
     assert len(shadow[0].facts) == 2
 
 
-def test_turn_level_no_trigger_returns_no_op(workspace: Path):
+def test_turn_level_no_trigger_returns_no_op(brain: Any, workspace: Path):
     classifier_verdict = TriggerVerdict(verdict="NONE")
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
     )
     res = asyncio.run(
@@ -180,7 +205,9 @@ def test_turn_level_no_trigger_returns_no_op(workspace: Path):
     assert curator.store.list_shadow() == []
 
 
-def test_turn_level_supersede_zero_facts_returns_no_op(workspace: Path):
+def test_turn_level_supersede_zero_facts_returns_no_op(
+    brain: Any, workspace: Path
+):
     """3b: SUPERSEDE with no extracted facts is a degenerate
     classifier output. Curator returns staged=False, reply None,
     no token. Real SUPERSEDE flows live in test_supersede_path.py.
@@ -192,6 +219,7 @@ def test_turn_level_supersede_zero_facts_returns_no_op(workspace: Path):
     )
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
     )
     res = asyncio.run(
@@ -212,18 +240,19 @@ def test_turn_level_supersede_zero_facts_returns_no_op(workspace: Path):
 # --------------------------------------------------------------------
 
 
-def test_tick_promote_happy_path(workspace: Path):
+def test_tick_promote_happy_path(brain: Any, workspace: Path):
     """ADD trigger → shadow → tick-promote (coherence COHERENT,
-    no sensitive hit) → live. Stages a source JSONL so the
+    no sensitive hit) → live. Seeds a source transcript so the
     Day-2-completion missing-transcript guard does not pre-empt
     the judge call."""
-    _stage_source_jsonl(workspace, "sess-promote", "remember Sarah likes jazz")
+    _seed_source(brain, "sess-promote", "remember Sarah likes jazz")
     classifier_verdict = TriggerVerdict(
         verdict="ADD", person_name="Sarah", qualifier="friend",
         facts=("likes jazz",), confidence=0.95, matched_pattern_id="ADD-1",
     )
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
         coherence_judge=_stub_judge(CoherenceVerdict.coherent()),
     )
@@ -248,7 +277,7 @@ def test_tick_promote_happy_path(workspace: Path):
     assert len(curator.tokens) == 0
 
 
-def test_tick_promote_blocks_on_incoherent_judge(workspace: Path):
+def test_tick_promote_blocks_on_incoherent_judge(brain: Any, workspace: Path):
     """Research doc C-J3: source-turn says 'I have no siblings',
     consent says 'remember my sister Sarah'. INCOHERENT BLOCKS
     promotion (entry stays in shadow)."""
@@ -260,11 +289,10 @@ def test_tick_promote_blocks_on_incoherent_judge(workspace: Path):
         reason="contradicts-window",
         explanation="user said 'I have no siblings' two turns earlier",
     )
-    _stage_source_jsonl(
-        workspace, "sess-cj3", "remember my sister Sarah hates jazz"
-    )
+    _seed_source(brain, "sess-cj3", "remember my sister Sarah hates jazz")
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
         coherence_judge=_stub_judge(incoherent),
     )
@@ -287,11 +315,11 @@ def test_tick_promote_blocks_on_incoherent_judge(workspace: Path):
     assert any(d.reason == "coherence-incoherent" for d in drops)
 
 
-def test_tick_promote_blocks_on_sensitive_hit(workspace: Path):
+def test_tick_promote_blocks_on_sensitive_hit(brain: Any, workspace: Path):
     """C-X1 analog: shadow entry contains a fact that the medical
     pattern catches at promote-time. BLOCKS promotion."""
-    _stage_source_jsonl(
-        workspace, "sess-med",
+    _seed_source(
+        brain, "sess-med",
         "remember that my coworker Marco is on prescription antidepressants",
     )
     classifier_verdict = TriggerVerdict(
@@ -301,6 +329,7 @@ def test_tick_promote_blocks_on_sensitive_hit(workspace: Path):
     )
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
         coherence_judge=_stub_judge(CoherenceVerdict.coherent()),
     )
@@ -318,12 +347,13 @@ def test_tick_promote_blocks_on_sensitive_hit(workspace: Path):
     assert curator.store.list_live() == []
 
 
-def test_tick_promote_blocks_on_missing_token(workspace: Path):
+def test_tick_promote_blocks_on_missing_token(brain: Any, workspace: Path):
     """If the in-memory token is gone (daemon restart, no recovery
     yet), promote BLOCKS this tick — but the shadow entry stays so
     restart-recovery can re-mint on the next startup."""
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         coherence_judge=_stub_judge(CoherenceVerdict.coherent()),
     )
     # Manually stage a person without minting a token (simulates
@@ -357,29 +387,29 @@ def test_tick_promote_blocks_on_missing_token(workspace: Path):
 
 # --------------------------------------------------------------------
 # Ask 2 (Day 2 completion): missing-transcript guard. Synthetic
-# Telegram session_uuid → no JSONL on disk → curator MUST block
+# Telegram session_uuid → no transcript on disk → curator MUST block
 # promotion deterministically rather than spawn the judge against
 # an empty transcript window.
 # --------------------------------------------------------------------
 
 
 def test_tick_promote_blocks_on_missing_transcript_for_telegram_synthetic_uuid(
-    workspace: Path,
+    brain: Any, workspace: Path,
 ):
     """Walks the real Telegram-triggered ADD code path:
 
     1. Trigger detector fires, mints token, writes pending shadow
-       entry with source_session = 'telegram-chat-99' (no JSONL on
-       disk for that synthetic id).
+       entry with source_session = 'telegram-chat-99' (no transcript
+       on disk for that synthetic id).
     2. Tick fires, RelationshipsCurator picks up the pending entry.
     3. Token-presence check passes (we just minted it).
     4. The curator pre-empts the judge call because source_msg is
-       None (no JSONL). Sets coherence_block = 'missing_transcript'
+       None (no transcript). Sets coherence_block = 'missing_transcript'
        on the shadow entry, records a drop event, returns
        PromoteResult(blocked_by='missing-transcript').
 
     Asserts the entry stays in shadow with the flag, judge is NEVER
-    invoked (would otherwise spawn a real claude -p subprocess in
+    invoked (would otherwise spawn a real brain subprocess in
     degraded mode), and a REPORT.md row is recorded."""
     judge_calls = 0
 
@@ -395,6 +425,7 @@ def test_tick_promote_blocks_on_missing_transcript_for_telegram_synthetic_uuid(
     )
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(classifier_verdict),
         coherence_judge=_spy_judge,
     )
@@ -402,7 +433,7 @@ def test_tick_promote_blocks_on_missing_transcript_for_telegram_synthetic_uuid(
     asyncio.run(
         curator.process_user_turn(
             "remember my coworker Sarah likes mystery novels",
-            session_uuid="telegram-chat-99",  # no JSONL on disk
+            session_uuid="telegram-chat-99",  # no transcript on disk
             turn_index=1,
         )
     )
@@ -425,8 +456,8 @@ def test_tick_promote_blocks_on_missing_transcript_for_telegram_synthetic_uuid(
     drops = curator.drain_drop_events()
     assert any(d.reason == "coherence-missing-transcript" for d in drops)
     # Token still in registry — entry is blocked, not dropped, so
-    # a future tick (e.g. once the JSONL becomes loadable via the
-    # Day 3 brain-session-UUID handoff) can retry.
+    # a future tick (e.g. once the transcript becomes loadable) can
+    # retry.
     assert len(curator.tokens) == 1
 
 
@@ -435,19 +466,19 @@ def test_tick_promote_blocks_on_missing_transcript_for_telegram_synthetic_uuid(
 # --------------------------------------------------------------------
 
 
-def test_restart_recovery_re_mints_on_verdict_match(workspace: Path):
+def test_restart_recovery_re_mints_on_verdict_match(
+    brain: Any, workspace: Path
+):
     """Shadow has a pending entry, daemon "restart" — the in-memory
     PendingTokens registry is empty. recover_after_restart re-runs
     the classifier against the stored source turn; verdict matches
     → token re-minted; subsequent tick promotes successfully."""
-    # Pre-stage source JSONL so the recovery can load the turn.
-    _stage_source_jsonl(
-        workspace, "sess-recover",
-        "remember Sarah likes jazz",
-    )
+    # Pre-seed the source transcript so recovery can load the turn.
+    _seed_source(brain, "sess-recover", "remember Sarah likes jazz")
     # Pre-write a shadow file directly (simulates surviving a restart).
     pre_curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(
             TriggerVerdict(
                 verdict="ADD", person_name="Sarah", qualifier="friend",
@@ -470,6 +501,7 @@ def test_restart_recovery_re_mints_on_verdict_match(workspace: Path):
     # against the same source turn.
     new_curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(
             TriggerVerdict(
                 verdict="ADD", person_name="Sarah", qualifier="friend",
@@ -491,16 +523,16 @@ def test_restart_recovery_re_mints_on_verdict_match(workspace: Path):
     assert promote_results[0].promoted is True
 
 
-def test_restart_recovery_drops_on_verdict_mismatch(workspace: Path):
+def test_restart_recovery_drops_on_verdict_mismatch(
+    brain: Any, workspace: Path
+):
     """Classifier returns a different verdict on the same source
     turn (e.g. classifier improved between releases) — drop the
     pending entry, surface in REPORT.md."""
-    _stage_source_jsonl(
-        workspace, "sess-mismatch",
-        "remember Sarah likes jazz",
-    )
+    _seed_source(brain, "sess-mismatch", "remember Sarah likes jazz")
     pre_curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(
             TriggerVerdict(
                 verdict="ADD", person_name="Sarah", qualifier="friend",
@@ -521,6 +553,7 @@ def test_restart_recovery_drops_on_verdict_mismatch(workspace: Path):
     # (verdict mismatch).
     new_curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(TriggerVerdict(verdict="NONE")),
     )
     recovered = asyncio.run(new_curator.recover_after_restart())
@@ -534,11 +567,13 @@ def test_restart_recovery_drops_on_verdict_mismatch(workspace: Path):
     assert any(d.reason == "recovery-verdict-mismatch" for d in drops)
 
 
-def test_restart_recovery_drops_on_missing_source(workspace: Path):
-    """Pending entry references a session UUID whose JSONL is
+def test_restart_recovery_drops_on_missing_source(
+    brain: Any, workspace: Path
+):
+    """Pending entry references a session UUID whose transcript is
     gone (workspace deleted, archive purge) — drop, surface."""
     # Stage a shadow person that points at a non-existent session.
-    curator = RelationshipsCurator(workspace=workspace)
+    curator = RelationshipsCurator(workspace=workspace, brain=brain)
     person = Person(
         slug="orphan",
         display_name="Orphan",
@@ -567,13 +602,14 @@ def test_restart_recovery_drops_on_missing_source(workspace: Path):
     assert any(d.reason == "recovery-source-missing" for d in drops)
 
 
-def test_restart_recovery_is_one_shot(workspace: Path):
+def test_restart_recovery_is_one_shot(brain: Any, workspace: Path):
     """recover_after_restart is idempotent — calling it twice
     returns an empty list the second time even if there's
     pending work."""
-    _stage_source_jsonl(workspace, "sess-once", "remember Sarah likes jazz")
+    _seed_source(brain, "sess-once", "remember Sarah likes jazz")
     curator = RelationshipsCurator(
         workspace=workspace,
+        brain=brain,
         classifier_call=_stub_classifier(
             TriggerVerdict(
                 verdict="ADD", person_name="Sarah", qualifier="friend",

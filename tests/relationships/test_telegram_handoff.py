@@ -3,11 +3,11 @@
 Covers:
 
 - ``MessageHandler.next_user_turn_index`` correctly counts
-  user-role lines in ``<encoded-cwd>/<session_uuid>.jsonl``.
-  Edge cases: empty / no-user-lines / 5-user-lines / file
-  doesn't exist.
+  user-role turns in the active brain's session transcript.
+  Edge cases: empty / no-user-turns / 5-user-turns / session
+  has no transcript yet.
 - ``MessageHandler.claim_next_turn_index`` cursor-collision
-  semantics: refuses on JSONL-not-advanced, restart-derived
+  semantics: refuses on transcript-not-advanced, restart-derived
   on next call.
 - Atomicity: two parallel ``claim_next_turn_index`` calls
   cannot both pass the check.
@@ -16,58 +16,49 @@ Covers:
   the hook reply lands.
 - Real session_uuid is threaded through, NOT
   ``telegram-chat-{chat_id}``.
-- Cursor-collision refusal: if the JSONL didn't advance, the
+- Cursor-collision refusal: if the transcript didn't advance, the
   next hook fire returns None, no shadow entry, no token,
   brain still proceeds.
+
+Brain parity: every turn-index test runs against BOTH real brains
+(claude-code JSONL + opencode SQLite) via the ``brain`` fixture.
+``next_user_turn_index`` routes through ``brain.iter_messages`` —
+this suite is the regression guard that it never reads
+``claude_session_jsonl_dir`` directly again.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.opencode import OpenCodeBrain
 from vexis_agent.core.handler import MessageHandler
-from vexis_agent.core.transcripts import claude_session_jsonl_dir
+from vexis_agent.core.running_tasks import RunningTasks
+from vexis_agent.core.sessions import SessionStore
+
+from tests._brain_seed import seed_transcript
 
 
 # ---------------------------------------------------------------- helpers
 
 
-def _write_jsonl(path: Path, *, user_count: int, assistant_count: int = 0) -> None:
-    """Write a synthetic Claude-Code session JSONL with ``user_count``
-    user-role messages and ``assistant_count`` assistant-role ones,
-    interleaved alternately. Timestamps increment by 1 second per line.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lines: list[str] = []
-    base = "2026-05-04T12:00:0{}Z"
+def _turns(user_count: int, assistant_count: int = 0) -> list[tuple[str, str]]:
+    """Build an interleaved (role, text) turn list — ``user_count``
+    user turns and ``assistant_count`` assistant turns, alternating
+    user-first (mirrors the legacy ``_write_jsonl`` interleave)."""
+    turns: list[tuple[str, str]] = []
     n = max(user_count, assistant_count)
-    seq = 0
     for i in range(n):
         if i < user_count:
-            lines.append(json.dumps({
-                "type": "user",
-                "uuid": f"u-{i}",
-                "timestamp": base.format(seq),
-                "message": {"role": "user", "content": f"user msg {i}"},
-            }))
-            seq += 1
+            turns.append(("user", f"user msg {i}"))
         if i < assistant_count:
-            lines.append(json.dumps({
-                "type": "assistant",
-                "uuid": f"a-{i}",
-                "timestamp": base.format(seq),
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": f"asst msg {i}"}],
-                },
-            }))
-            seq += 1
-    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+            turns.append(("assistant", f"asst msg {i}"))
+    return turns
 
 
 class _FakeSessionStore:
@@ -81,16 +72,60 @@ class _FakeSessionStore:
         return self._uuid
 
 
-class _FakeBrain:
+class _FakeBrainRespond:
+    """Wraps a real brain but stubs ``respond`` so the transport-level
+    tests never spawn a CLI. Transcript reads still hit the real
+    brain's ``iter_messages``."""
+
+    def __init__(self, real_brain: Any) -> None:
+        self._real = real_brain
+
     async def respond(self, message: str, chat_id: int) -> str:
         return "brain-reply"
 
+    def iter_messages(self, session_id: str):
+        return self._real.iter_messages(session_id)
 
-def _build_handler(workspace: Path, session_uuid: str) -> MessageHandler:
-    """Construct a MessageHandler stripped of brain/notifier — just
-    the SessionStore + workspace are needed for the accessors."""
+
+@pytest.fixture(params=["claude_code", "opencode"])
+def brain(request: pytest.FixtureRequest, tmp_path: Path) -> Any:
+    """A real brain (claude-code or opencode) constructed against tmp
+    paths. ``seed_transcript`` lays down transcripts the brain's
+    ``iter_messages`` reads back — JSONL for claude-code, opencode.db
+    rows for opencode (the autouse ``_isolate_opencode_db`` fixture
+    already points the reader at a tmp path)."""
+    workspace = tmp_path / f"ws-{request.param}"
+    workspace.mkdir(parents=True, exist_ok=True)
+    session = SessionStore(tmp_path / "sessions.json")
+    if request.param == "claude_code":
+        return ClaudeCodeBrain(
+            workspace=workspace,
+            session=session,
+            running_tasks=RunningTasks(),
+        )
+    return OpenCodeBrain(
+        workspace=workspace,
+        session=session,
+        running_tasks=RunningTasks(),
+    )
+
+
+@pytest.fixture
+def workspace(brain: Any) -> Path:
+    """The handler's workspace — just needs to be non-None so the
+    accessors take the brain-routed path rather than the
+    workspace-None test shortcut."""
+    return brain._workspace
+
+
+def _build_handler(
+    brain: Any, workspace: Path, session_uuid: str
+) -> MessageHandler:
+    """Construct a MessageHandler stripped of notifier — the real
+    brain (for transcript reads) + SessionStore + workspace are what
+    the relationships accessors need."""
     return MessageHandler(
-        brain=_FakeBrain(),  # type: ignore[arg-type]
+        brain=brain,
         sessions=_FakeSessionStore(session_uuid),  # type: ignore[arg-type]
         allowed_user_id=99,
         notifier=None,
@@ -98,43 +133,36 @@ def _build_handler(workspace: Path, session_uuid: str) -> MessageHandler:
     )
 
 
-@pytest.fixture
-def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: home))
-    ws = tmp_path / "ws"
-    ws.mkdir(parents=True, exist_ok=True)
-    return ws
-
-
 # ----------------------------------------------- next_user_turn_index
 
 
-def test_next_user_turn_index_no_jsonl_returns_one(workspace: Path):
-    h = _build_handler(workspace, "sess-fresh")
+def test_next_user_turn_index_no_transcript_returns_one(
+    brain: Any, workspace: Path
+):
+    h = _build_handler(brain, workspace, "sess-fresh")
     assert h.next_user_turn_index("sess-fresh") == 1
 
 
-def test_next_user_turn_index_zero_users_only_assistants(workspace: Path):
-    pdir = claude_session_jsonl_dir(workspace)
-    _write_jsonl(pdir / "sess-a.jsonl", user_count=0, assistant_count=2)
-    h = _build_handler(workspace, "sess-a")
+def test_next_user_turn_index_zero_users_only_assistants(
+    brain: Any, workspace: Path
+):
+    seed_transcript(brain, "sess-a", _turns(user_count=0, assistant_count=2))
+    h = _build_handler(brain, workspace, "sess-a")
     assert h.next_user_turn_index("sess-a") == 1
 
 
-def test_next_user_turn_index_five_user_lines(workspace: Path):
-    pdir = claude_session_jsonl_dir(workspace)
-    _write_jsonl(pdir / "sess-b.jsonl", user_count=5, assistant_count=4)
-    h = _build_handler(workspace, "sess-b")
+def test_next_user_turn_index_five_user_lines(brain: Any, workspace: Path):
+    seed_transcript(brain, "sess-b", _turns(user_count=5, assistant_count=4))
+    h = _build_handler(brain, workspace, "sess-b")
     assert h.next_user_turn_index("sess-b") == 6
 
 
-def test_next_user_turn_index_workspace_none_returns_one(tmp_path: Path):
+def test_next_user_turn_index_workspace_none_returns_one(
+    brain: Any, tmp_path: Path
+):
     """Test fixture path: handler constructed without workspace."""
     h = MessageHandler(
-        brain=_FakeBrain(),  # type: ignore[arg-type]
+        brain=brain,
         sessions=_FakeSessionStore("sess-x"),  # type: ignore[arg-type]
         allowed_user_id=99,
         notifier=None,
@@ -146,87 +174,87 @@ def test_next_user_turn_index_workspace_none_returns_one(tmp_path: Path):
 # ----------------------------------------------- claim_next_turn_index
 
 
-def test_claim_first_call_returns_one_no_jsonl(workspace: Path):
-    h = _build_handler(workspace, "sess-c")
+def test_claim_first_call_returns_one_no_transcript(
+    brain: Any, workspace: Path
+):
+    h = _build_handler(brain, workspace, "sess-c")
     got = asyncio.run(h.claim_next_turn_index("sess-c"))
     assert got == 1
 
 
-def test_claim_advances_after_jsonl_grows(workspace: Path):
-    """Successful brain dispatch grows the JSONL by one user line; the
-    next claim returns one past the new count."""
-    pdir = claude_session_jsonl_dir(workspace)
-    jsonl = pdir / "sess-d.jsonl"
-    _write_jsonl(jsonl, user_count=0)  # JSONL exists with 0 user lines
+def test_claim_advances_after_transcript_grows(brain: Any, workspace: Path):
+    """Successful brain dispatch grows the transcript by one user
+    turn; the next claim returns one past the new count."""
+    seed_transcript(brain, "sess-d", _turns(user_count=0))
 
-    h = _build_handler(workspace, "sess-d")
+    h = _build_handler(brain, workspace, "sess-d")
     first = asyncio.run(h.claim_next_turn_index("sess-d"))
     assert first == 1
 
-    # Simulate brain success: JSONL gains one user line.
-    _write_jsonl(jsonl, user_count=1)
+    # Simulate brain success: transcript gains one user turn.
+    seed_transcript(brain, "sess-d", _turns(user_count=1))
     second = asyncio.run(h.claim_next_turn_index("sess-d"))
     assert second == 2
 
 
-def test_claim_collision_returns_none_when_jsonl_did_not_advance(workspace: Path):
+def test_claim_collision_returns_none_when_transcript_did_not_advance(
+    brain: Any, workspace: Path
+):
     """The brain-error edge case: hook minted at index 1, brain
     didn't write, next hook should refuse."""
-    h = _build_handler(workspace, "sess-e")
+    h = _build_handler(brain, workspace, "sess-e")
     first = asyncio.run(h.claim_next_turn_index("sess-e"))
     assert first == 1
-    # JSONL didn't advance — second call sees proposed=1 again.
+    # Transcript didn't advance — second call sees proposed=1 again.
     second = asyncio.run(h.claim_next_turn_index("sess-e"))
     assert second is None
 
 
-def test_claim_recovers_after_collision_when_jsonl_finally_advances(
-    workspace: Path,
+def test_claim_recovers_after_collision_when_transcript_finally_advances(
+    brain: Any, workspace: Path
 ):
     """After a brain error + retry that succeeds, subsequent claims
     proceed at the right index."""
-    pdir = claude_session_jsonl_dir(workspace)
-    jsonl = pdir / "sess-f.jsonl"
-
-    h = _build_handler(workspace, "sess-f")
-    # First mint (cursor=1), brain errored — JSONL still empty.
+    h = _build_handler(brain, workspace, "sess-f")
+    # First mint (cursor=1), brain errored — transcript still empty.
     assert asyncio.run(h.claim_next_turn_index("sess-f")) == 1
     # Collision on retry (msg2 at same proposed=1).
     assert asyncio.run(h.claim_next_turn_index("sess-f")) is None
     # User retries the trigger; this time the brain wrote — the
-    # JSONL advanced. Cursor should accept (msg3 at proposed=2 > last=1).
-    _write_jsonl(jsonl, user_count=1)
+    # transcript advanced. Cursor should accept (proposed=2 > last=1).
+    seed_transcript(brain, "sess-f", _turns(user_count=1))
     assert asyncio.run(h.claim_next_turn_index("sess-f")) == 2
 
 
-def test_claim_cursor_is_per_session_uuid(workspace: Path):
+def test_claim_cursor_is_per_session_uuid(brain: Any, workspace: Path):
     """Switching sessions doesn't carry the cursor over."""
-    h = _build_handler(workspace, "sess-g")
+    h = _build_handler(brain, workspace, "sess-g")
     assert asyncio.run(h.claim_next_turn_index("sess-g")) == 1
     # A different session_uuid starts at its own cursor=0 default.
     assert asyncio.run(h.claim_next_turn_index("sess-h")) == 1
 
 
-def test_claim_restart_safety(workspace: Path):
+def test_claim_restart_safety(brain: Any, workspace: Path):
     """Cursor lives in memory; on a fresh handler instance the cursor
-    is empty and ``next_user_turn_index`` rebuilds from the JSONL."""
-    pdir = claude_session_jsonl_dir(workspace)
-    jsonl = pdir / "sess-i.jsonl"
-    _write_jsonl(jsonl, user_count=5)
+    is empty and ``next_user_turn_index`` rebuilds from the
+    transcript."""
+    seed_transcript(brain, "sess-i", _turns(user_count=5))
 
     # First handler "lifetime"
-    h1 = _build_handler(workspace, "sess-i")
+    h1 = _build_handler(brain, workspace, "sess-i")
     assert asyncio.run(h1.claim_next_turn_index("sess-i")) == 6
 
     # Daemon restart: a brand-new handler with no remembered state.
-    h2 = _build_handler(workspace, "sess-i")
-    # Pretend the brain wrote its turn before the restart, so JSONL
-    # now has 6 user lines.
-    _write_jsonl(jsonl, user_count=6)
+    h2 = _build_handler(brain, workspace, "sess-i")
+    # Pretend the brain wrote its turn before the restart, so the
+    # transcript now has 6 user turns.
+    seed_transcript(brain, "sess-i", _turns(user_count=6))
     assert asyncio.run(h2.claim_next_turn_index("sess-i")) == 7
 
 
-def test_claim_atomicity_under_concurrent_callers(workspace: Path):
+def test_claim_atomicity_under_concurrent_callers(
+    brain: Any, workspace: Path
+):
     """Two parallel claims for the same session must not both pass.
 
     The drain loop already serialises per-chat in production, so this
@@ -235,7 +263,7 @@ def test_claim_atomicity_under_concurrent_callers(workspace: Path):
     issuing many concurrent claims; exactly one should win the slot
     for proposed=1, the rest should see proposed <= last and refuse.
     """
-    h = _build_handler(workspace, "sess-j")
+    h = _build_handler(brain, workspace, "sess-j")
 
     async def scenario() -> list[int | None]:
         return await asyncio.gather(
@@ -350,10 +378,10 @@ class _OrderingHandler:
 
 
 def test_hook_fires_inside_drain_with_real_session_uuid(
-    workspace: Path, monkeypatch: pytest.MonkeyPatch
+    brain: Any, workspace: Path, monkeypatch: pytest.MonkeyPatch
 ):
     """End-to-end: relationships hook receives the brain's real
-    session_uuid (NOT 'telegram-chat-...'), with a JSONL-derived
+    session_uuid (NOT 'telegram-chat-...'), with a transcript-derived
     turn_index. Hook reply arrives BEFORE brain reply on Telegram.
 
     v3c Day 4a: this test exercises the explicit-consent fast lane,
@@ -365,12 +393,12 @@ def test_hook_fires_inside_drain_with_real_session_uuid(
         "vexis_agent.core.yaml_config.relationships_explicit_consent_enabled",
         lambda: True,
     )
-    pdir = claude_session_jsonl_dir(workspace)
-    _write_jsonl(pdir / "real-uuid-aaa.jsonl", user_count=2)
+    seed_transcript(brain, "real-uuid-aaa", _turns(user_count=2))
 
-    # Real handler with a recording relationships stub.
-    handler = _build_handler(workspace, "real-uuid-aaa")
-    handler._brain = _FakeBrain()  # patched
+    # Real handler; respond() stubbed so no CLI spawn, iter_messages
+    # still routes to the real brain.
+    handler = _build_handler(brain, workspace, "real-uuid-aaa")
+    handler._brain = _FakeBrainRespond(brain)  # type: ignore[assignment]
     # Override handle so we can record ordering.
     ordering = _OrderingHandler()
 
@@ -401,9 +429,9 @@ def test_hook_fires_inside_drain_with_real_session_uuid(
 
 
 def test_cursor_collision_skips_staging_silently(
-    workspace: Path, monkeypatch: pytest.MonkeyPatch
+    brain: Any, workspace: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """If the JSONL doesn't advance between two hook fires, the
+    """If the transcript doesn't advance between two hook fires, the
     second hook gets None back from claim_next_turn_index and
     skips staging — no relationships call, no Telegram receipt,
     brain still receives the user's text.
@@ -416,7 +444,8 @@ def test_cursor_collision_skips_staging_silently(
         "vexis_agent.core.yaml_config.relationships_explicit_consent_enabled",
         lambda: True,
     )
-    handler = _build_handler(workspace, "sess-coll")
+    handler = _build_handler(brain, workspace, "sess-coll")
+    handler._brain = _FakeBrainRespond(brain)  # type: ignore[assignment]
 
     async def patched_handle(user_id: int, chat_id: int, text: str):
         return "brain-reply"
@@ -427,14 +456,14 @@ def test_cursor_collision_skips_staging_silently(
     transport = _make_transport_with_curator(handler, 99, relationships)
     bot = _FakeBot()
 
-    # First message: mints at index 1, JSONL never advances (test
-    # doesn't simulate a real claude -p write).
+    # First message: mints at index 1, transcript never advances (test
+    # doesn't simulate a real brain write).
     asyncio.run(transport._dispatch_to_brain(bot, 42, 99, "msg1"))
     assert len(relationships.calls) == 1
     assert relationships.calls[0][1] == 1
 
-    # Second message: cursor still at 1, JSONL still has 0 user
-    # lines, claim_next_turn_index returns None. Hook short-circuits.
+    # Second message: cursor still at 1, transcript still has 0 user
+    # turns, claim_next_turn_index returns None. Hook short-circuits.
     asyncio.run(transport._dispatch_to_brain(bot, 42, 99, "msg2"))
     assert len(relationships.calls) == 1  # NO new call to relationships
     assert "cursor_collision" in relationships.counter_increments

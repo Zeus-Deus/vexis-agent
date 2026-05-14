@@ -22,18 +22,22 @@ Design citation: ``.plans/claude-md-reorganization-research.md``
 from pathlib import Path
 
 
-# Why 220 (defended in the research doc):
+# Why 224 (originally 220, defended in the research doc):
 #   - Cleaned target after the Day 1 rewrite: ~190 lines.
 #   - 220 - 190 = 30 lines of headroom = exactly one new feature
 #     section at the policy-prescribed maximum.
 #   - 250 would invite the same comfort-driven drift the cleanup
 #     fixed; 200 would risk tripping on Day 1 itself given
 #     formatting variance.
+#   - +4 (220 → 224): the brain-parity Invariants entry
+#     ("transcript reads route through brain.iter_messages()") —
+#     a new cross-feature contract, and the Invariants section is
+#     still under ~40 lines. This is the sanctioned bump path.
 # Bump only when the growth comes from new cross-feature
 # contracts in the Invariants section AND that section is
 # itself still under ~40 lines. Never bump for per-feature
 # bloat.
-CLAUDE_MD_MAX_LINES = 220
+CLAUDE_MD_MAX_LINES = 224
 
 
 def test_claude_md_stays_under_size_limit() -> None:

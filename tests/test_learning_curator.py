@@ -422,6 +422,81 @@ def test_spawned_uuid_excluded_on_next_tick(env, monkeypatch):
 
 
 # --------------------------------------------------------------------
+# Brain parity: the curator on the opencode brain
+# --------------------------------------------------------------------
+
+
+def test_opencode_brain_eligibility_scan_and_review(env, monkeypatch):
+    """End-to-end curator tick on the opencode brain.
+
+    claude-code keeps sessions as JSONL files; opencode keeps them as
+    ``opencode.db`` rows and yields ``SessionMeta(jsonl_path=None)``.
+    The curator's transcript read then routes through
+    ``brain.iter_messages`` instead of a direct file read — the
+    brain-agnostic branch (``learning_curator.py`` ~L1587) that the
+    claude-code suite never exercises. This mirrors
+    ``test_run_once_eligible_session_writes_shadow`` but proves the
+    whole eligibility-scan → review chain works on opencode.
+    """
+    from vexis_agent.core.brain.opencode import OpenCodeBrain
+    from vexis_agent.core.running_tasks import RunningTasks
+    from vexis_agent.core.sessions import SessionStore
+
+    from tests._brain_seed import seed_transcript
+
+    workspace = env
+    brain = OpenCodeBrain(
+        workspace=workspace,
+        session=SessionStore(workspace / "sessions.json"),
+        running_tasks=RunningTasks(),
+    )
+    # An abandoned session, last active 60 min ago — past the idle
+    # gate. Seeded into opencode.db (the autouse _isolate_opencode_db
+    # fixture already points the reader at a tmp DB).
+    last_ms = int(
+        datetime(2026, 5, 2, 10, 0, 0, tzinfo=timezone.utc).timestamp() * 1000
+    )
+    seed_transcript(
+        brain,
+        "oc-abandoned",
+        [("user", "msg 0 in oc-abandoned"), ("user", "msg 1 in oc-abandoned")],
+        last_updated_ms=last_ms,
+    )
+    monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
+
+    def _brain_routed_review(workspace_arg, meta):
+        # opencode metas carry no JSONL path — the review MUST read
+        # the transcript through the brain.
+        assert meta.jsonl_path is None
+        n_messages = sum(1 for _ in brain.iter_messages(meta.session_uuid))
+        today = lc._utc_now().strftime("%Y-%m-%d")
+        short = meta.session_uuid[:8]
+        lc._append_shadow_entry(
+            workspace_arg,
+            f"[learned {today}] (stub) reviewed session {short} — "
+            f"{n_messages} conversational messages parsed",
+        )
+        return f"stub: wrote 1 shadow entry ({n_messages} msgs)"
+
+    controller = LearningController(
+        workspace=workspace,
+        review_fn=_brain_routed_review,
+        brain=brain,
+    )
+    result = controller.run_now()
+
+    assert "oc-abandoned" in result.eligible
+    assert "oc-abandoned" in result.reviewed
+
+    shadow = workspace / "memories" / "MEMORY-SHADOW.md"
+    assert shadow.exists()
+    content = shadow.read_text(encoding="utf-8")
+    assert "[learned" in content
+    # The brain-routed read saw both seeded turns.
+    assert "2 conversational messages parsed" in content
+
+
+# --------------------------------------------------------------------
 # Day 3: per-tick REPORT.md + run.json
 # --------------------------------------------------------------------
 
@@ -601,7 +676,13 @@ def test_real_review_returns_skipped_outcome_for_oversized(env, monkeypatch):
     from vexis_agent.core.brain.null import BrainNull
 
     monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=12))
-    controller = LearningController(workspace=workspace, brain=BrainNull())
+    # transcript_workspace lets BrainNull enumerate the seeded JSONL
+    # sessions (eligibility scan) while still failing loud on any
+    # unexpected aux spawn — the oversized path must never spawn.
+    controller = LearningController(
+        workspace=workspace,
+        brain=BrainNull(transcript_workspace=workspace),
+    )
     result = controller.run_now()
 
     assert "huge" in result.reviewed  # success path advances reviewed.json
@@ -636,10 +717,13 @@ def test_real_review_triage_no_skips_sonnet_end_to_end(env, monkeypatch):
     # also runs per tick (commit 6) and consumes one AuxResult; pre-
     # load it with empty extractions JSON so the extractor sees a
     # no-op and the test stays focused on the triage gate.
-    brain = BrainNull(aux_results=[
-        AuxResult(stdout="NO\n", stderr="", returncode=0),
-        AuxResult(stdout='{"extractions": []}', stderr="", returncode=0),
-    ])
+    brain = BrainNull(
+        aux_results=[
+            AuxResult(stdout="NO\n", stderr="", returncode=0),
+            AuxResult(stdout='{"extractions": []}', stderr="", returncode=0),
+        ],
+        transcript_workspace=workspace,
+    )
     monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
 
     controller = LearningController(workspace=workspace, brain=brain)
@@ -677,11 +761,14 @@ def test_real_review_triage_yes_runs_sonnet_end_to_end(env, monkeypatch):
 
     # Triage YES (call 1) → sonnet "Nothing to save." (call 2) →
     # extractor empty JSON (call 3, runs after review per tick order).
-    brain = BrainNull(aux_results=[
-        AuxResult(stdout="YES\n", stderr="", returncode=0),
-        AuxResult(stdout="Nothing to save.\n", stderr="", returncode=0),
-        AuxResult(stdout='{"extractions": []}', stderr="", returncode=0),
-    ])
+    brain = BrainNull(
+        aux_results=[
+            AuxResult(stdout="YES\n", stderr="", returncode=0),
+            AuxResult(stdout="Nothing to save.\n", stderr="", returncode=0),
+            AuxResult(stdout='{"extractions": []}', stderr="", returncode=0),
+        ],
+        transcript_workspace=workspace,
+    )
     monkeypatch.setattr(lc, "_utc_now", lambda: _utc(hour=11))
 
     controller = LearningController(workspace=workspace, brain=brain)
