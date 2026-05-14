@@ -10,6 +10,9 @@ import type {
   ChatHistoryState,
   ChatReply,
   ChatSessionsState,
+  ComputerUseSettings,
+  ComputerUseSettingsResponse,
+  ComputerUseSettingsUpdate,
   VoiceInfo,
   VoiceReply,
   VoiceSettings,
@@ -524,6 +527,15 @@ export const api = {
     call<VoiceSettings>(token, "/voice", { signal }),
   voiceSettingsSet: (token: string, body: VoiceSettingsUpdate) =>
     call<VoiceSettingsResponse>(token, "/voice", { method: "POST", body }),
+  // Computer Use settings (dashboard Computer Use tab — per-feature
+  // model selection + dynamic fast-model switching).
+  computerUseSettings: (token: string, signal?: AbortSignal) =>
+    call<ComputerUseSettings>(token, "/computer-use", { signal }),
+  computerUseSettingsSet: (token: string, body: ComputerUseSettingsUpdate) =>
+    call<ComputerUseSettingsResponse>(token, "/computer-use", {
+      method: "POST",
+      body,
+    }),
   // STT: multipart upload of an audio Blob → {transcript, reply}.
   // Bypasses ``call`` because that helper sets Content-Type to
   // application/json — the browser handles multipart boundary

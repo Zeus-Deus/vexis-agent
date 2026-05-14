@@ -108,16 +108,25 @@ class MessageHandler:
     ) -> str | None:
         """Foreground turn entrypoint. ``model`` and ``reasoning_level``
         are optional per-turn overrides forwarded straight to
-        ``Brain.respond``. ``None`` (the default) on either preserves
-        the existing Telegram + text-chat path bit-for-bit. Voice call
-        mode is the only caller passing non-None values today, sourced
-        from ``voice.call_mode.{model,reasoning_level}`` in
-        ``~/.vexis/config.yaml``.
+        ``Brain.respond``. ``None`` (the default) on either is the
+        canonical foreground path — Voice call mode is the only caller
+        passing non-None values, sourced from
+        ``voice.call_mode.{model,reasoning_level}``.
+
+        When the caller passes ``None``, the computer-use model
+        selector gets a say (see :meth:`_apply_computer_use_override`):
+        if the user opted in AND this turn is doing computer-use work,
+        it may substitute a model. With no opt-in and no computer-use
+        activity it's a no-op, so Telegram + text chat stay bit-for-bit
+        unchanged.
         """
         if not is_allowed(user_id, self._allowed_user_id):
             log.warning("Rejected message from user_id=%s", user_id)
             return None
 
+        model, reasoning_level = self._apply_computer_use_override(
+            model, reasoning_level,
+        )
         message = await self._inject_context(chat_id, text)
 
         try:
@@ -183,6 +192,9 @@ class MessageHandler:
             yield ("error", None)
             return
 
+        model, reasoning_level = self._apply_computer_use_override(
+            model, reasoning_level,
+        )
         message = await self._inject_context(chat_id, text)
 
         full = ""
@@ -234,6 +246,41 @@ class MessageHandler:
             return
 
         yield ("done", full.strip() or _EMPTY_RESPONSE)
+
+    @staticmethod
+    def _apply_computer_use_override(
+        model: str | None, reasoning_level: str | None,
+    ) -> tuple[str | None, str | None]:
+        """Let the computer-use model selector substitute a per-turn
+        model when the caller didn't already pass one.
+
+        An explicit caller override (voice call mode) always wins —
+        if ``model`` is non-None we pass it straight through, so the
+        voice-isolation contract is untouched. When ``model`` is None
+        we consult ``core.computer_use``; it returns ``(None, None)``
+        unless the user opted in AND a fresh ``vexis-ui`` snapshot says
+        this turn is doing computer-use work. So with no opt-in this
+        is a pure no-op and Telegram + text chat keep their existing
+        semantics.
+        """
+        if model is not None:
+            return model, reasoning_level
+        try:
+            from vexis_agent.core.computer_use import (
+                resolve_computer_use_override,
+            )
+
+            cu_model, cu_reasoning = resolve_computer_use_override()
+        except Exception:  # pragma: no cover - defensive
+            log.debug("computer-use override resolution failed", exc_info=True)
+            return model, reasoning_level
+        if cu_model is not None:
+            log.info(
+                "computer-use: foreground turn using model override %r",
+                cu_model,
+            )
+            return cu_model, cu_reasoning
+        return model, reasoning_level
 
     async def _inject_context(self, chat_id: int, text: str) -> str:
         """Prepend any pending system notes to the user's message.

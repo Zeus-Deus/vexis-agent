@@ -153,16 +153,46 @@ class UIDriver:
             raise UIRuntimeError(payload_back.get("error", "unknown runner error"))
         return payload_back.get("result") or {}
 
+    # ----- runtime-state signal --------------------------------------
+
+    @staticmethod
+    def _record_activity(
+        *, element_count: int, used_vision_fallback: bool, stale: bool,
+    ) -> None:
+        """Feed the computer-use model selector. Best-effort and fully
+        isolated — a failure here (import error, no ``~/.vexis``) must
+        never affect the snapshot/vision call itself. See
+        ``core.computer_use`` for how the daemon reads this back."""
+        try:
+            from vexis_agent.core.computer_use import record_snapshot_activity
+
+            record_snapshot_activity(
+                element_count=element_count,
+                used_vision_fallback=used_vision_fallback,
+                stale=stale,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("could not record computer-use activity: %s", exc)
+
     # ----- public API -------------------------------------------------
 
     def snapshot(self) -> SnapshotResult:
         data = self._exec_runner(UIAction.SNAPSHOT, {})
-        return SnapshotResult(
+        result = SnapshotResult(
             snapshot=data.get("snapshot", ""),
             element_count=int(data.get("element_count", 0)),
             stale=bool(data.get("stale", False)),
             hint=data.get("hint", ""),
         )
+        # An AT-SPI tree — never the screenshot fallback. Whether it's
+        # "rich enough" to skip vision is the daemon's call (it knows
+        # the configured threshold); we just report the raw shape.
+        self._record_activity(
+            element_count=result.element_count,
+            used_vision_fallback=False,
+            stale=result.stale,
+        )
+        return result
 
     def click(self, index: int) -> dict:
         return self._exec_runner(UIAction.CLICK, {"index": int(index)})
@@ -179,6 +209,13 @@ class UIDriver:
         return self._exec_runner(UIAction.FOCUS, {"selector": str(selector)})
 
     def vision_snapshot(self, out_path: str | None = None) -> dict:
-        return self._exec_runner(
+        result = self._exec_runner(
             UIAction.VISION, {"out": out_path} if out_path else {}
         )
+        # The screenshot fallback — the interface is NOT described in
+        # text, so a vision-capable model is required. Recording this
+        # pushes the daemon back off the dynamic fast model.
+        self._record_activity(
+            element_count=0, used_vision_fallback=True, stale=False,
+        )
+        return result

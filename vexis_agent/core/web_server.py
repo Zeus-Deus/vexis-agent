@@ -2093,6 +2093,33 @@ class WebDashboard:
         async def post_voice(body: dict) -> dict:
             return await asyncio.to_thread(self._voice_set, body)
 
+        # Surfaces as the "Computer Use" tab. Mirrors the Voice tab:
+        # GET returns the current ``computer_use.*`` config + the
+        # discovery-backed model list + a live readout of the last
+        # ``vexis-ui`` snapshot; POST accepts a partial update and
+        # writes through the same atomic+comment-preserving path.
+
+        @app.get(
+            "/api/v1/computer-use",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_computer_use() -> dict:
+            from vexis_agent.core.computer_use import computer_use_payload
+
+            return await asyncio.to_thread(computer_use_payload)
+
+        @app.post(
+            "/api/v1/computer-use",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_computer_use(body: dict) -> dict:
+            from vexis_agent.core.computer_use import computer_use_set
+
+            try:
+                return await asyncio.to_thread(computer_use_set, body)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+
         @app.post(
             "/api/v1/chat/tts",
             dependencies=[Depends(_require_auth)],
@@ -3185,102 +3212,16 @@ class WebDashboard:
 
     @staticmethod
     def _voice_call_mode_available_models_static(active_brain: str) -> list[dict]:
-        """Build the available-models list for the Voice tab's
-        call-mode picker. Pulled out so the test surface is small —
-        delegating to ``core.model_discovery`` means new models
-        from a future Claude release surface automatically without
-        touching this file.
+        """Available-models list for the Voice tab's call-mode picker.
 
-        Per-entry shape (uniform across brains so the UI doesn't
-        fork by brain kind):
-
-            {
-              "id": str,                       # model id (canonical form)
-              "display_name": str | None,      # friendly label, e.g.
-                                               #   "Claude Opus 4.7"
-              "reasoning_levels": list[str],   # dynamic per-model
-              "max_input_tokens": int | None,  # context window
-              "max_tokens": int | None,        # max output tokens
-              "provider": str | None,          # "anthropic" / "openrouter"
-                                               #   / "github-copilot" / etc
-              "free": bool,                    # opencode reports cost.input
-                                               #   == cost.output == 0 → True
-              "cost_input_per_million":  float | None,  # opencode only;
-              "cost_output_per_million": float | None,  # null elsewhere
-            }
-
-        Every value comes from the brain's native discovery
-        (Anthropic ``/v1/models`` for claude-code; ``opencode models
-        --verbose`` for opencode). Nothing is hardcoded — adding a
-        new model to either backend surfaces here automatically.
-
-        Bare-alias filter: Anthropic's ``/v1/models`` returns both the
-        full ID (e.g. ``claude-haiku-4-5-20251001``) AND the lowercase
-        family alias (``haiku``, ``sonnet``, ``opus``). The aliases
-        are valid CLI inputs but confusing in a picker (no reasoning
-        metadata, look like UI bugs). Hidden by requiring claude-code
-        IDs to start with ``claude-`` and opencode IDs to contain
-        ``/``.
+        Thin alias over :func:`core.model_discovery.available_models_for_picker`
+        — the Voice tab and the Computer Use tab share that single
+        source of truth so a future Claude release surfaces in both
+        without touching either page.
         """
-        from vexis_agent.core.model_discovery import (
-            discover_claude_code_capabilities,
-            discover_claude_code_models,
-            discover_opencode_capabilities,
-            discover_opencode_models,
-        )
+        from vexis_agent.core.model_discovery import available_models_for_picker
 
-        def _from_caps(
-            mid: str, caps: dict, *, default_provider: str | None,
-        ) -> dict:
-            """Project a capability entry into the picker wire format.
-
-            ``default_provider`` is what we fall back to when the
-            entry didn't ship a ``provider`` field — claude-code
-            doesn't have per-model provider info because everything
-            is anthropic, so we set it to ``"anthropic"`` by default.
-            """
-            entry = caps.get(mid) or {}
-            return {
-                "id": mid,
-                "display_name": entry.get("display_name"),
-                "reasoning_levels": entry.get("reasoning_levels", []),
-                "max_input_tokens": entry.get("max_input_tokens"),
-                "max_tokens": entry.get("max_tokens"),
-                "provider": entry.get("provider") or default_provider,
-                "free": bool(entry.get("free", False)),
-                "cost_input_per_million": entry.get("cost_input_per_million"),
-                "cost_output_per_million": entry.get("cost_output_per_million"),
-            }
-
-        if active_brain == "claude-code":
-            ids = sorted(
-                m for m in discover_claude_code_models()
-                if m.startswith("claude-")
-            )
-            caps = discover_claude_code_capabilities()
-            return [
-                _from_caps(mid, caps, default_provider="anthropic")
-                for mid in ids
-            ]
-        if active_brain == "opencode":
-            ids = sorted(
-                m for m in discover_opencode_models()
-                if "/" in m
-            )
-            caps = discover_opencode_capabilities()
-            entries = [
-                _from_caps(mid, caps, default_provider=None)
-                for mid in ids
-            ]
-            # Free models pinned to the top of the picker — at 237
-            # entries the free tier is what most casual users will
-            # try first, and surfacing it requires zero scrolling.
-            # ``sorted`` is stable so within the free / non-free
-            # buckets the alphabetical id order from above is
-            # preserved.
-            return sorted(entries, key=lambda e: not e["free"])
-        # null brain — no real model list to surface.
-        return []
+        return available_models_for_picker(active_brain)
 
     def _voice_payload(self) -> dict:
         """Snapshot for the Voice tab. Combines the current ``voice.*``

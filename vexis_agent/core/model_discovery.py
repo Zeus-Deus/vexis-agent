@@ -1135,8 +1135,72 @@ def _cached(key: str, fetcher) -> set[str]:
     return value
 
 
+def available_models_for_picker(brain_kind: str) -> list[dict]:
+    """Build the available-models list for a dashboard model picker
+    (the Voice tab's call-mode picker and the Computer Use tab share
+    this — single source of truth so a future Claude release surfaces
+    in both pickers without touching either page).
+
+    Per-entry shape (uniform across brains so the UI doesn't fork by
+    brain kind)::
+
+        {
+          "id": str,                       # model id (canonical form)
+          "display_name": str | None,      # friendly label
+          "reasoning_levels": list[str],   # dynamic per-model
+          "max_input_tokens": int | None,  # context window
+          "max_tokens": int | None,        # max output tokens
+          "provider": str | None,          # "anthropic" / "openrouter" / …
+          "free": bool,
+          "cost_input_per_million":  float | None,  # opencode only
+          "cost_output_per_million": float | None,
+        }
+
+    Everything comes from the brain's native discovery — nothing is
+    hardcoded. Bare family aliases (``haiku``/``sonnet``/``opus`` for
+    claude-code) are filtered out: valid CLI inputs, but confusing in
+    a picker. claude-code IDs must start with ``claude-``; opencode
+    IDs must contain ``/``.
+    """
+
+    def _from_caps(
+        mid: str, caps: dict, *, default_provider: str | None,
+    ) -> dict:
+        entry = caps.get(mid) or {}
+        return {
+            "id": mid,
+            "display_name": entry.get("display_name"),
+            "reasoning_levels": entry.get("reasoning_levels", []),
+            "max_input_tokens": entry.get("max_input_tokens"),
+            "max_tokens": entry.get("max_tokens"),
+            "provider": entry.get("provider") or default_provider,
+            "free": bool(entry.get("free", False)),
+            "cost_input_per_million": entry.get("cost_input_per_million"),
+            "cost_output_per_million": entry.get("cost_output_per_million"),
+        }
+
+    if brain_kind == "claude-code":
+        ids = sorted(
+            m for m in discover_claude_code_models() if m.startswith("claude-")
+        )
+        caps = discover_claude_code_capabilities()
+        return [
+            _from_caps(mid, caps, default_provider="anthropic") for mid in ids
+        ]
+    if brain_kind == "opencode":
+        ids = sorted(m for m in discover_opencode_models() if "/" in m)
+        caps = discover_opencode_capabilities()
+        entries = [_from_caps(mid, caps, default_provider=None) for mid in ids]
+        # Free models pinned to the top; ``sorted`` is stable so the
+        # alphabetical id order within each bucket is preserved.
+        return sorted(entries, key=lambda e: not e["free"])
+    # null brain — no real model list to surface.
+    return []
+
+
 __all__ = [
     "MODEL_DISCOVERY_CLAUDE_CODE",
+    "available_models_for_picker",
     "configured_brains",
     "default_view_models",
     "discover_claude_code_capabilities",

@@ -800,6 +800,64 @@ export interface VoiceSettingsResponse extends VoiceSettings {
   backup_path: string | null;
 }
 
+// ----- computer use settings (dashboard tab) ---------------------
+//
+// Per-feature model selection for computer-use turns. Mirrors voice
+// call mode: strictly opt-in, inert for plain chat. The "dynamic"
+// layer is the Codex-style trick — a faster model kicks in when the
+// last vexis-ui snapshot was a rich AT-SPI tree (no screenshot
+// needed). See core/computer_use.py.
+
+// Live readout of the most recent vexis-ui snapshot. Null when there
+// has never been one. Drives the status strip on the Computer Use tab.
+export interface ComputerUseActivity {
+  element_count: number | null;
+  used_vision_fallback: boolean;
+  stale: boolean;
+  // Seconds since the snapshot landed. Null when the timestamp was
+  // unparseable.
+  age_seconds: number | null;
+  // Within the activity TTL — i.e. this still counts as "doing
+  // computer-use work".
+  fresh: boolean;
+  // Live verdict the dynamic switch keys off: fresh AND a rich tree.
+  rich: boolean;
+}
+
+export interface ComputerUseSettings {
+  // Empty string = "use brain default" — same sentinel the model
+  // picker's radio list uses.
+  model: string;
+  reasoning_level: string;
+  dynamic: {
+    enabled: boolean;
+    model: string;
+    reasoning_level: string;
+    // Indexed-widget floor for a snapshot to count as "rich".
+    min_elements: number;
+  };
+  available_models: AvailableModel[];
+  last_activity: ComputerUseActivity | null;
+}
+
+export interface ComputerUseSettingsUpdate {
+  // null / "" / "default" all mean "reset to brain default" server-
+  // side; the UI sends "" for clarity.
+  model?: string | null;
+  reasoning_level?: string | null;
+  dynamic?: {
+    enabled?: boolean;
+    model?: string | null;
+    reasoning_level?: string | null;
+    min_elements?: number;
+  };
+}
+
+export interface ComputerUseSettingsResponse extends ComputerUseSettings {
+  ok: true;
+  backup_path: string | null;
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Kanban — multi-task durable work queue.
 // Schema mirrors core/kanban/db.py. Wire-compatible with the

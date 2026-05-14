@@ -98,20 +98,20 @@ Two-step resolution: subsystems pick an abstract size tier
 `subsystem_tier(<name>)`; the active brain translates tier →
 native model id via `models.tiers.<brain-kind>.<tier>` config
 or `DEFAULT_TIER_MAP_<BRAIN>`. Foreground turn uses the brain's
-account default (no `--model` flag) — unless the caller passes a
-per-turn override (voice call mode does, sourced from
-`voice.call_mode.model`; Telegram/text-chat always pass `None`).
-
-Override per-subsystem under `models.subsystems.<name>` in
+account default (no `--model` flag) unless a per-turn override
+applies: voice call mode (`voice.call_mode.model`) or the
+computer-use selector (`computer_use.*` — a pinned model plus
+an optional dynamic fast-model layer, gated on recent
+`vexis-ui` activity). Telegram/text-chat pass `None`; the
+handler may then substitute a computer-use model. Per-subsystem
+override under `models.subsystems.<name>` in
 `~/.vexis/config.yaml`. Legacy raw-string keys (e.g.
-`models.coherence_judge: sonnet`) still work on claude-code
-via back-compat; they break on opencode (which requires
-`provider/model` shape). Sentinel `default` means
-"no `--model` flag — let the brain pick".
+`models.coherence_judge: sonnet`) work on claude-code via
+back-compat, break on opencode. `default` = no `--model` flag.
 
-**Pointers:** `docs/model-ux.md` (resolution table, slash,
-dashboard, hot-reload-vs-restart matrix) · `docs/migration.md`
-(legacy-keys-on-opencode trap recipe).
+**Pointers:** `docs/model-ux.md` (resolution, slash, dashboard,
+hot-reload matrix) · `docs/migration.md` (legacy-keys trap) ·
+`docs/computer-use-model.md` (per-feature + dynamic switch).
 
 ## Learning curator
 
