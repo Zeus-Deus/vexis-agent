@@ -7,7 +7,14 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from vexis_agent.core.brain.base import Brain, BrainCancelled, BrainTimeoutError, SessionLost
+from vexis_agent.core.brain.base import (
+    Brain,
+    BrainCancelled,
+    BrainPermanentError,
+    BrainTimeoutError,
+    BrainTransientError,
+    SessionLost,
+)
 from vexis_agent.core.auth import is_allowed
 from vexis_agent.core.notify import ContextNote, Notifier
 from vexis_agent.core.paths import skills_dir
@@ -18,6 +25,14 @@ from vexis_agent.core.transcripts import claude_session_jsonl_dir, iter_messages
 log = logging.getLogger(__name__)
 
 _BRAIN_ERROR = "⚠️ Something broke. Logs have details."
+# Transient: the upstream API hiccupped. The brain wrapper has
+# already retried once inline — if we got here both attempts failed.
+# Be specific about what happened so the user knows whether to wait
+# or check status.claude.com.
+_BRAIN_TRANSIENT_PREFIX = "⚠️ Upstream API hiccup — "
+# Permanent: auth, model id, malformed request. Retrying won't help;
+# the user has to fix something (re-auth, switch model, top up credit).
+_BRAIN_PERMANENT_PREFIX = "⚠️ "
 _SESSION_LOST = (
     "⚠️ Couldn't resume the previous conversation. "
     "Starting fresh — please send your message again."
@@ -37,9 +52,20 @@ _CLEAR_OK = "Conversation cleared."
 # wire-stable strings that travel through the SSE ``error`` event.
 # Adding a new code = update the frontend's ``mapErrorCode`` helper.
 
-# Brain returned a non-zero exit / unparseable output. Often
-# transient (rate limit, bad provider response). Retry button OK.
+# Brain returned a non-zero exit / unparseable output. Used as the
+# catch-all when the classifier didn't find a known transient or
+# permanent pattern. Retry button OK; the user is choosing to retry
+# blindly.
 _ERR_CODE_BRAIN_ERROR = "brain_error"
+# Brain failed with a recognised transient cause (Anthropic 5xx /
+# 429 / network blip) and the inline retry didn't recover.
+# Distinguished from ``brain_error`` so the UI can render a softer
+# affordance ("Try again in a moment") instead of a hard error.
+_ERR_CODE_BRAIN_TRANSIENT = "brain_transient"
+# Brain failed with a recognised permanent cause (auth, invalid
+# model, malformed request). Retry button suppressed — the user has
+# to fix the underlying problem.
+_ERR_CODE_BRAIN_PERMANENT = "brain_permanent"
 # Brain hung past the configured timeout. Retry won't help unless
 # the user shortens the prompt or switches model.
 _ERR_CODE_BRAIN_TIMEOUT = "brain_timeout"
@@ -57,6 +83,45 @@ _ERR_CODE_REJECTED = "rejected"
 # already have the traceback; user gets a generic "stream
 # interrupted" so we never render uncaught Python on the page.
 _ERR_CODE_UNKNOWN = "unknown"
+
+# Max length of a brain-error tail we'll inline into the user-facing
+# message. The full text always lives in the daemon log; this is just
+# what we send to Telegram/the chat bubble. 240 chars covers
+# "claude -p exited 1: API Error: 500 Internal server error. This is
+# a server-side issue, usually temporary — try again in a moment. If
+# it persists, check status.claude.com." with margin to spare. Going
+# longer risks Telegram message-length nag for a chain of retries.
+_BRAIN_ERROR_TAIL_LIMIT = 240
+
+
+def _shorten_brain_error(text: str) -> str:
+    """Trim a BrainError string to fit a user-facing toast.
+
+    Strips the ``claude -p exited N: `` prefix (the user doesn't care
+    about the exit code — they care about the *cause*) and caps at
+    ``_BRAIN_ERROR_TAIL_LIMIT`` with an ellipsis. Falls back to a
+    generic phrase if the input is empty.
+    """
+    s = (text or "").strip()
+    if not s:
+        return "claude -p failed with no diagnostic output."
+    # Drop the "claude -p exited N: " framing if present — the
+    # interesting bit is everything after the colon.
+    for prefix in ("claude -p exited 1: ", "claude -p exited 2: "):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    else:
+        # Generic "exited <N>:" match — substring from the first ": "
+        # after "exited " is the diagnostic body.
+        m = s.find("exited ")
+        if m == 0:
+            colon = s.find(": ", m)
+            if colon != -1:
+                s = s[colon + 2:]
+    if len(s) > _BRAIN_ERROR_TAIL_LIMIT:
+        s = s[: _BRAIN_ERROR_TAIL_LIMIT - 1].rstrip() + "…"
+    return s
 
 
 class MessageHandler:
@@ -142,6 +207,16 @@ class MessageHandler:
             return _BRAIN_TIMEOUT
         except SessionLost:
             return _SESSION_LOST
+        except BrainTransientError as exc:
+            # Brain wrapper already retried once inline and still
+            # failed. Surface the actual upstream wording — that's
+            # the difference between an opaque "Something broke" and
+            # an actionable "Anthropic 500, try again in a moment."
+            log.warning("Brain transient failure for chat_id=%s: %s", chat_id, exc)
+            return _BRAIN_TRANSIENT_PREFIX + _shorten_brain_error(str(exc))
+        except BrainPermanentError as exc:
+            log.warning("Brain permanent failure for chat_id=%s: %s", chat_id, exc)
+            return _BRAIN_PERMANENT_PREFIX + _shorten_brain_error(str(exc))
         except Exception:
             log.exception("Brain call failed")
             return _BRAIN_ERROR
@@ -235,6 +310,26 @@ class MessageHandler:
             yield ("error", {
                 "code": _ERR_CODE_SESSION_LOST,
                 "message": _SESSION_LOST,
+            })
+            return
+        except BrainTransientError as exc:
+            log.warning(
+                "Brain stream transient failure for chat_id=%s: %s",
+                chat_id, exc,
+            )
+            yield ("error", {
+                "code": _ERR_CODE_BRAIN_TRANSIENT,
+                "message": _BRAIN_TRANSIENT_PREFIX + _shorten_brain_error(str(exc)),
+            })
+            return
+        except BrainPermanentError as exc:
+            log.warning(
+                "Brain stream permanent failure for chat_id=%s: %s",
+                chat_id, exc,
+            )
+            yield ("error", {
+                "code": _ERR_CODE_BRAIN_PERMANENT,
+                "message": _BRAIN_PERMANENT_PREFIX + _shorten_brain_error(str(exc)),
             })
             return
         except Exception:

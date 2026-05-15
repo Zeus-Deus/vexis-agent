@@ -46,7 +46,9 @@ from vexis_agent.core.brain.base import (
     BrainHealth,
     BrainModelNotFoundError,
     BrainNotInstalled,
+    BrainPermanentError,
     BrainTimeoutError,
+    BrainTransientError,
     McpServerSpec,
     SessionLost,
 )
@@ -72,7 +74,9 @@ __all__ = [
     "BrainError",
     "BrainHealth",
     "BrainNotInstalled",
+    "BrainPermanentError",
     "BrainTimeoutError",
+    "BrainTransientError",
     "ClaudeCodeBrain",
     "McpServerSpec",
     "SessionLost",
@@ -101,6 +105,92 @@ BRAIN_TIMEOUT_SECONDS = 1800
 # around 4 MB base64); cheap because we only ever hold one line in
 # the buffer at a time.
 _BRAIN_STREAM_LIMIT_BYTES = 32 * 1024 * 1024
+
+# ── Transient-error inline retry ─────────────────────────────────
+# When the Anthropic API returns a 5xx / 429 / "overloaded" / network
+# blip, claude-code exits 1 and writes the error into the stream-json
+# output (NOT stderr) as the assistant's final message. The May 2026
+# scheduled-fire crash that prompted this hierarchy was caused by
+# exactly one such transient 500. To absorb sub-second hiccups
+# without the user seeing them, ``respond`` and ``astream`` retry
+# once on ``BrainTransientError`` with a short delay. One retry only:
+# more invites cascading double-charges on rate-limit cases where the
+# upstream is intentionally throttling us, and any outage longer
+# than a few seconds wants caller-side backoff (the schedule manager,
+# the user re-typing) not silent burn-in here.
+_TRANSIENT_RETRY_DELAY_SECONDS = 3.0
+_TRANSIENT_MAX_ATTEMPTS = 2  # initial + one retry
+
+# Pattern: claude-code wraps Anthropic API errors as
+#   "API Error: <HTTP code> <message>"
+# and prints the whole thing inside the final assistant text block. We
+# match the wording (not a parsed status code) because that's what's
+# actually visible to us on the failure path; the regression tests in
+# tests/test_brain_error_classification.py pin known wordings against
+# the right subclass. Update both alongside upstream wording changes.
+_TRANSIENT_ERROR_RE = re.compile(
+    r"API\s+Error:\s*5\d\d"          # any HTTP 5xx
+    r"|API\s+Error:\s*429"           # rate limit
+    r"|overloaded_error"             # Anthropic SDK-style code
+    r"|overloaded"                   # natural language
+    r"|rate.?limit"
+    r"|timed?\s*out"
+    r"|connection\s+reset"
+    r"|temporarily\s+unavailable"
+    r"|service\s+unavailable",
+    re.IGNORECASE,
+)
+_PERMANENT_ERROR_RE = re.compile(
+    r"API\s+Error:\s*40[013-9]"       # 4xx except 402/429 — 429 above
+    r"|API\s+Error:\s*41\d"
+    r"|API\s+Error:\s*42[0-8]"
+    r"|authentication"
+    r"|invalid_api_key"
+    r"|invalid_request_error"
+    r"|model\s+not\s+found"
+    r"|There's\s+an\s+issue\s+with\s+the\s+selected\s+model"
+    r"|insufficient\s+(credit|quota|balance)",
+    re.IGNORECASE,
+)
+
+
+def _classify_brain_failure(
+    *,
+    stderr_text: str,
+    assistant_text: str,
+) -> tuple[type[BrainError], str]:
+    """Pick the most specific ``BrainError`` subclass + diagnostic text
+    for a non-zero ``claude -p`` exit.
+
+    Returns ``(error_class, human_message)`` so the caller can do::
+
+        cls, msg = _classify_brain_failure(...)
+        raise cls(msg)
+
+    Why two text sources: claude-code's CLI is inconsistent about
+    *where* it writes failure detail. ``stderr`` carries low-level
+    crashes (subprocess died, JSON-RPC parse error). API errors and
+    permission denials land in ``stdout`` as a final assistant text
+    block instead, with stderr empty — which is exactly the scenario
+    that bit us on 15 May 2026 when an Anthropic 500 produced exit 1
+    + empty stderr + a single ``assistant`` event saying
+    "API Error: 500 Internal server error…". We combine both
+    sources, classify against the combined text, and surface the
+    actual wording in the message.
+
+    Fallback when neither pattern matches: ``BrainError`` base — the
+    caller treats that as "unknown failure, don't retry, surface
+    verbatim."
+    """
+    parts = [s.strip() for s in (stderr_text, assistant_text) if s and s.strip()]
+    combined = " | ".join(parts)
+    if not combined:
+        combined = "(no stderr or assistant text)"
+    if _TRANSIENT_ERROR_RE.search(combined):
+        return BrainTransientError, combined
+    if _PERMANENT_ERROR_RE.search(combined):
+        return BrainPermanentError, combined
+    return BrainError, combined
 
 
 def _session_jsonl_exists(workspace: Path, session_id: str) -> bool:
@@ -290,18 +380,34 @@ def build_system_prompt(workspace: Path) -> str:
 
 async def _read_stream_events(
     stream: asyncio.StreamReader | None, status_file: StatusFile
-) -> str:
+) -> tuple[str, str]:
     """Consume the brain's stream-json stdout, updating ``status_file``
-    on every tool_use event and returning the assistant's final text.
+    on every tool_use event.
 
-    The final text is the ``result`` field of the ``result`` event
-    Claude Code emits last. Malformed lines are logged and skipped so a
-    single corrupt event can't break the whole turn — historically
-    rare but we shouldn't lose a real reply over one bad line.
+    Returns ``(final_text, last_assistant_text)``:
+
+    * ``final_text`` — the ``result`` field of the terminal ``result``
+      event Claude Code emits last. This is the canonical reply on a
+      successful turn. Empty when the brain crashed before emitting a
+      ``result``.
+
+    * ``last_assistant_text`` — the concatenation of all text blocks
+      from ``assistant`` events seen during the stream. We only need
+      this for the failure path: when ``claude -p`` exits non-zero
+      because of an upstream API error, the error wording lands in an
+      ``assistant`` text block (NOT in stderr, NOT in a ``result``
+      event). Carrying it out of this helper lets the caller classify
+      the failure as transient / permanent / unknown and surface the
+      actual wording instead of "(no stderr)". Unused on success.
+
+    Malformed lines are logged and skipped so a single corrupt event
+    can't break the whole turn — historically rare but we shouldn't
+    lose a real reply over one bad line.
     """
     final_text = ""
+    assistant_text_parts: list[str] = []
     if stream is None:
-        return final_text
+        return final_text, ""
     while True:
         try:
             line = await stream.readline()
@@ -324,16 +430,21 @@ async def _read_stream_events(
             for block in content:
                 if not isinstance(block, dict):
                     continue
-                if block.get("type") != "tool_use":
-                    continue
-                name = block.get("name") or "Tool"
-                target = extract_tool_target(name, block.get("input") or {})
-                status_file.record_tool(name, target)
+                btype = block.get("type")
+                if btype == "tool_use":
+                    name = block.get("name") or "Tool"
+                    target = extract_tool_target(name, block.get("input") or {})
+                    status_file.record_tool(name, target)
+                elif btype == "text":
+                    text = block.get("text")
+                    if isinstance(text, str) and text:
+                        assistant_text_parts.append(text)
         elif kind == "result":
             result_text = event.get("result")
             if isinstance(result_text, str):
                 final_text = result_text
-    return final_text
+    last_assistant_text = "\n".join(assistant_text_parts).strip()
+    return final_text, last_assistant_text
 
 
 def audit_destructive_mentions(response: str) -> Iterator[tuple[str, bool]]:
@@ -471,18 +582,70 @@ class ClaudeCodeBrain(Brain):
             self._workspace,
         )
 
-        # Reserve before spawning so a /cancel arriving while claude -p is
-        # starting up is captured by the slot and surfaced via attach() →
-        # False below — closes the spawn-vs-register race.
+        # Inline retry on transient upstream failures (Anthropic 5xx /
+        # 429 / network blip). See ``_TRANSIENT_RETRY_DELAY_SECONDS``
+        # comment for the rationale: one retry absorbs sub-second
+        # hiccups; anything longer wants caller-side backoff. /cancel
+        # arriving between attempts short-circuits the loop so the
+        # user's Stop button is honoured even mid-retry.
+        for attempt in range(1, _TRANSIENT_MAX_ATTEMPTS + 1):
+            try:
+                final_text = await self._attempt_respond(argv, chat_id)
+                break
+            except BrainTransientError as exc:
+                if attempt >= _TRANSIENT_MAX_ATTEMPTS:
+                    raise
+                if self._running_tasks.was_cancelled(chat_id):
+                    raise
+                log.warning(
+                    "claude -p transient failure (attempt %d/%d) for "
+                    "chat %d: %s — retrying in %.1fs",
+                    attempt, _TRANSIENT_MAX_ATTEMPTS, chat_id,
+                    exc, _TRANSIENT_RETRY_DELAY_SECONDS,
+                )
+                await asyncio.sleep(_TRANSIENT_RETRY_DELAY_SECONDS)
+
+        # Mark only after a successful exit so a failed first call doesn't
+        # leave us thinking the UUID is live.
+        if not self._session.is_initialized():
+            self._session.mark_initialized()
+        response = (final_text or "").strip()
+        for reason, asked in audit_destructive_mentions(response):
+            if asked:
+                log.info("Vexis confirmed before destructive: %s", reason)
+            else:
+                log.info("Vexis ran without confirm: %s", reason)
+        log.info("Brain.respond completed for chat %d", chat_id)
+        return response
+
+    async def _attempt_respond(
+        self, argv: list[str], chat_id: int,
+    ) -> str:
+        """One spawn-and-await cycle for :meth:`respond`.
+
+        Returns the buffered ``result``-event text. Raises:
+
+        * ``BrainCancelled`` — /cancel fired (caller does not retry).
+        * ``BrainTimeoutError`` — exceeded ``BRAIN_TIMEOUT_SECONDS``.
+        * ``SessionLost`` — claude lost its session JSONL.
+        * ``BrainTransientError`` — upstream API hiccup; caller may retry.
+        * ``BrainPermanentError`` — upstream rejected the request shape.
+        * ``BrainError`` — anything else.
+
+        Extracted from ``respond`` so the caller can wrap the attempt in
+        a retry loop without duplicating the reserve/attach/spawn
+        machinery. Reserve + register live INSIDE this helper so each
+        attempt gets a fresh slot (the previous attempt's slot is
+        unregistered in ``finally`` before retry).
+        """
         reservation = await self._running_tasks.reserve(chat_id)
-        # Propagate chat_id to spawned tools (vexis-bg etc.) so they can
-        # route notifications back to the right Telegram conversation.
         env = {**os.environ, "VEXIS_CHAT_ID": str(chat_id)}
 
         status_file = StatusFile(chat_id)
         status_file.start()
 
         final_text = ""
+        assistant_text = ""
         stderr_bytes = b""
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -530,10 +693,10 @@ class ClaudeCodeBrain(Brain):
                 ) from exc
 
             try:
-                final_text = await stdout_task
+                final_text, assistant_text = await stdout_task
             except Exception:
                 log.exception("Brain stdout reader failed for chat %d", chat_id)
-                final_text = ""
+                final_text, assistant_text = "", ""
             try:
                 stderr_bytes = await stderr_task
             except Exception:
@@ -549,8 +712,8 @@ class ClaudeCodeBrain(Brain):
 
             if proc.returncode != 0:
                 err = stderr_bytes.decode(errors="replace").strip()
-                # Claude Code's wording has varied across versions; substring
-                # match is more robust than pinning an exact string.
+                # Session-lost detection takes precedence — wording is
+                # specific and recovery is a UUID rotation, not a retry.
                 if self._session.is_initialized() and "No conversation found" in err:
                     old_uuid = self._session.get()
                     new_uuid = self._session.rotate()
@@ -562,25 +725,23 @@ class ClaudeCodeBrain(Brain):
                     raise SessionLost(
                         "Claude Code session was lost. Rotated to new session."
                     )
-                raise BrainError(
-                    f"claude -p exited {proc.returncode}: {err or '(no stderr)'}"
+                # Everything else: classify by combined stderr +
+                # assistant-text body. The May 2026 schedule crash was
+                # exactly this path — stderr empty, assistant text
+                # "API Error: 500…". Before this change we raised
+                # ``BrainError("claude -p exited 1: (no stderr)")``
+                # and lost the actual cause.
+                cls, message = _classify_brain_failure(
+                    stderr_text=err, assistant_text=assistant_text,
+                )
+                raise cls(
+                    f"claude -p exited {proc.returncode}: {message}"
                 )
         finally:
             status_file.delete()
             await self._running_tasks.unregister(chat_id)
 
-        # Mark only after a successful exit so a failed first call doesn't
-        # leave us thinking the UUID is live.
-        if not self._session.is_initialized():
-            self._session.mark_initialized()
-        response = (final_text or "").strip()
-        for reason, asked in audit_destructive_mentions(response):
-            if asked:
-                log.info("Vexis confirmed before destructive: %s", reason)
-            else:
-                log.info("Vexis ran without confirm: %s", reason)
-        log.info("Brain.respond completed for chat %d", chat_id)
-        return response
+        return final_text
 
     async def astream(
         self,
@@ -661,6 +822,52 @@ class ClaudeCodeBrain(Brain):
             self._workspace,
         )
 
+        # Inline transient-retry. Matches the policy in :meth:`respond`,
+        # with one extra constraint: retry only if NOTHING was yielded
+        # downstream yet. Once we've emitted a text delta or a tool
+        # event the user/UI has consumed it, and retrying would
+        # double-render the same prefix and (worse) re-run any tool
+        # the brain already started. So a transient that hits mid-
+        # stream still propagates — only first-millisecond failures
+        # (API 5xx on the opening call) get the silent retry.
+        for attempt in range(1, _TRANSIENT_MAX_ATTEMPTS + 1):
+            yielded_anything = False
+            try:
+                async for event in self._attempt_astream(argv, chat_id):
+                    yielded_anything = True
+                    yield event
+                break  # clean completion
+            except BrainTransientError as exc:
+                if yielded_anything:
+                    raise
+                if attempt >= _TRANSIENT_MAX_ATTEMPTS:
+                    raise
+                if self._running_tasks.was_cancelled(chat_id):
+                    raise
+                log.warning(
+                    "claude -p (stream) transient failure (attempt "
+                    "%d/%d) for chat %d: %s — retrying in %.1fs",
+                    attempt, _TRANSIENT_MAX_ATTEMPTS, chat_id,
+                    exc, _TRANSIENT_RETRY_DELAY_SECONDS,
+                )
+                await asyncio.sleep(_TRANSIENT_RETRY_DELAY_SECONDS)
+
+        if not self._session.is_initialized():
+            self._session.mark_initialized()
+
+        log.info("Brain.astream completed for chat %d", chat_id)
+
+    async def _attempt_astream(
+        self, argv: list[str], chat_id: int,
+    ) -> AsyncIterator:
+        """One spawn-and-stream cycle for :meth:`astream`.
+
+        Async generator yielding the same discriminated union as
+        :meth:`astream` (text str or ``{"type": "tool", ...}`` dict).
+        Raises the same exception taxonomy as :meth:`_attempt_respond`
+        — caller decides whether to retry, based on whether anything
+        was yielded.
+        """
         reservation = await self._running_tasks.reserve(chat_id)
         env = {**os.environ, "VEXIS_CHAT_ID": str(chat_id)}
 
@@ -669,9 +876,14 @@ class ClaudeCodeBrain(Brain):
 
         # Concatenated deltas (for cross-check against the result
         # event) and the result-event text (used as fallback if no
-        # deltas arrived for some reason).
+        # deltas arrived for some reason). ``assistant_text`` accumulates
+        # text-block bodies from ``assistant`` events — distinct from
+        # the streamed ``accumulated`` deltas because API-error
+        # messages arrive as one buffered assistant text block, not
+        # as content_block_delta deltas. See _classify_brain_failure.
         accumulated = ""
         result_text = ""
+        assistant_text_parts: list[str] = []
         stderr_bytes = b""
         proc: asyncio.subprocess.Process | None = None
         try:
@@ -763,22 +975,32 @@ class ClaudeCodeBrain(Brain):
                         for block in content:
                             if not isinstance(block, dict):
                                 continue
-                            if block.get("type") != "tool_use":
-                                continue
-                            name = block.get("name") or "Tool"
-                            target = extract_tool_target(
-                                name, block.get("input") or {},
-                            )
-                            status_file.record_tool(name, target)
-                            # Tool event → chat UI. Distinct from
-                            # text deltas; consumers must distinguish
-                            # via ``isinstance``. Documented contract
-                            # on Brain.astream.
-                            yield {
-                                "type": "tool",
-                                "name": name,
-                                "target": target,
-                            }
+                            btype = block.get("type")
+                            if btype == "tool_use":
+                                name = block.get("name") or "Tool"
+                                target = extract_tool_target(
+                                    name, block.get("input") or {},
+                                )
+                                status_file.record_tool(name, target)
+                                # Tool event → chat UI. Distinct from
+                                # text deltas; consumers must distinguish
+                                # via ``isinstance``. Documented contract
+                                # on Brain.astream.
+                                yield {
+                                    "type": "tool",
+                                    "name": name,
+                                    "target": target,
+                                }
+                            elif btype == "text":
+                                # Captured for the failure-classification
+                                # path; not yielded — the streamed
+                                # content_block_delta deltas above are
+                                # the canonical UI source. API errors
+                                # arrive HERE as one buffered text
+                                # block with no preceding deltas.
+                                text = block.get("text")
+                                if isinstance(text, str) and text:
+                                    assistant_text_parts.append(text)
                 elif kind == "result":
                     rt = event.get("result")
                     if isinstance(rt, str):
@@ -809,15 +1031,20 @@ class ClaudeCodeBrain(Brain):
                     raise SessionLost(
                         "Claude Code session was lost. Rotated to new session.",
                     )
-                raise BrainError(
-                    f"claude -p exited {proc.returncode}: {err or '(no stderr)'}",
+                # Classify against stderr + buffered assistant text.
+                # Without this fallback, the May 2026 schedule crash
+                # surfaced as "(no stderr)" instead of "API Error:
+                # 500…" — see ``_classify_brain_failure``.
+                cls, message = _classify_brain_failure(
+                    stderr_text=err,
+                    assistant_text="\n".join(assistant_text_parts).strip(),
+                )
+                raise cls(
+                    f"claude -p exited {proc.returncode}: {message}",
                 )
         finally:
             status_file.delete()
             await self._running_tasks.unregister(chat_id)
-
-        if not self._session.is_initialized():
-            self._session.mark_initialized()
 
         # Defensive: if no deltas streamed (unusual but observed in
         # very-short replies on some backends) fall back to the
@@ -836,8 +1063,6 @@ class ClaudeCodeBrain(Brain):
                 "(result=%d chars, deltas=%d chars)",
                 chat_id, len(result_clean), len(accumulated_clean),
             )
-
-        log.info("Brain.astream completed for chat %d", chat_id)
 
     @staticmethod
     async def _kill_group(proc: asyncio.subprocess.Process) -> None:
