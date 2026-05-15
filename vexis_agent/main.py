@@ -523,6 +523,13 @@ async def _run() -> None:
     # exists by here; ScheduleManager.start() hasn't been called yet,
     # so the very first tick sees the dispatch_fn wired.
     schedule_manager.set_dispatch_fn(transport.dispatch_scheduled_fire)
+    # Reverse wire: the drain calls back into the manager with the
+    # real brain outcome so ``last_status`` reflects truth instead of
+    # the pre-emptive "ok" the dispatch-time _record_fire writes.
+    # Without this, a brain failure (the 15 May 2026 Anthropic 500)
+    # leaves the schedule showing ok forever despite the user seeing
+    # an error in Telegram.
+    transport._schedule_outcome_cb = schedule_manager.report_fire_outcome
 
     log.info("Vexis-Agent starting")
     await control_socket.start()

@@ -63,6 +63,14 @@ class QueuedMessage:
     actual sender so the auth gate at ``MessageHandler.handle`` works
     unchanged; goal continuations also carry the allowed user id —
     the field is purely a tag, never a substitute for the auth check.
+
+    ``schedule_id`` is set to the schedule's id when ``origin``
+    is ``"scheduled_fire"``, so the drain can report the brain
+    outcome back to :class:`ScheduleManager.report_fire_outcome`.
+    Without this tag the schedule's ``last_status`` would stay
+    pre-emptively ``"ok"`` even when the brain fails — the
+    15 May 2026 dashboard-vs-reality drift this fixes. ``None``
+    for non-scheduled messages.
     """
 
     user_id: int
@@ -73,6 +81,7 @@ class QueuedMessage:
         "scheduled_fire",
         "schedule_command",
     ] = "user"
+    schedule_id: str | None = None
 
 
 @dataclass
@@ -131,6 +140,7 @@ class RunningTasks:
         "scheduled_fire",
         "schedule_command",
     ] = "user",
+        schedule_id: str | None = None,
     ) -> int:
         """Append a follow-up message to the chat's queue. Should only be
         called after ``claim`` returned False. Returns the new depth.
@@ -141,11 +151,19 @@ class RunningTasks:
         sites work unchanged. The /goal post-turn hook passes
         ``origin="goal_continuation"`` (and the kickoff path does the
         same — see `.plans/goal-command-research.md` §3).
+
+        ``schedule_id`` carries the firing schedule's id when
+        ``origin="scheduled_fire"`` so the drain can report the
+        brain outcome back to the schedule manager. Ignored for
+        every other origin.
         """
         async with self._lock:
             state = self._chats.setdefault(chat_id, _ChatState())
             state.queue.append(
-                QueuedMessage(user_id=user_id, text=text, origin=origin)
+                QueuedMessage(
+                    user_id=user_id, text=text, origin=origin,
+                    schedule_id=schedule_id,
+                )
             )
             depth = len(state.queue)
         log.info(

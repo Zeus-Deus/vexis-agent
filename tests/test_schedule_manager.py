@@ -88,13 +88,16 @@ def _patch_enqueue(manager: ScheduleManager, fake: _FakeRunningTasks):
     """Replace manager._enqueue_synthetic so we don't need a real
     asyncio loop. Returns the patch context manager.
     """
-    def _fake_enqueue(*, chat_id: int, text: str) -> bool:
+    def _fake_enqueue(
+        *, chat_id: int, text: str, schedule_id: str | None = None,
+    ) -> bool:
         try:
             fake.enqueue(
                 chat_id=chat_id,
                 user_id=999,
                 text=text,
                 origin="scheduled_fire",
+                schedule_id=schedule_id,
             )
             return True
         except Exception:

@@ -340,7 +340,9 @@ def test_create_path_acks_then_dispatches_via_drain(
     assert "remind me every 30m to stretch" in synthetic
     # The kwarg is what lets the enqueue (drain-busy branch) tag the
     # message correctly.
-    assert args.kwargs == {"queue_origin": "schedule_command"}
+    assert args.kwargs == {
+        "queue_origin": "schedule_command", "schedule_id": None,
+    }
 
 
 def test_create_path_enqueues_when_drain_active(
@@ -383,7 +385,9 @@ def test_create_path_enqueues_when_drain_active(
     assert "every weekday at 9am do standup" in synthetic
     # The schedule_command origin must survive the round trip — it's
     # the tag that lets goal preemption skip schedule prompts.
-    assert args.kwargs == {"queue_origin": "schedule_command"}
+    assert args.kwargs == {
+        "queue_origin": "schedule_command", "schedule_id": None,
+    }
 
 
 def test_schedule_kickoff_returns_before_brain_completes(
