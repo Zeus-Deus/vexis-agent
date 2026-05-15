@@ -4,10 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
-from vexis_agent.core.brain.base import Brain, BrainCancelled, BrainTimeoutError, SessionLost
+from vexis_agent.core.brain.base import (
+    Brain,
+    BrainCancelled,
+    BrainPermanentError,
+    BrainTimeoutError,
+    BrainTransientError,
+    SessionLost,
+)
 from vexis_agent.core.auth import is_allowed
 from vexis_agent.core.notify import ContextNote, Notifier
 from vexis_agent.core.paths import skills_dir
@@ -17,6 +26,14 @@ from vexis_agent.core.skills import PinStore, archived_skill_names
 log = logging.getLogger(__name__)
 
 _BRAIN_ERROR = "⚠️ Something broke. Logs have details."
+# Transient: the upstream API hiccupped. The brain wrapper has
+# already retried once inline — if we got here both attempts failed.
+# Be specific about what happened so the user knows whether to wait
+# or check status.claude.com.
+_BRAIN_TRANSIENT_PREFIX = "⚠️ Upstream API hiccup — "
+# Permanent: auth, model id, malformed request. Retrying won't help;
+# the user has to fix something (re-auth, switch model, top up credit).
+_BRAIN_PERMANENT_PREFIX = "⚠️ "
 _SESSION_LOST = (
     "⚠️ Couldn't resume the previous conversation. "
     "Starting fresh — please send your message again."
@@ -36,9 +53,20 @@ _CLEAR_OK = "Conversation cleared."
 # wire-stable strings that travel through the SSE ``error`` event.
 # Adding a new code = update the frontend's ``mapErrorCode`` helper.
 
-# Brain returned a non-zero exit / unparseable output. Often
-# transient (rate limit, bad provider response). Retry button OK.
+# Brain returned a non-zero exit / unparseable output. Used as the
+# catch-all when the classifier didn't find a known transient or
+# permanent pattern. Retry button OK; the user is choosing to retry
+# blindly.
 _ERR_CODE_BRAIN_ERROR = "brain_error"
+# Brain failed with a recognised transient cause (Anthropic 5xx /
+# 429 / network blip) and the inline retry didn't recover.
+# Distinguished from ``brain_error`` so the UI can render a softer
+# affordance ("Try again in a moment") instead of a hard error.
+_ERR_CODE_BRAIN_TRANSIENT = "brain_transient"
+# Brain failed with a recognised permanent cause (auth, invalid
+# model, malformed request). Retry button suppressed — the user has
+# to fix the underlying problem.
+_ERR_CODE_BRAIN_PERMANENT = "brain_permanent"
 # Brain hung past the configured timeout. Retry won't help unless
 # the user shortens the prompt or switches model.
 _ERR_CODE_BRAIN_TIMEOUT = "brain_timeout"
@@ -56,6 +84,108 @@ _ERR_CODE_REJECTED = "rejected"
 # already have the traceback; user gets a generic "stream
 # interrupted" so we never render uncaught Python on the page.
 _ERR_CODE_UNKNOWN = "unknown"
+
+# Max length of a brain-error tail we'll inline into the user-facing
+# message. The full text always lives in the daemon log; this is just
+# what we send to Telegram/the chat bubble. 240 chars covers
+# "claude -p exited 1: API Error: 500 Internal server error. This is
+# a server-side issue, usually temporary — try again in a moment. If
+# it persists, check status.claude.com." with margin to spare. Going
+# longer risks Telegram message-length nag for a chain of retries.
+_BRAIN_ERROR_TAIL_LIMIT = 240
+
+
+@dataclass
+class TurnOutcome:
+    """Side-channel for telling the caller of :meth:`MessageHandler.handle`
+    (or :meth:`MessageHandler.stream`) what *kind* of result the brain
+    produced — distinct from the user-facing reply text.
+
+    The handler's existing return signature is "text or None"; both
+    branches collapse "brain succeeded" and "brain failed" into the
+    same string shape (the failure string is the user-visible toast).
+    The drain loop needs more than that — specifically the schedule
+    manager wants to know whether to mark a fire ``ok`` or ``error``
+    after the brain turn finishes.
+
+    Callers create an instance, pass it in, and read the populated
+    fields after the call returns. Callers that don't care leave the
+    parameter ``None``; the handler skips the population work.
+
+    ``kind`` values:
+
+      * ``"ok"`` — brain returned a reply.
+      * ``"empty"`` — brain returned an empty reply (the
+        ``_EMPTY_RESPONSE`` toast was sent). Counts as success for
+        schedule bookkeeping.
+      * ``"cancelled"`` — /cancel fired; no reply was sent by us.
+      * ``"rejected"`` — caller-side auth gate denied the message.
+      * ``"timeout"`` — brain exceeded ``BRAIN_TIMEOUT_SECONDS``.
+      * ``"session_lost"`` — claude session vanished; user got the
+        rotation toast.
+      * ``"transient"`` — upstream API hiccup (5xx, 429, network).
+        Schedule manager treats as retryable error.
+      * ``"permanent"`` — upstream rejected the request shape (auth,
+        bad model id). Schedule manager auto-pauses immediately.
+      * ``"unknown"`` — uncaught exception or unclassified failure.
+    """
+
+    kind: Literal[
+        "unknown", "ok", "empty", "cancelled", "rejected",
+        "timeout", "session_lost", "transient", "permanent",
+    ] = "unknown"
+    error_message: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        """True for the brain-side success cases — ``ok`` and ``empty``.
+
+        ``cancelled`` is NOT a success (user pulled the plug), but it
+        also isn't a brain failure — the schedule manager treats it
+        separately. See :meth:`ScheduleManager.report_fire_outcome`."""
+        return self.kind in ("ok", "empty")
+
+    @property
+    def is_brain_failure(self) -> bool:
+        """True iff the brain failed in a way that should advance
+        the schedule's error counter. Excludes user-driven exits
+        (cancelled, rejected) and timeouts (handled separately —
+        timeout could be user-induced via a long-running tool)."""
+        return self.kind in ("transient", "permanent", "unknown")
+
+    @property
+    def is_permanent_failure(self) -> bool:
+        return self.kind == "permanent"
+
+
+def _shorten_brain_error(text: str) -> str:
+    """Trim a BrainError string to fit a user-facing toast.
+
+    Strips the ``claude -p exited N: `` prefix (the user doesn't care
+    about the exit code — they care about the *cause*) and caps at
+    ``_BRAIN_ERROR_TAIL_LIMIT`` with an ellipsis. Falls back to a
+    generic phrase if the input is empty.
+    """
+    s = (text or "").strip()
+    if not s:
+        return "claude -p failed with no diagnostic output."
+    # Drop the "claude -p exited N: " framing if present — the
+    # interesting bit is everything after the colon.
+    for prefix in ("claude -p exited 1: ", "claude -p exited 2: "):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    else:
+        # Generic "exited <N>:" match — substring from the first ": "
+        # after "exited " is the diagnostic body.
+        m = s.find("exited ")
+        if m == 0:
+            colon = s.find(": ", m)
+            if colon != -1:
+                s = s[colon + 2:]
+    if len(s) > _BRAIN_ERROR_TAIL_LIMIT:
+        s = s[: _BRAIN_ERROR_TAIL_LIMIT - 1].rstrip() + "…"
+    return s
 
 
 class MessageHandler:
@@ -104,6 +234,7 @@ class MessageHandler:
         *,
         model: str | None = None,
         reasoning_level: str | None = None,
+        outcome: TurnOutcome | None = None,
     ) -> str | None:
         """Foreground turn entrypoint. ``model`` and ``reasoning_level``
         are optional per-turn overrides forwarded straight to
@@ -118,9 +249,20 @@ class MessageHandler:
         it may substitute a model. With no opt-in and no computer-use
         activity it's a no-op, so Telegram + text chat stay bit-for-bit
         unchanged.
+
+        ``outcome`` is an optional :class:`TurnOutcome` outparam.
+        Callers who need to distinguish "brain succeeded" from "brain
+        failed transiently" vs "brain failed permanently" — i.e. the
+        drain reporting back to the schedule manager — pass an
+        instance; the handler populates ``outcome.kind`` and
+        ``outcome.error_message`` before returning. Default ``None``
+        keeps the legacy contract for callers that only care about
+        the user-facing reply (web chat, voice, tests).
         """
         if not is_allowed(user_id, self._allowed_user_id):
             log.warning("Rejected message from user_id=%s", user_id)
+            if outcome is not None:
+                outcome.kind = "rejected"
             return None
 
         model, reasoning_level = self._apply_computer_use_override(
@@ -135,17 +277,46 @@ class MessageHandler:
             )
         except BrainCancelled:
             # /cancel handler already replied; nothing more to send.
+            if outcome is not None:
+                outcome.kind = "cancelled"
             return None
         except BrainTimeoutError:
             log.warning("Brain timed out for chat_id=%s", chat_id)
+            if outcome is not None:
+                outcome.kind = "timeout"
+                outcome.error_message = "brain timed out"
             return _BRAIN_TIMEOUT
         except SessionLost:
+            if outcome is not None:
+                outcome.kind = "session_lost"
             return _SESSION_LOST
-        except Exception:
+        except BrainTransientError as exc:
+            # Brain wrapper already retried once inline and still
+            # failed. Surface the actual upstream wording — that's
+            # the difference between an opaque "Something broke" and
+            # an actionable "Anthropic 500, try again in a moment."
+            log.warning("Brain transient failure for chat_id=%s: %s", chat_id, exc)
+            if outcome is not None:
+                outcome.kind = "transient"
+                outcome.error_message = str(exc)
+            return _BRAIN_TRANSIENT_PREFIX + _shorten_brain_error(str(exc))
+        except BrainPermanentError as exc:
+            log.warning("Brain permanent failure for chat_id=%s: %s", chat_id, exc)
+            if outcome is not None:
+                outcome.kind = "permanent"
+                outcome.error_message = str(exc)
+            return _BRAIN_PERMANENT_PREFIX + _shorten_brain_error(str(exc))
+        except Exception as exc:
             log.exception("Brain call failed")
+            if outcome is not None:
+                outcome.kind = "unknown"
+                outcome.error_message = str(exc) or "uncaught brain exception"
             return _BRAIN_ERROR
 
-        return reply.strip() or _EMPTY_RESPONSE
+        stripped = reply.strip()
+        if outcome is not None:
+            outcome.kind = "ok" if stripped else "empty"
+        return stripped or _EMPTY_RESPONSE
 
     async def stream(
         self,
@@ -155,6 +326,7 @@ class MessageHandler:
         *,
         model: str | None = None,
         reasoning_level: str | None = None,
+        outcome: TurnOutcome | None = None,
     ):
         """Streaming variant of :meth:`handle`. Yields incremental
         text chunks as the brain generates them, plus a sentinel
@@ -188,6 +360,8 @@ class MessageHandler:
         """
         if not is_allowed(user_id, self._allowed_user_id):
             log.warning("Rejected streaming message from user_id=%s", user_id)
+            if outcome is not None:
+                outcome.kind = "rejected"
             yield ("error", None)
             return
 
@@ -218,6 +392,8 @@ class MessageHandler:
                     yield ("chunk", event)
         except BrainCancelled:
             # User-initiated cancel — UI swallows silently, no toast.
+            if outcome is not None:
+                outcome.kind = "cancelled"
             yield ("error", {
                 "code": _ERR_CODE_CANCELLED,
                 "message": "",
@@ -225,26 +401,63 @@ class MessageHandler:
             return
         except BrainTimeoutError:
             log.warning("Brain stream timed out for chat_id=%s", chat_id)
+            if outcome is not None:
+                outcome.kind = "timeout"
+                outcome.error_message = "brain timed out"
             yield ("error", {
                 "code": _ERR_CODE_BRAIN_TIMEOUT,
                 "message": _BRAIN_TIMEOUT,
             })
             return
         except SessionLost:
+            if outcome is not None:
+                outcome.kind = "session_lost"
             yield ("error", {
                 "code": _ERR_CODE_SESSION_LOST,
                 "message": _SESSION_LOST,
             })
             return
-        except Exception:
+        except BrainTransientError as exc:
+            log.warning(
+                "Brain stream transient failure for chat_id=%s: %s",
+                chat_id, exc,
+            )
+            if outcome is not None:
+                outcome.kind = "transient"
+                outcome.error_message = str(exc)
+            yield ("error", {
+                "code": _ERR_CODE_BRAIN_TRANSIENT,
+                "message": _BRAIN_TRANSIENT_PREFIX + _shorten_brain_error(str(exc)),
+            })
+            return
+        except BrainPermanentError as exc:
+            log.warning(
+                "Brain stream permanent failure for chat_id=%s: %s",
+                chat_id, exc,
+            )
+            if outcome is not None:
+                outcome.kind = "permanent"
+                outcome.error_message = str(exc)
+            yield ("error", {
+                "code": _ERR_CODE_BRAIN_PERMANENT,
+                "message": _BRAIN_PERMANENT_PREFIX + _shorten_brain_error(str(exc)),
+            })
+            return
+        except Exception as exc:
             log.exception("Brain stream failed")
+            if outcome is not None:
+                outcome.kind = "unknown"
+                outcome.error_message = str(exc) or "uncaught brain exception"
             yield ("error", {
                 "code": _ERR_CODE_BRAIN_ERROR,
                 "message": _BRAIN_ERROR,
             })
             return
 
-        yield ("done", full.strip() or _EMPTY_RESPONSE)
+        stripped = full.strip()
+        if outcome is not None:
+            outcome.kind = "ok" if stripped else "empty"
+        yield ("done", stripped or _EMPTY_RESPONSE)
 
     @staticmethod
     def _apply_computer_use_override(

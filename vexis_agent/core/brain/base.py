@@ -94,6 +94,47 @@ class BrainAuthRequired(BrainError):
     """
 
 
+class BrainTransientError(BrainError):
+    """A brain failure that's likely to clear itself on retry.
+
+    Triggered by upstream API hiccups: HTTP 5xx, 429 rate limit, network
+    timeout / reset, "overloaded" / "temporarily unavailable" wording.
+    The message is the actual error text the brain produced, so the
+    user-facing toast can be specific ("Anthropic API hiccup — HTTP
+    500") instead of "Something broke."
+
+    Retry policy belongs to the *caller*, never the exception itself:
+
+      - Per-brain ``astream``/``respond`` MAY attempt a single inline
+        retry before raising, to absorb sub-second blips without the
+        user noticing. This is a courtesy, not a contract.
+      - Schedulers MAY add a longer backoff loop on top — but only for
+        schedules that declare themselves idempotent (a non-idempotent
+        prompt re-run could double-commit / double-charge / etc.).
+
+    Detection pattern is brain-specific (see e.g.
+    ``vexis_agent.core.brain.claude_code._classify_brain_failure``).
+    The exception type itself is brain-neutral.
+    """
+
+
+class BrainPermanentError(BrainError):
+    """A brain failure that won't be fixed by retry.
+
+    Triggered by errors with a stable cause that needs user action:
+    HTTP 4xx (auth, malformed request), invalid model id, insufficient
+    credit/quota. The retry policy is "don't" — surface the message
+    once and stop.
+
+    Carried in the same brain-neutral way as ``BrainTransientError``:
+    each brain's wrapper classifies its own CLI's error wording and
+    raises the right subclass. Schedulers that see this exception
+    should pause the schedule and notify the user instead of advancing
+    to tomorrow's slot — there is no point re-running a permanently
+    broken config.
+    """
+
+
 class BrainModelNotFoundError(BrainError):
     """The brain CLI rejected the configured model id at spawn time.
 

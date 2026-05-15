@@ -591,6 +591,18 @@ class TelegramTransport:
         # done-callback prunes them; ``flush_background_dispatch``
         # is the test-side drain.
         self._background_dispatch_tasks: set[asyncio.Task] = set()
+        # Outcome callback for scheduled fires. Set by main.py to
+        # ``schedule_manager.report_fire_outcome``. The drain calls
+        # this AFTER each brain turn whose QueuedMessage carries a
+        # ``schedule_id``, so the schedule's ``last_status`` reflects
+        # the actual brain outcome instead of the pre-emptive "ok"
+        # the dispatcher writes at enqueue time. ``None`` is the
+        # legacy / test wiring (no callback ⇒ no outcome reporting,
+        # behaviour identical to pre-fix).
+        # Signature: ``(schedule_id: str, *, success: bool,
+        #              error_message: str | None,
+        #              is_permanent: bool) -> None``
+        self._schedule_outcome_cb = None
         # concurrent_updates(True) is load-bearing for /cancel: PTB's default
         # serializes every update through one task, so a /cancel sent while
         # a brain call is in flight queues behind it for up to 30 minutes
@@ -737,6 +749,7 @@ class TelegramTransport:
         text: str,
         *,
         queue_origin: str = "user",
+        schedule_id: str | None = None,
     ) -> None:
         """Submit a message to the brain.
 
@@ -764,12 +777,16 @@ class TelegramTransport:
         if not await self._running_tasks.claim(chat_id):
             await self._running_tasks.enqueue(
                 chat_id, user_id, text, origin=queue_origin,  # type: ignore[arg-type]
+                schedule_id=schedule_id,
             )
             return
 
         typing_task = asyncio.create_task(self._keep_typing(bot, chat_id))
         try:
-            await self._drain_chat(bot, chat_id, user_id, text)
+            await self._drain_chat(
+                bot, chat_id, user_id, text,
+                first_schedule_id=schedule_id,
+            )
         finally:
             typing_task.cancel()
             try:
@@ -793,6 +810,7 @@ class TelegramTransport:
         *,
         label: str,
         queue_origin: str = "user",
+        schedule_id: str | None = None,
     ) -> asyncio.Task:
         """Fire ``_dispatch_to_brain`` in a tracked background task.
 
@@ -822,7 +840,9 @@ class TelegramTransport:
         """
         task = asyncio.create_task(
             self._dispatch_to_brain(
-                bot, chat_id, user_id, text, queue_origin=queue_origin,
+                bot, chat_id, user_id, text,
+                queue_origin=queue_origin,
+                schedule_id=schedule_id,
             ),
             name=f"vexis-bg-dispatch-{label}-{chat_id}",
         )
@@ -849,6 +869,7 @@ class TelegramTransport:
         chat_id: int,
         user_id: int,
         text: str,
+        schedule_id: str | None = None,
     ) -> bool:
         """Entry point for ``ScheduleManager`` fires.
 
@@ -885,6 +906,7 @@ class TelegramTransport:
                 text,
                 label="schedule_fire",
                 queue_origin="scheduled_fire",
+                schedule_id=schedule_id,
             )
             return True
         except Exception as exc:
@@ -950,7 +972,9 @@ class TelegramTransport:
         await asyncio.gather(*pending, return_exceptions=True)
 
     async def _drain_chat(
-        self, bot, chat_id: int, user_id: int, first_text: str
+        self, bot, chat_id: int, user_id: int, first_text: str,
+        *,
+        first_schedule_id: str | None = None,
     ) -> None:
         """Process one message after another for chat_id until the queue
         empties or /cancel flags the drain. The caller must already hold
@@ -960,6 +984,12 @@ class TelegramTransport:
         so a single broken turn (handler raising, Telegram send failing)
         logs and surfaces an error reply but does not kill the drain —
         queued follow-ups still run.
+
+        ``first_schedule_id`` is the schedule.id of the first message
+        when the drain was claimed directly by a scheduled fire (the
+        common case: schedule fires at idle wall-clock time, claims
+        the chat, runs the brain). Subsequent turns read the
+        schedule_id off their popped ``QueuedMessage`` instead.
         """
         text = first_text
         # The first turn's origin is "user" by construction:
@@ -968,7 +998,8 @@ class TelegramTransport:
         # as ``first_text``. Continuations only appear via
         # ``pop_or_release`` on subsequent iterations, where we read
         # the QueuedMessage's ``origin`` field directly.
-        origin = "user"
+        origin = "scheduled_fire" if first_schedule_id else "user"
+        current_schedule_id: str | None = first_schedule_id
         is_first = True
         while True:
             if not is_first and origin != "goal_continuation":
@@ -990,9 +1021,37 @@ class TelegramTransport:
             # helper handles all error / cursor-collision cases
             # internally; the drain proceeds to the brain regardless.
             await self._run_relationships_hook(bot, chat_id, text)
+            # Allocate a TurnOutcome only when the message is a
+            # scheduled fire — the brain's outcome is the only thing
+            # we use it for, and avoiding the allocation on real-user
+            # turns keeps the hot path identical to pre-fix.
+            from vexis_agent.core.handler import TurnOutcome
+            turn_outcome = (
+                TurnOutcome() if current_schedule_id else None
+            )
             reply = await self._dispatch_brain_turn(
                 bot, chat_id, user_id, text,
+                outcome=turn_outcome,
             )
+            # Report the outcome BEFORE the goal hook so the schedule
+            # manager learns about it even if the goal hook raises.
+            if (
+                current_schedule_id
+                and turn_outcome is not None
+                and self._schedule_outcome_cb is not None
+            ):
+                try:
+                    self._schedule_outcome_cb(
+                        current_schedule_id,
+                        success=turn_outcome.succeeded,
+                        error_message=turn_outcome.error_message,
+                        is_permanent=turn_outcome.is_permanent_failure,
+                    )
+                except Exception:
+                    log.exception(
+                        "schedule_outcome_cb failed for schedule %s",
+                        current_schedule_id,
+                    )
             # /goal post-turn hook: for chats with an active standing
             # goal, judge whether the reply satisfies the goal and
             # (if not + under budget) enqueue a continuation. No-op
@@ -1011,6 +1070,7 @@ class TelegramTransport:
             text = next_msg.text
             user_id = next_msg.user_id
             origin = next_msg.origin
+            current_schedule_id = next_msg.schedule_id
             is_first = False
 
     async def _on_clear(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3497,6 +3557,8 @@ class TelegramTransport:
 
     async def _dispatch_brain_turn(
         self, bot, chat_id: int, user_id: int, text: str,
+        *,
+        outcome=None,
     ) -> str | None:
         """One brain turn for the drain loop.
 
@@ -3524,11 +3586,30 @@ class TelegramTransport:
         """
         if not getattr(self, "_streaming_enabled", False):
             try:
-                reply = await self._handler.handle(user_id, chat_id, text)
-            except Exception:
+                # Only pass ``outcome`` when the caller actually wants
+                # it — test fakes and older handler signatures don't
+                # accept the kwarg, and we don't want to force every
+                # fixture in the tree to be touched. ``None`` means
+                # "I don't care," which is what every non-scheduled
+                # drain pass uses anyway.
+                if outcome is None:
+                    reply = await self._handler.handle(user_id, chat_id, text)
+                else:
+                    reply = await self._handler.handle(
+                        user_id, chat_id, text, outcome=outcome,
+                    )
+            except Exception as exc:
                 log.exception(
                     "Drain turn raised unexpectedly for chat %s", chat_id,
                 )
+                # Outcome was either populated by handle() before the
+                # exception (e.g. computer-use override raised) or not
+                # populated at all — either way, escalate to "unknown"
+                # so the schedule manager sees a real failure.
+                if outcome is not None and outcome.kind == "unknown":
+                    outcome.error_message = (
+                        outcome.error_message or str(exc) or "drain turn raised"
+                    )
                 reply = _DRAIN_TURN_BROKE
             if reply is not None:
                 try:
@@ -3540,13 +3621,22 @@ class TelegramTransport:
             return reply
 
         try:
-            reply = await self._send_brain_reply_streaming(
-                bot, chat_id, user_id, text,
-            )
-        except Exception:
+            if outcome is None:
+                reply = await self._send_brain_reply_streaming(
+                    bot, chat_id, user_id, text,
+                )
+            else:
+                reply = await self._send_brain_reply_streaming(
+                    bot, chat_id, user_id, text, outcome=outcome,
+                )
+        except Exception as exc:
             log.exception(
                 "Streaming drain turn raised unexpectedly for chat %s", chat_id,
             )
+            if outcome is not None and outcome.kind == "unknown":
+                outcome.error_message = (
+                    outcome.error_message or str(exc) or "streaming drain raised"
+                )
             try:
                 await bot.send_message(
                     chat_id=chat_id, text=_DRAIN_TURN_BROKE, parse_mode=None,
@@ -3560,6 +3650,8 @@ class TelegramTransport:
 
     async def _send_brain_reply_streaming(
         self, bot, chat_id: int, user_id: int, text: str,
+        *,
+        outcome=None,
     ) -> str | None:
         """Stream the brain's reply via incremental edit_message_text.
 
@@ -3636,7 +3728,12 @@ class TelegramTransport:
             Returns (text_to_render, text_recorded_as_last_edited)."""
             return text, text
 
-        async for event in self._handler.stream(user_id, chat_id, text):
+        stream_iter = (
+            self._handler.stream(user_id, chat_id, text)
+            if outcome is None
+            else self._handler.stream(user_id, chat_id, text, outcome=outcome)
+        )
+        async for event in stream_iter:
             kind, payload = event
             if kind == "chunk":
                 if not isinstance(payload, str) or not payload:

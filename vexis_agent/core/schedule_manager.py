@@ -285,10 +285,13 @@ class ScheduleManager:
 
         # Step 2: enqueue the synthetic user message.
         # Done from the daemon thread via run_coroutine_threadsafe;
-        # the asyncio loop owns RunningTasks.
+        # the asyncio loop owns RunningTasks. ``schedule.id`` rides
+        # along so the drain can call back ``report_fire_outcome``
+        # with the real brain result.
         success = self._enqueue_synthetic(
             chat_id=schedule.chat_id,
             text=schedule.prompt,
+            schedule_id=schedule.id,
         )
 
         # Step 3: record fire status. update_atomic with
@@ -364,7 +367,9 @@ class ScheduleManager:
         except KeyError:
             raise
 
-    def _enqueue_synthetic(self, *, chat_id: int, text: str) -> bool:
+    def _enqueue_synthetic(
+        self, *, chat_id: int, text: str, schedule_id: str | None = None,
+    ) -> bool:
         """Schedule the fire onto the asyncio loop. Returns True on
         success.
 
@@ -405,6 +410,7 @@ class ScheduleManager:
                         chat_id=chat_id,
                         user_id=self._user_id,
                         text=text,
+                        schedule_id=schedule_id,
                     ),
                     self._loop,
                 )
@@ -412,6 +418,34 @@ class ScheduleManager:
                 # background task (asyncio.create_task) and returns;
                 # it does NOT await the brain turn.
                 return bool(future.result(timeout=5.0))
+            except TypeError:
+                # Back-compat: a dispatch_fn that doesn't accept
+                # ``schedule_id`` yet (older transport, test fakes).
+                # Drop the kwarg and retry once so the wiring keeps
+                # working — the outcome callback just won't fire for
+                # this fire. Logged so the gap is visible.
+                log.debug(
+                    "dispatch_fn for chat=%d doesn't accept schedule_id; "
+                    "outcome callback disabled for this fire",
+                    chat_id,
+                )
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._dispatch_fn(
+                            chat_id=chat_id,
+                            user_id=self._user_id,
+                            text=text,
+                        ),
+                        self._loop,
+                    )
+                    return bool(future.result(timeout=5.0))
+                except Exception as exc:
+                    log.warning(
+                        "ScheduleManager dispatch_fn (legacy) failed for "
+                        "chat=%d: %s",
+                        chat_id, exc,
+                    )
+                    return False
             except Exception as exc:
                 log.warning(
                     "ScheduleManager dispatch_fn failed for chat=%d: %s",
@@ -432,6 +466,7 @@ class ScheduleManager:
                     user_id=self._user_id,
                     text=text,
                     origin="scheduled_fire",
+                    schedule_id=schedule_id,
                 ),
                 self._loop,
             )
@@ -465,6 +500,114 @@ class ScheduleManager:
             return bool(getter(chat_id))
         except Exception:
             return False
+
+    # ----- post-fire outcome (called from the drain) ----------------
+
+    def report_fire_outcome(
+        self,
+        schedule_id: str,
+        *,
+        success: bool,
+        error_message: str | None = None,
+        is_permanent: bool = False,
+    ) -> None:
+        """Apply the real brain outcome to a scheduled fire.
+
+        The dispatch path writes ``last_status="ok"`` as soon as the
+        prompt is enqueued (see :func:`_record_fire`) — pre-emptively
+        optimistic, because the brain runs in a background task and
+        the manager has no other way to know it finished. This
+        overwrites that pre-emptive write with the truth once the
+        drain has actually consumed the message and run the brain.
+
+        Called from the transport drain after each brain turn whose
+        :class:`QueuedMessage.schedule_id` is set. Safe to call from
+        either the asyncio loop thread or any worker thread —
+        ``ScheduleStore.update_atomic`` already handles cross-thread
+        access via fcntl.
+
+        Behaviour matrix:
+
+          - ``success=True``: ``last_status="ok"``,
+            ``consecutive_errors=0``, clear ``last_error``. Idempotent
+            with the pre-emptive write — they agree.
+          - ``success=False, is_permanent=False``: ``last_status=
+            "error"``, increment ``consecutive_errors``, record
+            ``error_message``. Auto-pause at threshold (same rule as
+            enqueue-failure today, just with a real cause string).
+          - ``success=False, is_permanent=True``: same plus
+            immediate auto-pause regardless of counter, with
+            ``paused_reason="permanent_failure: <short>"``. Retrying
+            an auth-failed schedule daily until N consecutive errors
+            is user-hostile; permanent errors mean stop now.
+
+        Unknown ``schedule_id`` (deleted mid-flight) is logged and
+        ignored — same defensive contract as
+        :meth:`_advance_and_save`.
+        """
+        if not schedule_id:
+            return
+        from dataclasses import replace
+
+        max_errors = self._max_consecutive_errors_fn()
+
+        def _mutate(s: ScheduleState) -> ScheduleState:
+            if success:
+                return replace(
+                    s,
+                    last_status="ok",
+                    last_error=None,
+                    consecutive_errors=0,
+                )
+            new_errors = s.consecutive_errors + 1
+            # Permanent failures bypass the threshold and pause now —
+            # the user has to fix something (auth, model id) so
+            # firing the broken prompt every day is just noise.
+            if is_permanent and s.status == "active":
+                short_reason = (error_message or "permanent failure")
+                if len(short_reason) > 120:
+                    short_reason = short_reason[:119] + "…"
+                return replace(
+                    s,
+                    last_status="error",
+                    last_error=error_message or "permanent brain failure",
+                    consecutive_errors=new_errors,
+                    status="paused",
+                    paused_reason=f"permanent_failure: {short_reason}",
+                )
+            # Transient or unknown — count toward the existing
+            # auto-pause threshold so repeated upstream outages
+            # still take the schedule out of rotation eventually.
+            if new_errors >= max_errors and s.status == "active":
+                return replace(
+                    s,
+                    last_status="error",
+                    last_error=error_message or "brain failure",
+                    consecutive_errors=new_errors,
+                    status="paused",
+                    paused_reason="auto: errors",
+                )
+            return replace(
+                s,
+                last_status="error",
+                last_error=error_message or "brain failure",
+                consecutive_errors=new_errors,
+            )
+
+        try:
+            self._store.update_atomic(
+                schedule_id, _mutate, refuse_terminal=False,
+            )
+        except KeyError:
+            log.info(
+                "report_fire_outcome: schedule %s no longer exists; "
+                "outcome dropped",
+                schedule_id,
+            )
+        except Exception:
+            log.exception(
+                "report_fire_outcome failed for schedule %s", schedule_id,
+            )
 
     # ----- boot-time sweep -------------------------------------------
 
