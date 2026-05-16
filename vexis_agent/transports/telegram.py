@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import tempfile
 import uuid
@@ -47,7 +48,15 @@ from vexis_agent.core.yaml_config import (
     telegram_streaming_enabled,
     telegram_streaming_min_interval_seconds,
 )
+from vexis_agent.tools.capture_source import (
+    CaptureSourceError,
+    RouterContext,
+    caption_hint,
+    caption_label,
+    resolve_source,
+)
 from vexis_agent.tools.desktop import CaptureError, capture_desktop
+from vexis_agent.tools.session_lock import is_session_locked
 from vexis_agent.tools.voxtype import TranscriptionEmpty, TranscriptionError, transcribe_audio
 
 log = logging.getLogger(__name__)
@@ -508,6 +517,91 @@ def _photo_too_large_for_telegram(path: Path) -> bool:
         # surface whatever the real error is.
         return False
     return width > _TELEGRAM_PHOTO_MAX_DIM or height > _TELEGRAM_PHOTO_MAX_DIM
+
+
+# ---------------------------------------------------------------------------
+# /screenshot source routing
+# ---------------------------------------------------------------------------
+
+
+def _extract_screenshot_modifier(text: str) -> str | None:
+    """Strip the leading ``/screenshot`` (and optional ``@botname``)
+    from the message text, returning everything else. ``None`` when
+    no modifier was supplied.
+
+    Examples:
+        ``/screenshot`` → ``None``
+        ``/screenshot host`` → ``"host"``
+        ``/screenshot sandbox foo`` → ``"sandbox foo"``
+        ``/screenshot@vexis_bot sandbox`` → ``"sandbox"``
+    """
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return None
+    parts = stripped.split(None, 1)
+    rest = parts[1].strip() if len(parts) == 2 else ""
+    return rest or None
+
+
+def _screenshot_help_text() -> str:
+    return (
+        "/screenshot — capture the host desktop (or a sandbox display).\n\n"
+        "Modifiers:\n"
+        "  /screenshot                  auto: current task's sandbox if any, "
+        "else host\n"
+        "  /screenshot host             real desktop\n"
+        "  /screenshot sandbox          latest active sandbox\n"
+        "  /screenshot sandbox <id>     specific sandbox by task-id\n"
+        "  /screenshot help             this message\n\n"
+        "Tip: when your host screen is locked, replying `sandbox` (or "
+        "`sandbox <id>`) switches the next capture."
+    )
+
+
+async def _build_router_context(modifier: str | None) -> RouterContext:
+    """Collect the live inputs the source router needs.
+
+    Lazy imports + best-effort probes: a missing docker or a failing
+    loginctl must not break the screenshot path, so we fall back to
+    empty/false rather than raising.
+    """
+    active: tuple[str, ...] = tuple()
+    try:
+        from vexis_agent.tools.sandbox import Sandbox  # type: ignore[import-not-found]
+
+        rows = await asyncio.to_thread(Sandbox.list_all)
+        active = tuple(r["task_id"] for r in rows if r.get("running"))
+    except Exception as exc:
+        log.debug("Sandbox.list_all probe failed: %s", exc)
+
+    try:
+        host_locked = await is_session_locked()
+    except Exception as exc:
+        log.debug("session-lock probe failed: %s", exc)
+        host_locked = False
+
+    return RouterContext(
+        requested=modifier,
+        current_task_id=os.environ.get("VEXIS_SANDBOX_TASK_ID"),
+        active_sandbox_task_ids=active,
+        host_locked=host_locked,
+    )
+
+
+def _format_screenshot_caption(source, ctx: RouterContext, summary: str) -> str | None:
+    """Build the Telegram photo caption.
+
+    Layout: ``📺 Host — <summary>`` or ``📦 Sandbox <id> — <summary>``,
+    plus an appended ``\\n⚠️ <hint>`` line when applicable.
+    """
+    emoji = "📺" if source.kind == "host" else "📦"
+    head = f"{emoji} {caption_label(source)}"
+    if summary:
+        head = f"{head} — {summary}"
+    hint = caption_hint(source, ctx)
+    if hint:
+        return f"{head}\n⚠️ {hint}"
+    return head
 
 
 def _greedy_join(parts: list[str], sep: str, max_len: int) -> list[str]:
@@ -3543,15 +3637,37 @@ class TelegramTransport:
         if not is_allowed(user.id, self._allowed_user_id):
             log.warning("Rejected /screenshot from user_id=%s", user.id)
             return
+
+        # Everything after the command word is the source modifier.
+        # ``/screenshot`` → None, ``/screenshot host`` → "host",
+        # ``/screenshot sandbox foo`` → "sandbox foo". Empty string and
+        # None both mean "auto".
+        modifier = _extract_screenshot_modifier(msg.text or "")
+
+        # ``help`` is a UX cheat: surface the modifier grammar without
+        # making the user re-read the docs.
+        if modifier and modifier.strip().lower() in ("help", "?", "--help"):
+            await msg.reply_text(_screenshot_help_text())
+            return
+
         try:
-            result = await capture_desktop()
+            ctx = await _build_router_context(modifier)
+            source = resolve_source(ctx)
+        except CaptureSourceError as exc:
+            await msg.reply_text(f"⚠️ {exc}")
+            return
+
+        try:
+            result = await capture_desktop(source=source)
         except CaptureError as exc:
-            log.warning("/screenshot failed: %s", exc)
+            log.warning("/screenshot failed (source=%s): %s", source.kind, exc)
             await msg.reply_text(f"⚠️ Screenshot failed: {exc}")
             return
+
+        caption = _format_screenshot_caption(source, ctx, result.summary)
         try:
             with result.image_path.open("rb") as fh:
-                await msg.reply_photo(photo=fh, caption=result.summary or None)
+                await msg.reply_photo(photo=fh, caption=caption)
         finally:
             result.image_path.unlink(missing_ok=True)
 
