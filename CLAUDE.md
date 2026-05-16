@@ -94,6 +94,13 @@ section — violating them is breaking the codebase.
   Only `core/transcripts.py` + `core/brain/claude_code.py` may
   touch `claude_session_jsonl_dir`; opencode has no JSONL
   (sessions live in `opencode.db`). Guarded by `test_brain_parity`.
+- **Screenshot/livestream source picks go through
+  `capture_source.resolve_source()`.** `/screenshot`, `vexis-screenshot`,
+  and `vexis-livestream start` all build a `RouterContext` (modifier,
+  `VEXIS_SANDBOX_TASK_ID`, live `Sandbox.list_all`, lock probe) and
+  call the same pure router. Sandbox capture moves the PNG to
+  `/tmp/vexis-screenshot-<ts>.png` so the Telegram path regex stays
+  source-agnostic. See `docs/screenshot-routing.md`.
 
 ## Model selection
 

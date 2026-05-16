@@ -36,7 +36,14 @@ COMMANDS: tuple[BotCommand, ...] = (
     BotCommand("rename", "Rename a session"),
     BotCommand("delete", "Delete a session"),
     BotCommand("clear", "Clear current session's history"),
-    BotCommand("screenshot", "Take a screenshot of the focused monitor"),
+    # Subcommand grammar (none / host / sandbox / sandbox <task-id> / help)
+    # is parsed by _on_screenshot rather than registered separately;
+    # Telegram command names can't contain spaces. Same posture as
+    # /curator and /learning. See docs/screenshot-routing.md.
+    BotCommand(
+        "screenshot",
+        "Screenshot host or per-task sandbox; reply 'help' for grammar",
+    ),
     BotCommand("tasks", "List background tasks"),
     BotCommand("status", "Show what I'm currently working on"),
     BotCommand("cancel", "Stop the current task or a named background task"),

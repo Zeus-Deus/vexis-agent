@@ -1,7 +1,19 @@
 """Screenshot + Hyprland state capture.
 
-Pure tool: given a scope, returns a path to a fresh PNG plus a structured
-state dict and a one-line summary. Knows nothing about Telegram or brains.
+Pure tool: given a scope (and optionally a non-host source), returns a
+path to a fresh PNG plus a structured state dict and a one-line summary.
+Knows nothing about Telegram or brains.
+
+Two capture paths share the same :class:`CaptureResult` envelope:
+
+* **Host** (default) — ``grim`` + ``hyprctl`` against the real desktop.
+  Honours the ``scope`` parameter (``focused-monitor`` / ``all-monitors``
+  / ``focused-window``).
+* **Sandbox** — delegates to ``UIDriver.vision_snapshot`` inside the
+  per-task Docker sandbox, then moves the resulting PNG from the
+  sandbox's mounted ``/scratch`` dir to ``/tmp/vexis-screenshot-<ts>.png``
+  so the Telegram regex picks it up the same way as a host capture.
+  ``scope`` is ignored here (a headless display has no monitors).
 """
 
 from __future__ import annotations
@@ -15,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from vexis_agent.core.subprocess import run
+from vexis_agent.tools.capture_source import CaptureSource
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +35,11 @@ GRIM_TIMEOUT_SECONDS = 5
 HYPRCTL_TIMEOUT_SECONDS = 2
 SCREENSHOT_DIR = Path("/tmp")
 SCREENSHOT_PREFIX = "vexis-screenshot-"
+# How long to wait for the sandbox-side ``vision-snapshot`` runner to
+# return before giving up. AT-SPI walk + screenshot fallback together
+# typically finish well under 5s; 15s leaves headroom for cold-start
+# images that need to load fonts/D-Bus the first time around.
+SANDBOX_CAPTURE_TIMEOUT_SECONDS = 15
 
 VALID_SCOPES = ("focused-monitor", "all-monitors", "focused-window")
 
@@ -42,7 +60,28 @@ class CaptureResult:
     summary: str = ""
 
 
-async def capture_desktop(scope: str = "focused-monitor") -> CaptureResult:
+async def capture_desktop(
+    scope: str = "focused-monitor",
+    source: CaptureSource | None = None,
+) -> CaptureResult:
+    """Capture a screenshot from the configured source.
+
+    ``source=None`` and ``source.kind == "host"`` both go through the
+    host path. ``source.kind == "sandbox"`` delegates to the per-task
+    Docker sandbox via :class:`UIDriver.vision_snapshot`. In both
+    cases the final image_path is a fresh
+    ``/tmp/vexis-screenshot-<ts>.png`` so downstream consumers
+    (the Telegram path-regex, brain output extraction) work
+    identically regardless of source.
+    """
+    if source is not None and source.kind == "sandbox":
+        if source.task_id is None:  # defensive — CaptureSource validates this
+            raise CaptureError("sandbox source missing task_id")
+        return await _capture_sandbox(source.task_id)
+    return await _capture_host(scope)
+
+
+async def _capture_host(scope: str) -> CaptureResult:
     if scope not in VALID_SCOPES:
         raise CaptureError(f"unknown scope: {scope!r}")
 
@@ -61,6 +100,74 @@ async def capture_desktop(scope: str = "focused-monitor") -> CaptureResult:
         ) from exc
 
     return CaptureResult(image_path=image_path, state=state, summary=summary)
+
+
+async def _capture_sandbox(task_id: str) -> CaptureResult:
+    # Lazy imports: keep this module's top-level dep graph minimal so
+    # the pure host-capture path is reachable on installs that don't
+    # have docker / the sandbox stack provisioned.
+    from vexis_agent.tools.sandbox.sandbox import scratch_dir_for
+    from vexis_agent.tools.ui.ui import ATSPIError, UIDriver
+
+    # Filename matches the host convention so the Telegram regex in
+    # _SCREENSHOT_PATH_RE picks it up unmodified, and so brain output
+    # extraction stays oblivious to the source.
+    fname = f"{SCREENSHOT_PREFIX}{int(time.time())}.png"
+    container_path = f"/scratch/{fname}"
+    scratch_host = scratch_dir_for(task_id)
+    container_host_path = scratch_host / fname
+    final_host_path = SCREENSHOT_DIR / fname
+
+    driver = UIDriver(task_id)
+
+    def _run_vision() -> dict:
+        return driver.vision_snapshot(container_path)
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_run_vision),
+            timeout=SANDBOX_CAPTURE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        raise CaptureError(
+            f"sandbox capture timed out after {SANDBOX_CAPTURE_TIMEOUT_SECONDS}s"
+            f" (task={task_id!r})"
+        ) from exc
+    except ATSPIError as exc:
+        raise CaptureError(f"sandbox capture failed: {exc}") from exc
+
+    if not container_host_path.exists():
+        raise CaptureError(
+            f"sandbox runner reported success but {container_host_path} is "
+            f"missing on host. Likely cause: /scratch isn't mounted (sandbox "
+            f"was started without the default mounts)."
+        )
+
+    # Read-and-rewrite (NOT shutil.move) so the final file is owned by
+    # the host user running the daemon. The original file inside the
+    # sandbox-mounted scratch dir is created as root (docker runs as
+    # root inside the container), and /tmp has the sticky bit set — so
+    # leaving a root-owned PNG in /tmp would break the downstream
+    # Telegram cleanup `image_path.unlink()`. Cleaning up the
+    # root-owned source file is best-effort: a permission failure
+    # leaves an orphan inside the sandbox's scratch dir, which dies
+    # with the sandbox anyway.
+    final_host_path.parent.mkdir(parents=True, exist_ok=True)
+    data = container_host_path.read_bytes()
+    final_host_path.write_bytes(data)
+    try:
+        container_host_path.unlink()
+    except OSError as exc:
+        log.debug("could not unlink sandbox-side %s: %s", container_host_path, exc)
+
+    via = result.get("via", "screenshot")
+    state = {
+        "source": "sandbox",
+        "task_id": task_id,
+        "via": via,
+    }
+    summary = f"Sandbox {task_id} ({via})"
+    return CaptureResult(image_path=final_host_path, state=state, summary=summary)
 
 
 # ---------- hyprctl ----------

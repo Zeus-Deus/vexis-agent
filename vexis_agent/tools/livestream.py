@@ -4,19 +4,29 @@ This module runs as a detached side-process spawned by
 `tools.livestream_cli` (`python -m tools.livestream`). The side-process
 owns:
 
-  - A FrameProducer that captures the focused monitor every
-    STREAM_INTERVAL_SECONDS via grim, holding the latest JPEG in memory.
+  - A FrameProducer that captures frames every STREAM_INTERVAL_SECONDS,
+    holding the latest JPEG in memory. Source is one of:
+      * host (default) — grim against the focused Hyprland monitor;
+      * sandbox — docker exec into the per-task sandbox container and
+        screenshot its Xvfb display with `import` (ImageMagick) or
+        `scrot` as fallback. The sandbox image must ship one of those
+        tools — debian:bookworm-slim does not by default, so this path
+        errors with a clear "install imagemagick / scrot" message.
   - An aiohttp server bound to 127.0.0.1:STREAM_PORT serving a tiny
     HTML page at /, the multipart/x-mixed-replace MJPEG stream at
     /stream, and a JSON /healthz route.
   - A `tailscale serve` mapping that fronts the local server on the
     user's tailnet at https://<host>.<tailnet>.ts.net/vexis.
   - A state file at $XDG_RUNTIME_DIR/vexis-agent/livestream.json
-    (pid, url, started_at, last_activity). The CLI reads this file.
+    (pid, url, started_at, last_activity, source). The CLI reads this file.
   - Signal handlers: SIGTERM/SIGINT = clean shutdown (removes the
     tailscale serve mapping); SIGUSR1 = touch (reset idle timer).
   - An idle watchdog that stops the daemon after IDLE_TIMEOUT_SECONDS
     of inactivity, or after CONSECUTIVE_FAILURE_LIMIT capture failures.
+
+The source is passed in from `livestream_cli start --source ...` via
+the env vars VEXIS_LIVESTREAM_SOURCE_KIND and
+VEXIS_LIVESTREAM_SOURCE_TASK_ID. Default = host.
 
 Limitation: the side-process pattern is a workaround for not having a
 daemon control socket. A future step should fold LiveStream into the
@@ -39,6 +49,7 @@ from pathlib import Path
 from aiohttp import web
 
 from vexis_agent.core.subprocess import run
+from vexis_agent.tools.capture_source import CaptureSource
 
 log = logging.getLogger("vexis.livestream")
 
@@ -72,6 +83,8 @@ class StreamState:
     url: str
     started_at: datetime
     last_activity: datetime
+    source_kind: str = "host"
+    source_task_id: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -79,6 +92,8 @@ class StreamState:
             "url": self.url,
             "started_at": self.started_at.isoformat(),
             "last_activity": self.last_activity.isoformat(),
+            "source_kind": self.source_kind,
+            "source_task_id": self.source_task_id,
         }
 
 
@@ -86,18 +101,39 @@ class StreamState:
 
 
 class FrameProducer:
-    """Captures the focused monitor as JPEG every `interval` seconds."""
+    """Captures the configured source as JPEG every `interval` seconds.
 
-    def __init__(self, interval: float, jpeg_quality: int) -> None:
+    Source defaults to host (the original behaviour). Sandbox source
+    requires the sandbox container to have `import` (ImageMagick) or
+    `scrot` available; the detected tool is cached after the first
+    successful capture to avoid re-probing per frame.
+    """
+
+    def __init__(
+        self,
+        interval: float,
+        jpeg_quality: int,
+        source: CaptureSource | None = None,
+    ) -> None:
         self._interval = interval
         self._jpeg_quality = jpeg_quality
+        self._source = source  # None == host (preserves existing behaviour)
         self._current_frame: bytes | None = None
         self._last_capture_time: float | None = None
         self._failure_streak = 0
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        # Host-source state
         self._monitor_name: str | None = None
         self._monitor_refresh_counter = 0
+        # Sandbox-source state — populated lazily on first capture.
+        self._sandbox_display: str | None = None
+        self._sandbox_capture_tool: str | None = None  # "import" or "scrot"
+        self._sandbox_container_name: str | None = None
+
+    @property
+    def source(self) -> CaptureSource | None:
+        return self._source
 
     @property
     def interval(self) -> float:
@@ -137,6 +173,12 @@ class FrameProducer:
                 pass
 
     async def _capture_one(self) -> None:
+        if self._source is not None and self._source.kind == "sandbox":
+            await self._capture_one_sandbox()
+            return
+        await self._capture_one_host()
+
+    async def _capture_one_host(self) -> None:
         if (
             self._monitor_name is None
             or self._monitor_refresh_counter >= MONITOR_REFRESH_EVERY
@@ -163,6 +205,112 @@ class FrameProducer:
         self._current_frame = stdout
         self._last_capture_time = time.time()
         self._failure_streak = 0
+
+    async def _capture_one_sandbox(self) -> None:
+        # Resolve display + container name lazily so we don't import the
+        # sandbox stack until a sandbox-source daemon is actually
+        # spawned. This keeps the host-only path free of docker import
+        # cost.
+        if self._sandbox_display is None or self._sandbox_container_name is None:
+            await self._resolve_sandbox_metadata()
+        if self._sandbox_capture_tool is None:
+            self._sandbox_capture_tool = await self._detect_sandbox_capture_tool()
+
+        if self._sandbox_capture_tool == "import":
+            # ImageMagick can write JPEG straight to stdout with quality.
+            inner = (
+                f"import -display {self._sandbox_display} -window root "
+                f"-quality {self._jpeg_quality} jpeg:-"
+            )
+        elif self._sandbox_capture_tool == "scrot":
+            # scrot writes to a path; we capture to /tmp inside the
+            # container and cat it back. /tmp is fine because it dies
+            # with the container.
+            inner = (
+                f"DISPLAY={self._sandbox_display} scrot -o "
+                f"-q {self._jpeg_quality} -F /tmp/vexis-livestream.jpg "
+                "&& cat /tmp/vexis-livestream.jpg"
+            )
+        else:
+            raise RuntimeError(
+                f"unknown sandbox capture tool: {self._sandbox_capture_tool!r}"
+            )
+
+        argv = [
+            "docker",
+            "exec",
+            self._sandbox_container_name,
+            "sh",
+            "-c",
+            inner,
+        ]
+        rc, stdout, stderr = await run("docker", argv, GRIM_TIMEOUT_SECONDS)
+        if rc != 0 or not stdout:
+            raise RuntimeError(
+                f"sandbox capture rc={rc} (tool={self._sandbox_capture_tool!r}): "
+                f"{stderr.decode(errors='replace').strip() or '(no stderr)'}"
+            )
+        self._current_frame = stdout
+        self._last_capture_time = time.time()
+        self._failure_streak = 0
+
+    async def _resolve_sandbox_metadata(self) -> None:
+        assert self._source is not None and self._source.kind == "sandbox"
+        task_id = self._source.task_id
+        assert task_id is not None  # validated by CaptureSource
+
+        from vexis_agent.tools.display import HeadlessDisplay
+        from vexis_agent.tools.sandbox.sandbox import container_name_for
+
+        try:
+            env = await asyncio.to_thread(HeadlessDisplay(task_id).env)
+        except Exception as exc:
+            raise LiveStreamError(
+                f"no display registered for task {task_id!r}: {exc}. "
+                f"Start one with `vexis-display start {task_id}`."
+            ) from exc
+
+        display = env.get("DISPLAY") or ":99"
+        if env.get("WAYLAND_DISPLAY"):
+            # wayland-headless sandboxes don't have a working `import`
+            # path (it requires X). Fast-fail rather than emit broken
+            # frames the user has to debug.
+            raise LiveStreamError(
+                f"task {task_id!r} runs a wayland-headless display; "
+                "livestream source=sandbox currently requires Xvfb."
+            )
+        self._sandbox_display = display
+        self._sandbox_container_name = container_name_for(task_id)
+
+    async def _detect_sandbox_capture_tool(self) -> str:
+        """Probe the sandbox for a screenshot tool. Cached after first hit."""
+        assert self._sandbox_container_name is not None
+        # ``command -v`` is POSIX and exits 0 iff the named tool is on
+        # PATH. We OR with `|| echo none` to avoid the non-zero exit
+        # cascading to our subprocess wrapper.
+        probe = (
+            "if command -v import >/dev/null 2>&1; then echo import; "
+            "elif command -v scrot >/dev/null 2>&1; then echo scrot; "
+            "else echo none; fi"
+        )
+        argv = ["docker", "exec", self._sandbox_container_name, "sh", "-c", probe]
+        rc, stdout, stderr = await run("docker", argv, GRIM_TIMEOUT_SECONDS)
+        if rc != 0:
+            raise LiveStreamError(
+                f"failed to probe sandbox for capture tool: "
+                f"{stderr.decode(errors='replace').strip()}"
+            )
+        tool = stdout.decode(errors="replace").strip().splitlines()[-1]
+        if tool == "none":
+            raise LiveStreamError(
+                f"sandbox {self._sandbox_container_name!r} has neither "
+                "`import` (imagemagick) nor `scrot`. Install one inside the "
+                "sandbox: `vexis-sandbox exec <task-id> -- apt-get install -y "
+                "imagemagick` (or scrot)."
+            )
+        if tool not in ("import", "scrot"):
+            raise LiveStreamError(f"unexpected capture-tool probe output: {tool!r}")
+        return tool
 
     async def _find_focused_monitor(self) -> str:
         rc, stdout, stderr = await run(
@@ -282,8 +430,11 @@ class StreamServer:
 
 
 class LiveStreamDaemon:
-    def __init__(self) -> None:
-        self._producer = FrameProducer(STREAM_INTERVAL_SECONDS, JPEG_QUALITY)
+    def __init__(self, source: CaptureSource | None = None) -> None:
+        self._source = source
+        self._producer = FrameProducer(
+            STREAM_INTERVAL_SECONDS, JPEG_QUALITY, source=source
+        )
         self._server = StreamServer(self._producer, STREAM_PORT)
         self._url: str | None = None
         self._tailscale_dns: str | None = None
@@ -461,6 +612,8 @@ class LiveStreamDaemon:
             url=self._url,
             started_at=self._started_at,
             last_activity=self._last_activity,
+            source_kind=self._source.kind if self._source else "host",
+            source_task_id=self._source.task_id if self._source else None,
         )
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state.to_dict()))
@@ -470,12 +623,39 @@ class LiveStreamDaemon:
 # ---------- side-process entrypoint ----------
 
 
+def _source_from_env() -> CaptureSource | None:
+    """Read VEXIS_LIVESTREAM_SOURCE_KIND / _TASK_ID, falling back to host.
+
+    Returns None for "host" so the existing host-only behaviour stays
+    identical (the FrameProducer treats None and CaptureSource(host)
+    the same — keeping None makes test diffs smaller).
+    """
+    kind = (os.environ.get("VEXIS_LIVESTREAM_SOURCE_KIND") or "").strip().lower()
+    if kind in ("", "host"):
+        return None
+    if kind == "sandbox":
+        task_id = (os.environ.get("VEXIS_LIVESTREAM_SOURCE_TASK_ID") or "").strip()
+        if not task_id:
+            print(
+                "livestream: VEXIS_LIVESTREAM_SOURCE_KIND=sandbox requires "
+                "VEXIS_LIVESTREAM_SOURCE_TASK_ID",
+                file=sys.stderr,
+            )
+            return None
+        return CaptureSource(kind="sandbox", task_id=task_id, reason="user-explicit")
+    print(
+        f"livestream: ignoring unknown VEXIS_LIVESTREAM_SOURCE_KIND={kind!r}",
+        file=sys.stderr,
+    )
+    return None
+
+
 def _main() -> int:
     logging.basicConfig(
         level=os.environ.get("VEXIS_LIVESTREAM_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    daemon = LiveStreamDaemon()
+    daemon = LiveStreamDaemon(source=_source_from_env())
     try:
         asyncio.run(daemon.run())
     except LiveStreamError as exc:
