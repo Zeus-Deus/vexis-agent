@@ -205,12 +205,57 @@ def test_driver_press_chord():
 
 def test_driver_vision_snapshot_default_path():
     drv, sb = _driver()
+    # ``via`` is whatever backend the runner picked. scrot is the
+    # default since it's auto-provisioned by `vexis-display start`;
+    # we use it here to pin the new policy. The driver itself is
+    # via-agnostic — see test_runner_source_lists_scrot_first below
+    # for the policy assertion against the runner script directly.
     payload = json.dumps(
-        {"ok": True, "result": {"path": "/tmp/vexis-ui-snapshot.png", "via": "x11-import"}}
+        {"ok": True, "result": {"path": "/tmp/vexis-ui-snapshot.png", "via": "x11-scrot"}}
     )
     sb.next_results = [ExecResult(("docker",), 0, payload + "\n", "")]
     out = drv.vision_snapshot()
     assert out["path"].endswith(".png")
+    assert out["via"] == "x11-scrot"
+
+
+def test_runner_source_lists_scrot_before_import_and_omits_grim():
+    """Policy: inside an Xvfb-only sandbox, scrot is the first
+    backend (auto-provisioned by `vexis-display start`), import is
+    the fallback, and grim is never tried (no Wayland in the
+    sandbox). Locking this here keeps the runner string honest
+    without needing to spin up a real sandbox."""
+    src = RUNNER_SOURCE
+    scrot_at = src.find('"x11-scrot"')
+    import_at = src.find('"x11-import"')
+    assert scrot_at != -1, "x11-scrot backend missing from runner"
+    assert import_at != -1, "x11-import backend missing from runner"
+    assert scrot_at < import_at, "scrot must be tried before import"
+    # grim cannot work in an Xvfb-only sandbox; keeping it as a
+    # backend only adds confusing 'grim not installed' noise to
+    # the error chain. The vision-snapshot block must not mention it.
+    vision_block_start = src.find("def _cmd_vision_snapshot")
+    next_def = src.find("def _", vision_block_start + 1)
+    vision_block = src[vision_block_start:next_def]
+    assert '"wayland-grim"' not in vision_block
+    assert '"grim"' not in vision_block
+
+
+def test_runner_source_emits_actionable_error_when_no_tool_installed():
+    """When neither scrot nor import is present, the runner must emit
+    a single message that names the fix command. That string is the
+    one the Telegram user sees verbatim; drift here is a UX regression."""
+    src = RUNNER_SOURCE
+    vision_block_start = src.find("def _cmd_vision_snapshot")
+    next_def = src.find("def _", vision_block_start + 1)
+    vision_block = src[vision_block_start:next_def]
+    assert "no screenshot tool installed" in vision_block
+    assert "vexis-display start" in vision_block
+    assert "apt-get install -y scrot" in vision_block
+    # The structured error_code lets the host distinguish "no tool"
+    # from "tool present but failed". Pin it so future refactors
+    # don't accidentally drop the discriminator.
+    assert "no_screenshot_tool" in vision_block
 
 
 # ---------------------------------------------------------------------------

@@ -241,6 +241,16 @@ class HeadlessDisplay:
         # session; otherwise docker exec hangs waiting for the child to
         # exit. The pidfile lets ``stop`` issue a kill without re-execing
         # ``pgrep``.
+        #
+        # We also provision ``scrot`` here (best-effort) so that the
+        # ``vision-snapshot`` runner inside ``vexis-ui`` and the Telegram
+        # ``/screenshot sandbox`` path both have a working X11 screenshot
+        # tool the moment the display comes up. A display without a
+        # screenshot tool is half-broken-by-design, so binding the
+        # install to display start is the cleanest single-source point.
+        # Failures are tolerated (sealed-network images, non-apt distros)
+        # — the warning lands in the display log and the runner gives a
+        # clear actionable error if a screenshot is later attempted.
         cmd = (
             "set -e\n"
             f"setsid Xvfb {display} -screen 0 {resolution}x24 -nolisten tcp "
@@ -253,6 +263,24 @@ class HeadlessDisplay:
             "  fi\n"
             "  sleep 0.1\n"
             "done\n"
+            # Best-effort screenshot-tool provisioning. Idempotent: if
+            # scrot is already on PATH (custom image) this is a single
+            # ``command -v`` and we move on. Output is appended to the
+            # display log so the user can grep it post-mortem.
+            "if ! command -v scrot >/dev/null 2>&1; then\n"
+            "  if command -v apt-get >/dev/null 2>&1; then\n"
+            "    (DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y "
+            f"--no-install-recommends scrot) >>{logfile} 2>&1 || "
+            f"echo 'warn: scrot install via apt-get failed; "
+            f"/screenshot sandbox will fail until installed manually' "
+            f">>{logfile}\n"
+            "  else\n"
+            f"    echo 'warn: scrot missing and no apt-get available; "
+            f"install a screenshot tool manually for /screenshot sandbox' "
+            f">>{logfile}\n"
+            "  fi\n"
+            "fi\n"
             f"cat {pidfile}\n"
         )
         res = self.sandbox.exec(["sh", "-c", cmd], auto_start=True, timeout=30)

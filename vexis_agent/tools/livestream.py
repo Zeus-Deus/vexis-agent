@@ -283,14 +283,21 @@ class FrameProducer:
         self._sandbox_container_name = container_name_for(task_id)
 
     async def _detect_sandbox_capture_tool(self) -> str:
-        """Probe the sandbox for a screenshot tool. Cached after first hit."""
+        """Probe the sandbox for a screenshot tool. Cached after first hit.
+
+        Probe order matches the policy in
+        :mod:`vexis_agent.tools.ui.runner_src` and the auto-provisioning
+        done by ``vexis-display start``: scrot first (default, tiny,
+        installed by display start), import as a fallback for custom
+        images that ship ImageMagick instead.
+        """
         assert self._sandbox_container_name is not None
         # ``command -v`` is POSIX and exits 0 iff the named tool is on
         # PATH. We OR with `|| echo none` to avoid the non-zero exit
         # cascading to our subprocess wrapper.
         probe = (
-            "if command -v import >/dev/null 2>&1; then echo import; "
-            "elif command -v scrot >/dev/null 2>&1; then echo scrot; "
+            "if command -v scrot >/dev/null 2>&1; then echo scrot; "
+            "elif command -v import >/dev/null 2>&1; then echo import; "
             "else echo none; fi"
         )
         argv = ["docker", "exec", self._sandbox_container_name, "sh", "-c", probe]
@@ -304,9 +311,10 @@ class FrameProducer:
         if tool == "none":
             raise LiveStreamError(
                 f"sandbox {self._sandbox_container_name!r} has neither "
-                "`import` (imagemagick) nor `scrot`. Install one inside the "
-                "sandbox: `vexis-sandbox exec <task-id> -- apt-get install -y "
-                "imagemagick` (or scrot)."
+                "`scrot` nor `import` (imagemagick). The normal path is to "
+                "start a display first: `vexis-display start <task-id>` "
+                "auto-provisions scrot. Manual fallback: "
+                "`vexis-sandbox exec <task-id> -- apt-get install -y scrot`."
             )
         if tool not in ("import", "scrot"):
             raise LiveStreamError(f"unexpected capture-tool probe output: {tool!r}")

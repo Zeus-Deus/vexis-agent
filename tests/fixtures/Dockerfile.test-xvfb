@@ -6,8 +6,14 @@
 #
 #   pytest -m display_real tests/test_display_integration.py
 FROM debian:bookworm-slim
+# scrot is the X11 screenshot tool the vision-snapshot runner prefers
+# (see vexis_agent/tools/ui/runner_src.py::_cmd_vision_snapshot). It
+# is also what `vexis-display start` auto-provisions on a vanilla
+# bookworm-slim sandbox — baking it in here keeps the integration
+# tests deterministic without paying an apt-get cold-start each run.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     x11-utils \
+    scrot \
     && rm -rf /var/lib/apt/lists/*
 CMD ["sleep", "infinity"]

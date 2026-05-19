@@ -106,8 +106,25 @@ async def _capture_sandbox(task_id: str) -> CaptureResult:
     # Lazy imports: keep this module's top-level dep graph minimal so
     # the pure host-capture path is reachable on installs that don't
     # have docker / the sandbox stack provisioned.
+    from vexis_agent.tools.display import DisplayNotFound, HeadlessDisplay
     from vexis_agent.tools.sandbox.sandbox import scratch_dir_for
     from vexis_agent.tools.ui.ui import ATSPIError, UIDriver
+
+    # Pre-check: a sandbox without a registered display can never
+    # produce a screenshot — every backend will hit "can't open
+    # display". Surface that as a single clear error here instead of
+    # letting the user see "all screenshot backends failed; last:
+    # Can't open display :99" from the runner. The probe is cheap
+    # (one file-system read) and runs before we spend time exec'ing
+    # into the container.
+    try:
+        HeadlessDisplay(task_id).env()
+    except DisplayNotFound as exc:
+        raise CaptureError(
+            f"sandbox capture failed: no display started for task "
+            f"{task_id!r}. Run `vexis-display start {task_id}` first "
+            f"(which also provisions scrot for screenshots)."
+        ) from exc
 
     # Filename matches the host convention so the Telegram regex in
     # _SCREENSHOT_PATH_RE picks it up unmodified, and so brain output
@@ -134,6 +151,11 @@ async def _capture_sandbox(task_id: str) -> CaptureResult:
             f" (task={task_id!r})"
         ) from exc
     except ATSPIError as exc:
+        # The runner emits a self-explanatory message for the
+        # "no screenshot tool installed" case (pointing the user at
+        # `vexis-display start` and the manual install fallback), so
+        # we pass it through without rewrapping. Other ATSPI failures
+        # get the generic prefix.
         raise CaptureError(f"sandbox capture failed: {exc}") from exc
 
     if not container_host_path.exists():

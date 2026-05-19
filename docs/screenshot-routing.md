@@ -66,20 +66,38 @@ with `⚠️`.
 
 ## Sandbox capture path
 
-For screenshots: `_capture_sandbox` in `tools/desktop.py` delegates to
+For screenshots: `_capture_sandbox` in `tools/desktop.py` first
+probes that a display is registered for the task (clear error
+pointing at `vexis-display start <id>` if not), then delegates to
 `UIDriver.vision_snapshot()` (the same code path the AT-SPI walker
 uses), writes the PNG to `/scratch/vexis-screenshot-<ts>.png` inside
 the sandbox, then moves it to `/tmp/vexis-screenshot-<ts>.png` on the
 host so the Telegram path regex picks it up unchanged.
 
 For livestream: `FrameProducer._capture_one_sandbox` `docker exec`s
-into the sandbox container and runs `import` (ImageMagick) or `scrot`
-against the Xvfb display, streaming JPEG bytes back over the pipe.
-**The sandbox image must ship one of those two tools** — the default
-`debian:bookworm-slim` does not. Install with e.g.
-`vexis-sandbox exec <task-id> -- apt-get install -y imagemagick`.
-Wayland-headless sandboxes (cage / Hyprland --headless) are
-unsupported by the livestream path today; use Xvfb.
+into the sandbox container and runs `scrot` (preferred) or `import`
+(ImageMagick fallback) against the Xvfb display, streaming JPEG bytes
+back over the pipe. Wayland-headless sandboxes (cage / Hyprland
+--headless) are unsupported by the livestream path today; use Xvfb.
+
+### Screenshot-tool provisioning
+
+A vanilla `debian:bookworm-slim` ships neither `scrot` nor
+`imagemagick`, so the sandbox needs one installed before `/screenshot
+sandbox` or the livestream path can succeed. The canonical hook is
+`vexis-display start <task-id>`: its Xvfb startup script does a
+best-effort `apt-get install -y --no-install-recommends scrot` if
+scrot is missing on PATH, with the install transcript appended to
+`/tmp/vexis-display-<task-id>.log` inside the sandbox. Custom images
+that bake scrot in pay zero cost (the `command -v scrot` probe
+short-circuits the apt path). Non-apt images and sealed-network
+sandboxes get a `warn: scrot install via apt-get failed` line in the
+display log and a clear error from the runner if a screenshot is
+later attempted.
+
+Manual fallback when the auto-install isn't viable:
+`vexis-sandbox exec <task-id> -- apt-get install -y scrot` (or
+`imagemagick` if you prefer `import`).
 
 ## What about the dashboard?
 

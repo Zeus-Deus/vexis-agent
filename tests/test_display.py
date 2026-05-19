@@ -95,6 +95,36 @@ def test_start_xvfb_issues_expected_script_and_persists_metadata():
     assert on_disk["pid"] == 4242
 
 
+def test_start_xvfb_provisions_scrot_on_first_start():
+    """A headless display without a screenshot tool is half-broken: the
+    Telegram /screenshot sandbox path silently routes to a sandbox
+    that can't take pictures. To prevent that we bind a best-effort
+    scrot install to display start. Failures land in the display log
+    rather than aborting start (sealed-network and non-apt images
+    must still be able to bring up Xvfb).
+    """
+    sb = StubSandbox()
+    sb.default_result = ExecResult(("docker",), 0, "4242\n", "")
+    display = HeadlessDisplay("disp-scrot", sandbox=sb)
+    display.start()
+    script = sb.calls[0][0][2]
+
+    # The probe-then-install gate: only run apt-get if scrot isn't
+    # already on PATH (preserves zero-cost startup for custom images
+    # that bake scrot in).
+    assert "command -v scrot" in script
+    # Apt path: must be wrapped in a `command -v apt-get` guard so
+    # non-Debian images don't crash. ``apt-get install`` + ``scrot``
+    # must both appear inside that branch.
+    assert "command -v apt-get" in script
+    assert "apt-get install" in script
+    assert "scrot" in script
+    # Best-effort: a failure path must end in `echo` (warn to log),
+    # NOT in a non-zero shell exit. Pinning the `|| echo` keyword
+    # captures the contract without over-specifying wording.
+    assert "|| echo" in script
+
+
 def test_start_xvfb_failure_surfaces_stderr():
     sb = StubSandbox()
     sb.next_results = [

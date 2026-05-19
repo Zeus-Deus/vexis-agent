@@ -212,6 +212,38 @@ def test_capture_desktop_sandbox_missing_task_id_raises():
         asyncio.run(desktop.capture_desktop(source=bad))
 
 
+def test_capture_sandbox_without_started_display_emits_actionable_error(
+    monkeypatch, tmp_path,
+):
+    """If no display is registered for the task, _capture_sandbox must
+    fail with a single clear message naming the fix command, instead
+    of exec'ing into the container only to bubble up an opaque
+    'all screenshot backends failed; last: Can't open display' from
+    the runner. Regression for the May 19 telegram report."""
+    from vexis_agent.tools import display as display_mod
+
+    # Point XDG_STATE_HOME at an empty tmp dir so HeadlessDisplay can't
+    # find a metadata file for our task → env() raises DisplayNotFound.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+
+    src = CaptureSource(
+        kind="sandbox", task_id="no-display-task", reason="user-explicit"
+    )
+    with pytest.raises(desktop.CaptureError) as excinfo:
+        asyncio.run(desktop.capture_desktop(source=src))
+
+    msg = str(excinfo.value)
+    # The message must (a) name the task, (b) point at the fix.
+    assert "no-display-task" in msg
+    assert "vexis-display start" in msg
+    # Sanity: we should not have hit the runner / "backends failed" path.
+    assert "backends failed" not in msg
+    # And the DisplayNotFound type from the display module should be
+    # what we caught — pins the contract that desktop.py uses that
+    # specific exception class.
+    assert isinstance(excinfo.value.__cause__, display_mod.DisplayNotFound)
+
+
 # ---------- CLI helper: source resolution against live state ----------
 
 

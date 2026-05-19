@@ -300,26 +300,63 @@ def _cmd_focus(args):
 
 
 def _cmd_vision_snapshot(args):
-    """Fallback: capture a screenshot. We try the obvious tools in
-    order — ``grim`` for Wayland, ``import`` (ImageMagick) for X11,
-    ``xwd | convert`` for stubborn X11 setups."""
+    """Fallback: capture a screenshot of the sandbox display.
+
+    Backend order is policy: ``scrot`` first (tiny, X11-native, and
+    auto-installed by ``vexis-display start`` on Xvfb backends), then
+    ``import`` (ImageMagick) for custom images that ship it. ``grim``
+    is intentionally absent — the sandbox display is Xvfb-only by
+    design (see ``vexis_agent/tools/display/display.py``), so a
+    Wayland tool can never succeed here and only adds noise to the
+    error chain.
+
+    Errors are structured: the JSON envelope carries ``error_code``
+    (``no_screenshot_tool`` when every backend was a ``FileNotFound``,
+    ``screenshot_failed`` otherwise) plus a ``tried`` list so the host
+    can render an actionable hint without parsing free-form text."""
     out_path = args.get("out") or "/tmp/vexis-ui-snapshot.png"
     backends = (
-        (["grim", out_path], "wayland-grim"),
+        (["scrot", "--overwrite", out_path], "x11-scrot"),
         (["import", "-window", "root", out_path], "x11-import"),
     )
+    tried = []
+    all_missing = True
     last_err = ""
     for argv, name in backends:
         try:
             res = subprocess.run(argv, check=False, capture_output=True)
         except FileNotFoundError:
+            tried.append({"backend": name, "status": "not-installed"})
             last_err = f"{argv[0]} not installed"
             continue
+        all_missing = False
         if res.returncode == 0:
             _emit({"ok": True, "result": {"path": out_path, "via": name}})
             return
-        last_err = res.stderr.decode(errors="replace").strip() or last_err
-    _err(f"all screenshot backends failed; last: {last_err}")
+        stderr = res.stderr.decode(errors="replace").strip()
+        tried.append({"backend": name, "status": "failed", "stderr": stderr})
+        last_err = stderr or last_err
+    if all_missing:
+        msg = (
+            "no screenshot tool installed in the sandbox. "
+            "Run `vexis-display start <task-id>` (which provisions "
+            "scrot automatically), or install one manually via "
+            "`vexis-sandbox exec <task-id> -- apt-get install -y scrot`."
+        )
+        _emit({
+            "ok": False,
+            "error": msg,
+            "error_code": "no_screenshot_tool",
+            "tried": tried,
+        })
+        sys.exit(1)
+    _emit({
+        "ok": False,
+        "error": f"all screenshot backends failed; last: {last_err}",
+        "error_code": "screenshot_failed",
+        "tried": tried,
+    })
+    sys.exit(1)
 
 
 def main():
