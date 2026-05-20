@@ -463,6 +463,16 @@ def _user_mcp_specs() -> list[dict]:
                     "got %r — skipping", path, name, transport,
                 )
                 continue
+            # Soft security nudge: a plaintext http:// endpoint sends
+            # request headers (bearer tokens!) unencrypted. The entry
+            # is still accepted — some local/dev servers are http —
+            # but the user should know.
+            if str(url).lower().startswith("http://"):
+                log.warning(
+                    "%s: mcp '%s' uses a plaintext http:// URL — request "
+                    "headers such as bearer tokens travel unencrypted; "
+                    "prefer https://", path, name,
+                )
             out.append({
                 "name": str(name),
                 "url": str(url),

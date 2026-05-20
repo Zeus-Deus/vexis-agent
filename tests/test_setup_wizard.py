@@ -869,6 +869,48 @@ def test_user_mcp_specs_rejects_bad_transport(
     assert sw._user_mcp_specs() == []
 
 
+def test_user_mcp_specs_warns_on_plaintext_http_url(
+    isolated_setup_env, monkeypatch, caplog
+) -> None:
+    """A plaintext http:// remote server is still accepted (soft
+    nudge, not a rejection) but logs a security warning — request
+    headers like bearer tokens would otherwise travel unencrypted."""
+    import logging
+
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    (home / "mcp-servers.yaml").write_text(
+        "servers:\n"
+        "  - name: insecure\n"
+        "    url: http://mcp.example.com/\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING):
+        specs = sw._user_mcp_specs()
+    # Still accepted — the warning is advisory only.
+    assert [s["name"] for s in specs] == ["insecure"]
+    assert "plaintext" in caplog.text
+
+
+def test_user_mcp_specs_no_plaintext_warning_for_https(
+    isolated_setup_env, monkeypatch, caplog
+) -> None:
+    """An https:// remote server raises no plaintext warning."""
+    import logging
+
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    (home / "mcp-servers.yaml").write_text(
+        "servers:\n"
+        "  - name: secure\n"
+        "    url: https://mcp.example.com/\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING):
+        sw._user_mcp_specs()
+    assert "plaintext" not in caplog.text
+
+
 def test_write_mcp_config_claude_code_remote(tmp_path) -> None:
     """A remote spec dict lands as claude-code's HTTP shape."""
     import json
