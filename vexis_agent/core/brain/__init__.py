@@ -29,6 +29,9 @@ from vexis_agent.core.brain.base import (
     TextEnd,
     ToolEnd,
     ToolStart,
+    interpolate_env,
+    mcp_spec_to_claude_code_entry,
+    mcp_spec_to_opencode_entry,
 )
 from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
 from vexis_agent.core.brain.null import BrainNull
@@ -59,4 +62,7 @@ __all__ = [
     "TextEnd",
     "ToolEnd",
     "ToolStart",
+    "interpolate_env",
+    "mcp_spec_to_claude_code_entry",
+    "mcp_spec_to_opencode_entry",
 ]

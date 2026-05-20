@@ -30,8 +30,10 @@ zero subprocess dependencies. The cross-brain contract test
 
 from __future__ import annotations
 
+import os
+import re
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Union
@@ -317,19 +319,143 @@ class BrainHealth:
 
 @dataclass(frozen=True)
 class McpServerSpec:
-    """Canonical MCP server description. Per-brain writers translate
-    this into the brain's native config shape (claude-code's
-    ``mcpServers: {name: {command, args, env}}`` vs opencode's
-    ``mcp: {name: {type, command: [argv...], environment, ...}}``).
+    """Canonical MCP server description — brain-agnostic. Per-brain
+    writers translate this into the brain's native config shape (see
+    :func:`mcp_spec_to_claude_code_entry` /
+    :func:`mcp_spec_to_opencode_entry`).
 
-    ``command`` is the executable; ``args`` are positional args that
-    follow it. ``env`` is per-server environment overrides applied at
-    spawn time by the brain."""
+    An MCP server is **either** a local stdio process **or** a remote
+    HTTP endpoint — exactly one of ``command`` / ``url`` must be set
+    (enforced in ``__post_init__``).
+
+    Local stdio servers (``command`` set):
+      ``command`` is the executable; ``args`` are positional args
+      that follow it; ``env`` is per-server environment overrides
+      applied at spawn time by the brain.
+
+    Remote HTTP servers (``url`` set):
+      ``url`` is the server endpoint. ``transport`` is ``"http"``
+      (Streamable HTTP — the default) or ``"sse"``. ``headers`` are
+      sent on every request, typically an ``Authorization`` bearer
+      token. Header values support ``${ENV_VAR}`` interpolation
+      (resolved against ``os.environ`` at native-file-write time by
+      the ``mcp_spec_to_*`` serialisers) so a raw token need not be
+      hardcoded; an unset variable is left literal so a missing
+      token fails loudly rather than becoming an empty header."""
 
     name: str
-    command: str
+    command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    url: str | None = None
+    transport: str = "http"
+    headers: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        has_command = bool(self.command)
+        has_url = bool(self.url)
+        if has_command and has_url:
+            raise ValueError(
+                f"MCP server {self.name!r}: set either 'command' "
+                f"(local stdio) or 'url' (remote HTTP), not both"
+            )
+        if not has_command and not has_url:
+            raise ValueError(
+                f"MCP server {self.name!r}: needs either 'command' "
+                f"(local stdio) or 'url' (remote HTTP)"
+            )
+        if has_url and self.transport not in ("http", "sse"):
+            raise ValueError(
+                f"MCP server {self.name!r}: transport must be 'http' "
+                f"or 'sse', got {self.transport!r}"
+            )
+
+    @property
+    def is_remote(self) -> bool:
+        """True for a remote HTTP server (``url`` set); False for a
+        local stdio server (``command`` set)."""
+        return bool(self.url)
+
+
+# ──────────────────────────────────────────────────────────────────
+# MCP native-config serialisers
+#
+# One McpServerSpec → one native-config entry, per brain. Shared by
+# the brain classes' ``write_mcp_config`` AND the setup-wizard mirror
+# writers (``setup_wizard._write_claude_code_mcp`` /
+# ``_write_opencode_mcp``) so the two writers physically cannot drift
+# — the per-entry shape lives in exactly one place.
+# ──────────────────────────────────────────────────────────────────
+
+
+_ENV_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def interpolate_env(
+    value: str, environ: Mapping[str, str] | None = None
+) -> str:
+    """Expand ``${VAR}`` placeholders in ``value`` from the
+    environment (``os.environ`` by default).
+
+    Used for MCP remote-server header values so a bearer token can
+    live in the environment instead of being hardcoded in
+    ``mcp-servers.yaml``. An unset variable is left literal
+    (``${VAR}`` stays as-is) so a missing token surfaces visibly
+    instead of silently collapsing to an empty header."""
+    env = os.environ if environ is None else environ
+    return _ENV_PLACEHOLDER.sub(
+        lambda m: env.get(m.group(1), m.group(0)), value
+    )
+
+
+def mcp_spec_to_claude_code_entry(spec: McpServerSpec) -> dict:
+    """Serialise one :class:`McpServerSpec` into claude-code's
+    ``.mcp.json`` ``mcpServers`` entry shape.
+
+    Remote → ``{"type": "http"|"sse", "url", "headers"?}``.
+    Local stdio → ``{"command", "args", "env"?}`` — deliberately no
+    ``type`` key (claude-code defaults an entry carrying ``command``
+    to stdio), kept that way so existing stdio configs round-trip
+    byte-identical."""
+    if spec.is_remote:
+        entry: dict = {"type": spec.transport, "url": spec.url}
+        if spec.headers:
+            entry["headers"] = {
+                k: interpolate_env(v) for k, v in spec.headers.items()
+            }
+        return entry
+    entry = {"command": spec.command, "args": list(spec.args)}
+    if spec.env:
+        entry["env"] = dict(spec.env)
+    return entry
+
+
+def mcp_spec_to_opencode_entry(spec: McpServerSpec) -> dict:
+    """Serialise one :class:`McpServerSpec` into opencode's
+    ``opencode.json`` ``mcp`` block entry shape.
+
+    Remote → ``{"type": "remote", "url", "enabled": True, "headers"?}``
+    — opencode negotiates HTTP vs SSE itself, so ``spec.transport``
+    has no native equivalent and is not emitted.
+    Local stdio → ``{"type": "local", "command": [argv...],
+    "enabled": True, "environment"?}``."""
+    if spec.is_remote:
+        entry: dict = {
+            "type": "remote", "url": spec.url, "enabled": True,
+        }
+        if spec.headers:
+            entry["headers"] = {
+                k: interpolate_env(v) for k, v in spec.headers.items()
+            }
+        return entry
+    entry = {
+        "type": "local",
+        "command": [spec.command, *spec.args],
+        "enabled": True,
+    }
+    if spec.env:
+        entry["environment"] = dict(spec.env)
+    return entry
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -603,8 +729,13 @@ class Brain(ABC):
         """Write the MCP server config in this brain's expected
         location and format. Returns the path written. Idempotent.
 
+        Each :class:`McpServerSpec` is either a local stdio server
+        or a remote HTTP server; per-entry translation goes through
+        :func:`mcp_spec_to_claude_code_entry` /
+        :func:`mcp_spec_to_opencode_entry`.
+
         claude-code: ``<workspace>/.mcp.json`` with
-        ``{"mcpServers": {name: {command, args, env}}}``.
+        ``{"mcpServers": {name: <native entry>}}``.
         opencode: merges ``vexis-``-prefixed entries into
         ``<workspace>/opencode.json`` ``mcp:`` block, preserving
         user-owned non-prefixed entries byte-for-byte (Phase C)."""

@@ -5,6 +5,14 @@ source of truth across both brain natives) with add / remove / list /
 show / refresh verbs so users don't have to hand-edit yaml for the
 common cases.
 
+An MCP server is **either** a local stdio process (``command`` +
+``args`` + ``env``) **or** a remote HTTP endpoint (``url`` +
+``transport`` + ``headers``). The two shapes are mutually exclusive;
+``add_server`` and the yaml parser reject an entry that sets both or
+neither. ``on_path`` (the PATH-resolvable binary check) is meaningful
+only for stdio servers — remote servers have no binary, so ``list`` /
+``status`` report ``on_path=True`` for them unconditionally.
+
 Notes:
 
 - Only user-declared servers (the yaml) are mutable. Built-in
@@ -22,7 +30,7 @@ Notes:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -80,15 +88,31 @@ def _normalize_servers(data: dict) -> list[dict]:
 
 @dataclass(frozen=True)
 class ServerEntry:
-    """One row of ``vexis-agent mcp list`` output."""
+    """One row of ``vexis-agent mcp list`` output.
+
+    Either a local stdio server (``command`` set, ``url`` None) or a
+    remote HTTP server (``url`` set, ``command`` None). ``is_remote``
+    discriminates. For remote servers ``on_path`` is always True —
+    there is no binary to resolve."""
 
     name: str
-    command: str
-    args: list[str]
-    env: dict[str, str]
-    binary: str            # PATH-check target; defaults to command
     source: str            # 'user' (in yaml) or 'builtin' (registry detector)
-    on_path: bool          # binary resolves via shutil.which
+    on_path: bool          # stdio: binary resolves via shutil.which;
+                           # remote: always True (no binary)
+    # ── local stdio fields ──
+    command: Optional[str] = None
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    binary: Optional[str] = None   # PATH-check target; defaults to command
+    # ── remote HTTP fields ──
+    url: Optional[str] = None
+    transport: str = "http"        # 'http' or 'sse'
+    headers: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def is_remote(self) -> bool:
+        """True for a remote HTTP server, False for a local stdio one."""
+        return self.url is not None
 
 
 def parse_env_assignments(pairs: list[str]) -> dict[str, str]:
@@ -108,6 +132,26 @@ def parse_env_assignments(pairs: list[str]) -> dict[str, str]:
     return out
 
 
+def parse_header_assignments(pairs: list[str]) -> dict[str, str]:
+    """Parse ``--header 'Key: Value'`` arguments for remote MCP
+    servers. Empty list → empty dict. Splits on the first ``:`` so
+    header values may themselves contain colons (e.g. a bearer token
+    or a URL). Surrounding whitespace is trimmed. Raises ValueError
+    on malformed entries."""
+    out: dict[str, str] = {}
+    for pair in pairs:
+        if ":" not in pair:
+            raise ValueError(
+                f"--header arguments must be 'Key: Value'; got {pair!r}"
+            )
+        k, _, v = pair.partition(":")
+        k = k.strip()
+        if not k:
+            raise ValueError(f"--header argument has empty key: {pair!r}")
+        out[k] = v.strip()
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Verbs
 # ──────────────────────────────────────────────────────────────────────
@@ -124,27 +168,62 @@ class AddResult:
 def add_server(
     *,
     name: str,
-    command: str,
+    command: Optional[str] = None,
     args: Optional[list[str]] = None,
     env: Optional[dict[str, str]] = None,
     binary: Optional[str] = None,
+    url: Optional[str] = None,
+    transport: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
 ) -> AddResult:
     """Add (or replace) an MCP server in the user yaml, then refresh
     both per-brain native files. Returns a summary describing what
-    landed."""
-    if not name or not command:
-        raise ValueError("name and command are required")
+    landed.
+
+    The server is either local stdio (pass ``command`` / ``args`` /
+    ``env`` / ``binary``) or remote HTTP (pass ``url`` / ``transport``
+    / ``headers``). ``command`` and ``url`` are mutually exclusive —
+    exactly one must be given."""
+    if not name:
+        raise ValueError("name is required")
+    has_command = bool(command)
+    has_url = bool(url)
+    if has_command and has_url:
+        raise ValueError(
+            "an MCP server is either local stdio or remote HTTP — "
+            "pass --command or --url, not both"
+        )
+    if not has_command and not has_url:
+        raise ValueError(
+            "an MCP server needs --command (local stdio) or "
+            "--url (remote HTTP)"
+        )
 
     data = _read_yaml()
     servers = _normalize_servers(data)
 
-    new_entry: dict = {"name": name, "command": command}
-    if binary is not None and binary != command:
-        new_entry["binary"] = binary
-    if args:
-        new_entry["args"] = list(args)
-    if env:
-        new_entry["env"] = dict(env)
+    new_entry: dict = {"name": name}
+    if has_url:
+        new_entry["url"] = url
+        transport = transport or "http"
+        if transport not in ("http", "sse"):
+            raise ValueError(
+                f"--transport must be 'http' or 'sse'; got {transport!r}"
+            )
+        # Only persist a non-default transport — keeps simple entries
+        # clean in the yaml.
+        if transport != "http":
+            new_entry["transport"] = transport
+        if headers:
+            new_entry["headers"] = dict(headers)
+    else:
+        new_entry["command"] = command
+        if binary is not None and binary != command:
+            new_entry["binary"] = binary
+        if args:
+            new_entry["args"] = list(args)
+        if env:
+            new_entry["env"] = dict(env)
 
     replaced = False
     out_servers: list[dict] = []
@@ -241,23 +320,41 @@ def list_servers() -> list[ServerEntry]:
             continue
         name = entry.get("name")
         command = entry.get("command")
-        if not name or not command:
+        url = entry.get("url")
+        if not name:
             continue
-        binary = entry.get("binary") or command
+        # Skip malformed entries (both shapes set, or neither) so
+        # ``list`` never crashes on a hand-edited yaml — the wizard's
+        # _user_mcp_specs() warns about these on refresh.
+        if bool(command) == bool(url):
+            continue
         # User-defined name overrides built-in name (matches the
         # same precedence rule the detector resolution uses).
         out = [e for e in out if e.name != name]
-        out.append(
-            ServerEntry(
-                name=str(name),
-                command=str(command),
-                args=list(entry.get("args") or []),
-                env=dict(entry.get("env") or {}),
-                binary=str(binary),
-                source="user",
-                on_path=shutil.which(str(binary)) is not None,
+        if url:
+            out.append(
+                ServerEntry(
+                    name=str(name),
+                    source="user",
+                    on_path=True,  # remote — no binary to resolve
+                    url=str(url),
+                    transport=str(entry.get("transport") or "http"),
+                    headers=dict(entry.get("headers") or {}),
+                )
             )
-        )
+        else:
+            binary = entry.get("binary") or command
+            out.append(
+                ServerEntry(
+                    name=str(name),
+                    source="user",
+                    on_path=shutil.which(str(binary)) is not None,
+                    command=str(command),
+                    args=list(entry.get("args") or []),
+                    env=dict(entry.get("env") or {}),
+                    binary=str(binary),
+                )
+            )
 
     return out
 
@@ -279,7 +376,10 @@ class ServerStatus:
 
     @property
     def fully_wired(self) -> bool:
-        """Brain-ready: PATH-resolvable AND present in both natives."""
+        """Brain-ready: present in both natives AND (for stdio
+        servers) PATH-resolvable. Remote servers have no binary so
+        ``on_path`` is always True for them — full wiring then just
+        means present in both native files."""
         return self.entry.on_path and self.in_claude_native and self.in_opencode_native
 
 

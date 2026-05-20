@@ -5,12 +5,16 @@
 # workspace MCP config. Run `vexis-agent setup` (or
 # `vexis-agent service restart`) so the brain picks them up.
 #
-# The wizard skips any entry whose `binary` isn't on PATH, so you can
-# declare aspirational entries without breaking anything.
+# Each entry is EITHER a local stdio server (`command`) OR a remote
+# HTTP server (`url`) — exactly one of the two. The wizard skips any
+# stdio entry whose `binary` isn't on PATH, so you can declare
+# aspirational entries without breaking anything. Remote entries have
+# no binary, so that check doesn't apply to them.
 
 servers: []
 
-# Example shapes — uncomment and adapt:
+# ── Local stdio servers ────────────────────────────────────────────
+# Spawned as a local process; vexis talks to them over stdio.
 #
 # servers:
 #   # Direct binary, no args.
@@ -32,3 +36,29 @@ servers: []
 #     env:
 #       MY_TOOL_API_KEY: "..."
 #       MY_TOOL_CONFIG: "~/.config/my-tool/cfg"
+
+# ── Remote HTTP servers ────────────────────────────────────────────
+# Reached over the network at a URL — no local binary to install.
+#
+# `transport` is optional: "http" (Streamable HTTP, the default) or
+# "sse". `headers` are sent on every request — typically an
+# Authorization bearer token.
+#
+# Header values support ${ENV_VAR} interpolation, resolved from the
+# environment when the native config files are written. Prefer this
+# over pasting a raw token: keep the secret in the environment (or
+# vexis's .env) and reference it as ${MY_TOKEN}. An unset variable is
+# left literal so a missing token fails loudly instead of silently
+# becoming an empty header.
+#
+# servers:
+#   # Minimal remote server, no auth.
+#   - name: my-remote
+#     url: https://mcp.example.com/
+#
+#   # Remote server with a bearer token from the environment.
+#   - name: my-authed-remote
+#     url: https://mcp.example.com/
+#     transport: http
+#     headers:
+#       Authorization: "Bearer ${MY_REMOTE_TOKEN}"
