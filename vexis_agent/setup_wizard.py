@@ -384,24 +384,37 @@ _MCP_DETECTORS: list[Callable[[], Optional[dict]]] = [_omarchy_kb_spec]
 def _user_mcp_specs() -> list[dict]:
     """Read user-declared MCP servers from $VEXIS_HOME/mcp-servers.yaml.
 
-    Schema (every key is optional except ``name`` + ``command``):
+    Each entry is **either** a local stdio server or a remote HTTP
+    server — exactly one of ``command`` / ``url`` must be present.
+
+    Local stdio shape (every key optional except ``name`` + ``command``):
 
       servers:
         - name: my-tool                # MCP server name (required)
           binary: my-tool              # presence check (optional);
-                                       # default: same as command's argv[0]
+                                       # default: same as command
           command: my-tool             # binary to invoke (required)
           args: ["--mcp"]
           env:
             MY_TOOL_API_KEY: "..."
 
-    The wizard skips entries whose ``binary`` isn't on PATH so users
-    can declare aspirational servers without having them installed
-    yet. This is vexis's extension mechanism — see CONTRIBUTING.md.
+    Remote HTTP shape (every key optional except ``name`` + ``url``):
+
+      servers:
+        - name: my-remote              # MCP server name (required)
+          url: https://mcp.example.com/  # endpoint (required)
+          transport: http              # "http" (default) or "sse"
+          headers:
+            Authorization: "Bearer ${MY_TOKEN}"
+
+    The wizard skips stdio entries whose ``binary`` isn't on PATH so
+    users can declare aspirational servers without having them
+    installed yet. Remote entries have no binary, so the PATH check
+    is skipped for them.
 
     Missing file → empty list (default state). Malformed file →
     warning + empty list (don't fail the whole wizard over YAML
-    drift).
+    drift). Individual malformed entries are skipped with a warning.
     """
     path = vexis_dir() / "mcp-servers.yaml"
     if not path.is_file():
@@ -423,15 +436,53 @@ def _user_mcp_specs() -> list[dict]:
             continue
         name = entry.get("name")
         command = entry.get("command")
-        if not name or not command:
+        url = entry.get("url")
+        if not name:
             log.warning(
-                "%s: skipping entry missing 'name' or 'command': %r",
-                path, entry,
+                "%s: skipping entry missing 'name': %r", path, entry,
             )
             continue
-        # Presence check: prefer explicit binary field, else use the
-        # command's basename. shutil.which honours PATH; entries
-        # whose binary isn't reachable are filtered out so the
+        if bool(command) and bool(url):
+            log.warning(
+                "%s: mcp '%s' sets both 'command' and 'url'; an entry "
+                "is either local stdio or remote — skipping", path, name,
+            )
+            continue
+        if not command and not url:
+            log.warning(
+                "%s: mcp '%s' has neither 'command' nor 'url'; "
+                "skipping", path, name,
+            )
+            continue
+        if url:
+            # Remote HTTP server — no binary, so no PATH check.
+            transport = str(entry.get("transport") or "http")
+            if transport not in ("http", "sse"):
+                log.warning(
+                    "%s: mcp '%s' transport must be 'http' or 'sse', "
+                    "got %r — skipping", path, name, transport,
+                )
+                continue
+            # Soft security nudge: a plaintext http:// endpoint sends
+            # request headers (bearer tokens!) unencrypted. The entry
+            # is still accepted — some local/dev servers are http —
+            # but the user should know.
+            if str(url).lower().startswith("http://"):
+                log.warning(
+                    "%s: mcp '%s' uses a plaintext http:// URL — request "
+                    "headers such as bearer tokens travel unencrypted; "
+                    "prefer https://", path, name,
+                )
+            out.append({
+                "name": str(name),
+                "url": str(url),
+                "transport": transport,
+                "headers": dict(entry.get("headers") or {}),
+            })
+            continue
+        # Local stdio server. Presence check: prefer explicit binary
+        # field, else use the command. shutil.which honours PATH;
+        # entries whose binary isn't reachable are filtered out so the
         # workspace MCP config doesn't reference dead invocations.
         binary = entry.get("binary") or command
         if shutil.which(binary) is None:
@@ -489,9 +540,12 @@ def write_mcp_config(workspace: Path, brain_kind: str, specs: list[dict]) -> Opt
     typed: list = [
         McpServerSpec(
             name=s["name"],
-            command=s["command"],
+            command=s.get("command"),
             args=list(s.get("args", [])),
             env=dict(s.get("env", {})),
+            url=s.get("url"),
+            transport=str(s.get("transport") or "http"),
+            headers=dict(s.get("headers", {})),
         )
         for s in specs
     ]
@@ -527,16 +581,19 @@ def _write_claude_code_mcp(workspace: Path, servers: list) -> Path:
     """Mirrors ClaudeCodeBrain.write_mcp_config without instantiating
     the brain — the brain ctor wants a SessionStore + RunningTasks the
     wizard has no business spinning up. Same atomic-write semantics.
+
+    Per-entry serialisation is the shared
+    ``mcp_spec_to_claude_code_entry`` so this writer and the brain's
+    cannot drift (stdio vs remote shape lives in one place).
     """
     import json
 
+    from vexis_agent.core.brain.base import mcp_spec_to_claude_code_entry
+
     path = workspace / ".mcp.json"
-    servers_dict: dict = {}
-    for spec in servers:
-        entry: dict = {"command": spec.command, "args": list(spec.args)}
-        if spec.env:
-            entry["env"] = dict(spec.env)
-        servers_dict[spec.name] = entry
+    servers_dict: dict = {
+        spec.name: mcp_spec_to_claude_code_entry(spec) for spec in servers
+    }
     body = {"mcpServers": servers_dict}
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
@@ -547,8 +604,15 @@ def _write_claude_code_mcp(workspace: Path, servers: list) -> Path:
 def _write_opencode_mcp(workspace: Path, servers: list) -> Path:
     """Namespace-merge into <workspace>/opencode.json with the
     ``vexis-`` prefix. Preserves user-owned non-prefixed entries
-    (matches OpenCodeBrain.write_mcp_config's contract)."""
+    (matches OpenCodeBrain.write_mcp_config's contract).
+
+    Per-entry serialisation is the shared
+    ``mcp_spec_to_opencode_entry`` so this writer and the brain's
+    cannot drift (stdio vs remote shape lives in one place).
+    """
     import json
+
+    from vexis_agent.core.brain.base import mcp_spec_to_opencode_entry
 
     prefix = "vexis-"
     path = workspace / "opencode.json"
@@ -563,11 +627,7 @@ def _write_opencode_mcp(workspace: Path, servers: list) -> Path:
     # Drop any prior vexis-prefixed entries so we replace cleanly.
     mcp_block = {k: v for k, v in mcp_block.items() if not k.startswith(prefix)}
     for spec in servers:
-        argv = [spec.command, *list(spec.args)]
-        entry = {"type": "local", "command": argv, "enabled": True}
-        if spec.env:
-            entry["environment"] = dict(spec.env)
-        mcp_block[f"{prefix}{spec.name}"] = entry
+        mcp_block[f"{prefix}{spec.name}"] = mcp_spec_to_opencode_entry(spec)
     if mcp_block:
         current["mcp"] = mcp_block
     elif "mcp" in current and not mcp_block:

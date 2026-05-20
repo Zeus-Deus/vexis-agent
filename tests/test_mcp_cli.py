@@ -267,3 +267,130 @@ def isolated_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("VEXIS_HOME", str(home))
     monkeypatch.setenv("VEXIS_WORKSPACE", str(workspace))
     return {"root": tmp_path, "home": home, "workspace": workspace}
+
+
+# ── parse_header_assignments ──────────────────────────────────────
+
+
+def test_parse_header_assignments_basic() -> None:
+    out = mcp_mod.parse_header_assignments(["Authorization: Bearer abc"])
+    assert out == {"Authorization": "Bearer abc"}
+
+
+def test_parse_header_assignments_value_may_contain_colons() -> None:
+    """Splits on the FIRST colon — header values often carry more."""
+    out = mcp_mod.parse_header_assignments(["X-Url: https://x.example/path"])
+    assert out == {"X-Url": "https://x.example/path"}
+
+
+def test_parse_header_assignments_rejects_missing_colon() -> None:
+    with pytest.raises(ValueError):
+        mcp_mod.parse_header_assignments(["BareHeader"])
+
+
+def test_parse_header_assignments_rejects_empty_key() -> None:
+    with pytest.raises(ValueError):
+        mcp_mod.parse_header_assignments([": value"])
+
+
+# ── add_server: remote (HTTP) servers ─────────────────────────────
+
+
+def test_add_server_remote_writes_yaml(isolated_paths) -> None:
+    result = mcp_mod.add_server(
+        name="ticktick",
+        url="https://mcp.ticktick.com/",
+        transport="sse",
+        headers={"Authorization": "Bearer ${TICKTICK_TOKEN}"},
+    )
+    body = yaml.safe_load(result.yaml_path.read_text())
+    assert body == {
+        "servers": [{
+            "name": "ticktick",
+            "url": "https://mcp.ticktick.com/",
+            "transport": "sse",
+            "headers": {"Authorization": "Bearer ${TICKTICK_TOKEN}"},
+        }]
+    }
+
+
+def test_add_server_remote_omits_default_transport(isolated_paths) -> None:
+    """Default transport (http) is not persisted — keeps the yaml clean."""
+    result = mcp_mod.add_server(name="r", url="https://mcp.example.com/")
+    body = yaml.safe_load(result.yaml_path.read_text())
+    assert body["servers"] == [{"name": "r", "url": "https://mcp.example.com/"}]
+
+
+def test_add_server_rejects_command_and_url(isolated_paths) -> None:
+    with pytest.raises(ValueError):
+        mcp_mod.add_server(name="x", command="thing", url="https://x/")
+
+
+def test_add_server_rejects_neither_command_nor_url(isolated_paths) -> None:
+    with pytest.raises(ValueError):
+        mcp_mod.add_server(name="x")
+
+
+def test_add_server_rejects_bad_transport(isolated_paths) -> None:
+    with pytest.raises(ValueError):
+        mcp_mod.add_server(name="x", url="https://x/", transport="grpc")
+
+
+def test_add_server_remote_refreshes_natives_with_remote_shape(
+    isolated_paths,
+) -> None:
+    """add_server for a remote server writes the correct remote shape
+    into BOTH per-brain native files."""
+    import json
+
+    mcp_mod.add_server(
+        name="ticktick",
+        url="https://mcp.ticktick.com/",
+        transport="http",
+        headers={"Authorization": "Bearer DUMMY"},
+    )
+    workspace = isolated_paths["workspace"]
+    claude = json.loads((workspace / ".mcp.json").read_text())
+    assert claude["mcpServers"]["ticktick"] == {
+        "type": "http",
+        "url": "https://mcp.ticktick.com/",
+        "headers": {"Authorization": "Bearer DUMMY"},
+    }
+    opencode = json.loads((workspace / "opencode.json").read_text())
+    assert opencode["mcp"]["vexis-ticktick"] == {
+        "type": "remote",
+        "url": "https://mcp.ticktick.com/",
+        "enabled": True,
+        "headers": {"Authorization": "Bearer DUMMY"},
+    }
+
+
+# ── list / status with remote servers ─────────────────────────────
+
+
+def test_list_servers_includes_remote_entry(isolated_paths) -> None:
+    """A remote server shows up in list output; on_path is True
+    (no binary) and is_remote flags it."""
+    mcp_mod.add_server(name="remote-tool", url="https://mcp.example.com/")
+    rows = mcp_mod.list_servers()
+    remote = next(r for r in rows if r.name == "remote-tool")
+    assert remote.is_remote is True
+    assert remote.on_path is True
+    assert remote.url == "https://mcp.example.com/"
+    assert remote.command is None
+
+
+def test_status_servers_remote_fully_wired_after_add(isolated_paths) -> None:
+    """add_server refreshes the natives, so a remote server is
+    fully_wired immediately — no PATH dependency."""
+    mcp_mod.add_server(
+        name="remote-tool",
+        url="https://mcp.example.com/",
+        headers={"Authorization": "Bearer DUMMY"},
+    )
+    rows = mcp_mod.status_servers()
+    remote = next(r for r in rows if r.entry.name == "remote-tool")
+    assert remote.entry.is_remote is True
+    assert remote.in_claude_native is True
+    assert remote.in_opencode_native is True
+    assert remote.fully_wired is True

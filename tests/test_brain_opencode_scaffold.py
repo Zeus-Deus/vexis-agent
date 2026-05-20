@@ -294,6 +294,30 @@ def test_write_mcp_config_emits_vexis_prefixed_entries(
     assert entry["enabled"] is True
 
 
+def test_write_mcp_config_emits_remote_entry(
+    brain: OpenCodeBrain, workspace: Path, monkeypatch
+):
+    """A remote McpServerSpec serialises to opencode's ``type: remote``
+    shape under the ``vexis-`` prefix; ${ENV_VAR} header values are
+    interpolated at write time."""
+    monkeypatch.setenv("VX_TICK_TOKEN", "sekret-token")
+    spec = McpServerSpec(
+        name="ticktick",
+        url="https://mcp.ticktick.com/",
+        transport="http",
+        headers={"Authorization": "Bearer ${VX_TICK_TOKEN}"},
+    )
+    path = brain.write_mcp_config([spec])
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    key = f"{VEXIS_MCP_PREFIX}ticktick"
+    assert on_disk["mcp"][key] == {
+        "type": "remote",
+        "url": "https://mcp.ticktick.com/",
+        "enabled": True,
+        "headers": {"Authorization": "Bearer sekret-token"},
+    }
+
+
 def test_write_mcp_config_preserves_user_owned_non_prefixed_entries(
     brain: OpenCodeBrain, workspace: Path
 ):

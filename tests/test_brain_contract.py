@@ -65,6 +65,9 @@ from vexis_agent.core.brain.base import (
     TextEnd,
     ToolEnd,
     ToolStart,
+    interpolate_env,
+    mcp_spec_to_claude_code_entry,
+    mcp_spec_to_opencode_entry,
 )
 from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
 from vexis_agent.core.brain.null import BrainNull
@@ -561,6 +564,114 @@ def test_claude_code_write_mcp_config_is_idempotent(
     path2 = claude_brain.write_mcp_config([spec])
     contents2 = path2.read_bytes()
     assert contents1 == contents2
+
+
+# ──────────────────────────────────────────────────────────────────
+# Remote (HTTP) MCP servers — McpServerSpec + native serialisers
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_mcp_server_spec_rejects_command_and_url_together():
+    """An MCP server is stdio xor remote — never both."""
+    with pytest.raises(ValueError, match="not both"):
+        McpServerSpec(name="bad", command="x", url="https://x/")
+
+
+def test_mcp_server_spec_rejects_neither_command_nor_url():
+    with pytest.raises(ValueError, match="needs either"):
+        McpServerSpec(name="bad")
+
+
+def test_mcp_server_spec_rejects_bad_transport():
+    with pytest.raises(ValueError, match="transport must be"):
+        McpServerSpec(name="bad", url="https://x/", transport="grpc")
+
+
+def test_mcp_server_spec_is_remote_flag():
+    assert McpServerSpec(name="s", command="x").is_remote is False
+    assert McpServerSpec(name="r", url="https://x/").is_remote is True
+
+
+def test_interpolate_env_expands_set_var(monkeypatch):
+    monkeypatch.setenv("VX_TEST_TOKEN", "sekret")
+    assert interpolate_env("Bearer ${VX_TEST_TOKEN}") == "Bearer sekret"
+
+
+def test_interpolate_env_leaves_unset_var_literal(monkeypatch):
+    """An unset var stays literal so a missing token fails loudly
+    instead of silently becoming an empty header."""
+    monkeypatch.delenv("VX_DEFINITELY_UNSET", raising=False)
+    assert (
+        interpolate_env("Bearer ${VX_DEFINITELY_UNSET}")
+        == "Bearer ${VX_DEFINITELY_UNSET}"
+    )
+
+
+def test_mcp_spec_to_claude_code_entry_stdio_shape_unchanged():
+    """stdio entries keep the legacy ``{command,args,env}`` shape with
+    no ``type`` key — existing configs must round-trip identically."""
+    spec = McpServerSpec(name="t", command="t", args=["--mcp"], env={"K": "v"})
+    assert mcp_spec_to_claude_code_entry(spec) == {
+        "command": "t", "args": ["--mcp"], "env": {"K": "v"},
+    }
+
+
+def test_mcp_spec_to_claude_code_entry_remote_http(monkeypatch):
+    monkeypatch.setenv("VX_TOK", "abc")
+    spec = McpServerSpec(
+        name="r", url="https://mcp.example.com/", transport="http",
+        headers={"Authorization": "Bearer ${VX_TOK}"},
+    )
+    assert mcp_spec_to_claude_code_entry(spec) == {
+        "type": "http",
+        "url": "https://mcp.example.com/",
+        "headers": {"Authorization": "Bearer abc"},
+    }
+
+
+def test_mcp_spec_to_claude_code_entry_remote_sse():
+    spec = McpServerSpec(name="r", url="https://x/", transport="sse")
+    assert mcp_spec_to_claude_code_entry(spec) == {
+        "type": "sse", "url": "https://x/",
+    }
+
+
+def test_mcp_spec_to_opencode_entry_remote(monkeypatch):
+    """opencode uses ``type: remote`` for both http and sse — it
+    negotiates the transport itself, so ``transport`` is not emitted."""
+    monkeypatch.setenv("VX_TOK", "abc")
+    spec = McpServerSpec(
+        name="r", url="https://mcp.example.com/", transport="sse",
+        headers={"Authorization": "Bearer ${VX_TOK}"},
+    )
+    assert mcp_spec_to_opencode_entry(spec) == {
+        "type": "remote",
+        "url": "https://mcp.example.com/",
+        "enabled": True,
+        "headers": {"Authorization": "Bearer abc"},
+    }
+
+
+def test_claude_code_write_mcp_config_remote_server(
+    claude_brain: ClaudeCodeBrain, workspace: Path,
+):
+    """A remote McpServerSpec lands as claude-code's HTTP shape."""
+    import json as _json
+    spec = McpServerSpec(
+        name="ticktick", url="https://mcp.ticktick.com/", transport="http",
+        headers={"Authorization": "Bearer DUMMY"},
+    )
+    path = claude_brain.write_mcp_config([spec])
+    data = _json.loads(path.read_text(encoding="utf-8"))
+    assert data == {
+        "mcpServers": {
+            "ticktick": {
+                "type": "http",
+                "url": "https://mcp.ticktick.com/",
+                "headers": {"Authorization": "Bearer DUMMY"},
+            }
+        }
+    }
 
 
 # ──────────────────────────────────────────────────────────────────

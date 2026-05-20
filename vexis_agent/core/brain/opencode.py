@@ -95,6 +95,7 @@ from vexis_agent.core.brain.base import (
     BrainTimeoutError,
     McpServerSpec,
     SessionLost,
+    mcp_spec_to_opencode_entry,
 )
 from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.core.sessions import SessionStore
@@ -1368,12 +1369,15 @@ class OpenCodeBrain(Brain):
             if not (isinstance(k, str) and k.startswith(VEXIS_MCP_PREFIX))
         }
 
-        # Re-emit vexis-owned servers under the prefix. Each
-        # ``McpServerSpec`` translates to OpenCode's local-MCP
-        # shape: ``{type: "local", command: [argv...], environment,
-        # enabled: True}``. The legacy claude-code split of
-        # ``command`` + ``args`` is collapsed into one list per
-        # OpenCode's schema (``packages/opencode/src/config/mcp.ts``).
+        # Re-emit vexis-owned servers under the prefix. Per-entry
+        # translation goes through ``mcp_spec_to_opencode_entry``
+        # (shared with the wizard mirror writer). A local stdio
+        # server becomes ``{type: "local", command: [argv...],
+        # environment, enabled: True}`` — the legacy claude-code
+        # split of ``command`` + ``args`` collapsed into one list
+        # per OpenCode's schema (``packages/opencode/src/config/
+        # mcp.ts``). A remote HTTP server becomes ``{type: "remote",
+        # url, enabled: True, headers}``.
         vexis_owned: dict = {}
         for spec in servers:
             key = (
@@ -1381,14 +1385,7 @@ class OpenCodeBrain(Brain):
                 if spec.name.startswith(VEXIS_MCP_PREFIX)
                 else f"{VEXIS_MCP_PREFIX}{spec.name}"
             )
-            entry: dict = {
-                "type": "local",
-                "command": [spec.command, *spec.args],
-                "enabled": True,
-            }
-            if spec.env:
-                entry["environment"] = dict(spec.env)
-            vexis_owned[key] = entry
+            vexis_owned[key] = mcp_spec_to_opencode_entry(spec)
 
         merged_mcp = {**user_owned, **vexis_owned}
 

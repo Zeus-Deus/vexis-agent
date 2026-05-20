@@ -51,6 +51,7 @@ from vexis_agent.core.brain.base import (
     BrainTransientError,
     McpServerSpec,
     SessionLost,
+    mcp_spec_to_claude_code_entry,
 )
 from vexis_agent.core.memory import MemoryStore
 from vexis_agent.core.paths import memories_dir, skills_dir
@@ -1280,7 +1281,12 @@ class ClaudeCodeBrain(Brain):
         with the real writer. The format is claude-code's native
         ``mcpServers`` shape:
 
-            {"mcpServers": {<name>: {"command", "args", "env"}}}
+            {"mcpServers": {<name>: <native entry>}}
+
+        Each entry is serialised by ``mcp_spec_to_claude_code_entry``
+        (shared with the wizard mirror writer): a local stdio server
+        becomes ``{command, args, env}``; a remote HTTP server
+        becomes ``{type, url, headers}``.
 
         Strategy: replace-all rather than namespace-merge.
         claude-code's ``.mcp.json`` is a workspace-scoped config
@@ -1297,15 +1303,10 @@ class ClaudeCodeBrain(Brain):
         claude-code will read without error).
         """
         path = self._workspace / ".mcp.json"
-        servers_dict: dict = {}
-        for spec in servers:
-            entry: dict = {
-                "command": spec.command,
-                "args": list(spec.args),
-            }
-            if spec.env:
-                entry["env"] = dict(spec.env)
-            servers_dict[spec.name] = entry
+        servers_dict: dict = {
+            spec.name: mcp_spec_to_claude_code_entry(spec)
+            for spec in servers
+        }
         merged = {"mcpServers": servers_dict}
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(

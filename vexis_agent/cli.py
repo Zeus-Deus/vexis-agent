@@ -474,18 +474,39 @@ def service_logs(
 @mcp_app.command("add")
 def mcp_add(
     name: str = typer.Argument(..., help="MCP server name surfaced to the brain."),
-    command: str = typer.Option(..., "--command", "-c", help="Binary to invoke."),
+    command: str = typer.Option(
+        "", "--command", "-c",
+        help="Binary to invoke (local stdio server). Mutually "
+        "exclusive with --url.",
+    ),
+    url: str = typer.Option(
+        "", "--url", "-u",
+        help="Endpoint of a remote HTTP MCP server. Mutually "
+        "exclusive with --command.",
+    ),
+    transport: str = typer.Option(
+        "http", "--transport", "-t",
+        help="Remote transport: 'http' (default) or 'sse'. "
+        "Ignored for stdio servers.",
+    ),
     arg: list[str] = typer.Option(
         [],
         "--arg",
         "-a",
-        help="Args passed after the command (repeatable).",
+        help="Args passed after the command, stdio only (repeatable).",
     ),
     env: list[str] = typer.Option(
         [],
         "--env",
         "-e",
-        help="KEY=VALUE per-server env (repeatable).",
+        help="KEY=VALUE per-server env, stdio only (repeatable).",
+    ),
+    header: list[str] = typer.Option(
+        [],
+        "--header",
+        "-H",
+        help="'Key: Value' request header, remote only (repeatable). "
+        "Values support ${ENV_VAR} interpolation.",
     ),
     binary: str = typer.Option(
         "",
@@ -496,24 +517,46 @@ def mcp_add(
 ) -> None:
     """Add (or replace) an MCP server in ~/.vexis/mcp-servers.yaml.
 
-    Auto-refreshes both per-brain native files (~/vexis-workspace/.mcp.json
-    and opencode.json) so the brain sees the new entry on next session.
+    A server is either local stdio (--command) or remote HTTP (--url);
+    the two are mutually exclusive. Auto-refreshes both per-brain
+    native files (~/vexis-workspace/.mcp.json and opencode.json) so the
+    brain sees the new entry on next session.
     """
-    from vexis_agent.daemon.mcp import add_server, parse_env_assignments
+    from vexis_agent.daemon.mcp import (
+        add_server,
+        parse_env_assignments,
+        parse_header_assignments,
+    )
+
+    if bool(command) == bool(url):
+        typer.echo(
+            "vexis-agent mcp add: pass exactly one of --command "
+            "(local stdio) or --url (remote HTTP).",
+            err=True,
+        )
+        raise typer.Exit(2)
 
     try:
         env_dict = parse_env_assignments(env)
+        header_dict = parse_header_assignments(header)
     except ValueError as exc:
         typer.echo(f"vexis-agent mcp add: {exc}", err=True)
         raise typer.Exit(2)
 
-    result = add_server(
-        name=name,
-        command=command,
-        args=arg or None,
-        env=env_dict or None,
-        binary=binary or None,
-    )
+    try:
+        result = add_server(
+            name=name,
+            command=command or None,
+            args=arg or None,
+            env=env_dict or None,
+            binary=binary or None,
+            url=url or None,
+            transport=transport,
+            headers=header_dict or None,
+        )
+    except ValueError as exc:
+        typer.echo(f"vexis-agent mcp add: {exc}", err=True)
+        raise typer.Exit(2)
     verb = "Replaced" if result.replaced_existing else "Added"
     typer.echo(f"{verb} '{result.name}' in {result.yaml_path}")
     for p in result.refreshed_paths:
@@ -561,9 +604,14 @@ def mcp_list() -> None:
     width_name = max(len(r.name) for r in rows)
     for r in rows:
         marker = "✓" if r.on_path else "✗"
-        cmdline = r.command + (" " + " ".join(r.args) if r.args else "")
+        if r.is_remote:
+            target = f"{r.url}  [remote/{r.transport}]"
+        else:
+            target = (r.command or "") + (
+                " " + " ".join(r.args) if r.args else ""
+            )
         typer.echo(
-            f"  {marker} [{r.source:<7}] {r.name:<{width_name}}  {cmdline}"
+            f"  {marker} [{r.source:<7}] {r.name:<{width_name}}  {target}"
         )
 
 
@@ -582,19 +630,34 @@ def mcp_status() -> None:
 
     for s in rows:
         e = s.entry
-        path_glyph = "✓" if e.on_path else "✗"
         claude_glyph = "✓" if s.in_claude_native else "✗"
         opencode_glyph = "✓" if s.in_opencode_native else "✗"
         wired_label = "ready" if s.fully_wired else "incomplete"
-        typer.echo(f"{e.name}  [{e.source}, {wired_label}]")
-        typer.echo(f"  binary on PATH:        {path_glyph}  ({e.binary})")
+        kind = "remote" if e.is_remote else "stdio"
+        typer.echo(f"{e.name}  [{e.source}, {kind}, {wired_label}]")
+        if e.is_remote:
+            typer.echo(f"  remote URL:            {e.url}")
+            typer.echo(f"  transport:             {e.transport}")
+        else:
+            path_glyph = "✓" if e.on_path else "✗"
+            typer.echo(f"  binary on PATH:        {path_glyph}  ({e.binary})")
         typer.echo(f"  in claude-code native: {claude_glyph}  ({e.name} in <workspace>/.mcp.json)")
         typer.echo(f"  in opencode native:    {opencode_glyph}  (vexis-{e.name} in <workspace>/opencode.json)")
-        cmdline = e.command + (" " + " ".join(e.args) if e.args else "")
-        typer.echo(f"  command:               {cmdline}")
-        if e.env:
-            for k, v in e.env.items():
-                typer.echo(f"  env:                   {k}={v}")
+        if e.is_remote:
+            # Header *names* only — never echo values (bearer tokens).
+            if e.headers:
+                typer.echo(
+                    f"  headers:               "
+                    f"{', '.join(sorted(e.headers))}"
+                )
+        else:
+            cmdline = (e.command or "") + (
+                " " + " ".join(e.args) if e.args else ""
+            )
+            typer.echo(f"  command:               {cmdline}")
+            if e.env:
+                for k, v in e.env.items():
+                    typer.echo(f"  env:                   {k}={v}")
         typer.echo()
 
 

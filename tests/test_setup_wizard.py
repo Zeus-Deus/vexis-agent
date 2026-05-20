@@ -795,6 +795,196 @@ def test_write_all_mcp_configs_writes_both_brains(tmp_path) -> None:
     assert (workspace / "opencode.json").is_file()
 
 
+def test_user_mcp_specs_reads_remote_entry(
+    isolated_setup_env, monkeypatch
+) -> None:
+    """A remote (url) entry is parsed with no PATH check — there is
+    no binary to resolve. Verified by giving an empty PATH."""
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    monkeypatch.setenv("PATH", str(isolated_setup_env / "no-bin"))
+    (home / "mcp-servers.yaml").write_text(
+        "servers:\n"
+        "  - name: remote-tool\n"
+        "    url: https://mcp.example.com/\n"
+        "    transport: sse\n"
+        "    headers:\n"
+        "      Authorization: 'Bearer abc'\n",
+        encoding="utf-8",
+    )
+    specs = sw._user_mcp_specs()
+    assert len(specs) == 1
+    assert specs[0] == {
+        "name": "remote-tool",
+        "url": "https://mcp.example.com/",
+        "transport": "sse",
+        "headers": {"Authorization": "Bearer abc"},
+    }
+
+
+def test_user_mcp_specs_remote_defaults_transport_http(
+    isolated_setup_env, monkeypatch
+) -> None:
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    (home / "mcp-servers.yaml").write_text(
+        "servers:\n"
+        "  - name: r\n"
+        "    url: https://mcp.example.com/\n",
+        encoding="utf-8",
+    )
+    specs = sw._user_mcp_specs()
+    assert specs[0]["transport"] == "http"
+    assert specs[0]["headers"] == {}
+
+
+def test_user_mcp_specs_rejects_command_and_url(
+    isolated_setup_env, monkeypatch
+) -> None:
+    """An entry that sets both shapes is malformed → skipped."""
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    (home / "mcp-servers.yaml").write_text(
+        "servers:\n"
+        "  - name: confused\n"
+        "    command: thing\n"
+        "    url: https://mcp.example.com/\n",
+        encoding="utf-8",
+    )
+    assert sw._user_mcp_specs() == []
+
+
+def test_user_mcp_specs_rejects_bad_transport(
+    isolated_setup_env, monkeypatch
+) -> None:
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    (home / "mcp-servers.yaml").write_text(
+        "servers:\n"
+        "  - name: r\n"
+        "    url: https://mcp.example.com/\n"
+        "    transport: grpc\n",
+        encoding="utf-8",
+    )
+    assert sw._user_mcp_specs() == []
+
+
+def test_user_mcp_specs_warns_on_plaintext_http_url(
+    isolated_setup_env, monkeypatch, caplog
+) -> None:
+    """A plaintext http:// remote server is still accepted (soft
+    nudge, not a rejection) but logs a security warning — request
+    headers like bearer tokens would otherwise travel unencrypted."""
+    import logging
+
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    (home / "mcp-servers.yaml").write_text(
+        "servers:\n"
+        "  - name: insecure\n"
+        "    url: http://mcp.example.com/\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING):
+        specs = sw._user_mcp_specs()
+    # Still accepted — the warning is advisory only.
+    assert [s["name"] for s in specs] == ["insecure"]
+    assert "plaintext" in caplog.text
+
+
+def test_user_mcp_specs_no_plaintext_warning_for_https(
+    isolated_setup_env, monkeypatch, caplog
+) -> None:
+    """An https:// remote server raises no plaintext warning."""
+    import logging
+
+    home = isolated_setup_env / "v"
+    home.mkdir()
+    (home / "mcp-servers.yaml").write_text(
+        "servers:\n"
+        "  - name: secure\n"
+        "    url: https://mcp.example.com/\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING):
+        sw._user_mcp_specs()
+    assert "plaintext" not in caplog.text
+
+
+def test_write_mcp_config_claude_code_remote(tmp_path) -> None:
+    """A remote spec dict lands as claude-code's HTTP shape."""
+    import json
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    specs = [{
+        "name": "ticktick",
+        "url": "https://mcp.ticktick.com/",
+        "transport": "http",
+        "headers": {"Authorization": "Bearer DUMMY"},
+    }]
+    path = sw.write_mcp_config(workspace, "claude-code", specs)
+    body = json.loads(path.read_text(encoding="utf-8"))
+    assert body["mcpServers"]["ticktick"] == {
+        "type": "http",
+        "url": "https://mcp.ticktick.com/",
+        "headers": {"Authorization": "Bearer DUMMY"},
+    }
+
+
+def test_write_mcp_config_opencode_remote(tmp_path) -> None:
+    """A remote spec dict lands as opencode's ``type: remote`` shape,
+    namespaced under the ``vexis-`` prefix."""
+    import json
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    specs = [{
+        "name": "ticktick",
+        "url": "https://mcp.ticktick.com/",
+        "transport": "http",
+        "headers": {"Authorization": "Bearer DUMMY"},
+    }]
+    path = sw.write_mcp_config(workspace, "opencode", specs)
+    body = json.loads(path.read_text(encoding="utf-8"))
+    assert body["mcp"]["vexis-ticktick"] == {
+        "type": "remote",
+        "url": "https://mcp.ticktick.com/",
+        "enabled": True,
+        "headers": {"Authorization": "Bearer DUMMY"},
+    }
+
+
+def test_write_mcp_config_remote_interpolates_env_headers(
+    tmp_path, monkeypatch
+) -> None:
+    """${ENV_VAR} in a header value is expanded from the environment
+    when the native file is written (both brains)."""
+    import json
+
+    monkeypatch.setenv("VX_WIZ_TOKEN", "from-env")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    specs = [{
+        "name": "r",
+        "url": "https://mcp.example.com/",
+        "transport": "http",
+        "headers": {"Authorization": "Bearer ${VX_WIZ_TOKEN}"},
+    }]
+    cc = json.loads(
+        sw.write_mcp_config(workspace, "claude-code", specs)
+        .read_text(encoding="utf-8")
+    )
+    oc = json.loads(
+        sw.write_mcp_config(workspace, "opencode", specs)
+        .read_text(encoding="utf-8")
+    )
+    assert cc["mcpServers"]["r"]["headers"]["Authorization"] == "Bearer from-env"
+    assert (
+        oc["mcp"]["vexis-r"]["headers"]["Authorization"] == "Bearer from-env"
+    )
+
+
 def test_run_setup_skips_mcp_when_nothing_detected(
     isolated_setup_env, monkeypatch
 ) -> None:
