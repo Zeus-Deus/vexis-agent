@@ -98,7 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_start = sub.add_parser(
-        "start", help="Start a headless display inside this task's sandbox."
+        "start",
+        help=(
+            "Start a headless display inside this task's sandbox. On "
+            "apt-based images the screenshot-path packages (xvfb, "
+            "scrot, python3) are auto-provisioned if missing."
+        ),
     )
     p_start.add_argument("task_id")
     p_start.add_argument(

@@ -17,19 +17,19 @@ running inside a sandbox's Xvfb display.
 /screenshot sandbox <id>     specific sandbox by task-id
 /screenshot help             show this matrix
 
-vexis-screenshot --source host
-vexis-screenshot --source sandbox
-vexis-screenshot --source sandbox:<task-id>
+vexis-desktop --source host
+vexis-desktop --source sandbox
+vexis-desktop --source sandbox:<task-id>
 
-vexis-livestream start --source sandbox:<task-id>
+vexis-stream start --source sandbox:<task-id>
 ```
 
 ## Routing rule
 
 The router lives in `vexis_agent/tools/capture_source.py` and is pure.
-All callsites (`vexis-screenshot`, `vexis-livestream`, Telegram
+All callsites (`vexis-desktop`, `vexis-stream`, Telegram
 `/screenshot`) MUST go through `resolve_source()` so the rule stays
-single-sourced. Brain-initiated bash invocations of `vexis-screenshot
+single-sourced. Brain-initiated bash invocations of `vexis-desktop
 --source …` are equally honoured — the router cares about the
 modifier and the live host state, not who's calling.
 
@@ -80,24 +80,29 @@ into the sandbox container and runs `scrot` (preferred) or `import`
 back over the pipe. Wayland-headless sandboxes (cage / Hyprland
 --headless) are unsupported by the livestream path today; use Xvfb.
 
-### Screenshot-tool provisioning
+### Display + screenshot-tool provisioning
 
-A vanilla `debian:bookworm-slim` ships neither `scrot` nor
-`imagemagick`, so the sandbox needs one installed before `/screenshot
-sandbox` or the livestream path can succeed. The canonical hook is
-`vexis-display start <task-id>`: its Xvfb startup script does a
-best-effort `apt-get install -y --no-install-recommends scrot` if
-scrot is missing on PATH, with the install transcript appended to
+A vanilla `debian:bookworm-slim` ships none of what the sandbox
+capture path needs: the X server (`xvfb`), an X11 screenshot tool
+(`scrot`), or the `python3` the capture runner is shipped into. The
+canonical provisioning hook is `vexis-display start <task-id>`: its
+startup script best-effort `apt-get install`s whatever of
+`xvfb` / `scrot` / `python3` is missing on PATH — in a single pass —
+with the install transcript appended to
 `/tmp/vexis-display-<task-id>.log` inside the sandbox. Custom images
-that bake scrot in pay zero cost (the `command -v scrot` probe
-short-circuits the apt path). Non-apt images and sealed-network
-sandboxes get a `warn: scrot install via apt-get failed` line in the
-display log and a clear error from the runner if a screenshot is
-later attempted.
+that bake these in pay zero cost (the `command -v` probes
+short-circuit the apt path).
 
-Manual fallback when the auto-install isn't viable:
-`vexis-sandbox exec <task-id> -- apt-get install -y scrot` (or
-`imagemagick` if you prefer `import`).
+`vexis-display start` then **verifies the X socket actually bound**
+before reporting success. A missing or failed Xvfb is surfaced as a
+non-zero exit with the display log attached — never a phantom
+`ok: true` with no X server behind it. Non-apt and sealed-network
+sandboxes therefore fail loudly at `vexis-display start` time, with
+an actionable message, rather than silently later from a screenshot.
+
+Manual fallback when the auto-install isn't viable (non-apt image):
+`vexis-sandbox exec <task-id> -- apt-get install -y xvfb scrot python3`
+(or the distro equivalent), then re-run `vexis-display start`.
 
 ## What about the dashboard?
 

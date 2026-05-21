@@ -16,6 +16,7 @@ import pytest
 
 from vexis_agent.tools.sandbox.backend import ExecResult
 from vexis_agent.tools.display import (
+    DISPLAY_START_TIMEOUT_SECONDS,
     DisplayMetadata,
     DisplayNotFound,
     DisplayStartFailed,
@@ -95,34 +96,67 @@ def test_start_xvfb_issues_expected_script_and_persists_metadata():
     assert on_disk["pid"] == 4242
 
 
-def test_start_xvfb_provisions_scrot_on_first_start():
-    """A headless display without a screenshot tool is half-broken: the
-    Telegram /screenshot sandbox path silently routes to a sandbox
-    that can't take pictures. To prevent that we bind a best-effort
-    scrot install to display start. Failures land in the display log
-    rather than aborting start (sealed-network and non-apt images
-    must still be able to bring up Xvfb).
+def test_start_xvfb_provisions_screenshot_path_packages():
+    """A headless display is only useful if the sandbox can be
+    screenshotted. The ``/screenshot sandbox`` path needs three things
+    a bare base image (debian:bookworm-slim) lacks: the X server
+    (xvfb), a screenshot tool (scrot), and the python3 the capture
+    runner is shipped into. ``start`` best-effort-installs whatever is
+    missing. Failures land in the display log rather than aborting
+    (sealed-network / non-apt images still get a clear error from the
+    socket probe — see the verification test below — not a phantom
+    success).
     """
     sb = StubSandbox()
     sb.default_result = ExecResult(("docker",), 0, "4242\n", "")
-    display = HeadlessDisplay("disp-scrot", sandbox=sb)
+    display = HeadlessDisplay("disp-prov", sandbox=sb)
     display.start()
     script = sb.calls[0][0][2]
 
-    # The probe-then-install gate: only run apt-get if scrot isn't
-    # already on PATH (preserves zero-cost startup for custom images
-    # that bake scrot in).
+    # Probe-then-install gate per package: only apt-get what isn't
+    # already on PATH (zero-cost startup for images that bake them in).
+    assert "command -v Xvfb" in script
     assert "command -v scrot" in script
-    # Apt path: must be wrapped in a `command -v apt-get` guard so
-    # non-Debian images don't crash. ``apt-get install`` + ``scrot``
-    # must both appear inside that branch.
+    assert "command -v python3" in script
+    # Apt path guarded by `command -v apt-get` so non-Debian images
+    # don't crash; one install pass covers every missing package.
     assert "command -v apt-get" in script
     assert "apt-get install" in script
-    assert "scrot" in script
-    # Best-effort: a failure path must end in `echo` (warn to log),
-    # NOT in a non-zero shell exit. Pinning the `|| echo` keyword
-    # captures the contract without over-specifying wording.
+    # Best-effort: the failure branch warns into the log via `echo`,
+    # it does NOT abort with a non-zero shell exit.
     assert "|| echo" in script
+
+
+def test_start_xvfb_verifies_x_socket_before_reporting_success():
+    """Defect regression: a missing Xvfb binary used to yield a
+    *phantom* display — pid recorded, ok=true returned — with no X
+    server behind it. ``start`` must poll for Xvfb's X socket and exit
+    non-zero (surfacing the display log) if it never binds, so the
+    failure shows up at start time instead of as an opaque "can't open
+    display" from a later screenshot.
+    """
+    sb = StubSandbox()
+    sb.default_result = ExecResult(("docker",), 0, "4242\n", "")
+    display = HeadlessDisplay("disp-verify", sandbox=sb)
+    display.start()
+    script = sb.calls[0][0][2]
+
+    # The script probes Xvfb's X socket ...
+    assert "/tmp/.X11-unix/X99" in script
+    # ... and bails out non-zero when the socket never appears.
+    assert "exit 1" in script
+    assert "never bound" in script
+
+
+def test_start_xvfb_uses_generous_provisioning_timeout():
+    """Cold provisioning may apt-get-install a large X-server package
+    set; the exec timeout has to outlast that, not the sub-second a
+    bare Xvfb launch needs. StubSandbox records (cmd, auto_start,
+    timeout) per call."""
+    sb = StubSandbox()
+    sb.default_result = ExecResult(("docker",), 0, "1\n", "")
+    HeadlessDisplay("disp-timeout", sandbox=sb).start()
+    assert sb.calls[0][2] == DISPLAY_START_TIMEOUT_SECONDS
 
 
 def test_start_xvfb_failure_surfaces_stderr():

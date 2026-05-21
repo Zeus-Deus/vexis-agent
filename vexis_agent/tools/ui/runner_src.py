@@ -339,8 +339,8 @@ def _cmd_vision_snapshot(args):
     if all_missing:
         msg = (
             "no screenshot tool installed in the sandbox. "
-            "Run `vexis-display start <task-id>` (which provisions "
-            "scrot automatically), or install one manually via "
+            "Run `vexis-display start <task-id>` (which provisions the "
+            "display + scrot automatically), or install one manually via "
             "`vexis-sandbox exec <task-id> -- apt-get install -y scrot`."
         )
         _emit({

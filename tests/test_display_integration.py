@@ -36,15 +36,23 @@ def _image_present(image: str) -> bool:
         return False
 
 
-if shutil.which("docker") is None or not _image_present(_TEST_IMAGE):  # pragma: no cover
+if shutil.which("docker") is None:  # pragma: no cover
     pytest.skip(
-        f"docker / image {_TEST_IMAGE} not available; skipping display real test",
+        "docker not available; skipping display real test",
         allow_module_level=True,
     )
 
 
 @pytest.fixture
 def sandboxed_task(tmp_path, monkeypatch):
+    """A task backed by the pre-baked ``vexis-test-xvfb`` fixture image
+    (xvfb already installed). Tests that exercise the cold-provisioning
+    path use a bare image directly instead — see
+    ``test_xvfb_autoprovisions_on_bare_image``."""
+    if not _image_present(_TEST_IMAGE):
+        pytest.skip(
+            f"image {_TEST_IMAGE} not built; see tests/fixtures/Dockerfile.test-xvfb"
+        )
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setenv("VEXIS_WORKSPACE", str(tmp_path / "ws"))
     tid = "adisp-" + uuid.uuid4().hex[:8]
@@ -83,3 +91,35 @@ def test_env_emits_display(sandboxed_task):
     display.start()
     env = display.env()
     assert env["DISPLAY"] == ":99"
+
+
+def test_xvfb_autoprovisions_on_bare_image(tmp_path, monkeypatch):
+    """Defect regression: on a bare image with no Xvfb, ``vexis-display
+    start`` must best-effort-install the X server, verify the X socket
+    actually bound, and only then report success — never a phantom
+    display.
+
+    Uses ``debian:bookworm-slim`` (docker auto-pulls) rather than the
+    pre-baked ``vexis-test-xvfb`` fixture precisely because the point
+    is to exercise the cold-provisioning path. Needs network for the
+    in-container apt-get install.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("VEXIS_WORKSPACE", str(tmp_path / "ws"))
+    tid = "abare-" + uuid.uuid4().hex[:8]
+    sb = Sandbox(tid)
+    sb.start(image="debian:bookworm-slim")
+    try:
+        display = HeadlessDisplay(tid, sandbox=sb)
+        # start() returns (rather than raising DisplayStartFailed) only
+        # if the in-container X-socket probe passed — a real server.
+        meta = display.start()
+        assert meta.backend == "xvfb"
+        # Cross-check from the host side: the X socket really exists.
+        check = sb.exec(["sh", "-c", "ls /tmp/.X11-unix/"])
+        assert "X99" in check.stdout, check.stdout
+        # The rest of the screenshot path was provisioned too.
+        assert sb.exec(["sh", "-c", "command -v scrot"]).ok
+        assert sb.exec(["sh", "-c", "command -v python3"]).ok
+    finally:
+        sb.stop()

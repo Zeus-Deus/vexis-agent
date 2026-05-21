@@ -10,6 +10,11 @@ file inside the container so :meth:`HeadlessDisplay.stop` can issue a
 Backend choice:
 
 * ``xvfb``      — ``Xvfb :N -screen 0 WIDTHxHEIGHTx24 -nolisten tcp``.
+  On apt-based images ``start`` best-effort-installs everything the
+  sandbox screenshot path needs — the X server (``xvfb``), a
+  screenshot tool (``scrot``) and the ``python3`` the capture runner
+  is shipped into — then verifies the X socket actually bound before
+  reporting success.
 * ``wayland-headless`` — ``Hyprland`` or ``cage`` started without a
   physical output, exposing ``$WAYLAND_DISPLAY=wayland-N``. The image
   is responsible for installing one of these; we try ``cage`` first
@@ -39,6 +44,13 @@ from vexis_agent.tools.sandbox import Sandbox, SandboxError
 DEFAULT_DISPLAY_NUMBER = 99
 DEFAULT_RESOLUTION = "1920x1080"
 SUPPORTED_BACKENDS = ("xvfb", "wayland-headless", "auto")
+
+# `vexis-display start` may have to apt-get-install the X server and a
+# screenshot tool on a bare image before it can launch Xvfb. That cold
+# provisioning pass dwarfs the actual Xvfb start, so the exec timeout
+# has to be generous; on an image that already ships them the startup
+# script returns in well under a second.
+DISPLAY_START_TIMEOUT_SECONDS = 300
 
 # Where inside the container we drop the PID + log so `stop` can find
 # them on a fresh ``vexis-display`` invocation. ``/tmp`` works because
@@ -237,56 +249,73 @@ class HeadlessDisplay:
         display = f":{display_number}"
         pidfile = PID_FILE_TEMPLATE.format(task_id=self.task_id)
         logfile = LOG_FILE_TEMPLATE.format(task_id=self.task_id)
-        # Use setsid so the Xvfb process detaches cleanly from the exec
-        # session; otherwise docker exec hangs waiting for the child to
-        # exit. The pidfile lets ``stop`` issue a kill without re-execing
-        # ``pgrep``.
+        socket = f"/tmp/.X11-unix/X{display_number}"
+        # The startup script runs entirely inside the sandbox and does
+        # three things, in order:
         #
-        # We also provision ``scrot`` here (best-effort) so that the
-        # ``vision-snapshot`` runner inside ``vexis-ui`` and the Telegram
-        # ``/screenshot sandbox`` path both have a working X11 screenshot
-        # tool the moment the display comes up. A display without a
-        # screenshot tool is half-broken-by-design, so binding the
-        # install to display start is the cleanest single-source point.
-        # Failures are tolerated (sealed-network images, non-apt distros)
-        # — the warning lands in the display log and the runner gives a
-        # clear actionable error if a screenshot is later attempted.
-        cmd = (
-            "set -e\n"
-            f"setsid Xvfb {display} -screen 0 {resolution}x24 -nolisten tcp "
-            f">{logfile} 2>&1 < /dev/null &\n"
-            f"echo $! > {pidfile}\n"
-            # Give the X server a moment to bind the socket
-            "for i in 1 2 3 4 5 6 7 8 9 10; do\n"
-            f"  if [ -S /tmp/.X11-unix/X{display_number} ]; then\n"
-            "    break\n"
-            "  fi\n"
-            "  sleep 0.1\n"
-            "done\n"
-            # Best-effort screenshot-tool provisioning. Idempotent: if
-            # scrot is already on PATH (custom image) this is a single
-            # ``command -v`` and we move on. Output is appended to the
-            # display log so the user can grep it post-mortem.
-            "if ! command -v scrot >/dev/null 2>&1; then\n"
-            "  if command -v apt-get >/dev/null 2>&1; then\n"
-            "    (DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y "
-            f"--no-install-recommends scrot) >>{logfile} 2>&1 || "
-            f"echo 'warn: scrot install via apt-get failed; "
-            f"/screenshot sandbox will fail until installed manually' "
-            f">>{logfile}\n"
-            "  else\n"
-            f"    echo 'warn: scrot missing and no apt-get available; "
-            f"install a screenshot tool manually for /screenshot sandbox' "
-            f">>{logfile}\n"
-            "  fi\n"
-            "fi\n"
-            f"cat {pidfile}\n"
+        #   1. Provision. The sandbox screenshot path needs three
+        #      things a bare base image (debian:bookworm-slim) lacks:
+        #      the X server (xvfb), a screenshot tool (scrot), and the
+        #      python3 runtime the capture runner is shipped into (see
+        #      tools/ui — the runner is run as `python3 -c <source>`).
+        #      We collect whatever is missing and apt-get-install it in
+        #      one pass. Failures are tolerated (non-apt distros,
+        #      sealed-network images) — they only warn into the display
+        #      log, because the socket probe in step 3 is the real
+        #      success gate. Anything the image already ships is
+        #      skipped for free (`command -v`).
+        #   2. Launch. ``setsid`` detaches Xvfb from the exec session so
+        #      ``docker exec`` doesn't block on the child; the pidfile
+        #      lets ``stop`` kill it without re-exec'ing ``pgrep``.
+        #   3. Verify. We poll for Xvfb's X socket and exit non-zero if
+        #      it never binds. Without this, a missing Xvfb binary
+        #      yields a *phantom* display — pid recorded, ``ok: true``
+        #      returned — that only fails much later as an opaque
+        #      "can't open display" from the screenshot path.
+        cmd = f"""\
+set -e
+: > {logfile}
+
+missing=
+command -v Xvfb    >/dev/null 2>&1 || missing="$missing xvfb"
+command -v scrot   >/dev/null 2>&1 || missing="$missing scrot"
+command -v python3 >/dev/null 2>&1 || missing="$missing python3"
+if [ -n "$missing" ]; then
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >>{logfile} 2>&1 &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $missing >>{logfile} 2>&1 || echo "warn: apt-get install of [$missing ] failed; the display may not come up and /screenshot sandbox will not work until installed manually" >>{logfile}
+  else
+    echo "warn: missing [$missing ] and no apt-get available; install manually for a headless display + /screenshot sandbox" >>{logfile}
+  fi
+fi
+
+setsid Xvfb {display} -screen 0 {resolution}x24 -nolisten tcp >>{logfile} 2>&1 < /dev/null &
+echo $! > {pidfile}
+
+up=
+i=0
+while [ "$i" -lt 50 ]; do
+  if [ -S {socket} ]; then up=1; break; fi
+  i=$((i + 1))
+  sleep 0.1
+done
+if [ -z "$up" ]; then
+  echo "Xvfb display {display} never bound its X socket ({socket})." >&2
+  echo "--- {logfile} ---" >&2
+  cat {logfile} >&2 2>/dev/null || true
+  exit 1
+fi
+cat {pidfile}
+"""
+        res = self.sandbox.exec(
+            ["sh", "-c", cmd],
+            auto_start=True,
+            timeout=DISPLAY_START_TIMEOUT_SECONDS,
         )
-        res = self.sandbox.exec(["sh", "-c", cmd], auto_start=True, timeout=30)
         if not res.ok:
             raise DisplayStartFailed(
-                f"Xvfb failed to start in task {self.task_id!r}: {res.stderr.strip() or res.stdout.strip()}"
+                f"Xvfb failed to start in task {self.task_id!r}: "
+                f"{res.stderr.strip() or res.stdout.strip()}"
             )
         try:
             pid = int((res.stdout.strip().splitlines() or ["0"])[-1])
