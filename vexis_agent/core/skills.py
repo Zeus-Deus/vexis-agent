@@ -40,6 +40,8 @@ from typing import Any, Iterator
 
 import yaml
 
+from vexis_agent.core.skill_history import record_version
+
 log = logging.getLogger(__name__)
 
 # Frontmatter contract: name + description required; description capped
@@ -54,9 +56,15 @@ MAX_SUPPORTING_FILE_BYTES = 1024 * 1024  # 1 MiB
 ALLOWED_SUBDIRS: frozenset[str] = frozenset({"references", "templates", "scripts"})
 
 # Names of skill subdirs/files that are NOT skills (sidecar state,
-# archive, backups, telemetry).
+# archive, backups, telemetry, version history).
 RESERVED_NAMES: frozenset[str] = frozenset(
-    {".archive", ".curator_backups", ".usage.json", ".pinned.json"}
+    {
+        ".archive",
+        ".curator_backups",
+        ".history",
+        ".usage.json",
+        ".pinned.json",
+    }
 )
 
 ARCHIVE_DIR_NAME = ".archive"
@@ -917,8 +925,15 @@ def create_skill(
     return OpResult(True, f"Created skill '{name}'.", {"path": str(skill_md)})
 
 
-def edit_skill(skills_root: Path, name: str, content: str) -> OpResult:
-    """Full SKILL.md rewrite. Validates the new content first."""
+def edit_skill(
+    skills_root: Path, name: str, content: str, *, actor: str = "agent"
+) -> OpResult:
+    """Full SKILL.md rewrite. Validates the new content first.
+
+    ``actor`` labels who triggered the edit (``agent`` / ``curator`` /
+    ``dashboard``); it flows into the version-history snapshot so the
+    dashboard can show "who changed this" alongside each past version.
+    """
     name_err = validate_skill_name(name)
     if name_err:
         return OpResult(False, name_err)
@@ -944,6 +959,13 @@ def edit_skill(skills_root: Path, name: str, content: str) -> OpResult:
     assert skill_dir is not None  # _resolve_writable_or_error contract
 
     skill_md = skill_dir / "SKILL.md"
+    # Snapshot the version we're about to replace so it stays
+    # recoverable. Best-effort — record_version never raises, and a
+    # read miss just means there's nothing to snapshot.
+    try:
+        record_version(skills_root, name, skill_md.read_text(encoding="utf-8"), actor)
+    except OSError:
+        pass
     try:
         _atomic_write_text(skill_md, content)
     except OSError as exc:
@@ -959,10 +981,14 @@ def patch_skill(
     new_string: str,
     *,
     replace_all: bool = False,
+    actor: str = "agent",
 ) -> OpResult:
     """Targeted edit. Default requires unique match; ``replace_all``
     relaxes that. Whitespace-tolerant: the matcher first tries exact
-    text, then a whitespace-collapsed pass to forgive indent drift."""
+    text, then a whitespace-collapsed pass to forgive indent drift.
+
+    ``actor`` labels who triggered the patch for the version-history
+    snapshot — see :func:`edit_skill`."""
     name_err = validate_skill_name(name)
     if name_err:
         return OpResult(False, name_err)
@@ -1005,6 +1031,9 @@ def patch_skill(
             False,
             f"patch broke frontmatter — name must remain '{name}'.",
         )
+    # Snapshot the pre-patch content before overwriting (``original``
+    # was already read above for the match).
+    record_version(skills_root, name, original, actor)
     try:
         _atomic_write_text(skill_md, new_content)
     except OSError as exc:

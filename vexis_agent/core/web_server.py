@@ -63,7 +63,9 @@ from vexis_agent.core.paths import (
 )
 from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.core.sessions import SessionStore
+from vexis_agent.core.skill_history import list_versions, read_version
 from vexis_agent.core.skills import (
+    _find_skill_dir,
     PinStore,
     UsageStore,
     archived_skill_names,
@@ -595,6 +597,120 @@ class WebDashboard:
                 raise HTTPException(400, op.message)
             return {"ok": True, "message": op.message, "extra": op.extra}
 
+        # ── Version history ───────────────────────────────────────
+        # Every edit to a workspace skill — agent, curator, or this
+        # dashboard — snapshots the prior SKILL.md into
+        # skills/.history/. These routes expose that timeline, a
+        # per-version diff against the live skill, and a restore.
+
+        @app.get(
+            "/api/v1/skills/{name}/history",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_skill_history(name: str) -> dict:
+            root = skills_dir(self._workspace)
+            return {
+                "name": name,
+                "versions": [
+                    {
+                        "version_id": v.version_id,
+                        "actor": v.actor,
+                        "recorded_at": v.recorded_at,
+                        "size": v.size,
+                    }
+                    for v in list_versions(root, name)
+                ],
+            }
+
+        @app.get(
+            "/api/v1/skills/{name}/history/{version_id}",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_skill_version(name: str, version_id: str) -> dict:
+            import difflib
+
+            root = skills_dir(self._workspace)
+            content = read_version(root, name, version_id)
+            if content is None:
+                raise HTTPException(
+                    404, f"no version '{version_id}' for skill '{name}'"
+                )
+            meta = next(
+                (v for v in list_versions(root, name)
+                 if v.version_id == version_id),
+                None,
+            )
+            parsed = parse_skill_md(content)
+            # Diff this snapshot against the current live SKILL.md so
+            # the UI can show exactly what changed since.
+            current = ""
+            skill_dir = _find_skill_dir(root, name)
+            if skill_dir is not None:
+                try:
+                    current = (skill_dir / "SKILL.md").read_text(
+                        encoding="utf-8"
+                    )
+                except OSError:
+                    current = ""
+            diff = "".join(
+                difflib.unified_diff(
+                    content.splitlines(keepends=True),
+                    current.splitlines(keepends=True),
+                    fromfile=f"version {version_id}",
+                    tofile="current",
+                )
+            )
+            return {
+                "name": name,
+                "version_id": version_id,
+                "actor": meta.actor if meta else "agent",
+                "recorded_at": meta.recorded_at if meta else None,
+                "content": content,
+                "body": parsed.body if parsed else content,
+                "description": parsed.description if parsed else "",
+                "diff": diff,
+            }
+
+        @app.post(
+            "/api/v1/skills/{name}/history/{version_id}/restore",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_skill_version_restore(
+            name: str,
+            version_id: str,
+            body: dict | None = Body(None),
+        ) -> dict:
+            body = body or {}
+            root = skills_dir(self._workspace)
+            content = read_version(root, name, version_id)
+            if content is None:
+                raise HTTPException(
+                    404, f"no version '{version_id}' for skill '{name}'"
+                )
+            # Same temporary-unpin opt-in as the edit path: restoring
+            # is an edit, so a pinned skill needs force_unpin. The
+            # current SKILL.md is itself snapshotted by edit_skill
+            # before the overwrite, so a restore is always reversible.
+            unpin_during = bool(body.get("force_unpin"))
+            pin_store = PinStore(root)
+            was_pinned = pin_store.is_pinned(name)
+            if was_pinned and unpin_during:
+                pin_store.unpin(name)
+            try:
+                op = edit_skill(root, name, content, actor="dashboard")
+            finally:
+                if was_pinned and unpin_during:
+                    pin_store.pin(name)
+            if not op.ok:
+                raise HTTPException(400, detail={"error": op.message})
+            return {
+                "ok": True,
+                "name": name,
+                "version_id": version_id,
+                "pinned": was_pinned,
+                "message": f"Restored skill '{name}' to version {version_id}.",
+            }
+
         # ── User-facing CRUD on workspace skills ──────────────────
         # The dashboard's "+ New skill" / Edit / Delete affordances
         # all hit these endpoints. Bundled + installed skills are
@@ -675,7 +791,7 @@ class WebDashboard:
             if was_pinned and unpin_during_edit:
                 pin_store.unpin(name)
             try:
-                op = edit_skill(root, name, content)
+                op = edit_skill(root, name, content, actor="dashboard")
             finally:
                 # Re-pin if we temporarily unpinned, regardless of
                 # whether the edit succeeded — the user's protection

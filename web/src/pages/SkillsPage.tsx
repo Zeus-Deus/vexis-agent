@@ -5,9 +5,13 @@ import type {
   ArchivedSkill,
   SkillBody,
   SkillsState,
+  SkillVersionActor,
+  SkillVersionDetail,
+  SkillVersionMeta,
 } from "../lib/types";
 import {
   classNames,
+  formatBytes,
   formatNumber,
   relativeTime,
 } from "../lib/format";
@@ -50,6 +54,8 @@ export function SkillsPage({ token, onAuthFail }: SkillsPageProps) {
   const [pendingByName, setPendingByName] = useState<Record<string, string>>({});
   const [modal, setModal] = useState<ModalMode>(null);
   const [installModal, setInstallModal] = useState<InstallModalState>({ open: false });
+  // The skill whose version history is open in the modal — null = closed.
+  const [historyFor, setHistoryFor] = useState<ActiveSkill | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -175,6 +181,14 @@ export function SkillsPage({ token, onAuthFail }: SkillsPageProps) {
     await refresh();
   }, [refresh]);
 
+  // A restore rewrites the live SKILL.md — same cache-bust as a save
+  // so the expanded body reflects the reverted content.
+  const handleHistoryRestored = useCallback(async () => {
+    setHistoryFor(null);
+    setBodies({});
+    await refresh();
+  }, [refresh]);
+
   // Categories the user has already used — feeds the create form's
   // category autocomplete so a new skill stays consistent with the
   // existing taxonomy.
@@ -249,6 +263,7 @@ export function SkillsPage({ token, onAuthFail }: SkillsPageProps) {
                   onPinToggle={() => handlePinToggle(skill)}
                   onEdit={() => handleEdit(skill.name)}
                   onDelete={() => handleDelete(skill.name)}
+                  onHistory={() => setHistoryFor(skill)}
                   delay={Math.min(idx, 8) * 35}
                 />
               ))}
@@ -316,6 +331,16 @@ export function SkillsPage({ token, onAuthFail }: SkillsPageProps) {
           onAuthFail={onAuthFail}
         />
       )}
+
+      {historyFor && (
+        <SkillHistoryModal
+          token={token}
+          skill={historyFor}
+          onClose={() => setHistoryFor(null)}
+          onRestored={handleHistoryRestored}
+          onAuthFail={onAuthFail}
+        />
+      )}
     </>
   );
 }
@@ -329,6 +354,7 @@ interface SkillRowProps {
   onPinToggle: () => void;
   onEdit: () => void;
   onDelete: () => void;
+  onHistory: () => void;
   delay: number;
 }
 
@@ -341,6 +367,7 @@ function SkillRow({
   onPinToggle,
   onEdit,
   onDelete,
+  onHistory,
   delay,
 }: SkillRowProps) {
   // Bundled + installed are read-only — only show Edit/Delete on
@@ -443,6 +470,20 @@ function SkillRow({
                   }}
                 >
                   Edit
+                </Button>
+                {/* History — read-only timeline of past SKILL.md
+                    versions. Always shown (even at zero versions, so
+                    the affordance is discoverable); the modal explains
+                    the feature when the history is still empty. */}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onHistory();
+                  }}
+                >
+                  History
                 </Button>
                 <Button
                   size="sm"
@@ -1058,6 +1099,437 @@ function InstallSkillModal({
   );
 }
 
+
+// ──────────────────────────────────────────────────────────────────
+// SkillHistoryModal — version timeline + diff + restore
+// ──────────────────────────────────────────────────────────────────
+
+interface SkillHistoryModalProps {
+  token: string;
+  skill: ActiveSkill;
+  onClose: () => void;
+  onRestored: () => Promise<void> | void;
+  onAuthFail: () => void;
+}
+
+// Actor → display label + glyph + Badge tone. "Who changed this" is
+// the whole point of the timeline, so each version reads its origin
+// at a glance: You (the dashboard) gets the accent, Vexis and the
+// curator stay neutral/grey so the eye lands on your own edits.
+const ACTOR_META: Record<
+  SkillVersionActor,
+  { label: string; glyph: string; tone: "accent" | "stale" | "neutral" }
+> = {
+  dashboard: { label: "You", glyph: "●", tone: "accent" },
+  agent: { label: "Vexis", glyph: "◆", tone: "neutral" },
+  curator: { label: "Curator", glyph: "⟳", tone: "stale" },
+};
+
+function actorMeta(actor: string) {
+  return ACTOR_META[actor as SkillVersionActor] ?? ACTOR_META.agent;
+}
+
+// Glyph colour for the bare (borderless) actor mark in the timeline.
+const ACTOR_GLYPH_CLASS: Record<string, string> = {
+  accent: "text-[var(--color-accent)]",
+  stale: "text-[var(--color-state-stale)]",
+  neutral: "text-[var(--color-fg-2)]",
+};
+
+type HistoryTab = "diff" | "full";
+
+/** Read-only version browser for one workspace skill. Loads the
+ *  timeline on open, lazy-fetches each version's content + diff on
+ *  select, and offers a confirm-gated restore. The restore reuses the
+ *  edit path server-side, so the pre-restore state is itself snapshotted
+ *  — every revert is reversible.
+ */
+function SkillHistoryModal({
+  token,
+  skill,
+  onClose,
+  onRestored,
+  onAuthFail,
+}: SkillHistoryModalProps) {
+  const [versions, setVersions] = useState<SkillVersionMeta[] | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [details, setDetails] = useState<Record<string, SkillVersionDetail>>(
+    {},
+  );
+  const [tab, setTab] = useState<HistoryTab>("diff");
+  const [restoring, setRestoring] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  // Load the version list once on open. Auto-select the newest so the
+  // detail pane opens on something useful rather than blank.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .skillHistory(token, skill.name)
+      .then((h) => {
+        if (cancelled) return;
+        setVersions(h.versions);
+        if (h.versions.length > 0) setSelected(h.versions[0].version_id);
+      })
+      .catch((exc) => {
+        if (cancelled) return;
+        if (exc instanceof ApiError && exc.status === 401) {
+          onAuthFail();
+          return;
+        }
+        setLoadError(exc instanceof Error ? exc.message : String(exc));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, skill.name, onAuthFail]);
+
+  // Lazy-fetch the selected version's content + diff, cached by id.
+  useEffect(() => {
+    if (selected === null || details[selected]) return;
+    let cancelled = false;
+    api
+      .skillVersion(token, skill.name, selected)
+      .then((d) => {
+        if (!cancelled) setDetails((p) => ({ ...p, [selected]: d }));
+      })
+      .catch((exc) => {
+        if (cancelled) return;
+        if (exc instanceof ApiError && exc.status === 401) onAuthFail();
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selected, details, token, skill.name, onAuthFail]);
+
+  // Esc closes — parity with the create / install modals.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape" && !restoring) onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, restoring]);
+
+  const selectedMeta = versions?.find((v) => v.version_id === selected) ?? null;
+  const detail = selected ? details[selected] ?? null : null;
+
+  async function onRestore() {
+    if (!selected || restoring) return;
+    const when = selectedMeta
+      ? relativeTime(selectedMeta.recorded_at)
+      : "this version";
+    if (
+      !window.confirm(
+        `Restore skill "${skill.name}" to the version from ${when}?\n\n` +
+          `The current version is saved to history first — you can undo this.`,
+      )
+    )
+      return;
+    setRestoring(true);
+    setActionError(null);
+    try {
+      await api.restoreSkillVersion(token, skill.name, selected, {
+        // A pinned skill needs the temporary-unpin opt-in; the server
+        // re-pins immediately after the write.
+        force_unpin: skill.pinned,
+      });
+      await onRestored();
+    } catch (exc) {
+      if (exc instanceof ApiError && exc.status === 401) {
+        onAuthFail();
+        return;
+      }
+      let message = exc instanceof Error ? exc.message : String(exc);
+      try {
+        const parsed = JSON.parse(message);
+        if (parsed?.detail?.error) message = parsed.detail.error;
+      } catch {
+        // not JSON — keep raw
+      }
+      setActionError(message);
+      setRestoring(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-40 bg-[var(--color-base)]/80 backdrop-blur-sm flex items-start justify-center pt-6 pb-6 px-3 sm:px-6 overflow-y-auto"
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !restoring) onClose();
+      }}
+    >
+      <div
+        className="hairline bg-[var(--color-surface)] w-full max-w-4xl flex flex-col max-h-[86vh]"
+        role="dialog"
+        aria-modal="true"
+      >
+        <header className="px-5 py-3 border-b border-[var(--color-border)] flex items-baseline gap-3">
+          <span className="font-data text-[10px] uppercase tracking-widest text-[var(--color-fg-dim)]">
+            skill history
+          </span>
+          <span className="font-data text-[12px] text-[var(--color-fg)]">
+            {skill.name}
+          </span>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={restoring}
+            className="ml-auto font-data text-[14px] text-[var(--color-fg-dim)] hover:text-[var(--color-fg)] disabled:opacity-50"
+            aria-label="close"
+          >
+            ✕
+          </button>
+        </header>
+
+        {versions === null && !loadError && (
+          <div className="px-5 py-10 font-data text-[11px] text-[var(--color-fg-dim)] animate-pulse-slow">
+            Loading version history…
+          </div>
+        )}
+
+        {loadError && (
+          <div className="px-5 py-4 text-[12px] text-[var(--color-error)] font-data">
+            Could not load history: {loadError}
+          </div>
+        )}
+
+        {versions !== null && versions.length === 0 && (
+          <div className="px-5 py-10">
+            <EmptyState
+              glyph="◷"
+              title="No history yet"
+              hint={`Versions are captured automatically every time this skill is edited — by you, by Vexis mid-session, or by the curator. As soon as ${skill.name} changes, the previous version shows up here.`}
+            />
+          </div>
+        )}
+
+        {versions !== null && versions.length > 0 && (
+          <div className="flex-1 min-h-0 flex h-[60vh]">
+            {/* ── Timeline ─────────────────────────────────────── */}
+            <aside className="w-48 sm:w-56 shrink-0 border-r border-[var(--color-border)] flex flex-col">
+              <div className="px-3 py-2 border-b border-[var(--color-border)] font-data text-[10px] uppercase tracking-widest text-[var(--color-fg-dim)]">
+                {versions.length} version{versions.length === 1 ? "" : "s"}
+              </div>
+              <ul className="relative flex-1 overflow-y-auto py-1">
+                {/* Continuous timeline spine; opaque dots sit on top. */}
+                <div
+                  aria-hidden
+                  className="absolute left-[18px] top-[18px] bottom-[18px] w-px -translate-x-1/2 bg-[var(--color-border)]"
+                />
+                {/* Anchor row: the live skill, head of the timeline. */}
+                <li className="relative flex gap-2.5 pl-3 pr-2.5 py-2.5">
+                  <span className="relative z-[1] w-3 flex justify-center shrink-0">
+                    <span className="mt-[2px] size-[9px] rounded-full bg-[var(--color-accent)]" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="text-[12px] text-[var(--color-fg)] font-medium">
+                      Current
+                    </span>
+                    <span className="block font-data text-[10px] text-[var(--color-fg-dim)] mt-0.5">
+                      live now
+                    </span>
+                  </span>
+                </li>
+                {versions.map((v) => {
+                  const m = actorMeta(v.actor);
+                  const isSel = v.version_id === selected;
+                  return (
+                    <li key={v.version_id} className="relative">
+                      <button
+                        onClick={() => setSelected(v.version_id)}
+                        className={classNames(
+                          "w-full text-left flex gap-2.5 pl-3 pr-2.5 py-2.5 transition-colors",
+                          isSel
+                            ? "bg-[var(--color-surface-2)]"
+                            : "hover:bg-[var(--color-surface-2)]/60",
+                        )}
+                      >
+                        <span className="relative z-[1] w-3 flex justify-center shrink-0">
+                          <span
+                            className={classNames(
+                              "mt-[2px] size-[9px] rounded-full transition-colors",
+                              isSel
+                                ? "bg-[var(--color-accent)]"
+                                : "bg-[var(--color-border-strong)]",
+                            )}
+                          />
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="flex items-center gap-1.5">
+                            <span
+                              aria-hidden
+                              className={classNames(
+                                "font-data text-[10px]",
+                                ACTOR_GLYPH_CLASS[m.tone],
+                              )}
+                            >
+                              {m.glyph}
+                            </span>
+                            <span
+                              className={classNames(
+                                "text-[12px] font-medium",
+                                isSel
+                                  ? "text-[var(--color-fg)]"
+                                  : "text-[var(--color-fg-2)]",
+                              )}
+                            >
+                              {m.label}
+                            </span>
+                          </span>
+                          <span className="block font-data text-[10px] text-[var(--color-fg-dim)] mt-0.5">
+                            {relativeTime(v.recorded_at)}
+                          </span>
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </aside>
+
+            {/* ── Detail ───────────────────────────────────────── */}
+            <section className="flex-1 min-w-0 flex flex-col">
+              <div className="border-b border-[var(--color-border)] flex items-stretch">
+                <button
+                  onClick={() => setTab("diff")}
+                  className={historyTabClass(tab === "diff")}
+                >
+                  Changes
+                </button>
+                <button
+                  onClick={() => setTab("full")}
+                  className={historyTabClass(tab === "full")}
+                >
+                  Full version
+                </button>
+                {selectedMeta && (
+                  <div className="ml-auto flex items-center gap-2 pr-4">
+                    <Badge
+                      tone={actorMeta(selectedMeta.actor).tone}
+                      glyph={actorMeta(selectedMeta.actor).glyph}
+                    >
+                      {actorMeta(selectedMeta.actor).label}
+                    </Badge>
+                    <span
+                      className="font-data text-[10px] text-[var(--color-fg-dim)]"
+                      title={selectedMeta.recorded_at}
+                    >
+                      {relativeTime(selectedMeta.recorded_at)} ·{" "}
+                      {formatBytes(selectedMeta.size)}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex-1 overflow-y-auto">
+                {!detail ? (
+                  <p className="px-4 py-4 font-data text-[11px] text-[var(--color-fg-dim)] animate-pulse-slow">
+                    Loading version…
+                  </p>
+                ) : tab === "diff" ? (
+                  <DiffView diff={detail.diff} />
+                ) : (
+                  <div className="px-4 py-4">
+                    {detail.description && (
+                      <p className="mb-3 pb-3 border-b border-[var(--color-border)] text-[12px] text-[var(--color-fg-2)] italic leading-snug">
+                        {detail.description}
+                      </p>
+                    )}
+                    <Markdown source={detail.body} />
+                  </div>
+                )}
+              </div>
+
+              <div className="px-4 py-3 border-t border-[var(--color-border)] flex items-center gap-3 flex-wrap">
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={onRestore}
+                  loading={restoring}
+                  disabled={!detail}
+                >
+                  Restore this version
+                </Button>
+                {actionError ? (
+                  <span className="font-data text-[10.5px] text-[var(--color-error)]">
+                    {actionError}
+                  </span>
+                ) : (
+                  <span className="font-data text-[10px] text-[var(--color-fg-dim)] leading-snug">
+                    overwrites the live skill — the current state is saved
+                    to history first
+                  </span>
+                )}
+                <span className="ml-auto font-data text-[10px] text-[var(--color-fg-dim)] hidden sm:inline">
+                  esc to close
+                </span>
+              </div>
+            </section>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function historyTabClass(active: boolean): string {
+  return classNames(
+    "uppercase-tight text-[10.5px] px-4 py-2.5 transition-colors border-b-2 -mb-px",
+    "focus:outline-none focus-visible:bg-[var(--color-surface)]",
+    active
+      ? "text-[var(--color-fg)] border-[var(--color-accent)]"
+      : "text-[var(--color-fg-dim)] border-transparent hover:text-[var(--color-fg-2)]",
+  );
+}
+
+/** Renders a unified diff with per-line colouring. The ``--- / +++``
+ *  file-header lines are dropped — the surrounding UI already names
+ *  "this version" vs "current", so they'd be redundant noise.
+ */
+function DiffView({ diff }: { diff: string }) {
+  const lines = diff.replace(/\n$/, "").split("\n");
+  const rendered = lines.filter(
+    (l) => !l.startsWith("--- ") && !l.startsWith("+++ "),
+  );
+  if (rendered.every((l) => l === "")) {
+    return (
+      <p className="px-4 py-4 text-[12px] text-[var(--color-fg-dim)]">
+        This version is identical to the current skill — nothing changed
+        since.
+      </p>
+    );
+  }
+  return (
+    <div className="font-data text-[11.5px] leading-[1.65] py-2">
+      {rendered.map((line, i) => {
+        let cls = "text-[var(--color-fg-dim)]";
+        if (line.startsWith("@@")) {
+          cls =
+            "text-[var(--color-accent)] bg-[var(--color-accent)]/[0.05] mt-1";
+        } else if (line.startsWith("+")) {
+          cls =
+            "text-[var(--color-diff-add)] bg-[var(--color-diff-add)]/[0.08]";
+        } else if (line.startsWith("-")) {
+          cls =
+            "text-[var(--color-diff-del)] bg-[var(--color-diff-del)]/[0.08]";
+        }
+        return (
+          <div
+            key={i}
+            className={classNames(
+              "px-4 whitespace-pre-wrap break-words",
+              cls,
+            )}
+          >
+            {line === "" ? " " : line}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 function inputClass(hasError: boolean): string {
   return classNames(

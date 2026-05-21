@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from vexis_agent.core.paths import skills_dir
+from vexis_agent.core.skill_history import ACTOR_CURATOR, record_version
 from vexis_agent.core.skills import (
     ALLOWED_SUBDIRS,
     ARCHIVE_DIR_NAME,
@@ -617,6 +618,19 @@ def _flip_one(
     if skill.has_skill_md:
         src = skill.staged_dir / "SKILL.md"
         dst = live_dir / "SKILL.md"
+        # S1 flip overwrites a live skill — snapshot the version the
+        # curator is replacing into the history tree first. (S3 has
+        # no live_dir, so there's nothing to supersede.)
+        if skill.live_dir is not None and dst.exists():
+            try:
+                record_version(
+                    live_root,
+                    skill.name,
+                    dst.read_text(encoding="utf-8"),
+                    ACTOR_CURATOR,
+                )
+            except OSError:
+                pass
         _atomic_replace(src, dst)
         files_copied.append("SKILL.md")
     for support_path in skill.support_files:

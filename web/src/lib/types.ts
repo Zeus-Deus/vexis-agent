@@ -54,6 +54,34 @@ export interface SkillBody {
   frontmatter: Record<string, unknown>;
 }
 
+// ── Skill version history ──────────────────────────────────────────
+// Each edit to a workspace skill snapshots the prior SKILL.md into
+// skills/.history/. Actor is who triggered the edit that replaced it.
+export type SkillVersionActor = "agent" | "curator" | "dashboard";
+
+export interface SkillVersionMeta {
+  version_id: string; // compact UTC stamp; also the API route segment
+  actor: SkillVersionActor;
+  recorded_at: string; // ISO 8601
+  size: number; // bytes
+}
+
+export interface SkillHistory {
+  name: string;
+  versions: SkillVersionMeta[];
+}
+
+export interface SkillVersionDetail {
+  name: string;
+  version_id: string;
+  actor: SkillVersionActor;
+  recorded_at: string | null;
+  content: string; // full SKILL.md as it was
+  body: string; // markdown after the frontmatter
+  description: string;
+  diff: string; // unified diff: this version → current live SKILL.md
+}
+
 export interface CuratorRunSummary {
   folder: string;
   started_at: string | null;
