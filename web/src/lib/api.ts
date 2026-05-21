@@ -36,6 +36,8 @@ import type {
   ScheduleRecord,
   SchedulesState,
   SkillBody,
+  SkillHistory,
+  SkillVersionDetail,
   SkillsState,
   StatusState,
   TailscaleStatus,
@@ -187,6 +189,34 @@ export const api = {
       token,
       `/skills/${encodeURIComponent(name)}`,
       { method: "DELETE" },
+    ),
+  // ── Version history (workspace skills) ──────────────────────
+  skillHistory: (token: string, name: string) =>
+    call<SkillHistory>(
+      token,
+      `/skills/${encodeURIComponent(name)}/history`,
+    ),
+  skillVersion: (token: string, name: string, versionId: string) =>
+    call<SkillVersionDetail>(
+      token,
+      `/skills/${encodeURIComponent(name)}/history/${encodeURIComponent(versionId)}`,
+    ),
+  restoreSkillVersion: (
+    token: string,
+    name: string,
+    versionId: string,
+    body: { force_unpin?: boolean } = {},
+  ) =>
+    call<{
+      ok: boolean;
+      name: string;
+      version_id: string;
+      pinned: boolean;
+      message: string;
+    }>(
+      token,
+      `/skills/${encodeURIComponent(name)}/history/${encodeURIComponent(versionId)}/restore`,
+      { method: "POST", body },
     ),
   installSkill: (
     token: string,

@@ -41,6 +41,12 @@
 
   --color-warn: #d4ad64;
   --color-error: #c66e6e;
+
+  /* Diff palette (skill version history). Deletions reuse the error
+     red; additions take a muted sage that sits naturally against the
+     warm-dark base — a literal bright green would read as foreign. */
+  --color-diff-add: #8aa173;
+  --color-diff-del: #c66e6e;
 }
 
 /* Base layer overrides. Body uses sans for chrome. Tabular figures

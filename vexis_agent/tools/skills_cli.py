@@ -78,6 +78,15 @@ def _is_curator_context() -> bool:
     return os.environ.get(CURATOR_ENV_VAR, "").strip() not in ("", "0", "false")
 
 
+def _actor() -> str:
+    """Version-history actor label for the current CLI invocation.
+
+    The curator's spawned process carries ``VEXIS_CURATOR=1``; every
+    other CLI invocation is the agent editing a skill mid-session.
+    """
+    return "curator" if _is_curator_context() else "agent"
+
+
 def _root() -> Path:
     workspace = workspace_dir(os.environ.get("VEXIS_WORKSPACE", "~/vexis-workspace"))
     return skills_dir(workspace)
@@ -129,11 +138,17 @@ def _cmd_create(name: str, content_path: str, category: str | None) -> int:
 
 
 def _cmd_edit(name: str, content_path: str) -> int:
-    return _emit(edit_skill(_root(), name, _read_content_arg(content_path)))
+    return _emit(
+        edit_skill(_root(), name, _read_content_arg(content_path), actor=_actor())
+    )
 
 
 def _cmd_patch(name: str, old: str, new: str, replace_all: bool) -> int:
-    return _emit(patch_skill(_root(), name, old, new, replace_all=replace_all))
+    return _emit(
+        patch_skill(
+            _root(), name, old, new, replace_all=replace_all, actor=_actor()
+        )
+    )
 
 
 def _cmd_delete(name: str) -> int:
