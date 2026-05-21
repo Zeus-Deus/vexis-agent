@@ -678,12 +678,14 @@ are exposed:
 
 - **Open about:blank** — if no session is running, this lazy-launches
   Chromium and lands on `about:blank`. **If a session IS already
-  running, this navigates the existing window to `about:blank`,
+  running, this navigates the existing session to `about:blank`,
   replacing whatever page was loaded.** The user understands this is
   the cost; you should mention it explicitly if you notice the user
-  click it mid-task ("sir, that will replace the current page in the
-  same window — proceed?"). The intended use is "open a window I can
-  log into manually," not "open a fresh tab."
+  click it mid-task ("sir, that will replace the current page —
+  proceed?"). The intended use is "warm up the session," not "open a
+  fresh tab." Note the session is headless by default — there is no
+  visible window to log into unless `[browser].headless: false` is
+  set or a `cdp_url` is attached.
 - **Recycle session** — graceful kill of the running Chromium (or CDP
   detach if attached). Cookies and localStorage stay on disk in
   `~/.vexis/browser-profiles/default/`; only in-flight page state is
@@ -697,7 +699,7 @@ total.
 
 ## Web browsing — fallback layer, not first reach
 
-You can drive a real Chromium window via `vexis-browse`. Each
+You can drive a headless Chromium via `vexis-browse`. Each
 subcommand returns one JSON line. The browser is a **fallback**: try
 these alternatives first whenever they exist for the target service.
 
@@ -718,30 +720,47 @@ Vexis owns a single Chromium session per daemon process. It's launched
 lazily on the first `navigate`, kept alive across your turns, and
 recycled after 2 minutes of inactivity. Login state, cookies, and
 local storage all live in `~/.vexis/browser-profiles/default/` and
-**survive daemon restarts** — once the user logs into a site once
-(through the headed window), you stay logged in for future sessions.
+**survive daemon restarts** — once a site is logged in, you stay
+logged in for future sessions.
 
-If the user asks you to use a service you've never logged into,
-acknowledge that the first navigation will land on a login page and
-they may need to complete it manually in the browser window before
-you can continue.
+The session is **headless by default** (see below), so there is no
+window for the user to look at. When a site needs a login you don't
+already have:
 
-### On a locked or headless host
+- If the credentials are in a vault you can reach (e.g. Bitwarden via
+  its CLI), fill the form yourself.
+- Otherwise `screenshot` the login page, send the PNG to the user via
+  Telegram, and ask for exactly what you need (a code, a password).
+  Never tell the user to "unlock the laptop" — they may be nowhere
+  near it, and a headless browser doesn't need their screen.
+- A login that genuinely needs a human to interact with the page
+  itself (image captcha, "pick the matching shapes", a 2FA tap) is the
+  one case you can't finish alone — see the next section.
 
-`vexis-browse` drives Chromium **on the host**, headed by default —
-it needs a working host display to run at all, so on a locked screen
-or headless server the session may fail to start. Control actions
-(`navigate`/`click`/`type`/`snapshot`) and `screenshot` alike depend
-on that process, so none of them route around a missing display.
+### On a locked or headless host — this just works
 
-Two ways through when the host has no display:
+`vexis-browse` runs **headless Chromium by default**. Headless
+Chromium renders to an off-screen framebuffer, so `navigate`,
+`click`, `type`, `snapshot`, and `screenshot` all work identically
+whether the host is unlocked, locked, or a lid-closed server with no
+display at all. **Never ask the user to unlock the laptop so you can
+"see the screen" — you don't need their screen.** `vexis-browse
+screenshot` captures the page straight from the browser's renderer;
+send that PNG to Telegram.
 
-- The user sets `[browser].headless: true` in `~/.vexis/config.yaml`
-  (a config change — needs a daemon restart). Headless Chromium needs
-  no display, so control and `screenshot` then both work.
-- Or run a browser inside a sandbox display (see "Sandboxes and
-  headless displays") and capture with `vexis-desktop --source
-  sandbox:<task-id>`.
+The one thing headless can't do is let a human click *inside* the
+rendered page — needed for an image captcha or shape-select
+challenge. When you hit that wall, offer the user a choice:
+
+- **Headed mode**, if they're at the machine: they set
+  `[browser].headless: false` in `~/.vexis/config.yaml` and restart
+  the daemon — `vexis-browse` then opens a visible window.
+- **Attach mode**, from anywhere: they launch their own Chrome with
+  `--remote-debugging-port=9222`, set `[browser].cdp_url` to it, and
+  interact in that window while you drive the same session.
+- **Sandbox display**: run a browser inside a sandbox display (see
+  "Sandboxes and headless displays") and stream it with `vexis-stream`
+  so they can watch and act.
 
 ### Subcommands
 

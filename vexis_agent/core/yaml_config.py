@@ -251,7 +251,11 @@ def browser_default_profile() -> str | None:
 
 
 def browser_headless() -> bool:
-    raw = _section("browser").get("headless", False)
+    # Default True: the daemon commonly runs on a lid-closed,
+    # screen-locked laptop-as-home-server with no usable display.
+    # Headless Chromium needs none. Set [browser].headless: false to
+    # opt into a visible window when physically at the machine.
+    raw = _section("browser").get("headless", True)
     return bool(raw)
 
 
