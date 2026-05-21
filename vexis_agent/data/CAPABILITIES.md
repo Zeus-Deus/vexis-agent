@@ -14,13 +14,38 @@ Other scopes:
 - `--scope all-monitors` — capture everything across all outputs.
 - `--scope focused-window` — capture just the currently focused window.
 
+`--scope` applies to host capture only — a sandbox display (below)
+has no monitors.
+
+### Capture source — host or sandbox
+
+`vexis-desktop --source` chooses where the pixels come from:
+
+- `host` (or omitted) — the real desktop. The default.
+- `sandbox` — the most-recently-active sandbox's headless display.
+- `sandbox:<task-id>` — a specific sandbox by task-id.
+
+Host capture needs an **active, unlocked local session** — on a
+locked screen or a headless server it yields only a lock screen or a
+failure. Sandbox capture builds its **own** display inside a
+container, so it works regardless of host state, headless servers
+included. When the user wants you to *see* something and the host has
+no usable display, set up a sandbox display (next section) and
+capture from there rather than reporting that you can't.
+
+The Telegram `/screenshot` command exposes the same routing
+(`/screenshot host` / `sandbox` / `sandbox <id>`, or bare for auto).
+Routing is decided **per capture** — there's no mode to activate;
+each call picks a source on its own.
+
 The command prints JSON to stdout with three fields:
 
 - `image_path` — absolute path to a fresh PNG under `/tmp/`.
 - `summary` — one-line human-readable description of what's on screen.
 - `state` — structured Hyprland state: active workspace, monitors, and
   every open window with class, title, geometry, focus, and floating
-  status.
+  status. (Host capture only — a sandbox capture's `state` just names
+  its source, task-id, and capture method.)
 
 When you take a screenshot the user should see, include the
 `image_path` verbatim in your reply. The transport detects paths of
@@ -33,6 +58,57 @@ questions like "what windows do I have open?" — it's faster, cheaper,
 and exact. Reach for the screenshot when pixels matter (something is
 visually wrong, you need OCR-equivalent reading, the user explicitly
 asked for an image).
+
+## Sandboxes and headless displays
+
+A **sandbox** is a per-task Docker container — isolated filesystem,
+processes, and packages — for running and testing things off the
+host. A sandbox can also host its own **headless display**, and that
+is what makes the locked-host / headless-server capture path work.
+
+### vexis-sandbox — per-task containers
+
+    vexis-sandbox start <task-id>           start (or reuse) the container
+    vexis-sandbox exec  <task-id> -- <cmd>  run a command inside it
+    vexis-sandbox cp    <task-id> <s> <d>   copy files host<->container
+    vexis-sandbox stop  <task-id>           stop and remove it
+    vexis-sandbox list                      list all sandboxes
+
+`<task-id>` is a short kebab-case name (3-30 chars, starts with a
+letter). State persists across `exec` calls under the same task-id;
+different task-ids are isolated. Each subcommand prints one JSON
+line; `exec` lazy-starts the container if it isn't running.
+
+### vexis-display — a headless display in a sandbox
+
+    vexis-display start <task-id>   start a headless X display
+    vexis-display env   <task-id>   print DISPLAY= for GUI commands
+    vexis-display stop  <task-id>   stop the display
+    vexis-display list              list recorded displays
+
+`vexis-display start` brings up an `Xvfb` virtual screen *inside* the
+sandbox — the host's display is never touched. On apt-based images it
+auto-installs what the capture path needs (`xvfb`, `scrot`,
+`python3`) and verifies the display came up before returning; if it
+can't, it fails with a clear error rather than faking success. The
+display dies with the sandbox.
+
+### Recipe: see a GUI app or browser on a headless host
+
+No manual setup — this works on a server with no physical display, or
+when the host screen is locked:
+
+1. `vexis-sandbox start <task-id>`
+2. `vexis-display start <task-id>`
+3. Run the app on that display, e.g.
+   `vexis-sandbox exec <task-id> -- env DISPLAY=:99 <gui-command>`
+   (`:99` is the default; confirm with `vexis-display env`). Any X11
+   app works — a browser, an editor, a GUI tool.
+4. `vexis-desktop --source sandbox:<task-id>` — screenshot it. The PNG
+   comes back exactly like a host capture; include `image_path` in
+   your reply to send it to the user.
+
+For the user, `/screenshot sandbox <id>` does step 4 from Telegram.
 
 ## Inbound images
 
@@ -257,6 +333,12 @@ question). The stream costs CPU and screen-capture bandwidth.
 Returns JSON with the URL. Send the URL to the user in your reply.
 The user can open it in any browser on any device signed into their
 Tailscale account.
+
+`vexis-stream start` also accepts `--source` (`host` / `sandbox` /
+`sandbox:<task-id>`, omitted = host) — live-stream a sandbox's
+headless display instead of the host monitor:
+
+    vexis-stream start --source sandbox:<task-id>
 
 Example reply:
     Streaming, sir. Watch at: https://your-host.your-tailnet.ts.net/vexis
@@ -643,6 +725,23 @@ If the user asks you to use a service you've never logged into,
 acknowledge that the first navigation will land on a login page and
 they may need to complete it manually in the browser window before
 you can continue.
+
+### On a locked or headless host
+
+`vexis-browse` drives Chromium **on the host**, headed by default —
+it needs a working host display to run at all, so on a locked screen
+or headless server the session may fail to start. Control actions
+(`navigate`/`click`/`type`/`snapshot`) and `screenshot` alike depend
+on that process, so none of them route around a missing display.
+
+Two ways through when the host has no display:
+
+- The user sets `[browser].headless: true` in `~/.vexis/config.yaml`
+  (a config change — needs a daemon restart). Headless Chromium needs
+  no display, so control and `screenshot` then both work.
+- Or run a browser inside a sandbox display (see "Sandboxes and
+  headless displays") and capture with `vexis-desktop --source
+  sandbox:<task-id>`.
 
 ### Subcommands
 

@@ -123,7 +123,7 @@ async def _capture_sandbox(task_id: str) -> CaptureResult:
         raise CaptureError(
             f"sandbox capture failed: no display started for task "
             f"{task_id!r}. Run `vexis-display start {task_id}` first "
-            f"(which also provisions scrot for screenshots)."
+            f"(which also provisions the sandbox screenshot tooling)."
         ) from exc
 
     # Filename matches the host convention so the Telegram regex in
