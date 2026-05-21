@@ -70,7 +70,7 @@ export function BrowserPage({ token, onAuthFail }: BrowserPageProps) {
     try {
       const result = await api.browserOpenBlank(token);
       if (result.ok) {
-        setActionMessage("Opened about:blank — drive the headed window manually.");
+        setActionMessage("Opened about:blank — session is warm.");
       } else {
         setActionMessage(
           `Open failed: ${result.error ?? "unknown error"}${
