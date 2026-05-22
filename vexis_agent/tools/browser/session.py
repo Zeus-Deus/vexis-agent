@@ -29,6 +29,7 @@ os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
 
 from browser_use import BrowserSession  # noqa: E402
 
+from vexis_agent.core.logging import redact_sensitive_logs  # noqa: E402
 from vexis_agent.tools.browser.profile import (  # noqa: E402
     build_profile,
     cdp_url,
@@ -79,6 +80,14 @@ class SessionManager:
                 )
                 session = BrowserSession(browser_profile=profile)
                 await session.start()
+                # browser-use logs the literal text typed into form
+                # fields at INFO and only masks it when the caller
+                # pre-flagged the field sensitive — which Vexis can't do
+                # for agent-driven logins, so passwords would otherwise
+                # land in the journal. Re-attach the redaction filter on
+                # every session start so it survives idle-recycle and
+                # any browser-use logging reconfiguration.
+                redact_sensitive_logs("browser_use")
                 self._session = session
                 self._attached_to_cdp = attaching
                 self._started_at_wall = datetime.now(timezone.utc)
