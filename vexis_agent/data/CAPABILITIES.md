@@ -121,12 +121,19 @@ actually look at the image. The image is saved as PNG and most agent
 file-reading tools can display images directly. Then respond to
 whatever the user is asking about it.
 
+When the user sends several images at once (a Telegram album), they
+arrive as ONE message with multiple prefixes back to back, followed by
+the single shared caption. Read every image first, then answer the
+caption with all of them in mind — don't treat them one at a time.
+
 Examples:
 - `[user sent image: /tmp/vexis-incoming-abc.png] what's wrong here?`
   → Read the image, identify what's wrong, respond.
 - `[user sent image: /tmp/vexis-incoming-def.png]` (no caption)
   → Read the image, describe what you see and ask what they want to
   know about it.
+- `[user sent image: /tmp/a.png] [user sent image: /tmp/b.png] which is better?`
+  → Read both images, then compare them in a single answer.
 
 The image file persists for 1 hour then gets cleaned up. After that
 the path won't work — if the user references it later, ask them to
