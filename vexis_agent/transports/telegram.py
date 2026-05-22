@@ -9,6 +9,7 @@ import re
 import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypeVar
@@ -161,6 +162,15 @@ _INCOMING_PHOTO_GLOB = "vexis-incoming-*.png"
 _INCOMING_PHOTO_MAX_AGE = timedelta(hours=1)
 _INCOMING_PHOTO_CLEANUP_INTERVAL_SECONDS = 600
 _INCOMING_BRAIN_PREFIX = "[user sent image: {path}]"
+# Telegram delivers an "album" (multiple photos sent together) as
+# separate photo messages sharing one media_group_id, with the caption
+# attached to only one of them. There is no "last photo of the group"
+# signal, so we buffer per media_group_id and dispatch the whole batch
+# as ONE brain turn once this quiet window elapses with no further
+# photo arriving. Sized comfortably above the sub-second gap Telegram
+# leaves between album messages so a slow download can't split a group.
+# See `_on_photo` / `_buffer_media_group_photo` / `_flush_media_group`.
+_MEDIA_GROUP_DEBOUNCE_SECONDS = 1.5
 _CANCEL_OK = "Cancelled, sir. What next?"
 _NOTHING_TO_CANCEL = "Nothing to cancel — I'm not working on anything right now."
 # /goal user-facing strings. Kept module-level so tests can import
@@ -485,13 +495,47 @@ def _make_pickup_preview(text: str, max_len: int = _PICKING_UP_PREVIEW_LEN) -> s
     return cleaned
 
 
-def _format_incoming_image_message(image_path: Path, caption: str | None) -> str:
-    """Build the synthetic brain message for an inbound image."""
-    prefix = _INCOMING_BRAIN_PREFIX.format(path=image_path)
+def _format_incoming_images_message(
+    image_paths: list[Path], caption: str | None
+) -> str:
+    """Build the synthetic brain message for one or more inbound images.
+
+    One ``[user sent image: <path>]`` prefix per image (in the order
+    given — album order for a media group), then the single shared
+    caption if there is one. The brain reads each path with its file
+    tool, so multiple prefixes in one message just means "look at all
+    of these, then answer the caption" — see data/CAPABILITIES.md.
+    """
+    prefix = " ".join(_INCOMING_BRAIN_PREFIX.format(path=p) for p in image_paths)
     body = (caption or "").strip()
     if body:
         return f"{prefix} {body}"
     return prefix
+
+
+def _format_incoming_image_message(image_path: Path, caption: str | None) -> str:
+    """Build the synthetic brain message for a single inbound image."""
+    return _format_incoming_images_message([image_path], caption)
+
+
+@dataclass
+class _MediaGroupBuffer:
+    """Accumulates one Telegram album (photos sharing a media_group_id).
+
+    Telegram delivers an album as N separate photo messages, with the
+    caption on whichever one the sending client attached it to. We
+    collect the downloaded image paths keyed by ``message_id`` (so the
+    batch keeps album order regardless of which download finishes
+    first), keep the single caption, and hold the live debounce timer
+    so a later photo in the same group can cancel-and-reschedule it.
+    """
+
+    chat_id: int
+    user_id: int
+    bot: object
+    entries: dict[int, Path] = field(default_factory=dict)
+    caption: str | None = None
+    timer: "asyncio.Task | None" = None
 
 
 def _cleanup_incoming_images(
@@ -728,6 +772,16 @@ class TelegramTransport:
         # callback_data budget. Dies on daemon restart — user
         # re-issues /model set <sub> and starts a fresh picker.
         self._picker_pending: dict[tuple[int, int], dict] = {}
+        # Telegram album buffering (see `_on_photo` / `_flush_media_group`).
+        # ``media_group_id`` → in-progress `_MediaGroupBuffer`. Guarded by
+        # the lock because ``concurrent_updates(True)`` lets the photos of
+        # one album land as concurrent PTB tasks. ``_media_group_timers``
+        # holds a strong reference to each live debounce task — without it
+        # asyncio can GC a timer mid-flush (gh-91887, same trap as
+        # ``_background_dispatch_tasks`` above).
+        self._media_group_buffers: dict[str, _MediaGroupBuffer] = {}
+        self._media_group_lock = asyncio.Lock()
+        self._media_group_timers: set[asyncio.Task] = set()
         # Streaming reply config (see docs/telegram-streaming.md).
         # Read once at startup to avoid hot-path disk reads on every
         # turn — the rest of vexis follows the same pattern for
@@ -1670,11 +1724,94 @@ class TelegramTransport:
 
         tg_file = await photo.get_file()
         await tg_file.download_to_drive(custom_path=image_path)
+
+        # Album: when the user sends several photos together, Telegram
+        # delivers each as its own photo message sharing one
+        # media_group_id (caption on whichever one the client picked).
+        # Buffer them and dispatch the whole batch as a SINGLE brain
+        # turn so the agent sees every image alongside the prompt,
+        # instead of answering each photo as a separate turn.
+        media_group_id = getattr(msg, "media_group_id", None)
+        if media_group_id is not None:
+            await self._buffer_media_group_photo(
+                media_group_id=media_group_id,
+                message_id=getattr(msg, "message_id", 0),
+                image_path=image_path,
+                caption=msg.caption,
+                chat_id=chat_id,
+                user_id=user.id,
+                bot=bot,
+            )
+            return
+
         synthetic = _format_incoming_image_message(image_path, msg.caption)
         # Preempt any pending goal continuations — photo turn should
         # run after the current in-flight turn, not behind continuations.
         await self._preempt_goal_continuations(chat_id)
         await self._dispatch_to_brain(bot, chat_id, user.id, synthetic)
+
+    async def _buffer_media_group_photo(
+        self,
+        *,
+        media_group_id: str,
+        message_id: int,
+        image_path: Path,
+        caption: str | None,
+        chat_id: int,
+        user_id: int,
+        bot: object,
+    ) -> None:
+        """Add one album photo to its media-group buffer and (re)arm the
+        debounce timer.
+
+        Each arriving photo cancels the timer the previous one armed and
+        starts a fresh one, so the batch only dispatches once the album
+        stops arriving (``_MEDIA_GROUP_DEBOUNCE_SECONDS`` of quiet). See
+        ``_flush_media_group`` for the dispatch side.
+        """
+        async with self._media_group_lock:
+            buf = self._media_group_buffers.get(media_group_id)
+            if buf is None:
+                buf = _MediaGroupBuffer(chat_id=chat_id, user_id=user_id, bot=bot)
+                self._media_group_buffers[media_group_id] = buf
+            buf.entries[message_id] = image_path
+            # Telegram puts the caption on exactly one message of the
+            # album; keep the first non-empty one we see.
+            if caption and caption.strip() and not buf.caption:
+                buf.caption = caption
+            if buf.timer is not None:
+                buf.timer.cancel()
+            timer = asyncio.create_task(self._flush_media_group(media_group_id))
+            # Strong ref so asyncio can't GC the timer mid-flush.
+            self._media_group_timers.add(timer)
+            timer.add_done_callback(self._media_group_timers.discard)
+            buf.timer = timer
+
+    async def _flush_media_group(self, media_group_id: str) -> None:
+        """Debounce-fire for one album: wait out the quiet window, then
+        dispatch every buffered photo as a single brain turn.
+
+        A photo arriving before the window elapses cancels this task and
+        arms a fresh one (see ``_buffer_media_group_photo``), so only the
+        last timer standing reaches the dispatch.
+        """
+        try:
+            await asyncio.sleep(_MEDIA_GROUP_DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        async with self._media_group_lock:
+            buf = self._media_group_buffers.get(media_group_id)
+            # Superseded by a newer timer (or already flushed) — stand down.
+            if buf is None or buf.timer is not asyncio.current_task():
+                return
+            del self._media_group_buffers[media_group_id]
+        image_paths = [buf.entries[mid] for mid in sorted(buf.entries)]
+        synthetic = _format_incoming_images_message(image_paths, buf.caption)
+        # Preempt any pending goal continuations — same rationale as the
+        # single-photo path: the album turn runs after the in-flight
+        # turn, not behind queued continuations.
+        await self._preempt_goal_continuations(buf.chat_id)
+        await self._dispatch_to_brain(buf.bot, buf.chat_id, buf.user_id, synthetic)
 
     async def _on_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message

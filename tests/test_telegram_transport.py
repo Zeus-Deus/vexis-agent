@@ -4,6 +4,11 @@ Photo updates from Telegram should land on disk as
 /tmp/vexis-incoming-<uuid>.png and be routed to the brain as a synthetic
 text message. A periodic cleanup sweeps files older than 1 hour.
 
+An album (multiple photos sent together, sharing a media_group_id) is
+buffered behind a debounce window and dispatched as a SINGLE brain turn
+carrying every image prefix plus the one caption — see the
+media_group tests below.
+
 Tests follow the codebase convention of sync test functions calling
 asyncio.run() rather than pytest-asyncio.
 """
@@ -21,6 +26,7 @@ import pytest
 from vexis_agent.core import paths, status as status_module
 from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.core.status import StatusSnapshot
+import vexis_agent.transports.telegram as telegram_mod
 from vexis_agent.transports.telegram import (
     _INCOMING_PHOTO_DIR,
     _PICKING_UP_PREFIX,
@@ -29,6 +35,7 @@ from vexis_agent.transports.telegram import (
     _build_incoming_photo_path,
     _cleanup_incoming_images,
     _format_incoming_image_message,
+    _format_incoming_images_message,
     _format_status_duration,
     _format_status_reply,
     _make_pickup_preview,
@@ -55,6 +62,29 @@ def test_format_message_with_blank_caption_drops_caption():
     path = Path("/tmp/vexis-incoming-abc.png")
     assert _format_incoming_image_message(path, "   \n") == (
         "[user sent image: /tmp/vexis-incoming-abc.png]"
+    )
+
+
+def test_format_images_message_multiple_with_caption():
+    """An album batches into one prefix per image, then one caption."""
+    paths = [
+        Path("/tmp/vexis-incoming-a.png"),
+        Path("/tmp/vexis-incoming-b.png"),
+        Path("/tmp/vexis-incoming-c.png"),
+    ]
+    out = _format_incoming_images_message(paths, "what's wrong here?")
+    assert out == (
+        "[user sent image: /tmp/vexis-incoming-a.png] "
+        "[user sent image: /tmp/vexis-incoming-b.png] "
+        "[user sent image: /tmp/vexis-incoming-c.png] what's wrong here?"
+    )
+
+
+def test_format_images_message_multiple_without_caption():
+    paths = [Path("/tmp/vexis-incoming-a.png"), Path("/tmp/vexis-incoming-b.png")]
+    assert _format_incoming_images_message(paths, None) == (
+        "[user sent image: /tmp/vexis-incoming-a.png] "
+        "[user sent image: /tmp/vexis-incoming-b.png]"
     )
 
 
@@ -146,12 +176,21 @@ class _FakeBot:
 
 class _FakeMessage:
     def __init__(
-        self, photo: tuple, caption: str | None, chat_id: int, bot: _FakeBot
+        self,
+        photo: tuple,
+        caption: str | None,
+        chat_id: int,
+        bot: _FakeBot,
+        *,
+        media_group_id: str | None = None,
+        message_id: int = 0,
     ) -> None:
         self.photo = photo
         self.caption = caption
         self.chat_id = chat_id
         self._bot = bot
+        self.media_group_id = media_group_id
+        self.message_id = message_id
 
     def get_bot(self) -> _FakeBot:
         return self._bot
@@ -174,8 +213,10 @@ class _FakeHandler:
         self.last_user_id: int | None = None
         self.last_chat_id: int | None = None
         self.last_text: str | None = None
+        self.handle_calls = 0
 
     async def handle(self, user_id: int, chat_id: int, text: str) -> str | None:
+        self.handle_calls += 1
         self.last_user_id = user_id
         self.last_chat_id = chat_id
         self.last_text = text
@@ -216,6 +257,10 @@ def _make_transport(handler: _FakeHandler, allowed_user_id: int) -> TelegramTran
     # transport with ``_streaming_enabled = True``.
     t._streaming_enabled = False  # type: ignore[attr-defined]
     t._streaming_min_interval = 1.0  # type: ignore[attr-defined]
+    # Telegram album buffering state — bypassed __init__ doesn't set it.
+    t._media_group_buffers = {}  # type: ignore[attr-defined]
+    t._media_group_lock = asyncio.Lock()  # type: ignore[attr-defined]
+    t._media_group_timers = set()  # type: ignore[attr-defined]
     return t
 
 
@@ -306,6 +351,85 @@ def test_on_photo_rejects_disallowed_user():
 
     assert photo.file.saved_to is None
     assert handler.last_text is None
+
+
+def test_on_photo_media_group_batches_into_single_turn(monkeypatch):
+    """An album — photos sharing a media_group_id — becomes ONE brain
+    turn carrying every image prefix plus the single caption, instead
+    of one turn per photo. Prefixes are ordered by message_id (album
+    order), independent of which photo arrives or downloads first.
+    """
+    monkeypatch.setattr(telegram_mod, "_MEDIA_GROUP_DEBOUNCE_SECONDS", 0.05)
+    handler = _FakeHandler(reply=None)
+    transport = _make_transport(handler, allowed_user_id=_USER)
+    bot = _FakeBot()
+    # Three photos; the caption rides the middle message. message_ids
+    # are sent out of order to prove the batch sorts by message_id.
+    photos = [_FakePhoto(), _FakePhoto(), _FakePhoto()]
+    specs = [
+        (photos[0], None, 102),
+        (photos[1], "describe all of these", 100),
+        (photos[2], None, 101),
+    ]
+
+    async def run() -> None:
+        for photo, caption, message_id in specs:
+            msg = _FakeMessage(
+                photo=(photo,), caption=caption, chat_id=_CHAT, bot=bot,
+                media_group_id="album-1", message_id=message_id,
+            )
+            await transport._on_photo(_FakeUpdate(msg, _FakeUser(_USER)), None)
+        # Wait out the debounce window + the dispatched drain.
+        await asyncio.sleep(0.3)
+
+    try:
+        asyncio.run(run())
+
+        assert handler.handle_calls == 1
+        saved = [p.file.saved_to for p in photos]
+        assert all(s is not None for s in saved)
+        # message_id order: photo[1] (100), photo[2] (101), photo[0] (102).
+        assert handler.last_text == (
+            f"[user sent image: {saved[1]}] "
+            f"[user sent image: {saved[2]}] "
+            f"[user sent image: {saved[0]}] describe all of these"
+        )
+    finally:
+        for p in photos:
+            if p.file.saved_to is not None:
+                p.file.saved_to.unlink(missing_ok=True)
+
+
+def test_on_photo_media_group_without_caption_uses_bare_prefixes(monkeypatch):
+    """A captionless album still batches into a single turn."""
+    monkeypatch.setattr(telegram_mod, "_MEDIA_GROUP_DEBOUNCE_SECONDS", 0.05)
+    handler = _FakeHandler(reply=None)
+    transport = _make_transport(handler, allowed_user_id=_USER)
+    bot = _FakeBot()
+    photos = [_FakePhoto(), _FakePhoto()]
+
+    async def run() -> None:
+        for i, photo in enumerate(photos):
+            msg = _FakeMessage(
+                photo=(photo,), caption=None, chat_id=_CHAT, bot=bot,
+                media_group_id="album-2", message_id=200 + i,
+            )
+            await transport._on_photo(_FakeUpdate(msg, _FakeUser(_USER)), None)
+        await asyncio.sleep(0.3)
+
+    try:
+        asyncio.run(run())
+
+        assert handler.handle_calls == 1
+        saved = [p.file.saved_to for p in photos]
+        assert all(s is not None for s in saved)
+        assert handler.last_text == (
+            f"[user sent image: {saved[0]}] [user sent image: {saved[1]}]"
+        )
+    finally:
+        for p in photos:
+            if p.file.saved_to is not None:
+                p.file.saved_to.unlink(missing_ok=True)
 
 
 # --- pickup preview formatting ---------------------------------------------
