@@ -3,11 +3,12 @@
 Covers ``TelegramTransport._send_brain_reply_streaming`` and the
 ``_dispatch_brain_turn`` router that picks streaming vs buffered.
 
-Pin: 13 streaming-side cases (placeholder, edits, throttle, rollover,
-done sentinel, error path, screenshot extraction, disabled fallback,
-empty response, dispatcher exception). Plus 5 cases on the
-``_split_at_streaming_boundary`` helper. Counts drift; this docstring
-tracks the truth at write time, not the runtime.
+Pin: 14 streaming-side cases (placeholder, placeholder transient-
+network retry, edits, throttle, rollover, done sentinel, error path,
+screenshot extraction, disabled fallback, empty response, dispatcher
+exception). Plus 5 cases on the ``_split_at_streaming_boundary``
+helper. Counts drift; this docstring tracks the truth at write time,
+not the runtime.
 
 Tests follow the codebase convention of sync test functions calling
 ``asyncio.run()`` rather than pytest-asyncio, matching the style in
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from telegram.error import TimedOut
 
 from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.transports.telegram import (
@@ -127,6 +129,29 @@ class _StreamingBot:
         self.edits.append((chat_id, message_id, text))
 
 
+class _FlakyStreamingBot(_StreamingBot):
+    """``_StreamingBot`` whose first ``fail_times`` ``send_message``
+    calls raise a transient ``TimedOut`` before succeeding — exercises
+    the placeholder-send retry in ``_send_brain_reply_streaming``."""
+
+    def __init__(self, fail_times: int) -> None:
+        super().__init__()
+        self._remaining_failures = fail_times
+        self.send_attempts = 0
+
+    async def send_message(
+        self, *, chat_id: int, text: str, parse_mode: Any = None,
+        **kw: Any,
+    ) -> _FakeMessage:
+        self.send_attempts += 1
+        if self._remaining_failures > 0:
+            self._remaining_failures -= 1
+            raise TimedOut()
+        return await super().send_message(
+            chat_id=chat_id, text=text, parse_mode=parse_mode, **kw
+        )
+
+
 class _StreamingHandler:
     """Async-iterable stub for ``MessageHandler.stream``.
 
@@ -188,6 +213,30 @@ def test_streaming_sends_placeholder_first():
 
     # Placeholder is the first send.
     assert bot.sent_messages
+    assert bot.sent_messages[0] == (_CHAT, _STREAMING_PLACEHOLDER)
+
+
+def test_streaming_placeholder_survives_transient_network_error(monkeypatch):
+    """A transient TimedOut on the placeholder send is retried, not
+    surfaced — the turn completes normally instead of breaking. This
+    is the failure mode the retry helper was added for."""
+    # Zero the backoff so the retry sleeps don't slow the test.
+    monkeypatch.setattr(
+        "vexis_agent.transports.telegram._TELEGRAM_SEND_BACKOFF_SECONDS",
+        0.0,
+    )
+    handler = _StreamingHandler([("chunk", "hi there"), ("done", "hi there")])
+    transport = _make_streaming_transport(handler)
+    bot = _FlakyStreamingBot(fail_times=2)
+
+    final = asyncio.run(
+        transport._send_brain_reply_streaming(bot, _CHAT, _USER, "hi")
+    )
+
+    assert final == "hi there"
+    # Placeholder send took 3 tries (2 transient failures + success);
+    # only the successful send is recorded, and it is still first.
+    assert bot.send_attempts == 3
     assert bot.sent_messages[0] == (_CHAT, _STREAMING_PLACEHOLDER)
 
 

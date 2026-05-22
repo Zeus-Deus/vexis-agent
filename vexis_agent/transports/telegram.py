@@ -8,8 +8,10 @@ import os
 import re
 import tempfile
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TypeVar
 
 from PIL import Image, UnidentifiedImageError
 from telegram import (
@@ -19,6 +21,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import BadRequest, NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -60,6 +63,63 @@ from vexis_agent.tools.session_lock import is_session_locked
 from vexis_agent.tools.voxtype import TranscriptionEmpty, TranscriptionError, transcribe_audio
 
 log = logging.getLogger(__name__)
+
+
+# --- Transient-network retry for outbound Telegram calls --------------
+#
+# A long-lived bot intermittently hits a TCP connect/read timeout or a
+# DNS blip posting to api.telegram.org — likeliest when the host is
+# also busy with other network I/O (e.g. a browser-automation task).
+# python-telegram-bot does not retry outbound sends, so a 1-2s blip
+# would otherwise surface to the user as "Something broke". A couple of
+# retries with short linear backoff turn that into an invisible
+# self-heal. Backoff is a module global so tests can zero it out.
+_TELEGRAM_SEND_ATTEMPTS = 3
+_TELEGRAM_SEND_BACKOFF_SECONDS = 1.0
+
+_T = TypeVar("_T")
+
+
+async def _send_telegram_with_retry(
+    label: str,
+    chat_id: int,
+    make_call: Callable[[], Awaitable[_T]],
+) -> _T:
+    """Await an outbound Telegram call, retrying transient network errors.
+
+    ``make_call`` is a zero-argument callable returning a *fresh*
+    coroutine each time it is invoked — a coroutine can only be awaited
+    once, so every retry needs a new one.
+
+    Retried: ``TimedOut`` and bare ``NetworkError`` — genuinely
+    transient connectivity faults. NOT retried: ``BadRequest``, which
+    subclasses ``NetworkError`` but is a permanent 4xx (stale message
+    id, "message is not modified", chat not found) — it re-raises at
+    once. ``RetryAfter`` is not a ``NetworkError`` and is left to
+    propagate untouched; its server-mandated delay is not ours to
+    hammer. The final attempt's exception propagates, so a real outage
+    still surfaces to the caller.
+    """
+    last_exc: NetworkError | None = None
+    for attempt in range(1, _TELEGRAM_SEND_ATTEMPTS + 1):
+        try:
+            return await make_call()
+        except BadRequest:
+            raise
+        except NetworkError as exc:
+            last_exc = exc
+            if attempt == _TELEGRAM_SEND_ATTEMPTS:
+                break
+            delay = _TELEGRAM_SEND_BACKOFF_SECONDS * attempt
+            log.warning(
+                "Telegram %s for chat %s hit a transient network error "
+                "(attempt %d/%d: %s) — retrying in %.1fs",
+                label, chat_id, attempt, _TELEGRAM_SEND_ATTEMPTS, exc, delay,
+            )
+            await asyncio.sleep(delay)
+    assert last_exc is not None  # loop only exits here after a NetworkError
+    raise last_exc
+
 
 _TYPING_REFRESH_SECONDS = 4
 _MAX_CHUNK = 4000
@@ -3754,8 +3814,11 @@ class TelegramTransport:
                     outcome.error_message or str(exc) or "streaming drain raised"
                 )
             try:
-                await bot.send_message(
-                    chat_id=chat_id, text=_DRAIN_TURN_BROKE, parse_mode=None,
+                await _send_telegram_with_retry(
+                    "broken-turn ack", chat_id,
+                    lambda: bot.send_message(
+                        chat_id=chat_id, text=_DRAIN_TURN_BROKE, parse_mode=None,
+                    ),
                 )
             except Exception:
                 log.exception(
@@ -3815,9 +3878,14 @@ class TelegramTransport:
         """
         # 1. Placeholder bubble. Doubles as the first ack so the
         #    user sees a reaction inside ~200ms, even if the brain
-        #    takes 20s to emit its first delta.
-        placeholder = await bot.send_message(
-            chat_id=chat_id, text=_STREAMING_PLACEHOLDER, parse_mode=None,
+        #    takes 20s to emit its first delta. This is the make-or-
+        #    break send — if it fails the whole turn breaks — so it
+        #    rides the transient-network retry.
+        placeholder = await _send_telegram_with_retry(
+            "placeholder send", chat_id,
+            lambda: bot.send_message(
+                chat_id=chat_id, text=_STREAMING_PLACEHOLDER, parse_mode=None,
+            ),
         )
         message_id = placeholder.message_id
         # ``current_buffer``: text in the message identified by
@@ -4114,7 +4182,12 @@ class TelegramTransport:
         if not text:
             return
         for chunk in split_for_telegram(text):
-            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=None)
+            await _send_telegram_with_retry(
+                "reply send", chat_id,
+                lambda chunk=chunk: bot.send_message(
+                    chat_id=chat_id, text=chunk, parse_mode=None,
+                ),
+            )
 
     @staticmethod
     async def _keep_typing(bot, chat_id: int) -> None:
