@@ -283,6 +283,11 @@ async def extract_relationships(
             reasoning_level=subsystem_reasoning("relationships_extractor"),
             timeout_seconds=EXTRACTOR_TIMEOUT_SECONDS,
             env_overrides={EXTRACTOR_ENV_VAR: "1"},
+            # Issue #10 — defense in depth: the extractor produces a
+            # JSON list of facts the candidate-store consumes. It
+            # never writes files; a poisoned transcript must not coax
+            # it into doing so either.
+            allowed_tools=[],
             cwd=workspace,
             subsystem="relationships_extractor",
         )

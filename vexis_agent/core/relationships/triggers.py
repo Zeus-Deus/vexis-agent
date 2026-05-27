@@ -297,6 +297,10 @@ async def _classifier_call(
             reasoning_level=subsystem_reasoning("relationships_classifier"),
             timeout_seconds=CLASSIFIER_TIMEOUT_SECONDS,
             env_overrides={RELATIONSHIPS_CLASSIFIER_ENV_VAR: "1"},
+            # Issue #10 — defense in depth: the relationships
+            # classifier is a JSON-emitting text judge. Zero
+            # legitimate need for tools.
+            allowed_tools=[],
             cwd=workspace,
             subsystem="relationships_classifier",
         )

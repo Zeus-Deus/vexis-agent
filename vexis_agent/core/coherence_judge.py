@@ -653,6 +653,10 @@ def run_coherence_judge(
                 reasoning_level=subsystem_reasoning("coherence_judge"),
                 timeout_seconds=COHERENCE_JUDGE_TIMEOUT_SECONDS,
                 env_overrides={COHERENCE_JUDGE_ENV_VAR: "1"},
+                # Issue #10 — defense in depth: the coherence judge is
+                # advisory-only and produces a text verdict. Zero
+                # legitimate need for tools.
+                allowed_tools=[],
                 cwd=workspace,
                 subsystem="coherence_judge",
             )

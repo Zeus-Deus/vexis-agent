@@ -412,7 +412,18 @@ def run_phase2(
                 reasoning_level=subsystem_reasoning("curator"),
                 timeout_seconds=PHASE2_TIMEOUT_SECONDS,
                 env_overrides={"VEXIS_CURATOR": "1"},
-                allow_tools=True,  # consolidation writes files
+                # Issue #10 — defense in depth: the consolidation pass
+                # moves / merges / archives skill SKILL.md trees. The
+                # narrowest legitimate surface is Read + Write + Edit
+                # (no Bash, no WebFetch, no NotebookEdit). ``Glob`` is
+                # in the allowlist so the model can discover the
+                # candidate trees the curator's prompt points it at.
+                # ``allow_tools`` left True for the same backstop the
+                # claude_code argv builder uses to add the bypass
+                # flag; ``allowed_tools`` takes precedence when both
+                # are set.
+                allow_tools=True,
+                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
                 cwd=workspace,
                 subsystem="curator",
             )

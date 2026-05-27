@@ -122,8 +122,10 @@ class BrainNull(Brain):
         """Return the full kwarg snapshot for every ``spawn_aux()``
         call. Each dict has keys: ``prompt``, ``model_tier``,
         ``timeout_seconds``, ``env_overrides``, ``allow_tools``,
-        ``cwd``. Tests that need to assert on env-override merging,
-        tool-permission flag, or per-call timeout use this."""
+        ``allowed_tools``, ``cwd``, ``subsystem``, ``reasoning_level``,
+        ``context_window``. Tests that need to assert on env-override
+        merging, the per-call defense-in-depth tool allowlist (Issue
+        #10), or per-call timeout use this."""
         return [dict(r) for r in self._aux_records]
 
     def mcp_writes(self) -> list[list[McpServerSpec]]:
@@ -176,17 +178,27 @@ class BrainNull(Brain):
         timeout_seconds: float = 60.0,
         env_overrides: dict[str, str] | None = None,
         allow_tools: bool = False,
+        allowed_tools: list[str] | None = None,
         cwd: Path | None = None,
         subsystem: str | None = None,
         reasoning_level: str | None = None,
         context_window: int | None = None,
     ) -> AuxResult:
+        # Issue #10 — record ``allowed_tools`` on the call record so
+        # tests can assert each caller's defense-in-depth allowlist
+        # without spawning a real subprocess. ``None`` stays ``None``
+        # (back-compat: caller didn't pass it); an explicit list (even
+        # ``[]``) is preserved as-is so the test surface can tell the
+        # text-only-explicit case apart from the back-compat case.
         self._aux_records.append({
             "prompt": prompt,
             "model_tier": model_tier,
             "timeout_seconds": timeout_seconds,
             "env_overrides": dict(env_overrides) if env_overrides else None,
             "allow_tools": allow_tools,
+            "allowed_tools": (
+                list(allowed_tools) if allowed_tools is not None else None
+            ),
             "cwd": cwd,
             "subsystem": subsystem,
             "reasoning_level": reasoning_level,
