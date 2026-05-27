@@ -709,6 +709,13 @@ DEFAULT_SUBSYSTEM_TIERS: dict[str, str] = {
     "learning_review": "small",
     "learning_triage": "tiny",
     "migration_classifier": "small",
+    # Issue #11 — conversation compressor. ``small`` because
+    # summarisation is largely mechanical: read the transcript, fit
+    # it into the fixed-section template. A larger tier doesn't
+    # produce qualitatively better summaries for the cost. Users
+    # who want the highest-fidelity summary on multi-day goals can
+    # override via ``models.subsystems.compressor: large``.
+    "compressor": "small",
 }
 
 # Default tier→model map for the claude-code brain. The keys are the
@@ -1025,6 +1032,93 @@ def brain_file_mutation_footer_enabled() -> bool:
         if cleaned in ("false", "no", "0", "off"):
             return False
     return _FILE_MUTATION_FOOTER_DEFAULT
+
+
+# ──────────────────────────────────────────────────────────────────
+# Conversation compression (Issue #11)
+#
+# Off-by-default trigger settings live here so they're hot-reloaded
+# per call (the compressor is called once before every brain turn;
+# re-reading the config is cheap and lets a user dial the threshold
+# down for testing without restarting the daemon).
+# ──────────────────────────────────────────────────────────────────
+
+
+DEFAULT_COMPRESSION_ENABLED = True
+# Fraction of the active model's context window that triggers
+# compression. 0.80 leaves a 20% margin for the user's next message,
+# the assistant's reply, and any tool calls. Lower this to fire
+# compression earlier (useful when running models with small
+# windows); raise it to defer compression as long as possible.
+DEFAULT_COMPRESSION_THRESHOLD_RATIO = 0.80
+# Turn count above which compression also fires. Catches sessions
+# that the token estimator alone would miss (many small turns).
+DEFAULT_COMPRESSION_THRESHOLD_TURNS = 40
+# How many recent turns are kept verbatim after compression.
+DEFAULT_COMPRESSION_PROTECT_LAST_N_TURNS = 10
+
+
+def compression_enabled() -> bool:
+    """``True`` iff the compressor is enabled. Default ``True``.
+
+    Disable via ``compression.enabled: false`` in
+    ``~/.vexis/config.yaml`` — the handler's pre-turn call to
+    :meth:`Brain.compress_if_needed` short-circuits to a no-op
+    when this returns ``False``.
+    """
+    raw = _section("compression").get("enabled", DEFAULT_COMPRESSION_ENABLED)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        cleaned = raw.strip().lower()
+        if cleaned in ("true", "yes", "1", "on"):
+            return True
+        if cleaned in ("false", "no", "0", "off"):
+            return False
+    return DEFAULT_COMPRESSION_ENABLED
+
+
+def compression_threshold_ratio() -> float:
+    """Fraction of the model context window that triggers compression.
+
+    Clamped to ``[0.10, 0.95]`` — outside that band compression is
+    either pointless (too high) or fires constantly (too low). Bad
+    values fall back to :data:`DEFAULT_COMPRESSION_THRESHOLD_RATIO`.
+    """
+    raw = _section("compression").get(
+        "threshold_ratio", DEFAULT_COMPRESSION_THRESHOLD_RATIO,
+    )
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_COMPRESSION_THRESHOLD_RATIO
+    if v < 0.10 or v > 0.95:
+        return DEFAULT_COMPRESSION_THRESHOLD_RATIO
+    return v
+
+
+def compression_threshold_turns() -> int:
+    """Turn-count compression trigger. Default
+    :data:`DEFAULT_COMPRESSION_THRESHOLD_TURNS` (40). Minimum 5 — any
+    lower and the user can't even complete a short conversation
+    before getting compressed."""
+    return _int_or_default(
+        _section("compression").get("threshold_turns"),
+        DEFAULT_COMPRESSION_THRESHOLD_TURNS,
+        minimum=5,
+    )
+
+
+def compression_protect_last_n_turns() -> int:
+    """How many recent turns to keep verbatim after compression.
+    Default :data:`DEFAULT_COMPRESSION_PROTECT_LAST_N_TURNS` (10).
+    Minimum 2 — below that the model loses the immediate context
+    around the user's last message."""
+    return _int_or_default(
+        _section("compression").get("protect_last_n_turns"),
+        DEFAULT_COMPRESSION_PROTECT_LAST_N_TURNS,
+        minimum=2,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────

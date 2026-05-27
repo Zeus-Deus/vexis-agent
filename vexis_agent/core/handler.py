@@ -282,6 +282,13 @@ class MessageHandler:
         )
         message = await self._inject_context(chat_id, text)
 
+        # Issue #11 — pre-turn conversation compression. Best-effort:
+        # any failure inside ``compress_if_needed`` is swallowed at
+        # the brain layer; we wrap defensively here too so a buggy
+        # third-party brain implementation can't take the foreground
+        # turn down with it.
+        await self._maybe_compress()
+
         try:
             reply = await self._brain.respond(
                 message, chat_id,
@@ -381,6 +388,13 @@ class MessageHandler:
             model, reasoning_level,
         )
         message = await self._inject_context(chat_id, text)
+
+        # Issue #11 — same pre-turn compression hook as :meth:`handle`.
+        # Streaming and buffered paths must behave identically here:
+        # if the buffered path compresses, the streamed path must
+        # also compress, or the same conversation produces different
+        # transcripts depending on which transport drove the turn.
+        await self._maybe_compress()
 
         full = ""
         try:
@@ -505,6 +519,39 @@ class MessageHandler:
             )
             return cu_model, cu_reasoning
         return model, reasoning_level
+
+    async def _maybe_compress(self) -> None:
+        """Call :meth:`Brain.compress_if_needed` on the active session.
+
+        Issue #11 — pre-turn compression. Failure-tolerant: any
+        exception (the brain's compressor crashed, the JSONL parse
+        bailed, an aux spawn timed out) is logged and swallowed so
+        a broken compressor cannot take the foreground turn down
+        with it. The brain implementations already do this layer
+        internally; we wrap a second time at the handler so a third-
+        party brain that hasn't read the contract still can't
+        regress the turn.
+        """
+        try:
+            session_id = self._sessions.get()
+        except Exception:  # pragma: no cover - defensive
+            log.debug("compressor: could not read active session", exc_info=True)
+            return
+        if not session_id:
+            return
+        try:
+            compressed = await self._brain.compress_if_needed(session_id)
+        except Exception:
+            log.warning(
+                "compressor: brain.compress_if_needed raised for session %s",
+                session_id, exc_info=True,
+            )
+            return
+        if compressed:
+            log.info(
+                "compressor: rewrote transcript for session %s before turn",
+                session_id,
+            )
 
     async def _inject_context(self, chat_id: int, text: str) -> str:
         """Prepend pending system notes AND the file-mutation

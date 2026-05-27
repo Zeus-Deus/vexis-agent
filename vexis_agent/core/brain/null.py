@@ -95,6 +95,15 @@ class BrainNull(Brain):
         # brains drain their disk-derived buffer. Default empty so
         # the existing suite stays oblivious to the feature.
         self._files_changed_by_chat: dict[int, list[str]] = {}
+        # Issue #11: record of ``compress_if_needed`` calls so tests
+        # that exercise the handler's pre-turn compression hook can
+        # assert the call happened without spinning up a real brain.
+        # Each entry is the ``session_id`` argument the handler
+        # passed. ``_compress_returns`` is a queue of return values
+        # — tests pre-load to drive specific code paths (e.g.
+        # "second turn returns True, first returns False").
+        self._compress_calls: list[str] = []
+        self._compress_returns: list[bool] = []
 
     # ─── injection / inspection helpers (test-facing API) ────────
 
@@ -276,6 +285,31 @@ class BrainNull(Brain):
     async def kill_in_flight(self) -> None:
         # No subprocess to kill in the null brain.
         return None
+
+    # ─── Issue #11 — compress_if_needed test surface ─────────────
+
+    def queue_compress_returns(self, *values: bool) -> None:
+        """Test hook: pre-load the return values for the next N
+        :meth:`compress_if_needed` calls. Unspecified calls fall back
+        to the ABC default (``False``)."""
+        self._compress_returns.extend(values)
+
+    def compress_calls(self) -> list[str]:
+        """Test hook: return the list of session_ids
+        :meth:`compress_if_needed` was called with, in order."""
+        return list(self._compress_calls)
+
+    async def compress_if_needed(self, session_id: str) -> bool:
+        """No-op by default (per ABC contract — null brain is inert).
+
+        Tests can drive specific behaviour by pre-loading
+        :meth:`queue_compress_returns`. Every call is recorded
+        regardless so the test can assert the handler made the
+        call."""
+        self._compress_calls.append(session_id)
+        if self._compress_returns:
+            return self._compress_returns.pop(0)
+        return False
 
     # ─── Issue #9 — file-mutation verifier footer test surface ───
 
