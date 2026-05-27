@@ -86,3 +86,56 @@ def test_allowlisted_files_exist() -> None:
             f"allowlisted path {rel!r} no longer exists — update "
             "_ALLOWLIST in this test to match the new location."
         )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Issue #11 — Brain.compress_if_needed parity
+# ──────────────────────────────────────────────────────────────────
+
+
+import asyncio
+import inspect
+
+from vexis_agent.core.brain.base import Brain
+from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.null import BrainNull
+from vexis_agent.core.brain.opencode import OpenCodeBrain
+
+
+def test_compress_if_needed_exists_on_all_brains() -> None:
+    """Every brain implementation MUST expose ``compress_if_needed``
+    — the handler calls it unconditionally before each turn."""
+    for brain_cls in (Brain, ClaudeCodeBrain, BrainNull, OpenCodeBrain):
+        assert hasattr(brain_cls, "compress_if_needed"), (
+            f"{brain_cls.__name__} is missing compress_if_needed — "
+            "every Brain must accept the pre-turn call site, even "
+            "if the implementation is a no-op."
+        )
+        method = getattr(brain_cls, "compress_if_needed")
+        assert inspect.iscoroutinefunction(method), (
+            f"{brain_cls.__name__}.compress_if_needed must be async — "
+            "the handler awaits it directly."
+        )
+
+
+def test_compress_if_needed_is_noop_on_null_brain() -> None:
+    """BrainNull's default behaviour must be no-op (returns False)
+    so test fixtures that never opt into compression don't see
+    surprise rewrites."""
+    brain = BrainNull()
+    result = asyncio.run(brain.compress_if_needed("some-session-id"))
+    assert result is False
+    # And the call IS recorded for assertions.
+    assert brain.compress_calls() == ["some-session-id"]
+
+
+def test_compress_if_needed_null_brain_queue_drives_returns() -> None:
+    """The pre-loaded queue lets tests drive specific return values."""
+    brain = BrainNull()
+    brain.queue_compress_returns(True, False, True)
+    results = [
+        asyncio.run(brain.compress_if_needed(f"s{i}")) for i in range(4)
+    ]
+    # First three from the queue, fourth falls back to False.
+    assert results == [True, False, True, False]
+    assert brain.compress_calls() == ["s0", "s1", "s2", "s3"]

@@ -34,7 +34,10 @@ import re
 import shutil
 import signal
 import subprocess
+import uuid as _uuid
 from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from vexis_agent.core.brain.base import (
@@ -1333,6 +1336,208 @@ class ClaudeCodeBrain(Brain):
             return False
         return _is_curator_owned(jsonl_path)
 
+    # ─── Issue #11: conversation compression ─────────────────────
+
+    async def compress_if_needed(self, session_id: str) -> bool:
+        """Summarise the older half of the session JSONL when the
+        configured threshold is crossed.
+
+        Implementation outline:
+
+          1. Walk the JSONL, collecting (role, text, original_line)
+             tuples in chronological order for every conversational
+             turn. Non-conversational lines (permission-mode,
+             file-history-snapshot, queue-operation, attachment) are
+             retained as ``preamble``/``epilogue`` segments so we
+             never strip claude-code's bookkeeping out from under it.
+          2. Build a :class:`CompressionInputs` with the live system
+             prompt + an empty tool_schemas_text (claude-code surfaces
+             tool schemas via subprocess flags, not strings we hold
+             in memory — the conservative estimate is fine because
+             the threshold ratio is already an 80% safety margin).
+          3. If :func:`should_compress` says no, log and return False.
+          4. Compute a :class:`ReplacementPlan` (handles iterative
+             summaries — a session whose first conversational turn
+             is a SUMMARY_PREFIX message folds the previous summary
+             into the new one).
+          5. Render the summariser prompt, call
+             :meth:`spawn_aux(model_tier=subsystem_tier("compressor"))`
+             with text-only tool allowlist (``allowed_tools=[]``) and
+             ``VEXIS_COMPRESSOR=1`` for audit logs.
+          6. On a clean stdout, atomically rewrite the JSONL:
+             ``preamble`` + synthetic SUMMARY_PREFIX user turn +
+             verbatim copy of the protected-tail original lines.
+
+        Compression is a best-effort optimisation — any failure
+        (summariser timed out, returned junk, JSONL parse failed,
+        rename failed) logs and returns False rather than raising.
+        The next turn runs without compression; the handler tries
+        again on the following turn.
+
+        Recursion-guard invariant: the synthetic summary message
+        starts with :data:`~vexis_agent.core.brain.compressor.SUMMARY_PREFIX`
+        which does NOT overlap any of the recursion-guard prefixes,
+        so a compressed foreground transcript still passes the
+        curator's content-prefix filter (which is the right answer
+        — we WANT the curator to be able to review compressed
+        sessions for lessons).
+        """
+        from vexis_agent.core.brain.compressor import (
+            CompressionInputs,
+            build_first_compaction_prompt,
+            build_iterative_compaction_prompt,
+            plan_replacement,
+            serialize_messages_for_summary,
+            should_compress,
+            wrap_with_summary_prefix,
+        )
+        from vexis_agent.core.transcripts import claude_session_jsonl_dir
+        from vexis_agent.core.yaml_config import (
+            compression_enabled,
+            compression_protect_last_n_turns,
+            compression_threshold_ratio,
+            compression_threshold_turns,
+            subsystem_tier,
+        )
+
+        if not compression_enabled():
+            return False
+
+        jsonl_path = (
+            claude_session_jsonl_dir(self._workspace) / f"{session_id}.jsonl"
+        )
+        if not jsonl_path.is_file():
+            return False
+
+        # Step 1: parse the JSONL into ordered segments. We keep the
+        # raw line bytes for the protected tail so the byte-for-byte
+        # invariant survives the rewrite — pull-and-rewrite via the
+        # flattened TranscriptMessage shape would lose tool-call
+        # blocks and metadata.
+        parsed = await asyncio.to_thread(_parse_jsonl_for_compression, jsonl_path)
+        if parsed is None:
+            return False
+        preamble_lines, message_records, epilogue_lines = parsed
+        if not message_records:
+            return False
+
+        messages = [(rec.role, rec.text) for rec in message_records]
+
+        # Step 2: trigger decision.
+        system_prompt = self._system_prompt_for(session_id)
+        inputs = CompressionInputs(
+            messages=messages,
+            system_prompt=system_prompt,
+            tool_schemas_text="",  # claude-code surfaces tools via CLI flags
+            context_window_tokens=None,
+            threshold_ratio=compression_threshold_ratio(),
+            threshold_turns=compression_threshold_turns(),
+        )
+        decision = should_compress(inputs)
+        if not decision.compress:
+            log.debug(
+                "compress_if_needed(claude-code, %s): %s",
+                session_id, decision.reason,
+            )
+            return False
+        log.info(
+            "compress_if_needed(claude-code, %s): triggering — %s",
+            session_id, decision.reason,
+        )
+
+        # Step 3: plan the replacement.
+        protect = compression_protect_last_n_turns()
+        plan = plan_replacement(messages, protect_last_n_turns=protect)
+        if not plan.messages_to_summarise:
+            log.debug(
+                "compress_if_needed(claude-code, %s): nothing to summarise "
+                "(protected tail of %d already covers all turns)",
+                session_id, protect,
+            )
+            return False
+
+        # Step 4: build the summariser prompt + spawn the aux call.
+        new_block = serialize_messages_for_summary(plan.messages_to_summarise)
+        if plan.previous_summary is not None:
+            prompt = build_iterative_compaction_prompt(
+                plan.previous_summary, new_block,
+            )
+        else:
+            prompt = build_first_compaction_prompt(new_block)
+
+        try:
+            result = await self.spawn_aux(
+                prompt,
+                model_tier=subsystem_tier("compressor"),
+                # 180s ceiling — summariser output is bounded by the
+                # template (~10 sections); a multi-minute spawn is
+                # almost certainly stuck rather than productive.
+                timeout_seconds=180.0,
+                # Forensic marker so audit logs / curator scans can
+                # tell vexis-spawned compressions apart. The content-
+                # prefix check on the resulting JSONL is the canonical
+                # filter; this env var is for `ps` and logging.
+                env_overrides={"VEXIS_COMPRESSOR": "1"},
+                # Defense in depth: the summariser writes prose, not
+                # tool calls. An explicit text-only allowlist makes a
+                # poisoned transcript that tries to coax the summariser
+                # into running Bash fail loud instead of execute.
+                allowed_tools=[],
+                cwd=self._workspace,
+                subsystem="compressor",
+            )
+        except Exception as exc:
+            log.warning(
+                "compress_if_needed(claude-code, %s): spawn_aux failed: %s",
+                session_id, exc,
+            )
+            return False
+        if result.returncode != 0:
+            log.warning(
+                "compress_if_needed(claude-code, %s): summariser exited %d "
+                "(stderr=%r)",
+                session_id, result.returncode,
+                (result.stderr or "")[:200],
+            )
+            return False
+        summary_body = (result.stdout or "").strip()
+        if not summary_body:
+            log.warning(
+                "compress_if_needed(claude-code, %s): summariser returned empty body",
+                session_id,
+            )
+            return False
+
+        synthetic_user_text = wrap_with_summary_prefix(summary_body)
+
+        # Step 5: atomically rewrite the JSONL.
+        try:
+            await asyncio.to_thread(
+                _rewrite_jsonl_with_summary,
+                jsonl_path,
+                session_id,
+                preamble_lines,
+                synthetic_user_text,
+                message_records,
+                plan.protected_tail_indices,
+                epilogue_lines,
+                self._workspace,
+            )
+        except Exception:
+            log.exception(
+                "compress_if_needed(claude-code, %s): JSONL rewrite failed",
+                session_id,
+            )
+            return False
+        log.info(
+            "compress_if_needed(claude-code, %s): rewrote transcript "
+            "(%d summarised → 1 summary turn + %d protected)",
+            session_id,
+            len(plan.messages_to_summarise),
+            len(plan.protected_tail),
+        )
+        return True
+
     def write_mcp_config(self, servers: list[McpServerSpec]) -> Path:
         """Write claude-code's MCP server config to
         ``<workspace>/.mcp.json``.
@@ -1498,3 +1703,255 @@ class ClaudeCodeBrain(Brain):
         the same file-mutation summary the handler injected on the
         next user message — without racing the handler's consume."""
         return list(self._files_changed_by_chat.get(chat_id, []))
+
+
+# ──────────────────────────────────────────────────────────────────
+# Issue #11 — JSONL parse + atomic rewrite helpers
+#
+# Kept at module level so the conversation-compressor module can be
+# exercised in unit tests without needing a full ClaudeCodeBrain
+# subprocess. The per-brain method on the class above is a thin
+# orchestrator over these.
+# ──────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _CompressionMsgRecord:
+    """One conversational turn's contribution to the compressor's
+    flat representation.
+
+    ``line_index``: 0-based offset into the JSONL line list — used
+    by the rewrite helper to copy protected-tail lines byte-for-byte.
+    ``role`` / ``text``: flattened shape the compressor's prompt
+    builder consumes.
+    """
+
+    line_index: int
+    role: str
+    text: str
+
+
+def _parse_jsonl_for_compression(
+    jsonl_path: Path,
+) -> tuple[list[str], list[_CompressionMsgRecord], list[str]] | None:
+    """Walk a claude-code JSONL and split it into the three segments
+    the compressor cares about.
+
+    Returns ``(preamble_lines, message_records, epilogue_lines)`` where:
+
+    - ``preamble_lines``: every non-conversational JSONL line that
+      preceded the FIRST conversational turn. Things like
+      ``permission-mode``, the initial ``file-history-snapshot``
+      — claude-code reads these on resume, dropping them would
+      break the session.
+    - ``message_records``: one record per ``user`` / ``assistant``
+      turn (sidechain excluded), in chronological order. Each
+      carries the 0-based ``line_index`` into the raw line list so
+      protected-tail lines can be copied byte-for-byte by the
+      rewriter.
+    - ``epilogue_lines``: any trailing non-conversational lines
+      after the LAST conversational turn (``stop_hook_summary``,
+      ``last-prompt`` metadata). These come AFTER the protected
+      tail in the rewrite, preserving order.
+
+    Returns ``None`` on read error so the caller can bail without
+    rewriting. The "no work to do" answer is ``([], [], [])`` —
+    a JSONL that exists but has no parseable lines.
+
+    Sidechain lines (``isSidechain: true``) are preserved in the
+    epilogue tail so subagent-thread metadata is never lost.
+    Non-conversational lines INTERLEAVED with conversational lines
+    (rare — claude-code typically emits all metadata up front)
+    are emitted as part of the surrounding conversational segment:
+    we attach them to the most recent message's segment so a
+    ``permission-mode`` flip mid-conversation rides with the turn
+    it relates to.
+    """
+    try:
+        raw_lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        log.debug("compressor: could not read %s: %s", jsonl_path, exc)
+        return None
+
+    preamble: list[str] = []
+    message_records: list[_CompressionMsgRecord] = []
+    epilogue: list[str] = []
+    first_conv_idx: int | None = None
+    last_conv_idx: int | None = None
+
+    # First pass: locate conversational lines and extract their text.
+    # Sidechain lines AND non-conversational metadata stay in
+    # preamble/epilogue around the conversational window.
+    conv_indices: list[int] = []
+    parsed_by_idx: dict[int, dict] = {}
+    for idx, raw in enumerate(raw_lines):
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") not in ("user", "assistant"):
+            continue
+        if obj.get("isSidechain") is True:
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        conv_indices.append(idx)
+        parsed_by_idx[idx] = obj
+        if first_conv_idx is None:
+            first_conv_idx = idx
+        last_conv_idx = idx
+
+    if not conv_indices:
+        # No conversational content — nothing to compress.
+        return [], [], list(raw_lines)
+
+    # Build the message records, flattening the message content the
+    # same way ``core.transcripts._flatten_content`` does.
+    for idx in conv_indices:
+        obj = parsed_by_idx[idx]
+        msg = obj.get("message", {})
+        role = str(msg.get("role") or obj.get("type") or "")
+        content = msg.get("content")
+        text = _flatten_content_for_compressor(content)
+        message_records.append(
+            _CompressionMsgRecord(
+                line_index=idx, role=role, text=text,
+            )
+        )
+
+    # Preamble: every line BEFORE the first conversational line.
+    # Epilogue: every line AFTER the last conversational line.
+    # Lines between the first and last conversational line stay
+    # interleaved in the raw_lines slice that the rewriter copies
+    # — they ride with the messages around them.
+    assert first_conv_idx is not None and last_conv_idx is not None
+    preamble = [raw_lines[i] for i in range(first_conv_idx)]
+    epilogue = [
+        raw_lines[i] for i in range(last_conv_idx + 1, len(raw_lines))
+    ]
+    return preamble, message_records, epilogue
+
+
+def _flatten_content_for_compressor(content: object) -> str:
+    """Same shape as :func:`core.transcripts._flatten_content` but
+    inlined so the compressor doesn't have to import transcripts (which
+    would tighten the brain-isolation invariant a notch too far —
+    transcripts.py is allowed to be claude-code-specific)."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            t = block.get("text")
+            if isinstance(t, str):
+                parts.append(t)
+    return "\n".join(parts)
+
+
+def _build_synthetic_summary_jsonl_line(
+    session_id: str,
+    workspace: Path,
+    summary_text: str,
+) -> str:
+    """Render the synthetic user-turn JSONL line for the rewrite.
+
+    Shape matches the user-turn lines claude-code itself writes
+    (see the sample in ``docs/compression.md``). The fields we
+    can supply deterministically (uuid, timestamp, sessionId, cwd,
+    type, isSidechain, parentUuid, message) are populated; the
+    rest are omitted — claude-code tolerates missing optional
+    fields on resume.
+
+    ``message.content`` is a plain string (not a list of content
+    blocks) so flatteners that look at ``[role=user, content=str]``
+    pick it up uniformly. ``promptId`` matches ``uuid`` for
+    self-consistency.
+    """
+    msg_uuid = str(_uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    record = {
+        "parentUuid": None,
+        "isSidechain": False,
+        "promptId": msg_uuid,
+        "type": "user",
+        "message": {"role": "user", "content": summary_text},
+        "uuid": msg_uuid,
+        "timestamp": now,
+        "userType": "vexis-compressor",
+        "cwd": str(workspace),
+        "sessionId": session_id,
+    }
+    return json.dumps(record, ensure_ascii=False)
+
+
+def _rewrite_jsonl_with_summary(
+    jsonl_path: Path,
+    session_id: str,
+    preamble_lines: list[str],
+    synthetic_user_text: str,
+    message_records: list[_CompressionMsgRecord],
+    protected_tail_indices: list[int],
+    epilogue_lines: list[str],
+    workspace: Path,
+) -> None:
+    """Atomically replace ``jsonl_path`` with: ``preamble`` +
+    synthetic SUMMARY user turn + verbatim lines of the protected
+    tail + ``epilogue``.
+
+    The protected-tail lines come from the ORIGINAL JSONL by index
+    so the byte-for-byte preservation invariant survives the
+    rewrite. Tempfile + rename keeps the swap atomic — a crash
+    mid-rewrite leaves the original JSONL untouched.
+
+    ``protected_tail_indices`` is the list of indices into
+    ``message_records`` (NOT into the raw JSONL) that the
+    compressor decided to keep. Each record's ``line_index`` then
+    locates the raw JSONL line to copy. We re-read the JSONL once
+    to avoid carrying the whole line list across the
+    asyncio.to_thread boundary.
+    """
+    raw_lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+
+    out_lines: list[str] = []
+    out_lines.extend(preamble_lines)
+
+    summary_line = _build_synthetic_summary_jsonl_line(
+        session_id, workspace, synthetic_user_text,
+    )
+    out_lines.append(summary_line)
+
+    # Copy protected tail lines verbatim, preserving order.
+    protected_line_indices = [
+        message_records[i].line_index for i in protected_tail_indices
+    ]
+    if protected_line_indices:
+        # The slice from first-protected-line to last-protected-line
+        # preserves any interleaved non-conversational lines that
+        # belong with them (queue-operation, permission-mode flips,
+        # etc.). The original claude-code JSONL keeps those in
+        # chronological order; the rewriter must too.
+        start = min(protected_line_indices)
+        end = max(protected_line_indices)
+        for i in range(start, end + 1):
+            out_lines.append(raw_lines[i])
+
+    out_lines.extend(epilogue_lines)
+
+    # Atomic swap. The ``.compressing`` suffix is distinctive so a
+    # `ls` after a crash makes the abandoned tempfile obvious for
+    # cleanup. ``Path.replace`` is the POSIX rename — atomic on the
+    # same filesystem.
+    tmp_path = jsonl_path.with_suffix(jsonl_path.suffix + ".compressing")
+    tmp_path.write_text(
+        "\n".join(out_lines) + "\n", encoding="utf-8",
+    )
+    tmp_path.replace(jsonl_path)

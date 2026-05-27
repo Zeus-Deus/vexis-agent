@@ -1573,6 +1573,87 @@ class OpenCodeBrain(Brain):
         ``ClaudeCodeBrain`` exposes."""
         return None
 
+    # ─── Issue #11: conversation compression ─────────────────────
+
+    async def compress_if_needed(self, session_id: str) -> bool:
+        """Decide whether the session's transcript needs compression
+        and log the decision — but DO NOT rewrite ``opencode.db``
+        from this brain implementation yet.
+
+        OpenCode stores sessions as rows in a live SQLite database
+        the foreground process holds a write transaction against.
+        A safe in-place rewrite (DELETE/INSERT of message + part
+        rows under that contention, plus index updates, plus the
+        cross-table FK invariants OpenCode's own writer maintains)
+        is a meaningful lift — the issue explicitly allows deferring
+        it to a follow-up (Issue #11 "Out of scope" section).
+
+        What this implementation DOES do:
+
+          - Trigger detection runs (so the dashboard / log can show
+            "would have compressed" diagnostics on long opencode
+            sessions). Re-uses the brain-agnostic
+            :func:`~vexis_agent.core.brain.compressor.should_compress`.
+          - Logs a single line per crossed threshold so the user
+            knows when their opencode session enters the danger zone
+            without surprising them with a silent SQL rewrite.
+
+        Returns ``False`` (no rewrite happened) regardless of
+        trigger state until the SQL rewrite is implemented. The
+        handler treats the False as "no-op" and proceeds with the
+        regular turn — same behaviour as the default ABC.
+        """
+        from vexis_agent.core.brain.compressor import (
+            CompressionInputs,
+            should_compress,
+        )
+        from vexis_agent.core.yaml_config import (
+            compression_enabled,
+            compression_threshold_ratio,
+            compression_threshold_turns,
+        )
+
+        if not compression_enabled():
+            return False
+
+        messages: list[tuple[str, str]] = []
+        try:
+            for msg in self.iter_messages(session_id):
+                if msg.role in ("user", "assistant") and msg.text:
+                    messages.append((msg.role, msg.text))
+        except Exception:  # pragma: no cover - defensive
+            log.debug(
+                "compress_if_needed(opencode, %s): iter_messages failed",
+                session_id, exc_info=True,
+            )
+            return False
+        if not messages:
+            return False
+
+        system_prompt = self._system_prompt_for(session_id)
+        decision = should_compress(
+            CompressionInputs(
+                messages=messages,
+                system_prompt=system_prompt,
+                tool_schemas_text="",
+                threshold_ratio=compression_threshold_ratio(),
+                threshold_turns=compression_threshold_turns(),
+            )
+        )
+        if decision.compress:
+            log.warning(
+                "compress_if_needed(opencode, %s): would compress but "
+                "opencode SQL rewrite not yet implemented — %s. "
+                "Track Issue #11 follow-up for the SQL rewrite path.",
+                session_id, decision.reason,
+            )
+        else:
+            log.debug(
+                "compress_if_needed(opencode, %s): %s",
+                session_id, decision.reason,
+            )
+        return False
+
     # ─── Issue #9: file-mutation verifier footer plumbing ────────
     # Identical contract to ClaudeCodeBrain's matching helpers —
     # see those docstrings for the rationale. Duplicated rather

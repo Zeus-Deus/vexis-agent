@@ -229,3 +229,26 @@ still supported but no longer required.
 
 **Pointers:** `docs/brains.md` · `docs/migration.md` ·
 `docs/model-ux.md` · `docs/dogfood-checklist.md`.
+
+## Conversation compression (Issue #11)
+
+Before every brain turn the handler calls
+`brain.compress_if_needed(session_id)`. When the transcript
+crosses either threshold — token estimate ≥ 80% of context
+window OR turn count > 40 — the brain spawns an aux
+summariser (`subsystem_tier("compressor")`, default `small`),
+gets back a structured summary, and atomically rewrites the
+on-disk transcript: system metadata preserved, the older
+turns folded into one synthetic user-turn whose body starts
+with `SUMMARY_PREFIX`, the last 10 turns kept byte-for-byte.
+
+`SUMMARY_PREFIX` is distinct from every recursion-guard
+prefix on purpose: a compressed foreground transcript still
+passes the curator's content-prefix filter (the right answer
+— we WANT the curator to be able to review long sessions for
+lessons). Iterative compression detects the prior summary by
+its prefix and folds it into the new one. Claude-code lands
+the JSONL rewrite; opencode logs the trigger but defers the
+SQL rewrite to a follow-up.
+
+**Pointers:** `docs/compression.md`.

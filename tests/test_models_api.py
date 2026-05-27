@@ -140,23 +140,23 @@ def test_get_models_rejects_wrong_token(client: TestClient):
 
 def test_get_models_empty_config_returns_default_table(client: TestClient):
     """Fresh install — no config file. Returns the default
-    resolution table for claude-code with all 9... 7 known
-    subsystems resolved to their DEFAULT_SUBSYSTEM_TIERS values
-    (well, 8 entries including the dead migration_classifier)."""
+    resolution table for claude-code with all known subsystems
+    resolved to their DEFAULT_SUBSYSTEM_TIERS values (including
+    the dead migration_classifier which surfaces a rule-7 info
+    finding, and the Issue #11 conversation compressor)."""
     r = client.get("/api/v1/models", headers=_hdr())
     assert r.status_code == 200
     data = r.json()
     assert data["brain_kind"] == "claude-code"
 
-    # All 8 known subsystems (DEFAULT_SUBSYSTEM_TIERS) appear,
-    # including the dead migration_classifier (which surfaces a
-    # rule-7 info finding).
+    # All known subsystems (DEFAULT_SUBSYSTEM_TIERS) appear.
     subsystem_names = {row["name"] for row in data["subsystems"]}
     expected = {
         "curator", "coherence_judge", "goal_judge",
         "relationships_extractor", "relationships_classifier",
         "learning_review", "learning_triage",
         "migration_classifier",
+        "compressor",  # Issue #11
     }
     assert subsystem_names == expected
 

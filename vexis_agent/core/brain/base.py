@@ -860,3 +860,67 @@ class Brain(ABC):
         override to return a snapshot of the current contents.
         """
         return []
+
+    # ─── conversation compression (Issue #11) ────────────────────
+    #
+    # Long Telegram sessions — especially multi-turn ``/goal`` loops
+    # spanning days — grow until the underlying CLI silently drops
+    # early turns. The compressor's job is to summarise the older
+    # half of the transcript into a structured block BEFORE the
+    # native context cap is hit, so the brain never enters silent-
+    # compaction mode. See ``docs/compression.md`` for the design.
+    #
+    # Contract:
+    #   - The handler MAY call ``compress_if_needed`` before every
+    #     ``respond``/``astream`` to give the brain a chance to
+    #     rewrite its on-disk transcript.
+    #   - Returns ``True`` when the brain actually rewrote the
+    #     transcript (caller logs at INFO), ``False`` otherwise
+    #     (no-op — either below threshold, disabled, or the brain
+    #     doesn't implement compression yet).
+    #   - Must never raise on compressor failure: compression is a
+    #     best-effort optimisation and a broken summariser must
+    #     degrade gracefully (return False, log) instead of taking
+    #     the foreground turn down with it.
+    #   - The synthetic summary message the brain inserts MUST start
+    #     with :data:`vexis_agent.core.brain.compressor.SUMMARY_PREFIX`
+    #     — not any of the recursion-guard prefixes
+    #     (``CURATOR_REVIEW_PROMPT_PREFIX``, ``GOAL_JUDGE_PROMPT_PREFIX``,
+    #     ``KANBAN_WORKER_PREFIX``) — so the curator's content-prefix
+    #     filter recognises compressed-foreground transcripts as
+    #     eligible for review (a SUMMARY_PREFIX is NOT a curator-
+    #     owned session). The matching invariant is pinned in
+    #     CLAUDE.md and asserted by ``tests/test_compressor.py``.
+
+    async def compress_if_needed(self, session_id: str) -> bool:
+        """Compress the named session's transcript when it crosses
+        the configured threshold.
+
+        Default implementation is a no-op (returns ``False``). Brains
+        that maintain a per-session transcript (claude-code's JSONL,
+        opencode's SQLite rows) override this to:
+
+          1. Read the current transcript via :meth:`iter_messages`.
+          2. Decide whether to compress (token estimate OR turn-count
+             threshold, see :mod:`vexis_agent.core.brain.compressor`).
+          3. Summarise the older messages via :meth:`spawn_aux` with
+             ``model_tier=subsystem_tier("compressor")``.
+          4. Atomically rewrite the on-disk transcript with the
+             system prompt unchanged, a synthetic SUMMARY_PREFIX user
+             turn at position 1, and the last K real turns preserved
+             byte-for-byte.
+
+        Step 4 is the load-bearing safety contract: the curator
+        recursion guard and goal-judge keep working on the
+        compressed transcript because :meth:`iter_messages` walks
+        the same on-disk store. The summary turn is read by both
+        the foreground brain (which sees it as the first user turn
+        on next resume) and by transcript-readers (which see it as
+        a normal user message — distinguishable by the SUMMARY_PREFIX
+        opening).
+
+        Brains that don't yet implement compression keep the
+        default ``False`` so the handler's pre-turn call is a no-op
+        on those brains rather than an error.
+        """
+        return False
