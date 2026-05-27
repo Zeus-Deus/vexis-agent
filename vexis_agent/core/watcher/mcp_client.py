@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import time
 from typing import Any, Optional
@@ -39,6 +40,23 @@ INITIALIZE_PROTOCOL_VERSION = "2024-11-05"
 CLIENT_NAME = "vexis-watcher"
 CLIENT_VERSION = "0.1.0"
 DEFAULT_TIMEOUT_SECONDS = 5.0
+
+# Override knob for users whose codemux MCP binary isn't named
+# ``codemux`` (e.g. a side-loaded ``codemux-remote`` build). When set
+# this beats the ``mcp-servers.yaml`` lookup; an explicit kwarg to
+# ``CodemuxMcpClient(binary=...)`` still beats this. See
+# ``_resolve_binary()`` for the full precedence chain.
+VEXIS_CODEMUX_BINARY_ENV = "VEXIS_CODEMUX_BINARY"
+# The MCP server name we look up in ``~/.vexis/mcp-servers.yaml``.
+# Hardcoded — the watcher only knows how to drive codemux today. If a
+# future fork wants to rename the server, plumb a constructor arg
+# rather than making this a knob.
+_CODEMUX_MCP_NAME = "codemux"
+# TODO: the YAML entry may legitimately set ``args`` to something
+# other than ``["mcp"]`` once codemux grows new subcommands; today we
+# always pass ``mcp`` regardless of what the YAML says. Revisit when
+# codemux ships a second MCP-serving subcommand.
+_CODEMUX_MCP_SUBCOMMAND = "mcp"
 
 # Exponential respawn backoff for a chronically-failing ``codemux mcp``
 # subprocess. Without this, a Codemux build that segfaults on every
@@ -60,6 +78,78 @@ class CodemuxMcpError(RuntimeError):
     """Raised when an MCP call returns ``isError: true`` or malformed data."""
 
 
+def _binary_from_mcp_yaml() -> Optional[str]:
+    """Return the ``command`` field of the codemux MCP entry in
+    ``~/.vexis/mcp-servers.yaml``, or None if no such entry exists
+    or the file can't be parsed.
+
+    We deliberately do NOT route this through
+    ``setup_wizard.detect_mcp_servers`` — that helper filters out
+    entries whose binary isn't on ``$PATH``, but here we want the raw
+    ``command`` string so ``shutil.which`` in ``_ensure_running`` is
+    the single source of truth for "is it actually invokable" and the
+    user can declare an aspirational path without us silently falling
+    back to a stale default.
+
+    Any failure (YAML drift, missing file, weird types) silently
+    falls through to the next precedence step — the resolver MUST
+    NOT crash startup over a malformed user file.
+    """
+    try:
+        from vexis_agent.core.paths import vexis_dir  # lazy: keep startup graph small
+        import yaml  # type: ignore[import-untyped]
+    except Exception:
+        return None
+    try:
+        path = vexis_dir() / "mcp-servers.yaml"
+    except Exception:
+        return None
+    if not path.is_file():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    servers = data.get("servers")
+    if not isinstance(servers, list):
+        return None
+    for entry in servers:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("name") != _CODEMUX_MCP_NAME:
+            continue
+        command = entry.get("command")
+        if isinstance(command, str) and command:
+            return command
+    return None
+
+
+def _resolve_binary() -> str:
+    """Decide which binary the watcher should spawn for ``codemux mcp``.
+
+    Precedence (highest first):
+      1. ``$VEXIS_CODEMUX_BINARY`` environment variable.
+      2. ``command`` field of the entry named ``codemux`` in
+         ``~/.vexis/mcp-servers.yaml``.
+      3. The literal ``"codemux"`` fallback (vanilla install).
+
+    Reads disk on every call so adding the YAML entry takes effect on
+    the next ``CodemuxMcpClient`` construction without code changes —
+    matches the CLAUDE.md "config reads disk per call" invariant.
+    Explicit constructor args (``binary=...``) bypass this entirely;
+    tests rely on that contract.
+    """
+    env = os.environ.get(VEXIS_CODEMUX_BINARY_ENV)
+    if env:
+        return env
+    yaml_cmd = _binary_from_mcp_yaml()
+    if yaml_cmd:
+        return yaml_cmd
+    return CODEMUX_BINARY
+
+
 class CodemuxMcpClient:
     """Persistent stdio JSON-RPC client.
 
@@ -68,8 +158,11 @@ class CodemuxMcpClient:
     invocations so requests/responses don't interleave on the wire.
     """
 
-    def __init__(self, *, binary: str = CODEMUX_BINARY) -> None:
-        self._binary = binary
+    def __init__(self, *, binary: Optional[str] = None) -> None:
+        # ``binary=None`` → run the env-var / YAML / default resolver.
+        # An explicit kwarg (including the legacy ``binary="codemux"``
+        # the backoff tests pass) bypasses the resolver verbatim.
+        self._binary = binary if binary is not None else _resolve_binary()
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._next_id = 1
         self._lock = asyncio.Lock()
@@ -174,7 +267,7 @@ class CodemuxMcpClient:
             )
         try:
             proc = await asyncio.create_subprocess_exec(
-                self._binary, "mcp",
+                self._binary, _CODEMUX_MCP_SUBCOMMAND,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
