@@ -331,6 +331,70 @@ def test_curator_prompt_invariant():
     )
 
 
+def test_curator_prompt_contains_do_not_capture_block():
+    """The rendered review prompt must carry the "Do NOT capture"
+    poison-pattern block — see issue #8.
+
+    The block names five concrete failure modes the model has been
+    seen to fall into when the prompt only describes what to
+    capture. Each pattern keyword is asserted so a future edit that
+    deletes one of the bullets fails this test instead of silently
+    re-opening that failure mode in production.
+
+    If you intentionally restructure the block, update the
+    pattern_keywords list below — do NOT delete the assertion. The
+    deeper invariant is "the curator prompt must explicitly refuse
+    these subjects", and the keyword set is the cheapest test for
+    that property short of a full LLM eval (see
+    scripts/eval_learning.py for the live-LLM version).
+    """
+    from vexis_agent.core.learning_review import _build_review_prompt
+
+    prompt = _build_review_prompt(
+        "(transcript here)",
+        skill_index_text="(skill index)",
+        existing_memory_text="(existing memory)",
+        user_queue_text="(user queue)",
+    )
+
+    # Header presence — the block has to be findable as a section
+    # so the model parses it as a top-level refusal directive, not
+    # buried inline.
+    assert "## Do NOT capture" in prompt, (
+        "Curator prompt is missing the 'Do NOT capture' section header. "
+        "See vexis_agent/core/learning_review.py — the block should sit "
+        "between the USER candidate queue section and the Output contract."
+    )
+
+    # Each of the five named poison patterns must appear by its
+    # distinguishing keyword. We assert on words tied to the pattern
+    # name (e.g. "Negative tool claims") rather than example strings,
+    # so re-phrasing the examples doesn't break the test.
+    pattern_keywords = [
+        "Negative tool claims",
+        "Environment failures",
+        "Transient errors",
+        "Single-session anecdotes",
+        "Model self-attribution",
+    ]
+    missing = [kw for kw in pattern_keywords if kw not in prompt]
+    assert not missing, (
+        f"Curator 'Do NOT capture' block is missing pattern(s): "
+        f"{missing}. Each named poison pattern must appear by its "
+        f"header phrase so the model sees it as a distinct refusal."
+    )
+
+    # Sanity: the block must appear BEFORE the output contract — the
+    # model reads top-to-bottom and we want the refusals in scope
+    # when it decides the verdict, not after.
+    block_pos = prompt.index("## Do NOT capture")
+    contract_pos = prompt.index("## Output contract")
+    assert block_pos < contract_pos, (
+        "'Do NOT capture' block must appear before '## Output contract' "
+        "so the refusals are in scope when the model picks a verdict."
+    )
+
+
 # --------------------------------------------------------------------
 # 4. eligibility_map + failure_count
 # --------------------------------------------------------------------
