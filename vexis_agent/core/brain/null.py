@@ -89,6 +89,12 @@ class BrainNull(Brain):
         # Session-token counter — rotates produce monotonic ids.
         self._session_counter = count(1)
         self._session_token: str | None = f"null-session-{next(self._session_counter)}"
+        # Issue #9: tests that exercise the file-mutation verifier
+        # footer pre-inject a per-chat list via ``set_files_changed``;
+        # ``consume_files_changed`` drains it the same way the real
+        # brains drain their disk-derived buffer. Default empty so
+        # the existing suite stays oblivious to the feature.
+        self._files_changed_by_chat: dict[int, list[str]] = {}
 
     # ─── injection / inspection helpers (test-facing API) ────────
 
@@ -258,3 +264,19 @@ class BrainNull(Brain):
     async def kill_in_flight(self) -> None:
         # No subprocess to kill in the null brain.
         return None
+
+    # ─── Issue #9 — file-mutation verifier footer test surface ───
+
+    def set_files_changed(self, chat_id: int, files: list[str]) -> None:
+        """Test-only: stage a file-mutation list that the next
+        :meth:`consume_files_changed` call drains. Mirrors how
+        ``ClaudeCodeBrain`` populates its buffer from a real
+        snapshot diff; tests can drive the verifier footer code
+        path without spinning up a real brain subprocess."""
+        self._files_changed_by_chat[chat_id] = list(files)
+
+    def consume_files_changed(self, chat_id: int) -> list[str]:
+        return self._files_changed_by_chat.pop(chat_id, [])
+
+    def peek_files_changed(self, chat_id: int) -> list[str]:
+        return list(self._files_changed_by_chat.get(chat_id, []))

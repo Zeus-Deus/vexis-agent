@@ -22,6 +22,8 @@ from vexis_agent.core.notify import ContextNote, Notifier
 from vexis_agent.core.paths import skills_dir
 from vexis_agent.core.sessions import SessionInfo, SessionStore
 from vexis_agent.core.skills import PinStore, archived_skill_names
+from vexis_agent.core.workspace_snapshot import format_verifier_footer
+from vexis_agent.core.yaml_config import brain_file_mutation_footer_enabled
 
 log = logging.getLogger(__name__)
 
@@ -217,6 +219,16 @@ class MessageHandler:
         # both see the same ``proposed`` and pass.
         self._dispatched_turn_index: dict[str, int] = {}
         self._cursor_lock = asyncio.Lock()
+        # Issue #9: per-chat counter for the file-mutation verifier
+        # footer. Incremented every time the handler injects a footer
+        # (i.e. once per *successful* brain turn that produced
+        # mutations the next turn will be told about). The footer
+        # header reads "[turn-N verifier]" where N is the ordinal of
+        # the turn that just finished — purely cosmetic so the model
+        # can correlate the summary with its own sense of the
+        # conversation. In-memory only; daemon restart resets to 0
+        # because the brain's mutation buffer is also in-memory.
+        self._verifier_turn_index: dict[int, int] = {}
 
     @property
     def brain(self) -> Brain:
@@ -495,23 +507,85 @@ class MessageHandler:
         return model, reasoning_level
 
     async def _inject_context(self, chat_id: int, text: str) -> str:
-        """Prepend any pending system notes to the user's message.
+        """Prepend pending system notes AND the file-mutation
+        verifier footer (Issue #9) to the user's message.
 
-        Notes are buffered by the notifier as side effects of background
-        events (task completions, restart warnings) and consumed atomically
-        here. If the buffer is empty the message is returned unchanged.
+        Two parallel signals get injected at the top of the next
+        brain turn's user message:
+
+          1. **System notes** (notifier buffer) — task completions,
+             daemon-restart warnings. Consumed atomically here.
+
+          2. **Verifier footer** — the list of files the brain
+             actually mutated during the previous turn, computed
+             from a workspace-snapshot diff in the brain wrapper.
+             Lets the model self-correct against silent write
+             failures ("I edited foo.py" when no such edit
+             happened). See :mod:`core.workspace_snapshot`.
+
+        When neither signal has content the message is returned
+        unchanged so existing single-turn semantics are preserved.
+
+        Header order: verifier footer first (its content is about
+        the *previous* turn so it makes sense to read before the
+        SYSTEM CONTEXT block, which is about events fired since
+        then), then [SYSTEM CONTEXT], then [USER MESSAGE].
         """
-        if self._notifier is None:
-            return text
-        notes = await self._notifier.consume_context(chat_id)
-        if not notes:
-            return text
-        log.info(
-            "Injecting %d system context note(s) into chat %d brain turn",
-            len(notes),
-            chat_id,
+        notes = (
+            await self._notifier.consume_context(chat_id)
+            if self._notifier is not None else []
         )
-        return _format_with_context(notes, text)
+        verifier_footer = self._build_verifier_footer(chat_id)
+
+        if not notes and not verifier_footer:
+            return text
+        if notes:
+            log.info(
+                "Injecting %d system context note(s) into chat %d brain turn",
+                len(notes),
+                chat_id,
+            )
+        return _format_with_context(notes, text, verifier_footer)
+
+    def _build_verifier_footer(self, chat_id: int) -> str | None:
+        """Drain the brain's file-mutation buffer for ``chat_id`` and
+        render the verifier footer. Returns ``None`` when:
+
+          * the feature is disabled in config, OR
+          * the brain wrapper doesn't track mutations (e.g.
+            ``BrainNull`` in tests that don't pre-inject), OR
+          * the previous turn changed nothing AND no previous
+            turn has run yet (the "no diff to report" case is
+            distinct from "diff says nothing changed" — the
+            latter still emits the footer with "(none detected)"
+            so the model knows we *checked*).
+
+        The turn ordinal in the header is the count of footers
+        *emitted* for this chat, not the count of brain turns
+        run. That keeps the number stable even when the feature
+        is toggled mid-conversation: every emitted footer has a
+        unique ordinal in conversation order.
+        """
+        if not brain_file_mutation_footer_enabled():
+            return None
+        try:
+            files = self._brain.consume_files_changed(chat_id)
+        except Exception:  # pragma: no cover - defensive
+            log.exception(
+                "brain.consume_files_changed failed for chat %d", chat_id,
+            )
+            return None
+        # Suppress the footer for the very first turn (no previous
+        # turn = nothing to verify). We detect "first turn" as
+        # "no entry recorded yet AND no files came back" — once the
+        # brain has run at least once, even an empty list means
+        # "previous turn changed nothing" and we surface that.
+        last = self._verifier_turn_index.get(chat_id, 0)
+        if last == 0 and not files:
+            return None
+        turn = last + 1
+        self._verifier_turn_index[chat_id] = turn
+        return format_verifier_footer(turn, files)
 
     async def handle_clear(self, user_id: int) -> str | None:
         if not is_allowed(user_id, self._allowed_user_id):
@@ -749,24 +823,39 @@ _SYSTEM_CONTEXT_HEADER = "[SYSTEM CONTEXT — events since your last reply]"
 _USER_MESSAGE_HEADER = "[USER MESSAGE]"
 
 
-def _format_with_context(notes: list[ContextNote], user_text: str) -> str:
+def _format_with_context(
+    notes: list[ContextNote],
+    user_text: str,
+    verifier_footer: str | None = None,
+) -> str:
     """Render the [SYSTEM CONTEXT] / [USER MESSAGE] envelope for the brain.
 
     Each note becomes one bullet line: ``- HH:MM <text>``. Multi-line
     note bodies have their continuation lines indented under the bullet
     so the structure stays readable to both the brain and a human
     inspecting the log.
+
+    ``verifier_footer`` (Issue #9) is the pre-rendered
+    ``[turn-N verifier]`` block. When non-None it goes FIRST — the
+    block describes the *previous* turn (a snapshot diff), so the
+    model reads about its prior writes before it reads about events
+    that fired since then. Either or both may be empty.
     """
-    lines: list[str] = []
-    for note in notes:
-        local_time = note.timestamp.astimezone().strftime("%H:%M")
-        body_lines = note.text.splitlines() or [""]
-        first, *rest = body_lines
-        lines.append(f"- {local_time} {first}")
-        for cont in rest:
-            lines.append(f"  {cont}")
-    block = "\n".join((_SYSTEM_CONTEXT_HEADER, *lines))
-    return f"{block}\n\n{_USER_MESSAGE_HEADER}\n{user_text}"
+    sections: list[str] = []
+    if verifier_footer:
+        sections.append(verifier_footer)
+    if notes:
+        lines: list[str] = []
+        for note in notes:
+            local_time = note.timestamp.astimezone().strftime("%H:%M")
+            body_lines = note.text.splitlines() or [""]
+            first, *rest = body_lines
+            lines.append(f"- {local_time} {first}")
+            for cont in rest:
+                lines.append(f"  {cont}")
+        sections.append("\n".join((_SYSTEM_CONTEXT_HEADER, *lines)))
+    sections.append(f"{_USER_MESSAGE_HEADER}\n{user_text}")
+    return "\n\n".join(sections)
 
 
 def _format_sessions(infos: list[SessionInfo]) -> str:

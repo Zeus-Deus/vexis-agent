@@ -782,3 +782,49 @@ class Brain(ABC):
         to track ``self._current_proc`` and call ``os.killpg`` when
         invoked."""
         return None
+
+    # ─── per-turn file-mutation verifier (Issue #9) ──────────────
+    #
+    # Each ``respond``/``astream`` call MAY snapshot the workspace
+    # before and after the subprocess runs, then store the diff
+    # keyed by chat_id so the handler can inject a verifier footer
+    # at the top of the next turn's user message. The Brain ABC
+    # exposes only the read side — the snapshot is an implementation
+    # detail of each concrete brain (claude-code + opencode both
+    # call out to :mod:`core.workspace_snapshot`; BrainNull is inert
+    # but accepts injected results for tests).
+    #
+    # Contract:
+    #   - Returns the list of repo-relative paths that changed
+    #     during the most recent ``respond``/``astream`` for this
+    #     ``chat_id``. Sorted, deduplicated.
+    #   - Returns an empty list when the brain has not yet
+    #     completed a turn for this chat, or when the snapshot
+    #     was disabled (``brain.file_mutation_footer: false``) or
+    #     bailed out (workspace too large, walk errored).
+    #   - Caller is expected to ``consume_files_changed`` (which
+    #     also clears the buffer) once it has rendered the footer
+    #     so two consecutive reads don't see the same diff twice.
+
+    def consume_files_changed(self, chat_id: int) -> list[str]:
+        """Pop and return the files mutated during the most recent
+        ``respond``/``astream`` for ``chat_id``.
+
+        Default implementation returns ``[]`` — brains that don't
+        snapshot the workspace have nothing to consume. Subclasses
+        that DO snapshot override this to drain a per-chat buffer
+        (which is what makes the verifier footer "per turn" — the
+        next turn injects what we found, then forgets it).
+        """
+        return []
+
+    def peek_files_changed(self, chat_id: int) -> list[str]:
+        """Non-draining read of the same buffer ``consume_files_changed``
+        drains. Used by the goal judge hook so the judge sees the
+        same file-mutation summary the handler injected on the
+        next user message, without racing the handler's consume.
+
+        Default returns ``[]``; subclasses that maintain the buffer
+        override to return a snapshot of the current contents.
+        """
+        return []
