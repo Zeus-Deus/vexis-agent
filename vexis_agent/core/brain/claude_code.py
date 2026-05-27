@@ -64,6 +64,11 @@ from vexis_agent.core.skills import (
     build_skills_index_block,
 )
 from vexis_agent.core.status import StatusFile, extract_tool_target
+from vexis_agent.core.workspace_snapshot import (
+    diff as _snapshot_diff,
+    snapshot as _take_snapshot,
+)
+from vexis_agent.core.yaml_config import brain_file_mutation_footer_enabled
 
 # Re-export the exception types so existing import sites
 # (``from core.brain.claude_code import BrainCancelled, ...``) keep
@@ -490,6 +495,12 @@ class ClaudeCodeBrain(Brain):
         # by design, see CAPABILITIES.md for the model-facing
         # documentation of this trap.
         self._system_prompt_cache: dict[str, str] = {}
+        # Issue #9: per-chat buffer of files mutated during the most
+        # recent ``respond``/``astream`` call. Drained by the handler
+        # via :meth:`consume_files_changed` when it builds the next
+        # turn's user message. Cleared on read so two reads in a row
+        # don't double-report a single turn's mutations.
+        self._files_changed_by_chat: dict[int, list[str]] = {}
 
     def _system_prompt_for(self, session_uuid: str) -> str:
         cached = self._system_prompt_cache.get(session_uuid)
@@ -583,28 +594,39 @@ class ClaudeCodeBrain(Brain):
             self._workspace,
         )
 
+        # Issue #9 — file-mutation verifier footer. Snapshot the
+        # workspace BEFORE the brain subprocess runs; diff AFTER (in
+        # the finally below) so failures, cancellations, and timeouts
+        # still record any partial writes the brain made. The
+        # snapshot is best-effort: a failed walk returns ``{}`` and
+        # the verifier footer degrades gracefully to "(none detected)".
+        before_snapshot = await self._maybe_take_snapshot()
+
         # Inline retry on transient upstream failures (Anthropic 5xx /
         # 429 / network blip). See ``_TRANSIENT_RETRY_DELAY_SECONDS``
         # comment for the rationale: one retry absorbs sub-second
         # hiccups; anything longer wants caller-side backoff. /cancel
         # arriving between attempts short-circuits the loop so the
         # user's Stop button is honoured even mid-retry.
-        for attempt in range(1, _TRANSIENT_MAX_ATTEMPTS + 1):
-            try:
-                final_text = await self._attempt_respond(argv, chat_id)
-                break
-            except BrainTransientError as exc:
-                if attempt >= _TRANSIENT_MAX_ATTEMPTS:
-                    raise
-                if self._running_tasks.was_cancelled(chat_id):
-                    raise
-                log.warning(
-                    "claude -p transient failure (attempt %d/%d) for "
-                    "chat %d: %s — retrying in %.1fs",
-                    attempt, _TRANSIENT_MAX_ATTEMPTS, chat_id,
-                    exc, _TRANSIENT_RETRY_DELAY_SECONDS,
-                )
-                await asyncio.sleep(_TRANSIENT_RETRY_DELAY_SECONDS)
+        try:
+            for attempt in range(1, _TRANSIENT_MAX_ATTEMPTS + 1):
+                try:
+                    final_text = await self._attempt_respond(argv, chat_id)
+                    break
+                except BrainTransientError as exc:
+                    if attempt >= _TRANSIENT_MAX_ATTEMPTS:
+                        raise
+                    if self._running_tasks.was_cancelled(chat_id):
+                        raise
+                    log.warning(
+                        "claude -p transient failure (attempt %d/%d) for "
+                        "chat %d: %s — retrying in %.1fs",
+                        attempt, _TRANSIENT_MAX_ATTEMPTS, chat_id,
+                        exc, _TRANSIENT_RETRY_DELAY_SECONDS,
+                    )
+                    await asyncio.sleep(_TRANSIENT_RETRY_DELAY_SECONDS)
+        finally:
+            await self._record_files_changed(chat_id, before_snapshot)
 
         # Mark only after a successful exit so a failed first call doesn't
         # leave us thinking the UUID is live.
@@ -823,40 +845,51 @@ class ClaudeCodeBrain(Brain):
             self._workspace,
         )
 
-        # Inline transient-retry. Matches the policy in :meth:`respond`,
-        # with one extra constraint: retry only if NOTHING was yielded
-        # downstream yet. Once we've emitted a text delta or a tool
-        # event the user/UI has consumed it, and retrying would
-        # double-render the same prefix and (worse) re-run any tool
-        # the brain already started. So a transient that hits mid-
-        # stream still propagates — only first-millisecond failures
-        # (API 5xx on the opening call) get the silent retry.
-        for attempt in range(1, _TRANSIENT_MAX_ATTEMPTS + 1):
-            yielded_anything = False
-            try:
-                async for event in self._attempt_astream(argv, chat_id):
-                    yielded_anything = True
-                    yield event
-                break  # clean completion
-            except BrainTransientError as exc:
-                if yielded_anything:
-                    raise
-                if attempt >= _TRANSIENT_MAX_ATTEMPTS:
-                    raise
-                if self._running_tasks.was_cancelled(chat_id):
-                    raise
-                log.warning(
-                    "claude -p (stream) transient failure (attempt "
-                    "%d/%d) for chat %d: %s — retrying in %.1fs",
-                    attempt, _TRANSIENT_MAX_ATTEMPTS, chat_id,
-                    exc, _TRANSIENT_RETRY_DELAY_SECONDS,
-                )
-                await asyncio.sleep(_TRANSIENT_RETRY_DELAY_SECONDS)
+        # Issue #9 — same file-mutation snapshot dance as :meth:`respond`.
+        # See the analogous block there for the rationale; the streaming
+        # path runs the same brain subprocess so writes land identically.
+        # The diff is recorded in the ``finally`` so a cancelled stream
+        # or a transient that exhausts retries still surfaces any
+        # partial writes the brain made.
+        before_snapshot = await self._maybe_take_snapshot()
 
-        if not self._session.is_initialized():
-            self._session.mark_initialized()
+        try:
+            # Inline transient-retry. Matches the policy in :meth:`respond`,
+            # with one extra constraint: retry only if NOTHING was yielded
+            # downstream yet. Once we've emitted a text delta or a tool
+            # event the user/UI has consumed it, and retrying would
+            # double-render the same prefix and (worse) re-run any tool
+            # the brain already started. So a transient that hits mid-
+            # stream still propagates — only first-millisecond failures
+            # (API 5xx on the opening call) get the silent retry.
+            for attempt in range(1, _TRANSIENT_MAX_ATTEMPTS + 1):
+                yielded_anything = False
+                try:
+                    async for event in self._attempt_astream(argv, chat_id):
+                        yielded_anything = True
+                        yield event
+                    break  # clean completion
+                except BrainTransientError as exc:
+                    if yielded_anything:
+                        raise
+                    if attempt >= _TRANSIENT_MAX_ATTEMPTS:
+                        raise
+                    if self._running_tasks.was_cancelled(chat_id):
+                        raise
+                    log.warning(
+                        "claude -p (stream) transient failure (attempt "
+                        "%d/%d) for chat %d: %s — retrying in %.1fs",
+                        attempt, _TRANSIENT_MAX_ATTEMPTS, chat_id,
+                        exc, _TRANSIENT_RETRY_DELAY_SECONDS,
+                    )
+                    await asyncio.sleep(_TRANSIENT_RETRY_DELAY_SECONDS)
 
-        log.info("Brain.astream completed for chat %d", chat_id)
+            if not self._session.is_initialized():
+                self._session.mark_initialized()
+
+            log.info("Brain.astream completed for chat %d", chat_id)
+        finally:
+            await self._record_files_changed(chat_id, before_snapshot)
 
     async def _attempt_astream(
         self, argv: list[str], chat_id: int,
@@ -1347,3 +1380,94 @@ class ClaudeCodeBrain(Brain):
         is exposed on the ABC for a future world where ``/cancel``
         wants to talk to the brain directly."""
         return None
+
+    # ─── Issue #9: file-mutation verifier footer plumbing ────────
+
+    async def _maybe_take_snapshot(self):
+        """Pre-turn workspace snapshot used by the file-mutation
+        verifier footer.
+
+        Returns ``None`` when the feature is disabled in config
+        (``brain.file_mutation_footer: false``) — the matching
+        ``_record_files_changed`` call short-circuits on ``None``,
+        so disabling the feature truly skips both walks for ~zero
+        overhead.
+
+        Snapshot work is CPU-bound (one ``stat`` per file plus
+        directory iteration); offload to a worker thread so we
+        don't stall the event loop on a slow disk.
+        """
+        if not brain_file_mutation_footer_enabled():
+            return None
+        try:
+            return await asyncio.to_thread(_take_snapshot, self._workspace)
+        except Exception:  # pragma: no cover - defensive
+            log.exception(
+                "workspace snapshot (pre-turn) failed for chat workspace %s",
+                self._workspace,
+            )
+            return None
+
+    async def _record_files_changed(
+        self, chat_id: int, before_snapshot,
+    ) -> None:
+        """Diff the post-turn workspace state against ``before_snapshot``
+        and stash the result for :meth:`consume_files_changed`.
+
+        Runs in the ``finally`` of ``respond`` / ``astream`` so we
+        capture mutations even on cancellation, timeout, or transient-
+        exhaustion failure paths. A snapshot that fails (None passed
+        in, or the after-walk errors) collapses to "no diff recorded"
+        rather than poisoning the buffer with a stale entry.
+        """
+        if before_snapshot is None:
+            return
+        try:
+            after_snapshot = await asyncio.to_thread(
+                _take_snapshot, self._workspace,
+            )
+        except Exception:  # pragma: no cover - defensive
+            log.exception(
+                "workspace snapshot (post-turn) failed for chat %d", chat_id,
+            )
+            return
+        try:
+            changed = _snapshot_diff(before_snapshot, after_snapshot)
+        except Exception:  # pragma: no cover - defensive
+            log.exception(
+                "workspace snapshot diff failed for chat %d", chat_id,
+            )
+            return
+        if changed:
+            log.info(
+                "chat %d: %d file(s) mutated this turn (first 5: %s)",
+                chat_id, len(changed), changed[:5],
+            )
+        # Always overwrite — each turn's diff supersedes the previous
+        # one even if the next handler turn hasn't consumed it. The
+        # alternative (merge) would let a turn with no mutations
+        # *clear* a stale diff but accumulate diffs across consumer
+        # gaps, which surfaces the wrong "previous turn" to the user.
+        self._files_changed_by_chat[chat_id] = changed
+
+    def consume_files_changed(self, chat_id: int) -> list[str]:
+        """Pop the most recent turn's file-mutation list for
+        ``chat_id``. Returns ``[]`` when no turn has run or the
+        previous reader already drained the buffer.
+
+        Drain semantics keep the verifier footer "per turn": once
+        the handler injects it onto the next turn's prompt, a
+        subsequent reader (the goal judge) gets a separate call
+        and a separate buffer if it needs the same diff — currently
+        both the handler and the goal hook fire from the same drain
+        iteration so one drain suffices, but the contract leaves
+        room for future readers via :meth:`peek_files_changed`.
+        """
+        return self._files_changed_by_chat.pop(chat_id, [])
+
+    def peek_files_changed(self, chat_id: int) -> list[str]:
+        """Non-draining read of the same buffer. Used by the goal
+        judge hook in ``transports/telegram.py`` so the judge sees
+        the same file-mutation summary the handler injected on the
+        next user message — without racing the handler's consume."""
+        return list(self._files_changed_by_chat.get(chat_id, []))

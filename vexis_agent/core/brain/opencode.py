@@ -101,6 +101,11 @@ from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.core.sessions import SessionStore
 from vexis_agent.core.status import StatusFile, extract_tool_target
 from vexis_agent.core.transcripts import SessionMeta, TranscriptMessage
+from vexis_agent.core.workspace_snapshot import (
+    diff as _snapshot_diff,
+    snapshot as _take_snapshot,
+)
+from vexis_agent.core.yaml_config import brain_file_mutation_footer_enabled
 
 log = logging.getLogger(__name__)
 
@@ -659,6 +664,11 @@ class OpenCodeBrain(Brain):
         # prompts per agent definition shape so byte-identical
         # ``OPENCODE_CONFIG_CONTENT`` hits the cache.
         self._system_prompt_cache: dict[str, str] = {}
+        # Issue #9: same per-chat file-mutation buffer ClaudeCodeBrain
+        # maintains. Drained by the handler's verifier-footer injector
+        # on the next turn so the brain can self-correct against
+        # silent-write failures.
+        self._files_changed_by_chat: dict[int, list[str]] = {}
         # Step 6.5: install the foreground-shell safety plugin into
         # the workspace before the first opencode run. The plugin
         # (vexis_agent/data/opencode_safety_plugin.mjs) gets copied
@@ -690,6 +700,29 @@ class OpenCodeBrain(Brain):
             f" (reasoning: {reasoning_level})" if reasoning_level else "",
         )
 
+        # Issue #9 — file-mutation verifier footer. Snapshot the
+        # workspace BEFORE the brain subprocess runs; diff AFTER (in
+        # the outer ``finally``). The opencode subprocess writes the
+        # same files (edits, shell tool output redirects) so the
+        # behaviour mirrors the claude-code path exactly.
+        before_snapshot = await self._maybe_take_snapshot()
+
+        try:
+            return await self._respond_inner(
+                message, chat_id,
+                model=model, reasoning_level=reasoning_level,
+            )
+        finally:
+            await self._record_files_changed(chat_id, before_snapshot)
+
+    async def _respond_inner(
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ) -> str:
         # Phase C Day 4: ``is_initialized`` flips to True after the
         # first successful ``respond``, at which point ``self._session.get()``
         # returns the OpenCode-generated session id (harvested from
@@ -1482,6 +1515,60 @@ class OpenCodeBrain(Brain):
         proc registered by ``RunningTasks.attach``. Same hook
         ``ClaudeCodeBrain`` exposes."""
         return None
+
+    # ─── Issue #9: file-mutation verifier footer plumbing ────────
+    # Identical contract to ClaudeCodeBrain's matching helpers —
+    # see those docstrings for the rationale. Duplicated rather
+    # than hoisted to a mixin because each brain owns its own
+    # ``self._files_changed_by_chat`` buffer and the snapshot work
+    # is fundamentally per-brain (the subprocess lifecycles differ
+    # enough that the wrap site can't be shared cleanly).
+
+    async def _maybe_take_snapshot(self):
+        if not brain_file_mutation_footer_enabled():
+            return None
+        try:
+            return await asyncio.to_thread(_take_snapshot, self._workspace)
+        except Exception:  # pragma: no cover - defensive
+            log.exception(
+                "workspace snapshot (pre-turn) failed for chat workspace %s",
+                self._workspace,
+            )
+            return None
+
+    async def _record_files_changed(
+        self, chat_id: int, before_snapshot,
+    ) -> None:
+        if before_snapshot is None:
+            return
+        try:
+            after_snapshot = await asyncio.to_thread(
+                _take_snapshot, self._workspace,
+            )
+        except Exception:  # pragma: no cover - defensive
+            log.exception(
+                "workspace snapshot (post-turn) failed for chat %d", chat_id,
+            )
+            return
+        try:
+            changed = _snapshot_diff(before_snapshot, after_snapshot)
+        except Exception:  # pragma: no cover - defensive
+            log.exception(
+                "workspace snapshot diff failed for chat %d", chat_id,
+            )
+            return
+        if changed:
+            log.info(
+                "chat %d: %d file(s) mutated this turn (first 5: %s)",
+                chat_id, len(changed), changed[:5],
+            )
+        self._files_changed_by_chat[chat_id] = changed
+
+    def consume_files_changed(self, chat_id: int) -> list[str]:
+        return self._files_changed_by_chat.pop(chat_id, [])
+
+    def peek_files_changed(self, chat_id: int) -> list[str]:
+        return list(self._files_changed_by_chat.get(chat_id, []))
 
 
 # ──────────────────────────────────────────────────────────────────

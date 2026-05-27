@@ -610,8 +610,10 @@ def test_hook_dedupes_existing_continuation_on_enqueue(
     asyncio.run(seed())
 
     # Stub evaluate_after_turn so the hook reaches the enqueue branch
-    # without spawning a real judge.
-    async def _fake_evaluate(self, last_response, brain):  # noqa: ARG001
+    # without spawning a real judge. ``**_kw`` absorbs Issue #9's new
+    # ``files_changed`` kwarg without forcing every existing mock to
+    # care about the file-mutation verifier footer.
+    async def _fake_evaluate(self, last_response, brain, **_kw):  # noqa: ARG001
         return {
             "status": "active",
             "should_continue": True,
@@ -856,7 +858,9 @@ def test_pause_during_judge_call_drops_continuation(
 
     from vexis_agent.core.goal_manager import CONTINUATION_PROMPT_TEMPLATE, GoalManager as _GM
 
-    async def evaluate_with_concurrent_pause(self, last_response: str, brain) -> dict:
+    async def evaluate_with_concurrent_pause(
+        self, last_response: str, brain, **_kw,
+    ) -> dict:
         # Stand in for evaluate_after_turn: do the manager's work
         # (turns_used++, save), then perform a paused-status write
         # via a separate manager instance to mimic /goal pause
@@ -1087,11 +1091,13 @@ def test_continuation_arrives_first_then_user_message(
     bot = _FakeBot()
     judge_calls: list[str] = []
 
-    async def judge_capture(workspace, goal, last_response, brain):
+    async def judge_capture(workspace, goal, last_response, brain, **_kw):
         # Phase B: judge_goal is async and accepts ``brain`` as the
         # 4th positional. The captured ``brain`` is a ``BrainNull``
         # from the FakeHandler; this mock ignores it and returns a
         # pre-decided verdict so the test stays deterministic.
+        # Issue #9: ``**_kw`` absorbs the new ``files_changed`` kwarg
+        # the transport now forwards from the brain's snapshot diff.
         judge_calls.append(last_response)
         # First call: continue. Second (after user turn): done.
         # Day 5: judge_goal returns ``(verdict, reason, parse_failed)``;

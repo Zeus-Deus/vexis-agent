@@ -308,7 +308,11 @@ class GoalManager:
     # ----- the post-turn entry point ---------------------------------
 
     async def evaluate_after_turn(
-        self, last_response: str, brain: "Brain"
+        self,
+        last_response: str,
+        brain: "Brain",
+        *,
+        files_changed: list[str] | None = None,
     ) -> dict[str, Any]:
         """Run the judge, update state, return a decision dict.
 
@@ -357,7 +361,8 @@ class GoalManager:
         state.last_turn_at = datetime.now(timezone.utc)
 
         verdict, reason, parse_failed = await judge_goal(
-            self._workspace, state.goal, last_response, brain
+            self._workspace, state.goal, last_response, brain,
+            files_changed=files_changed,
         )
         # Cache the cited verdict on disk so /goal status can show it
         # without re-running the judge. ``"skipped"`` is recorded as-is

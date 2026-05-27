@@ -106,8 +106,28 @@ GOAL_JUDGE_PROMPT_PREFIX = (
 _JUDGE_USER_PROMPT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Agent's most recent response:\n{response}\n\n"
+    "{files_block}"
     "Is the goal satisfied?"
 )
+
+# Issue #9: the file-mutation verifier footer the brain wrapper
+# computed for the just-finished turn. Folded into the judge prompt
+# as an *explicit signal* (not a tail-end footer) so a model that
+# claims "I wrote foo.py" while the snapshot diff says nothing
+# changed gets called out at the judge gate instead of marching the
+# goal forward on the false claim. The block is omitted entirely
+# when no diff is available (footer disabled, first turn, walk
+# failed) so the prompt stays byte-identical to the pre-Issue-#9
+# shape in that case.
+_FILES_CHANGED_BLOCK_HEADER = (
+    "Files the agent actually modified during that response "
+    "(from a workspace snapshot diff — ground truth):"
+)
+# Cap on how many paths land in the judge prompt. Same intent as
+# :data:`core.workspace_snapshot._FOOTER_MAX_PATHS` — keep the prompt
+# bounded so a runaway turn (50k touched files after an unintended
+# `find . -exec touch`) doesn't blow the context budget.
+_JUDGE_FILES_CHANGED_MAX = 40
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -205,7 +225,11 @@ def _parse_judge_response(raw: str) -> tuple[bool, str, bool]:
 # ──────────────────────────────────────────────────────────────────
 
 
-def _render_prompt(goal: str, last_response: str) -> str:
+def _render_prompt(
+    goal: str,
+    last_response: str,
+    files_changed: list[str] | None = None,
+) -> str:
     """Compose the full prompt sent to ``claude -p``.
 
     System block + blank line + user block. ``claude -p`` ignores
@@ -218,10 +242,28 @@ def _render_prompt(goal: str, last_response: str) -> str:
     :data:`GOAL_JUDGE_PROMPT_PREFIX` so the curator's content-prefix
     filter recognises the resulting JSONL. The unit test
     ``test_goal_judge_prompt_invariant`` enforces this.
+
+    ``files_changed`` (Issue #9) is the snapshot-diff list the brain
+    wrapper computed for the just-finished turn. None or [] omits the
+    file-mutation block entirely so the prompt shape stays identical
+    to pre-Issue-#9 behaviour. A non-empty list folds in a labeled
+    "ground truth" section the judge weighs against the response —
+    the explicit hook the issue calls for.
     """
+    files_block = ""
+    if files_changed:
+        truncated = list(files_changed[:_JUDGE_FILES_CHANGED_MAX])
+        if len(files_changed) > _JUDGE_FILES_CHANGED_MAX:
+            extra = len(files_changed) - _JUDGE_FILES_CHANGED_MAX
+            truncated.append(f"…and {extra} more")
+        bullet_lines = "\n".join(f"- {p}" for p in truncated)
+        files_block = (
+            f"{_FILES_CHANGED_BLOCK_HEADER}\n{bullet_lines}\n\n"
+        )
     user_section = _JUDGE_USER_PROMPT_TEMPLATE.format(
         goal=_truncate(goal, _GOAL_MAX_CHARS),
         response=_truncate(last_response, _RESPONSE_MAX_CHARS),
+        files_block=files_block,
     )
     return f"{JUDGE_SYSTEM_PROMPT}\n\n{user_section}"
 
@@ -231,6 +273,8 @@ async def judge_goal(
     goal: str,
     last_response: str,
     brain: Brain,
+    *,
+    files_changed: list[str] | None = None,
 ) -> tuple[str, str, bool]:
     """Ask the auxiliary judge whether ``goal`` is satisfied by ``last_response``.
 
@@ -284,7 +328,7 @@ async def judge_goal(
         # and continue. Don't spawn the judge for nothing.
         return "continue", "empty response (nothing to evaluate)", False
 
-    prompt = _render_prompt(goal, last_response)
+    prompt = _render_prompt(goal, last_response, files_changed=files_changed)
 
     try:
         result = await brain.spawn_aux(

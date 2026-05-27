@@ -15,6 +15,16 @@ Canonical schema reference (every block is optional; missing file
                                   # is opt-in — flipping requires the
                                   # legacy-keys → tier-schema migration
                                   # documented in docs/migration.md.
+      file_mutation_footer: true  # Issue #9: snapshot workspace pre/post
+                                  # every brain turn and inject a
+                                  # "[turn-N verifier]" block on the
+                                  # next user message so the model
+                                  # self-corrects against silent write
+                                  # failures. Default true; flip false
+                                  # on workspaces where the per-turn
+                                  # snapshot walk is too slow (~50 ms
+                                  # for 10k files). Hot-reloaded — no
+                                  # daemon restart.
 
     # ── memory limits ───────────────────────────────────────────
     memory:
@@ -979,6 +989,42 @@ def brain_kind() -> str:
         )
         return "claude-code"
     return cleaned
+
+
+# Default for the per-turn file-mutation verifier footer (Issue #9).
+# On for every workspace by default — the snapshot walk is bounded
+# by the prune set in :mod:`core.workspace_snapshot` and stays under
+# 100 ms for the 10k-file budget the issue calls out. Users with
+# pathologically large workspaces (or workspaces where the prune set
+# misses a big custom build dir) flip ``brain.file_mutation_footer:
+# false`` in ``~/.vexis/config.yaml`` to disable.
+_FILE_MUTATION_FOOTER_DEFAULT = True
+
+
+def brain_file_mutation_footer_enabled() -> bool:
+    """Read ``brain.file_mutation_footer`` from ``~/.vexis/config.yaml``.
+
+    Default ``True``. Reads disk per call so toggling the flag takes
+    effect on the next brain turn without a daemon restart (the
+    snapshot work is a per-turn decision, not a startup-bound
+    capability). Anything that doesn't parse as a bool falls back
+    to the default rather than erroring — config typos must never
+    wedge the brain.
+    """
+    raw = _section("brain").get(
+        "file_mutation_footer", _FILE_MUTATION_FOOTER_DEFAULT,
+    )
+    if isinstance(raw, bool):
+        return raw
+    # YAML loaders sometimes hand back the string "true"/"false" if
+    # the user quoted it; accept those too.
+    if isinstance(raw, str):
+        cleaned = raw.strip().lower()
+        if cleaned in ("true", "yes", "1", "on"):
+            return True
+        if cleaned in ("false", "no", "0", "off"):
+            return False
+    return _FILE_MUTATION_FOOTER_DEFAULT
 
 
 # ──────────────────────────────────────────────────────────────────

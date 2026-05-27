@@ -3669,8 +3669,24 @@ class TelegramTransport:
             if not mgr.is_active():
                 return
 
+            # Issue #9 — pass the file-mutation snapshot diff the
+            # brain wrapper just recorded to the judge. ``peek``
+            # (not consume) so the handler's next-turn injector
+            # still sees the same list — both surfaces want the
+            # ground-truth mutation set, and the brain's drain
+            # semantics let consume_files_changed clear the buffer
+            # exactly once on the next user-message _inject_context.
+            try:
+                files_changed = self._handler._brain.peek_files_changed(chat_id)
+            except Exception:  # pragma: no cover - defensive
+                log.exception(
+                    "goal hook: peek_files_changed failed for chat %s",
+                    chat_id,
+                )
+                files_changed = []
             decision = await mgr.evaluate_after_turn(
-                last_response or "", self._handler._brain
+                last_response or "", self._handler._brain,
+                files_changed=files_changed,
             )
         except Exception:
             log.exception("goal hook failed before/at evaluate; chat %s", chat_id)
