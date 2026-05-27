@@ -199,6 +199,26 @@ def create(
             "Europe/London). Omit to use daemon-local."
         ),
     ),
+    script: Optional[str] = typer.Option(
+        None,
+        "--script",
+        help=(
+            "Optional pre-run script under ~/.vexis/scripts/. Runs "
+            "before the brain turn each tick; if its last stdout line "
+            "is '{\"wakeAgent\": false}' the brain turn is skipped. "
+            "Otherwise stdout is prepended to the prompt so the brain "
+            "sees what the script found. See docs/schedules.md."
+        ),
+    ),
+    script_timeout: Optional[float] = typer.Option(
+        None,
+        "--script-timeout",
+        help=(
+            "Hard timeout (seconds) for --script. Default 120. On "
+            "timeout the subprocess is killed and the brain turn is "
+            "SKIPPED (an unresponsive monitor must not pin an LLM)."
+        ),
+    ),
     output: str = typer.Option(
         "json",
         "--output",
@@ -312,6 +332,40 @@ def create(
         )
         raise typer.Exit(code=7)
 
+    # Issue #12: validate --script path at create time so the brain (or
+    # CLI user) gets immediate feedback rather than discovering at
+    # first tick that their path was bogus. The manager re-validates
+    # at fire time too — this is a UX nicety, not the security gate.
+    if script is not None:
+        from vexis_agent.core.schedule_manager import (
+            ScriptPathError,
+            _resolve_script_path,
+        )
+        try:
+            _resolve_script_path(script)
+        except ScriptPathError as exc:
+            typer.echo(
+                json.dumps(
+                    {
+                        "error": "script_path_invalid",
+                        "message": str(exc),
+                        "suggestion": (
+                            "place your script under ~/.vexis/scripts/ "
+                            "and pass --script <name> (no leading path)"
+                        ),
+                    }
+                ),
+                err=True,
+            )
+            raise typer.Exit(code=10)
+
+    # Default timeout matches the dataclass default — but materialise
+    # the explicit float here so the on-disk row has the exact value,
+    # not a stale "None" that the from_dict path then coerces.
+    timeout_value = (
+        float(script_timeout) if script_timeout is not None else 120.0
+    )
+
     state = ScheduleState(
         id=new_schedule_id(),
         chat_id=chat_id,
@@ -322,6 +376,8 @@ def create(
         next_fire_at=next_fire,
         status="active",
         created_at=datetime.now(timezone.utc),
+        script=script,
+        script_timeout_seconds=timeout_value,
     )
     store.save(state)
 
@@ -335,6 +391,8 @@ def create(
         ),
         "schedule_display": state.schedule_display,
         "tz": parsed.get("tz"),
+        "script": state.script,
+        "script_timeout_seconds": state.script_timeout_seconds,
     }
     if output == "text":
         typer.echo(_render_text(state, verbose=True))

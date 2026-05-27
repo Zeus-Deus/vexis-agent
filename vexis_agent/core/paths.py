@@ -178,6 +178,21 @@ def goals_path() -> Path:
     return vexis_dir() / "goals.json"
 
 
+def schedules_scripts_dir() -> Path:
+    """`~/.vexis/scripts/` — user-managed pre-run scripts for /schedule.
+
+    Created lazily on first call. A schedule's ``script`` field is a
+    name (or relative path) under this directory; the manager rejects
+    anything that resolves outside it (no symlink-out, no ``../``).
+
+    Scripts run as the daemon user, no extra sandboxing — matches
+    CLAUDE.md "single-user by design". See `docs/schedules.md`.
+    """
+    path = vexis_dir() / "scripts"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def user_candidates_path() -> Path:
     """`~/.vexis/learning/user_candidates.json`. Day 3 queue file.
 

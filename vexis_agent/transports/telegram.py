@@ -364,7 +364,14 @@ _SCHEDULE_HELP = (
     "/schedule — Set reminders and recurring tasks.\n\n"
     "Examples:\n"
     "  /schedule remind me every weekday at 9am to do standup\n"
-    "  /schedule in 30 minutes ping me about the build\n\n"
+    "  /schedule in 30 minutes ping me about the build\n"
+    "  /schedule every 5m --script check_mail.sh ping if new mail\n\n"
+    "Pre-run script (wake gate):\n"
+    "  --script <name>          — run ~/.vexis/scripts/<name> first;\n"
+    "                             skip the LLM turn when the script\n"
+    "                             prints {\"wakeAgent\": false}.\n"
+    "  --script-timeout <sec>   — kill the script after N seconds\n"
+    "                             (default 120). See docs/schedules.md.\n\n"
     "Management:\n"
     "  /schedule list           — show active schedules\n"
     "  /schedule pause <id>     — temporarily stop one\n"
@@ -410,6 +417,62 @@ _DAEMON_RESTART_LOST = (
     "Sir, when the daemon restarted, background task `{name}` didn't survive. "
     "Want me to relaunch it?"
 )
+
+
+# Issue #12 — argparse-lite for /schedule's --script and --script-timeout
+# tokens. The slash command forwards user text to the brain, but these
+# two flags are mechanical enough to hoist out: the brain doesn't need
+# to interpret "the script foo.sh" as "pass --script foo.sh". Hoisting
+# also gives us a deterministic place to validate the timeout shape.
+_SCHEDULE_FLAG_SCRIPT_RE = re.compile(
+    r"\s--script(?:=|\s+)([^\s]+)",
+)
+_SCHEDULE_FLAG_TIMEOUT_RE = re.compile(
+    r"\s--script-timeout(?:=|\s+)([^\s]+)",
+)
+
+
+def _parse_schedule_script_flags(
+    text: str,
+) -> tuple[str, str | None, str | None]:
+    """Strip ``--script <path>`` and ``--script-timeout <secs>`` from
+    ``text`` and return ``(cleaned_text, script, script_timeout)``.
+
+    Cleaning behaviour:
+
+      * Tokens are recognised in either ``--script=foo`` or
+        ``--script foo`` form.
+      * Recognised tokens are removed from the returned text so the
+        brain doesn't see them mixed into the schedule expression.
+      * Unrecognised input (missing value, malformed timeout) is left
+        in place — the brain may still figure it out from natural
+        language. We don't reject hard at the transport layer.
+
+    Returning the raw token values (not parsed floats) lets the brain
+    do the final coercion via the typed CLI flag — keeps the validation
+    rules in one place (``cli_schedule.create``).
+    """
+    # Pad with a leading space so the regex's ``\s`` anchor catches a
+    # flag at the very start of the text.
+    padded = " " + text
+
+    script: str | None = None
+    script_timeout: str | None = None
+
+    m = _SCHEDULE_FLAG_SCRIPT_RE.search(padded)
+    if m:
+        script = m.group(1)
+        padded = padded[: m.start()] + padded[m.end() :]
+
+    m = _SCHEDULE_FLAG_TIMEOUT_RE.search(padded)
+    if m:
+        script_timeout = m.group(1)
+        padded = padded[: m.start()] + padded[m.end() :]
+
+    # Strip the leading pad space we added; collapse internal double
+    # spaces that the removal might have left behind.
+    cleaned = re.sub(r"\s{2,}", " ", padded).strip()
+    return cleaned, script, script_timeout
 
 
 def split_for_telegram(text: str, max_len: int = _MAX_CHUNK) -> list[str]:
@@ -2321,11 +2384,39 @@ class TelegramTransport:
             await msg.reply_text(_SCHEDULE_HELP)
             return
 
+        # Issue #12 — extract --script / --script-timeout tokens before
+        # passing the rest of the text to the brain. The brain still
+        # owns cron-expression interpretation and the schedule_create
+        # call, but we hoist these flags into a structured hint so the
+        # brain knows to forward them as ``--script`` / ``--script-timeout``
+        # to its CLI tool. Inline parsing here keeps the brain prompt
+        # short (it sees "you must pass --script foo.sh" rather than
+        # having to fish those flags out of natural language).
+        (
+            schedule_text_clean,
+            script_hint,
+            script_timeout_hint,
+        ) = _parse_schedule_script_flags(schedule_text)
+
         # Synthetic message body: the leading [user invoked /schedule]
         # tag is an explicit-intent hint so the brain treats the
         # following text as a scheduling request even if the phrasing
         # is ambiguous.
-        synthetic = f"[user invoked /schedule]\n{schedule_text}"
+        synthetic_lines = [
+            "[user invoked /schedule]",
+            schedule_text_clean,
+        ]
+        if script_hint is not None:
+            synthetic_lines.append(
+                f"[script: {script_hint}] "
+                f"— pass --script {script_hint} to schedule_create."
+            )
+        if script_timeout_hint is not None:
+            synthetic_lines.append(
+                f"[script-timeout: {script_timeout_hint}] "
+                f"— pass --script-timeout {script_timeout_hint}."
+            )
+        synthetic = "\n".join(synthetic_lines)
 
         # Ack first so the user sees something immediately; the brain
         # response takes longer.
