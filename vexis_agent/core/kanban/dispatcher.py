@@ -480,7 +480,15 @@ class KanbanController:
                 model_tier=lane.tier,
                 timeout_seconds=float(max_runtime),
                 env_overrides=env_overrides,
+                # Issue #10 — kanban workers run real tasks and need
+                # broad tool access. The narrower per-lane allowlist
+                # (``LaneSpec.tool_allowlist``) is the natural next
+                # step but explicitly out of scope here; for now this
+                # caller stays on the back-compat allow_tools=True
+                # path. ``allowed_tools`` is left None so the boolean
+                # still wins.
                 allow_tools=True,
+                allowed_tools=None,
                 cwd=cwd,
                 subsystem="kanban_worker",
             )

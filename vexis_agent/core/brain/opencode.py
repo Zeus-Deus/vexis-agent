@@ -580,12 +580,57 @@ def _is_session_not_found_error(err: object) -> bool:
 # ──────────────────────────────────────────────────────────────────
 
 
+# Issue #10 — defense-in-depth: when callers pass an explicit
+# ``allowed_tools`` list, we translate Claude-Code-style tool names
+# into opencode's permission categories. Opencode's permission keys
+# are coarse (``edit`` / ``write`` / ``shell`` / ``webfetch``) so the
+# mapping is one-to-many. A category becomes ``"allow"`` if ANY tool
+# the caller listed maps to it, otherwise ``"deny"``. Read-only
+# categories (Read/Grep/Glob/LS) are not gated by opencode's
+# permission system at all — they always run — so they don't appear
+# in the map and don't need an entry.
+_TOOL_TO_OPENCODE_PERMISSION: dict[str, str] = {
+    "Edit": "edit",
+    "MultiEdit": "edit",
+    "NotebookEdit": "edit",
+    "Write": "write",
+    "Bash": "shell",
+    "Shell": "shell",
+    "WebFetch": "webfetch",
+    "WebSearch": "webfetch",
+}
+
+
+def _permission_from_allowlist(allowed_tools: list[str]) -> dict[str, str]:
+    """Translate a Claude-Code-style ``allowed_tools`` list into
+    opencode's per-category permission dict.
+
+    Empty list → all categories ``"deny"`` (text-only). Any tool in
+    the list whose category appears in
+    :data:`_TOOL_TO_OPENCODE_PERMISSION` unlocks that whole category
+    — the categories are coarser than Claude's per-tool names so the
+    mapping is lossy in the permissive direction. Categories the
+    caller didn't grant remain ``"deny"`` so a poisoned prompt can't
+    coax the model into the wrong tool surface.
+    """
+    granted: set[str] = set()
+    for tool in allowed_tools:
+        category = _TOOL_TO_OPENCODE_PERMISSION.get(tool)
+        if category is not None:
+            granted.add(category)
+    return {
+        category: ("allow" if category in granted else "deny")
+        for category in ("edit", "write", "shell", "webfetch")
+    }
+
+
 def _build_opencode_config_content(
     *,
     agent_name: str,
     system_prompt: str,
     model: str | None,
     allow_tools: bool,
+    allowed_tools: list[str] | None = None,
 ) -> str:
     """Serialise the per-spawn config blob.
 
@@ -612,11 +657,21 @@ def _build_opencode_config_content(
     can't prompt, the call fails loud rather than silently
     misbehaving). ``allow_tools=True`` (skill curator) leaves
     permissions open.
+
+    ``allowed_tools`` (Issue #10) is a defense-in-depth refinement:
+    when non-None it overrides ``allow_tools`` and emits a
+    per-category permission block. ``[]`` → text-only (all categories
+    deny). A list grants the specific categories its tools fall into
+    (via :func:`_permission_from_allowlist`) and denies the rest.
     """
     agent_def: dict = {"prompt": system_prompt}
     if model:
         agent_def["model"] = model
-    if not allow_tools:
+    if allowed_tools is not None:
+        # Explicit per-call allowlist (Issue #10) — wins over the
+        # legacy ``allow_tools`` boolean.
+        agent_def["permission"] = _permission_from_allowlist(allowed_tools)
+    elif not allow_tools:
         # Deny everything by default; the prompt is text-only.
         # Mirrors the deny-rules in
         # ``packages/opencode/src/cli/cmd/run.ts:359-374`` (which
@@ -989,6 +1044,7 @@ class OpenCodeBrain(Brain):
         timeout_seconds: float = 60.0,
         env_overrides: dict[str, str] | None = None,
         allow_tools: bool = False,
+        allowed_tools: list[str] | None = None,
         cwd: Path | None = None,
         subsystem: str | None = None,
         reasoning_level: str | None = None,
@@ -1036,6 +1092,7 @@ class OpenCodeBrain(Brain):
             system_prompt="",  # aux prompt is the user message
             model=model,
             allow_tools=allow_tools,
+            allowed_tools=allowed_tools,
         )
 
         env = dict(os.environ)

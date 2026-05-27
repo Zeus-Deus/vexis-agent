@@ -1382,6 +1382,10 @@ def _run_triage(
                 reasoning_level=subsystem_reasoning("learning_triage"),
                 timeout_seconds=LEARNING_TRIAGE_TIMEOUT_SECONDS,
                 env_overrides={RECURSION_ENV_VAR: "1"},
+                # Issue #10 — defense in depth: triage is a YES/NO
+                # text classifier. It has zero legitimate reason to
+                # touch the filesystem or shell.
+                allowed_tools=[],
                 cwd=workspace,
                 subsystem="learning_triage",
             )
@@ -1552,6 +1556,12 @@ def run_review(
                 reasoning_level=subsystem_reasoning("learning_review"),
                 timeout_seconds=LEARNING_REVIEW_TIMEOUT_SECONDS,
                 env_overrides={RECURSION_ENV_VAR: "1"},
+                # Issue #10 — defense in depth: the full review is a
+                # text-only JSON judge. It produces a structured
+                # ReviewOutput; the curator writes the files later.
+                # A poisoned transcript must not coax the judge into
+                # touching disk or shell.
+                allowed_tools=[],
                 cwd=workspace,
                 subsystem="learning_review",
             )

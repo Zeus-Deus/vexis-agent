@@ -1145,6 +1145,7 @@ class ClaudeCodeBrain(Brain):
         timeout_seconds: float = 60.0,
         env_overrides: dict[str, str] | None = None,
         allow_tools: bool = False,
+        allowed_tools: list[str] | None = None,
         cwd: Path | None = None,
         subsystem: str | None = None,
         reasoning_level: str | None = None,
@@ -1168,6 +1169,18 @@ class ClaudeCodeBrain(Brain):
         prompt (used by the skill curator and learning review). Off
         by default so judges and classifiers — which expect text-only
         verdicts — fail loud if the model unexpectedly tries a tool.
+
+        ``allowed_tools`` is a defense-in-depth per-call allowlist
+        (Issue #10). When non-None it overrides ``allow_tools``:
+
+          - ``allowed_tools=[]`` → text-only spawn (no
+            ``--allowedTools``, no bypass flag); a stray tool
+            attempt fails loud rather than hanging on a permission
+            prompt that headless mode can't answer.
+          - ``allowed_tools=['Read', 'Grep']`` → emits
+            ``--allowedTools Read Grep`` + ``--permission-mode
+            bypassPermissions`` so the named tools run without a
+            prompt. ``DISALLOWED_TOOLS`` continues to apply on top.
 
         On a non-zero exit, returns the ``AuxResult`` with the
         non-zero ``returncode``; subsystems decide how to handle it.
@@ -1195,7 +1208,21 @@ class ClaudeCodeBrain(Brain):
         # Brain.spawn_aux's docstring.
         _ = context_window
         argv.append(prompt)
-        if allow_tools:
+        # Issue #10 — defense-in-depth: explicit per-call allowlist
+        # wins over the legacy boolean. Text-only mode (None+False
+        # OR explicit []) emits neither flag; tool-using modes emit
+        # the appropriate combination of --allowedTools (when an
+        # explicit list is provided) and --permission-mode
+        # bypassPermissions (always required in headless -p to avoid
+        # an interactive prompt deadlock when ANY tool is allowed).
+        if allowed_tools is not None:
+            if allowed_tools:
+                argv += ["--allowedTools", *allowed_tools]
+                argv += ["--permission-mode", "bypassPermissions"]
+            # explicit [] → text-only; no flags added. A stray tool
+            # attempt fails loud because headless -p has no UI to
+            # answer the resulting permission prompt.
+        elif allow_tools:
             argv += ["--permission-mode", "bypassPermissions"]
 
         env = dict(os.environ)

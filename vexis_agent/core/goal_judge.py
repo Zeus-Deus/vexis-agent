@@ -337,6 +337,10 @@ async def judge_goal(
             reasoning_level=subsystem_reasoning("goal_judge"),
             timeout_seconds=GOAL_JUDGE_TIMEOUT_SECONDS,
             env_overrides={GOAL_JUDGE_ENV_VAR: "1"},
+            # Issue #10 — defense in depth: the goal judge produces a
+            # done/continue verdict. The brain turn it judges may have
+            # touched files; the judge itself never should.
+            allowed_tools=[],
             cwd=workspace,
             subsystem="goal_judge",
         )

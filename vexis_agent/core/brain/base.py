@@ -590,6 +590,7 @@ class Brain(ABC):
         timeout_seconds: float = 60.0,
         env_overrides: dict[str, str] | None = None,
         allow_tools: bool = False,
+        allowed_tools: list[str] | None = None,
         cwd: Path | None = None,
         subsystem: str | None = None,
         reasoning_level: str | None = None,
@@ -615,12 +616,43 @@ class Brain(ABC):
         etc.) so the spawned process can self-identify in audit logs.
 
         ``allow_tools`` controls whether the spawned brain can use
-        tools. ``False`` (the default for judges and extractors) means
+        tools (legacy all-or-nothing knob — kept for back-compat).
+        ``False`` (the default for judges and extractors) means
         the call is text-only — if the model tries a tool, the call
         will hang waiting for a permission prompt. ``True`` adds the
         appropriate "bypass permissions" flag so tool calls succeed
         without prompting (used by the skill curator's consolidation
         pass and the learning review).
+
+        ``allowed_tools`` is a defense-in-depth refinement of
+        ``allow_tools``: an explicit per-call tool allowlist.
+        Semantics:
+
+          - ``allowed_tools=None`` AND ``allow_tools=False`` →
+            text-only (current behaviour preserved).
+          - ``allowed_tools=None`` AND ``allow_tools=True`` →
+            unrestricted tools (back-compat for callers that
+            haven't been migrated yet).
+          - ``allowed_tools=[]`` → text-only (explicit form; same
+            effective behaviour as ``allow_tools=False`` but the
+            caller has *declared* their intent).
+          - ``allowed_tools=['Read', 'Grep']`` → only those tools
+            may be invoked. No interactive permission prompts (the
+            brain still spawns with the appropriate bypass flag so
+            disallowed-tool calls fail loud instead of hanging).
+
+        When ``allowed_tools`` is non-None it wins over
+        ``allow_tools``. Each brain translates to its native idiom:
+        claude-code emits ``--allowedTools <name> ...`` (the
+        ``DISALLOWED_TOOLS`` global continues to apply on top);
+        opencode constructs a per-tool ``permission`` agent block
+        that allows the named tools and denies everything else.
+
+        This kwarg exists for defense-in-depth: a poisoned
+        transcript should not be able to coax the curator-review
+        LLM into calling ``Bash`` / ``Write`` / ``WebFetch`` even
+        if the prompt manages to argue for it. Each caller declares
+        the narrowest tool surface it legitimately needs.
 
         ``cwd`` is the working directory for the spawned subprocess.
         Defaults to the brain's workspace (so the spawned session's
