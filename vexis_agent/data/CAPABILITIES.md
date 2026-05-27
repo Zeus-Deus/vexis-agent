@@ -961,3 +961,40 @@ id (use `list` first to find it; refuse politely if ambiguous and
 ask which one). Soft-clear (`clear`) is reversible only by creating
 a new schedule with the same prompt — the cleared record is
 audit-retained, not revivable.
+
+## Codemux orchestration — `vexis-watch`
+
+When you delegate work to a Codemux workspace (claude-code,
+opencode, aider, anything launched in a pane), the inner agent runs
+in a PTY that never exits — so `vexis-bg`'s exit-notification path
+can't tell you when it goes quiet. The watcher closes this gap.
+Active ONLY when the `codemux` MCP is wired into
+`~/.vexis/mcp-servers.yaml`; on hosts without it, none of this
+applies.
+
+To enrol a workspace for monitoring:
+
+    vexis-watch register \
+      --name my-build \
+      --workspace <codemux-workspace-id> \
+      --agent-kind claude-code \
+      --idle-after 30s \
+      --goal "<one-liner of what's running>"
+
+Walk away. When the inner agent stops emitting bytes for the idle
+threshold, the user gets one Telegram message naming the workspace,
+the goal hint, and the last line of output. Inline replies the user
+can send back: `tail <name>` (last 20 lines), `peek <name>` (asks
+Vexis to summarise), `mute <name>` / `unmute <name>`, `unwatch
+<name>`. `/codemux` lists all watched workspaces.
+
+If you start a fresh session and the system prompt says "Active
+Codemux work: N workspaces — run 'vexis-watch status' for details.",
+that's the lead — call `vexis-watch status` before answering
+"what's building?" or similar. Per-workspace state is deliberately
+NOT in the prompt; the CLI is where you go for details.
+
+The CLI emits JSON to stdout. When the Codemux MCP isn't wired the
+daemon returns "Codemux MCP not configured" and the CLI exits 0 —
+safe to call from any skill without a pre-check. See
+`docs/codemux-watcher.md` for the full reference.

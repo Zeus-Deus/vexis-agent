@@ -228,6 +228,17 @@ ships an MCP server with semantic search over Omarchy / Arch /
 Hyprland docs. Follow its README to spin it up, then point vexis at
 it via `~/.vexis/mcp-servers.yaml`.
 
+**Codemux users:** wire the `codemux` MCP into
+`~/.vexis/mcp-servers.yaml` and vexis activates a watcher that
+pings you on Telegram when long-running Codemux work (claude-code,
+opencode, aider, whatever you launched in a workspace pane) goes
+idle. `vexis-watch register --name my-build --workspace
+<workspace-id> --agent-kind claude-code` enrols a build; walk away;
+get a single Telegram message when the inner agent stops emitting
+bytes for ~30s. `/codemux` from the phone lists what's watched.
+See `docs/codemux-watcher.md`. Without the `codemux` MCP wired,
+nothing changes — zero cost.
+
 ## Choosing your brain
 
 The default is `claude-code`. To use opencode instead, set in

@@ -72,3 +72,24 @@ goals:
 relationships:
   explicit_consent_enabled: false
   approval_hint_enabled: true
+
+# ── codemux orchestration watcher (see docs/codemux-watcher.md) ─────
+# Active ONLY when the `codemux` MCP is wired into mcp-servers.yaml;
+# otherwise the entire section is ignored.
+#
+#   poll_interval_seconds      — how often the watcher reads each
+#                                workspace's terminal scrollback.
+#                                Default 5.0; range [1.0, 300.0].
+#                                Worst-case notify latency is
+#                                idle_after_seconds + this.
+#   oscillation_window_seconds — debounce: a second idle transition
+#                                inside this window of the previous
+#                                one flips the status but suppresses
+#                                the Telegram ping. Default 60.0;
+#                                range [0.0, 3600.0]. Set to 0 to
+#                                disable debounce.
+#
+# Changes take effect on daemon restart.
+watcher:
+  poll_interval_seconds: 5.0
+  oscillation_window_seconds: 60.0

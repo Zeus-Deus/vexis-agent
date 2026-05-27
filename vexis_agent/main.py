@@ -333,9 +333,44 @@ async def _run() -> None:
     )
     browser_manager = get_browser_manager()
     browser_tools = BrowserTools(browser_manager, workspace)
+    # Codemux orchestration watcher. Conditional activation: present
+    # only when the Codemux MCP is wired into ~/.vexis/mcp-servers.yaml,
+    # so users without Codemux pay zero cost (no poll loop, no slash
+    # command registration, no system-prompt header). See LAYER 1f /
+    # NON-NEGOTIABLES in the watcher spec and docs/codemux-watcher.md.
+    from vexis_agent.core.watcher import (
+        WatcherController,
+        codemux_mcp_configured,
+    )
+    watcher: WatcherController | None = None
+    if codemux_mcp_configured():
+        # Per-deployment cadence knobs (see yaml_config.watcher_*).
+        # Read once at construction; restart to change. The defaults
+        # (5s poll, 60s oscillation window) give ≤35s notification
+        # latency at the default 30s idle threshold without spamming
+        # terminal_read.
+        from vexis_agent.core.yaml_config import (
+            watcher_oscillation_window_seconds as _watcher_osc,
+            watcher_poll_interval_seconds as _watcher_poll,
+        )
+        watcher = WatcherController(
+            poll_interval_seconds=_watcher_poll(),
+            oscillation_window_seconds=_watcher_osc(),
+        )
+        log.info(
+            "watcher: Codemux MCP detected — controller active "
+            "(poll=%.1fs, oscillation_window=%.1fs)",
+            _watcher_poll(), _watcher_osc(),
+        )
+    else:
+        log.info(
+            "watcher: Codemux MCP not configured; skipping "
+            "controller, /codemux slash command, and system-prompt header"
+        )
+
     control_socket = ControlSocket(
         default_socket_path(),
-        _build_dispatch(background_tasks, browser_tools),
+        _build_dispatch(background_tasks, browser_tools, watcher),
     )
 
     # Phase C Day 3: ``brain.kind`` selects the agent CLI to spawn
@@ -383,6 +418,16 @@ async def _run() -> None:
         # Never let validator failures block daemon startup.
         log.exception("model_validator startup pass raised; continuing")
 
+    # Watcher's header_block() is called once per session-prompt build
+    # (cached in ClaudeCodeBrain._system_prompt_for so prefix-cache
+    # stays stable for the rest of the session). Returning None means
+    # "no header line." Wired only when the controller exists so the
+    # zero-cost contract for non-Codemux users holds.
+    extra_prompt_blocks = (
+        (lambda: ([watcher.header_block()] if watcher.header_block() else []))
+        if watcher is not None else None
+    )
+
     if _kind == "opencode":
         from vexis_agent.core.brain.opencode import OpenCodeBrain
         brain = OpenCodeBrain(
@@ -403,6 +448,7 @@ async def _run() -> None:
             workspace=workspace,
             session=sessions,
             running_tasks=running_tasks,
+            extra_prompt_blocks=extra_prompt_blocks,
         )
         log.info("Brain: ClaudeCodeBrain (brain.kind=claude-code)")
     handler = MessageHandler(
@@ -513,7 +559,13 @@ async def _run() -> None:
         dashboard=dashboard,
         schedule_store=schedule_store,
         kanban_store=kanban_store,
+        watcher=watcher,
     )
+    # The watcher pushes its idle pings through the same notifier the
+    # rest of the daemon uses — same per-chat context buffer, same
+    # Markdown fall-back, same retry shape as vexis-bg's exit pings.
+    if watcher is not None:
+        watcher.set_notify(notifier.send)
 
     # Wire the dispatch callback so ScheduleManager fires route through
     # the transport's ``claim() ? drain : enqueue`` protocol instead of
@@ -539,9 +591,13 @@ async def _run() -> None:
     schedule_manager.start(asyncio.get_running_loop())
     if kanban_controller is not None:
         kanban_controller.start(asyncio.get_running_loop())
+    if watcher is not None:
+        await watcher.start()
     try:
         await transport.run()
     finally:
+        if watcher is not None:
+            await watcher.stop()
         if kanban_controller is not None:
             await kanban_controller.stop()
         if kanban_store is not None:
@@ -624,13 +680,50 @@ def _dashboard_port_from_env() -> int:
     return port
 
 
-def _build_dispatch(bg: BackgroundTasks, browser: BrowserTools):
+def _build_dispatch(
+    bg: BackgroundTasks,
+    browser: BrowserTools,
+    watcher: "object | None" = None,  # WatcherController; weak-typed to avoid import cycle
+):
     """Wire control-socket ops to in-daemon singletons.
 
     The dispatcher is intentionally exhaustive — adding a new op here is
     the same effort as adding a new bg/browser method, and unknown ops
     return a structured error rather than silently 200ing.
+
+    ``watcher`` is ``None`` when the Codemux MCP isn't configured;
+    ``watch_*`` ops in that mode return ``CodemuxNotConfigured`` so
+    ``vexis-watch`` can print the conditional-activation message and
+    exit cleanly. The op surface is otherwise identical, which keeps
+    the CLI / spec stable across MCP-on / MCP-off states.
     """
+    # Lazy import keeps tests of _build_dispatch that don't care about
+    # the watcher path independent of the watcher import side effects.
+    from vexis_agent.core.watcher import (
+        DEFAULT_IDLE_AFTER_SECONDS as _W_DEFAULT_IDLE,
+        DuplicateName as _WDuplicate,
+        UnknownName as _WUnknown,
+        UNAVAILABLE_MESSAGE as _WUnavailable,
+    )
+    from vexis_agent.core.watcher.sources import SourceUnavailable as _WSrcGone
+
+    # Friendlier "workspace not active" path. When the user invokes
+    # ``vexis-watch register --workspace <id>`` and the target workspace
+    # isn't the one currently focused in Codemux, the MCP can't read
+    # its panes — workspace_info/pane_list operate on the active
+    # workspace only. We surface a distinct ``WorkspaceNotActive`` so
+    # the CLI can print a fix-suggesting message rather than a raw
+    # SourceUnavailable. Detected by string-match on the resolver's
+    # error wording — the resolver lives in a single file so the
+    # phrasing is pinned by import.
+    _WS_NOT_ACTIVE_MARKERS = ("is not the active codemux workspace",)
+
+    def _watcher_unavailable() -> dict:
+        return {
+            "ok": False,
+            "error": _WUnavailable,
+            "kind": "CodemuxNotConfigured",
+        }
 
     async def dispatch(op: str, args: dict) -> dict:
         if op == "bg_spawn":
@@ -790,6 +883,178 @@ def _build_dispatch(bg: BackgroundTasks, browser: BrowserTools):
                 bool(args.get("full_page", False)),
                 include_base64=include_b64,
             )
+        if op == "watch_register":
+            if watcher is None:
+                return _watcher_unavailable()
+            # ``identifier`` (source-specific id) and ``workspace_id``
+            # (Codemux user-facing handle) can BOTH appear in args:
+            # the CLI's ``--workspace`` flag fills ``workspace_id``
+            # for codemux registrations, and the dispatch then auto-
+            # resolves to a session id. Direct callers (raw control-
+            # socket clients, tests) may pass ``identifier`` and skip
+            # the resolution step. Backward-compatible with the
+            # earlier-shipping dispatch shape.
+            try:
+                name = str(args["name"])
+                source_type = str(args.get("source", "codemux"))
+                agent_kind = str(args["agent_kind"])
+                chat_id = int(args["chat_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                return {
+                    "ok": False,
+                    "error": f"bad watch_register args: {exc}",
+                    "kind": "BadRequest",
+                }
+            idle_after = args.get("idle_after_seconds")
+            try:
+                idle_after_int = (
+                    int(idle_after) if idle_after is not None
+                    else _W_DEFAULT_IDLE
+                )
+            except (TypeError, ValueError):
+                return {
+                    "ok": False,
+                    "error": "'idle_after_seconds' must be an int",
+                    "kind": "BadRequest",
+                }
+            goal_hint_raw = args.get("goal_hint")
+            goal_hint = goal_hint_raw if isinstance(goal_hint_raw, str) else None
+            repo_path_raw = args.get("repo_path")
+            repo_path = repo_path_raw if isinstance(repo_path_raw, str) else None
+            workspace_id_raw = args.get("workspace_id")
+            workspace_id = (
+                workspace_id_raw if isinstance(workspace_id_raw, str) else None
+            )
+            identifier_raw = args.get("identifier")
+            identifier = (
+                identifier_raw if isinstance(identifier_raw, str) else None
+            )
+            try:
+                if (
+                    source_type == "codemux"
+                    and workspace_id
+                    and not identifier
+                ):
+                    # Auto-resolve workspace_id → session_id. The
+                    # daemon owns the live MCP client; the CLI just
+                    # ships the workspace_id and trusts us to do the
+                    # mapping. This is the happy-path call from a
+                    # Vexis skill inside the workspace it wants to
+                    # watch.
+                    agent = await watcher.register_codemux_workspace(
+                        name=name,
+                        workspace_id=workspace_id,
+                        agent_kind=agent_kind,
+                        chat_id=chat_id,
+                        idle_after_seconds=idle_after_int,
+                        goal_hint=goal_hint,
+                    )
+                else:
+                    # Direct path: caller already knows the right
+                    # source-specific identifier (a session id for
+                    # codemux, a pid for a future PTY plugin, etc.).
+                    if not identifier:
+                        return {
+                            "ok": False,
+                            "error": (
+                                "missing 'identifier' (or 'workspace_id' "
+                                "for codemux source)"
+                            ),
+                            "kind": "BadRequest",
+                        }
+                    agent = await watcher.register_agent(
+                        name=name,
+                        source_type=source_type,
+                        identifier=identifier,
+                        agent_kind=agent_kind,
+                        chat_id=chat_id,
+                        idle_after_seconds=idle_after_int,
+                        goal_hint=goal_hint,
+                        repo_path=repo_path,
+                        workspace_id=workspace_id,
+                    )
+            except _WDuplicate as exc:
+                return {"ok": False, "error": str(exc), "kind": "DuplicateName"}
+            except _WSrcGone as exc:
+                msg = str(exc)
+                kind = "SourceUnavailable"
+                if any(m in msg.lower() for m in _WS_NOT_ACTIVE_MARKERS):
+                    kind = "WorkspaceNotActive"
+                return {"ok": False, "error": msg, "kind": kind}
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc), "kind": "BadRequest"}
+            return {"ok": True, "result": agent.to_dict()}
+        if op == "watch_unregister":
+            if watcher is None:
+                return _watcher_unavailable()
+            name = str(args.get("name", ""))
+            if not name:
+                return {"ok": False, "error": "missing 'name'", "kind": "BadRequest"}
+            try:
+                agent = await watcher.unregister_agent(name)
+            except _WUnknown as exc:
+                return {"ok": False, "error": str(exc), "kind": "UnknownName"}
+            return {"ok": True, "result": agent.to_dict()}
+        if op == "watch_list":
+            if watcher is None:
+                return _watcher_unavailable()
+            return {
+                "ok": True,
+                "result": [a.to_dict() for a in watcher.list_agents()],
+            }
+        if op == "watch_status":
+            if watcher is None:
+                return _watcher_unavailable()
+            name = args.get("name")
+            if isinstance(name, str) and name:
+                agent = watcher.get_agent(name)
+                if agent is None:
+                    return {
+                        "ok": False,
+                        "error": f"no watched agent named {name!r}",
+                        "kind": "UnknownName",
+                    }
+                return {"ok": True, "result": agent.to_dict()}
+            return {
+                "ok": True,
+                "result": [a.to_dict() for a in watcher.list_agents()],
+            }
+        if op == "watch_mute":
+            if watcher is None:
+                return _watcher_unavailable()
+            name = str(args.get("name", ""))
+            if not name:
+                return {"ok": False, "error": "missing 'name'", "kind": "BadRequest"}
+            muted = bool(args.get("muted", True))
+            try:
+                agent = await watcher.mute_agent(name, muted)
+            except _WUnknown as exc:
+                return {"ok": False, "error": str(exc), "kind": "UnknownName"}
+            return {"ok": True, "result": agent.to_dict()}
+        if op == "watch_tail":
+            if watcher is None:
+                return _watcher_unavailable()
+            name = str(args.get("name", ""))
+            if not name:
+                return {"ok": False, "error": "missing 'name'", "kind": "BadRequest"}
+            lines_arg = args.get("lines", 20)
+            try:
+                lines = int(lines_arg)
+            except (TypeError, ValueError):
+                return {
+                    "ok": False,
+                    "error": "'lines' must be an int",
+                    "kind": "BadRequest",
+                }
+            if lines <= 0:
+                lines = 20
+            try:
+                text = await watcher.tail(name, lines)
+            except _WUnknown as exc:
+                return {"ok": False, "error": str(exc), "kind": "UnknownName"}
+            except _WSrcGone as exc:
+                return {"ok": False, "error": str(exc), "kind": "SourceUnavailable"}
+            return {"ok": True, "result": {"text": text}}
         return {"ok": False, "error": f"unknown op '{op}'", "kind": "BadRequest"}
 
     return dispatch

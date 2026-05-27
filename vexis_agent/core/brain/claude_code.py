@@ -35,7 +35,7 @@ import shutil
 import signal
 import subprocess
 import uuid as _uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -476,10 +476,21 @@ class ClaudeCodeBrain(Brain):
         workspace: Path,
         session: SessionStore,
         running_tasks: RunningTasks,
+        *,
+        extra_prompt_blocks: Callable[[], list[str]] | None = None,
     ) -> None:
         self._workspace = workspace
         self._session = session
         self._running_tasks = running_tasks
+        # Codemux watcher hook (LAYER 2 of the watcher spec). The
+        # daemon wires this to ``WatcherController.header_block()``
+        # which returns AT MOST one short line listing the active
+        # workspace count. None = no header injection. Per-session
+        # cache below freezes the result for the session so the prefix
+        # cache stays stable across turns; the per-spawn re-read of
+        # this callable matches the spec's "at Vexis session spawn"
+        # semantics. Always None when Codemux MCP isn't configured.
+        self._extra_prompt_blocks = extra_prompt_blocks
         # Step 6.5: install the PreToolUse safety hook into
         # <workspace>/.claude/settings.json before the first claude -p
         # spawn. Idempotent + merge-friendly — see
@@ -510,6 +521,21 @@ class ClaudeCodeBrain(Brain):
         if cached is not None:
             return cached
         prompt = build_system_prompt(self._workspace)
+        # Watcher header (LAYER 2). The provider returns a list (0 or
+        # 1 strings today; future plugins may add more). Resolved once
+        # per session UUID — the cache below freezes the result so
+        # mid-session changes to the registry don't perturb the
+        # prefix-cache hash. ``/clear`` rotates the UUID and the
+        # header re-resolves naturally.
+        if self._extra_prompt_blocks is not None:
+            try:
+                blocks = self._extra_prompt_blocks() or []
+            except Exception:
+                log.exception("extra_prompt_blocks provider raised; ignoring")
+                blocks = []
+            for block in blocks:
+                if isinstance(block, str) and block.strip():
+                    prompt = prompt + "\n\n" + block.strip()
         # FIFO trim: dicts preserve insertion order in Python 3.7+, so
         # the first key is always the oldest. Cap is a safety net for
         # long-running daemons that accumulate many session rotations.

@@ -1491,3 +1491,91 @@ def telegram_streaming_min_interval_seconds() -> float:
         )
         return DEFAULT_TELEGRAM_STREAMING_MIN_INTERVAL_SECONDS
     return value
+
+
+# ---- Codemux orchestration watcher ----------------------------------
+#
+# These two keys ride under the ``watcher:`` section of
+# ``~/.vexis/config.yaml``. They take effect on daemon restart — the
+# poller reads them once at construction time. Hot-reload is not
+# worth the cycles for a knob users tune once.
+#
+# Defaults chosen so the worst-case time from "inner agent went
+# silent" to "Telegram ping arrives" is bounded by
+# ``idle_after_seconds + poll_interval_seconds`` — 30s + 5s = 35s
+# with the shipping defaults, well under a minute. Crank
+# ``poll_interval_seconds`` down for snappier pings at the cost of
+# more terminal_read MCP traffic; crank it up to be gentler on a
+# busy desktop.
+DEFAULT_WATCHER_POLL_INTERVAL_SECONDS: float = 5.0
+DEFAULT_WATCHER_OSCILLATION_WINDOW_SECONDS: float = 60.0
+_WATCHER_POLL_INTERVAL_FLOOR: float = 1.0
+_WATCHER_POLL_INTERVAL_CEILING: float = 300.0
+_WATCHER_OSCILLATION_WINDOW_FLOOR: float = 0.0
+_WATCHER_OSCILLATION_WINDOW_CEILING: float = 3600.0
+
+
+def _float_in_range(
+    raw: Any,
+    *,
+    default: float,
+    floor: float,
+    ceiling: float,
+    label: str,
+) -> float:
+    """Coerce a yaml value into a bounded float. Outside the band,
+    emit one warning and use the default — same posture as the
+    streaming min-interval helper above."""
+    if isinstance(raw, bool):
+        # ``true`` accidentally coerces to 1.0 otherwise.
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if value < floor or value > ceiling:
+        log.warning(
+            "%s=%r out of range [%.1f, %.1f]; using default %.1f",
+            label, value, floor, ceiling, default,
+        )
+        return default
+    return value
+
+
+def watcher_poll_interval_seconds() -> float:
+    """How often the watcher polls each registered source. Default 5s.
+
+    Clamped to ``[1.0, 300.0]``. With the default 30s idle threshold
+    the 5s cadence keeps worst-case notification latency ≤ 35s; users
+    who care more about laptop battery than snappy pings can raise
+    this without changing the idle threshold each agent was
+    registered with."""
+    return _float_in_range(
+        _section("watcher").get(
+            "poll_interval_seconds", DEFAULT_WATCHER_POLL_INTERVAL_SECONDS,
+        ),
+        default=DEFAULT_WATCHER_POLL_INTERVAL_SECONDS,
+        floor=_WATCHER_POLL_INTERVAL_FLOOR,
+        ceiling=_WATCHER_POLL_INTERVAL_CEILING,
+        label="watcher.poll_interval_seconds",
+    )
+
+
+def watcher_oscillation_window_seconds() -> float:
+    """Debounce window for idle re-notifications. Default 60s.
+
+    A second idle transition within this window of the previous one
+    flips the status but suppresses the Telegram ping — a bursty
+    agent that flickers idle→running→idle stays quiet until it
+    actually settles. Clamped to ``[0.0, 3600.0]``; 0 disables
+    debounce (every transition pings)."""
+    return _float_in_range(
+        _section("watcher").get(
+            "oscillation_window_seconds",
+            DEFAULT_WATCHER_OSCILLATION_WINDOW_SECONDS,
+        ),
+        default=DEFAULT_WATCHER_OSCILLATION_WINDOW_SECONDS,
+        floor=_WATCHER_OSCILLATION_WINDOW_FLOOR,
+        ceiling=_WATCHER_OSCILLATION_WINDOW_CEILING,
+        label="watcher.oscillation_window_seconds",
+    )

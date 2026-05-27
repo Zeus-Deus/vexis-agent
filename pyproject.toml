@@ -47,6 +47,11 @@ vexis-agent = "vexis_agent.cli:app"
 # bash files in scripts/ remain for dev-checkout convenience but are no
 # longer the canonical entry points.
 vexis-bg = "vexis_agent.tools.background_cli:main"
+# Codemux orchestration watcher (see docs/codemux-watcher.md). Registers
+# long-running terminal-attached agents (today: Codemux workspaces; PTY
+# + tmux plugins land later) and pings the user on Telegram when the
+# inner agent goes idle. Activated only when the Codemux MCP is wired.
+vexis-watch = "vexis_agent.tools.watch_cli:main"
 vexis-browse = "vexis_agent.tools.browser_cli:main"
 vexis-desktop = "vexis_agent.tools.desktop_cli:main"
 # Build-and-test loop primitives — see `.plans/agent-research.md`.
