@@ -340,6 +340,60 @@ If your IDENTITY candidate is a genuinely new claim (no existing
 queue entry covers it), omit ``target`` entirely. The dispatcher
 creates a new queue entry on first observation.
 
+## Do NOT capture — poison patterns
+
+The patterns below are real failure modes seen in production curator
+runs. Each one looks plausible inside a single transcript but
+becomes corrosive once it lands in long-term memory and gets
+re-spoken in every future session's system prompt. Reviewers — past
+and future — keep deleting items in these shapes, so the prompt now
+calls them out explicitly. Do NOT capture; if a lesson candidate
+matches any of these patterns, prefer "Nothing to save." (or
+class=VOLATILE for that signal) instead.
+
+Why each one is poison:
+
+  - **Negative tool claims** harden into self-imposed refusals the
+    agent cites against itself for months after the underlying
+    issue was fixed. The model has no visibility into whether a
+    failure it saw was structural or a one-off. ("voxtype.transcribe
+    is broken", "the X tool doesn't work", "browser tools are
+    unreliable", "always fails on Y") — never write these.
+  - **Environment failures** (timeouts, OOMs, missing binaries,
+    "command not found", unconfigured credentials, uninstalled
+    packages, fresh-install errors) are infra state, not lessons.
+    The user can fix infra; a durable rule cannot. ("goal_judge
+    subprocesses time out", "vexis-agent crashes on startup",
+    "ffmpeg is missing") — never write these.
+  - **Transient errors** (rate limits, 5xx responses, 429s,
+    network blips, Anthropic / provider hiccups) resolve on retry.
+    Capturing them mints false rules like "the API is unreliable"
+    that survive long after the incident. If retry worked, the
+    lesson is the retry pattern — not the original failure.
+  - **Single-session anecdotes presented as general rules.** One
+    transcript is one observation; one observation is not a class.
+    "Today the parser broke on payload X" is a bug report, not a
+    rule. Wait for the pattern to recur across sessions before
+    promoting; until then, the bug fix belongs in code, not memory.
+  - **Model self-attribution** — phrases like "Claude struggled
+    with X", "the agent kept hallucinating Y", "Vexis got
+    confused about Z". Single-turn self-reports are noisy and
+    the model cannot accurately introspect its own reasoning;
+    promoting them creates rules that pathologize normal behavior
+    or pre-emptively forbid valid tool use.
+
+Subtle exception: if a tool failed because of setup state, the
+lesson is the FIX (install command, config step, env var to set)
+under an existing setup or troubleshooting skill — never "this
+tool does not work" as a standalone constraint. PROCEDURAL S1/S2
+on a setup skill is fine; SITUATIONAL ("the user's X is
+broken") is not.
+
+This block exists because removing it would silently re-open all
+five failure modes above. Future editors: do not delete as
+"obvious" — the model needs to see these refusals before forming
+the verdict, not just at code-review time.
+
 ## Output contract
 
 Emit either the literal string

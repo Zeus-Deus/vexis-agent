@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Eval harness for the learning curator (§7.4 + Day 4 v2 extension).
 
-Runs ten scenarios — five v1 carryover + five new v2 — each a
-synthetic 4-message session with one explicit user correction (or
-identity signal / dedup setup), then judges whether the curator
-correctly classified, routed, and (for procedural scenarios)
-generalized the lesson to a same-class probe without misfiring on
-a different-class probe.
+Runs sixteen scenarios — five v1 carryover + six v2 (skill routing,
+identity, memory dedup) + five issue-#8 poison-pattern scenarios —
+each a synthetic 4-message session with one explicit user correction
+(or identity signal / dedup setup / poison signal). The driver
+judges whether the curator correctly classified, routed, and (for
+procedural scenarios) generalized the lesson to a same-class probe
+without misfiring on a different-class probe. Poison scenarios
+grade on G9: did the curator REFUSE to capture the noisy signal.
 
-Pass criteria for the shadow → live flip (v2 §4.3):
+Pass criteria for the shadow → live flip (v2 §4.3, extended by
+issue #8 for G9):
 
-  G1 = 8/8    every scenario produces a verified lesson (or, for
-              the dedup scenario, correctly REJECTS — that counts
-              as G1 ✓ for that scenario)
-  G2 = 8/8    every evidence string verifies verbatim
+  G1 = N/N    every scenario produces a verified lesson (or, for
+              the dedup + poison scenarios, correctly REJECTS —
+              that counts as G1 ✓ for those scenarios)
+  G2 = N/N    every evidence string verifies verbatim
   G3 ≥ 6/8   lessons APPLY to same-class probes (relaxed because
               several v2 scenarios don't naturally fit the same-
               class probe shape — see v2 doc §4.3 defense)
@@ -22,11 +25,13 @@ Pass criteria for the shadow → live flip (v2 §4.3):
   G6 = 2/2    skill update vs creation correctness
   G7 = 2/2    memory dedup works
   G8 = 2/2    USER.md threshold respected
+  G9 = 5/5    poison patterns (issue #8) correctly REJECTED —
+              "Nothing to save." or class=VOLATILE
 
 Usage:
     python scripts/eval_learning.py [--out report.md]
 
-Cost: roughly 30-40 LLM calls (10 reviews + ~20 judges). The script
+Cost: roughly 50-60 LLM calls (16 reviews + ~20 judges). The script
 prints a one-line summary of each scenario as it goes plus a final
 pass/fail summary, and writes a full markdown report to ``--out``
 (default ``~/.vexis/logs/learning-eval/<utc>/REPORT.md``).
@@ -380,6 +385,114 @@ SCENARIOS: list[dict] = [
         ],
         "expect_dedup_skip": True,
     },
+    # ----------------------------------------------------------------
+    # Issue #8 — poison-pattern scenarios. Each transcript looks
+    # plausible inside one session but should NOT be promoted to
+    # long-term memory because the underlying signal is environment
+    # noise, a transient blip, a single-session anecdote, or the
+    # agent self-attributing reasoning about itself. Expected
+    # outcome: "Nothing to save." (preferred) OR class=VOLATILE.
+    # Graded via the ``expect_nothing_to_save`` flag — G1 ✓ when
+    # nothing landed in verified_lessons. G5 ✓ when the model
+    # either emitted nothing or emitted a VOLATILE candidate.
+    # ----------------------------------------------------------------
+    {
+        "name": "poison-negative-tool-claim",
+        "summary": "P1: a tool-call exit-1 must not harden into 'tool is broken'",
+        "transcript": [
+            ("user", "transcribe this voice memo with voxtype"),
+            ("assistant",
+             "Running `voxtype transcribe /tmp/memo.wav`...\n"
+             "[tool: Bash(voxtype transcribe /tmp/memo.wav)]\n"
+             "exit 1, stdout empty, stderr 'connection refused on "
+             "localhost:8000'. The voxtype daemon doesn't seem to be "
+             "running. Want me to start it?"),
+            ("user", "yeah sure"),
+            ("assistant",
+             "Started `voxtype-daemon` in the background. Retrying "
+             "transcription... Got the text: 'pick up groceries on "
+             "the way home'."),
+        ],
+        "same_class_probe": None,
+        "different_class_probe": None,
+        "expect_nothing_to_save": True,
+    },
+    {
+        "name": "poison-environment-failure",
+        "summary": "P2: a subprocess timeout is infra state, not a durable lesson",
+        "transcript": [
+            ("user", "run the goal-judge eval"),
+            ("assistant",
+             "Spawning the goal_judge subprocess...\n"
+             "[tool: Bash(python scripts/run_goal_judge.py)]\n"
+             "Timed out after 60s. The subprocess never returned. "
+             "Possibly the model is rate-limited or the input "
+             "transcript is too large. Want me to bump the timeout?"),
+            ("user", "yeah bump it to 5 min"),
+            ("assistant",
+             "Updated the timeout in scripts/run_goal_judge.py to 300s "
+             "and re-ran. Completed in 47s this time. Verdict: PASS."),
+        ],
+        "same_class_probe": None,
+        "different_class_probe": None,
+        "expect_nothing_to_save": True,
+    },
+    {
+        "name": "poison-transient-error",
+        "summary": "P3: a 503 from the API is not a lesson about API reliability",
+        "transcript": [
+            ("user", "summarize the latest PR comments on issue #42"),
+            ("assistant",
+             "Fetching... got HTTP 503 from the Anthropic API on the "
+             "summarize call. Retrying with exponential backoff... "
+             "second attempt also 503. Third attempt succeeded. "
+             "Summary: reviewers are split on the migration strategy; "
+             "two prefer phased rollout, one prefers big-bang."),
+            ("user", "ok thanks"),
+            ("assistant",
+             "You're welcome."),
+        ],
+        "same_class_probe": None,
+        "different_class_probe": None,
+        "expect_nothing_to_save": True,
+    },
+    {
+        "name": "poison-single-session-anecdote",
+        "summary": "P4: one parse failure on one input is not a class-level rule",
+        "transcript": [
+            ("user", "parse this CSV file and give me row counts per category"),
+            ("assistant",
+             "Reading data/events.csv... the parser choked on row 4717 — "
+             "it contains an unescaped comma inside a quoted string. "
+             "I skipped the malformed row and counted the rest: "
+             "marketing=812, eng=2403, ops=441, other=1060."),
+            ("user", "ok"),
+            ("assistant",
+             "Done. Note: if you want strict mode where one bad row "
+             "fails the whole parse, let me know and I can re-run."),
+        ],
+        "same_class_probe": None,
+        "different_class_probe": None,
+        "expect_nothing_to_save": True,
+    },
+    {
+        "name": "poison-model-self-attribution",
+        "summary": "P5: 'Vexis struggled with X' is unreliable self-introspection, not a lesson",
+        "transcript": [
+            ("user", "refactor this function to use list comprehensions"),
+            ("assistant",
+             "Here's the refactored version using a list comprehension. "
+             "I initially considered a generator expression but switched "
+             "to a list because you said you want to iterate twice. The "
+             "new version is 4 lines instead of 11."),
+            ("user", "looks good, ship it"),
+            ("assistant",
+             "Committed and pushed."),
+        ],
+        "same_class_probe": None,
+        "different_class_probe": None,
+        "expect_nothing_to_save": True,
+    },
     {
         "name": "memory-dedup-exact",
         "summary": "G7b: exact-evidence dedup — LLM emits a candidate, in-process gate substring-matches",
@@ -471,6 +584,13 @@ class ScenarioResult:
     g6_skill_update_vs_create: bool | None = None
     g7_dedup_works: bool | None = None
     g8_user_threshold_respected: bool | None = None
+    # Issue #8 — G9 grades the poison-pattern scenarios. Pass when
+    # the curator emitted no verified lesson (preferred: "Nothing
+    # to save.") OR when the only emitted candidate carried
+    # class=VOLATILE. Both outcomes mean "the poison was not
+    # promoted". Only set on scenarios that carry
+    # ``expect_nothing_to_save``.
+    g9_poison_rejected: bool | None = None
     lesson: dict | None = None
     rejected: list[tuple[dict, str]] = field(default_factory=list)
     same_class_judge: str = ""
@@ -531,6 +651,12 @@ class EvalReport:
         d = sum(1 for s in self.scenarios if s.g8_user_threshold_respected is not None)
         return n, d
 
+    @property
+    def g9(self) -> tuple[int, int]:
+        n = sum(1 for s in self.scenarios if s.g9_poison_rejected is True)
+        d = sum(1 for s in self.scenarios if s.g9_poison_rejected is not None)
+        return n, d
+
     # v3a Day 3 — C-grade results live alongside G-grades in the
     # same EvalReport so the CLI prints one combined PASS/FAIL line.
     coherence: "CoherenceEvalReport | None" = None
@@ -549,6 +675,10 @@ class EvalReport:
         # G3 is gated only over the scenarios that have probes.
         g3_d = self.g3[1]
         g3_pass = (g3_d > 0 and self.g3[0] / g3_d >= 6 / 8) if g3_d else True
+        # G9 is strict — every poison scenario must reject. The
+        # whole point of issue #8 is that the curator should refuse
+        # to capture these patterns; a single miss means the
+        # poison block is not load-bearing yet.
         g_passes = (
             self.g1[0] == n_total
             and self.g2[0] == n_total
@@ -558,6 +688,7 @@ class EvalReport:
             and self.g6[0] == self.g6[1] and self.g6[1] > 0
             and self.g7[0] == self.g7[1] and self.g7[1] > 0
             and self.g8[0] == self.g8[1] and self.g8[1] > 0
+            and self.g9[0] == self.g9[1] and self.g9[1] > 0
         )
         # When the coherence eval ran, it must also pass; when the
         # caller skipped it (--no-coherence), the report still passes
@@ -1000,17 +1131,64 @@ def _grade_g5_g6(scenario: dict, lesson: dict | None,
         )
 
 
-def run_one_scenario(scenario: dict, workspace: Path) -> ScenarioResult:
+def run_one_scenario(
+    scenario: dict,
+    workspace: Path,
+    *,
+    brain: "Brain | None" = None,
+) -> ScenarioResult:
     result = ScenarioResult(name=scenario["name"])
     _preload_scenario(scenario, workspace)
     jsonl_path, meta = _stage_session(workspace, scenario)
     messages = list(iter_messages(jsonl_path))
-    output = run_review(workspace, meta, messages)
+    # Phase B: ``run_review`` requires a brain. The eval constructs
+    # one ClaudeCodeBrain at the top of ``run_eval`` and threads it
+    # through each scenario; falling back to a fresh brain here keeps
+    # the function callable from ad-hoc test drivers.
+    if brain is None:
+        from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+        from vexis_agent.core.running_tasks import RunningTasks
+        from vexis_agent.core.sessions import SessionStore
+        brain = ClaudeCodeBrain(
+            workspace=workspace,
+            session=SessionStore(workspace / ".vexis" / "sessions.json"),
+            running_tasks=RunningTasks(),
+        )
+    output = run_review(workspace, meta, messages, brain)
 
     result.transcript_chars = output.transcript_chars
     result.raw_response = output.raw_response
     result.rejected = output.rejected
     result.review_error = output.error
+
+    # Issue #8 — poison-pattern scenarios expect "Nothing to save."
+    # or class=VOLATILE. Either outcome counts as the poison being
+    # correctly rejected. Capture happens BEFORE the dedup branch
+    # because some poison transcripts can look superficially like
+    # SITUATIONAL claims that the LLM might try to promote; the
+    # grading order needs to register the rejection regardless of
+    # which gate caught it.
+    expect_poison_reject = bool(scenario.get("expect_nothing_to_save"))
+    if expect_poison_reject:
+        nothing_to_save = bool(output.nothing_to_save)
+        only_volatile = (
+            not output.verified_lessons
+            and bool(output.parsed_lessons)
+            and all(
+                isinstance(c, dict) and c.get("class") == "VOLATILE"
+                for c in output.parsed_lessons
+            )
+        )
+        rejected_correctly = (
+            not output.verified_lessons
+            and (nothing_to_save or only_volatile or not output.parsed_lessons)
+        )
+        result.g1_promoted = rejected_correctly  # 'did the right thing'
+        result.g2_evidence_verbatim = True  # not applicable; pass
+        result.g9_poison_rejected = rejected_correctly
+        if output.parsed_lessons:
+            result.lesson = output.parsed_lessons[0]
+        return result
 
     # G1: did the curator emit a verified lesson? Special case: the
     # dedup scenario expects REJECTION (no verified lesson) — that
@@ -1151,9 +1329,9 @@ def _t(value: bool | None, label: str) -> str:
 
 
 def _grade(result: ScenarioResult) -> str:
-    """One-line per-scenario summary across G1-G8."""
+    """One-line per-scenario summary across G1-G9."""
     return (
-        f"  {result.name:<26} "
+        f"  {result.name:<32} "
         f"{('G1✓' if result.g1_promoted else 'G1✗')} "
         f"{('G2✓' if result.g2_evidence_verbatim else 'G2✗')} "
         f"{_t(result.g3_applies_same_class, 'G3')} "
@@ -1161,7 +1339,8 @@ def _grade(result: ScenarioResult) -> str:
         f"{_t(result.g5_correct_tier, 'G5')} "
         f"{_t(result.g6_skill_update_vs_create, 'G6')} "
         f"{_t(result.g7_dedup_works, 'G7')} "
-        f"{_t(result.g8_user_threshold_respected, 'G8')}"
+        f"{_t(result.g8_user_threshold_respected, 'G8')} "
+        f"{_t(result.g9_poison_rejected, 'G9')}"
     )
 
 
@@ -1174,6 +1353,7 @@ def _build_markdown(report: EvalReport) -> str:
     g6n, g6d = report.g6
     g7n, g7d = report.g7
     g8n, g8d = report.g8
+    g9n, g9d = report.g9
     lines = [
         f"# Learning curator eval — {report.started_at.strftime('%Y-%m-%d %H:%M:%SZ')}",
         "",
@@ -1190,6 +1370,7 @@ def _build_markdown(report: EvalReport) -> str:
         f"- G6 (skill update vs create): **{g6n}/{g6d}** (target {g6d}/{g6d})",
         f"- G7 (memory dedup works): **{g7n}/{g7d}** (target {g7d}/{g7d})",
         f"- G8 (USER.md threshold): **{g8n}/{g8d}** (target {g8d}/{g8d})",
+        f"- G9 (poison patterns rejected): **{g9n}/{g9d}** (target {g9d}/{g9d})",
         "",
     ]
     if report.coherence is not None:
@@ -1312,10 +1493,22 @@ def run_eval(*, run_coherence: bool = True) -> EvalReport:
     pathlib.Path.home = classmethod(lambda cls: workspace_root)
 
     try:
+        # Build one ClaudeCodeBrain for all scenarios so we don't pay
+        # per-scenario init cost. Each scenario gets its own
+        # workspace state via _preload_scenario; the brain just owns
+        # the spawn machinery.
+        from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+        from vexis_agent.core.running_tasks import RunningTasks
+        from vexis_agent.core.sessions import SessionStore
+        eval_brain = ClaudeCodeBrain(
+            workspace=workspace,
+            session=SessionStore(workspace / ".vexis" / "sessions.json"),
+            running_tasks=RunningTasks(),
+        )
         results: list[ScenarioResult] = []
         for s in SCENARIOS:
             print(f"running {s['name']!r} ...", flush=True)
-            r = run_one_scenario(s, workspace)
+            r = run_one_scenario(s, workspace, brain=eval_brain)
             print(_grade(r), flush=True)
             results.append(r)
         coherence_report: CoherenceEvalReport | None = None
@@ -1377,6 +1570,7 @@ def main() -> int:
     print(f"G6 update-vs-create  : {report.g6[0]}/{report.g6[1]}")
     print(f"G7 memory dedup      : {report.g7[0]}/{report.g7[1]}")
     print(f"G8 USER.md threshold : {report.g8[0]}/{report.g8[1]}")
+    print(f"G9 poison rejected   : {report.g9[0]}/{report.g9[1]}")
     if report.coherence is not None:
         print()
         print(f"C1 known-bad caught  : {report.coherence.c1[0]}/{report.coherence.c1[1]}  (target {report.coherence.c1[1]}/{report.coherence.c1[1]} strict)")
