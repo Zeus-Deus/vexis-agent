@@ -1,6 +1,6 @@
 # Schedules — pre-run script + wake gate
 
-> Issue #12. Lets a cron-style monitoring schedule cost ~0 when idle.
+Lets a cron-style monitoring schedule cost ~0 when idle.
 
 ## TL;DR
 
@@ -240,6 +240,5 @@ VEXIS_SCHEDULE_TICK_TS=$(date -u +%FT%TZ) \
 
 - Source pattern: Hermes-agent `cron/jobs.py:551-980` —
   `--script`, `wakeAgent: false`, `no_agent` mode, `context_from`.
-- Issue #12 — design + acceptance.
 - Tests: `tests/test_schedule_script.py` — covers all five
   acceptance cases plus round-trip + slash-flag parser.

@@ -1,4 +1,4 @@
-# Conversation compression (Issue #11)
+# Conversation compression
 
 Long Vexis sessions — multi-day `/goal` loops, kanban workers
 chewing through hundreds of turns — grow until the underlying agent
@@ -139,8 +139,8 @@ re-checking that test.
   rewrite of `~/.local/share/opencode/opencode.db` is deferred.
   Opencode's foreground process holds a write transaction
   against the DB; a safe DELETE/INSERT under that contention
-  plus its own FK invariants is a meaningful lift the original
-  Issue #11 explicitly allows deferring. Track follow-up.
+  plus its own FK invariants is a meaningful lift that's
+  explicitly deferred. Track follow-up.
 - **null** — no-op (the test fake doesn't have a transcript
   to rewrite). Tests pre-load return values via
   `BrainNull.queue_compress_returns(True, False)`.

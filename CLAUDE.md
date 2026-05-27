@@ -67,11 +67,16 @@ section — violating them is breaking the codebase.
   or `KANBAN_WORKER_PREFIX`. Env vars set on aux spawns
   (`VEXIS_CURATOR=1`, `VEXIS_GOAL_JUDGE=1`, `VEXIS_KANBAN=1`,
   etc.) are forensic markers for audit logs only.
-- **Aux subsystems route through `brain.spawn_aux`.** Never
-  shell out directly. Tier choice is subsystem-owned (caller
-  passes `model_tier="small"`); tier→native translation is
-  brain-owned (each brain reads `models.tiers.<kind>.<tier>`
-  or its `DEFAULT_TIER_MAP_<KIND>` constant).
+- **Aux subsystems route through `brain.spawn_aux` with an
+  explicit tool allowlist.** Never shell out directly. Tier
+  choice is subsystem-owned (`model_tier="small"`); tier→native
+  translation is brain-owned (each brain reads
+  `models.tiers.<kind>.<tier>` or its `DEFAULT_TIER_MAP_<KIND>`).
+  Every shipping caller passes `allowed_tools=[...]` declaring
+  the narrowest tool surface it needs — judges and extractors
+  text-only, the skill curator Read/Write/Edit/Glob/Grep (no
+  Bash, no WebFetch). A poisoned transcript can't argue an aux
+  into a tool it wasn't given.
 - **Config reads disk per call; `brain.kind` is read once at
   startup.** `subsystem_tier()` and `model_for_tier()` re-read
   `~/.vexis/config.yaml` every invocation — tier edits hot-
@@ -230,7 +235,7 @@ still supported but no longer required.
 **Pointers:** `docs/brains.md` · `docs/migration.md` ·
 `docs/model-ux.md` · `docs/dogfood-checklist.md`.
 
-## Conversation compression (Issue #11)
+## Conversation compression
 
 Before every brain turn the handler calls
 `brain.compress_if_needed(session_id)`. When the transcript
@@ -252,3 +257,23 @@ the JSONL rewrite; opencode logs the trigger but defers the
 SQL rewrite to a follow-up.
 
 **Pointers:** `docs/compression.md`.
+
+## File-mutation verifier footer
+
+Each brain turn snapshots the workspace before and after; the
+diff is prepended to the next user message as
+`[turn-N verifier] Files changed last turn: ...` so the model
+self-corrects against silent write failures. The goal judge
+consumes the same diff via `brain.peek_files_changed` and
+weighs the brain's response against ground truth rather than
+the brain's own claims.
+
+Snapshot work runs via `asyncio.to_thread` (~1.5ms on the
+vexis-agent repo, under 200ms on a 10k-file workspace).
+Disable via `brain.file_mutation_footer: false` (default
+`true`); reads disk per turn so toggling takes effect
+immediately. The `[turn-N verifier]` marker is deliberately
+NOT in the recursion-guard prefix set — verifier-footered
+turns remain visible to the learning curator.
+
+**Pointers:** `docs/file-mutation-verifier.md`.

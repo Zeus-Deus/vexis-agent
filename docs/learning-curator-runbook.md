@@ -111,6 +111,31 @@ The audit trail records `triage_skipped` and `triage_result`
 (`YES` / `NO` / `FAIL_OPEN` / `ERROR` / `DISABLED`) per session so
 parse-failure rates and quality drift are visible in `run.json`.
 
+## Poison-pattern refusal
+
+The full-review prompt (`core/learning_review.py`) carries an
+explicit "Do NOT capture" block that sits between the candidate
+queue and the output contract. It enumerates five failure modes
+the prompt used to leave open:
+
+1. **Negative tool claims** — "the brain can't do X" assertions
+   that age into wrong as the tool surface grows.
+2. **Environment failures** — "the build failed because Docker
+   wasn't running" — situational, not a lesson.
+3. **Transient errors** — "the API returned 503 once" — noise.
+4. **Single-session anecdotes** — one-off observations without
+   recurrence evidence (IDENTITY needs ≥2 sessions; SITUATIONAL
+   needs explicit grounding).
+5. **Model self-attribution** — "Claude prefers X" — the brain
+   has no stable identity to attribute preferences to.
+
+The eval suite (`scripts/eval_learning.py`) carries five
+matching fixtures under the G9 grade ("poison rejected"); live
+runs against `claude -p` return `Nothing to save.` on all five.
+A prompt-structure unit test asserts each of the five named
+patterns appears verbatim in the rendered review prompt — drift
+trips the test, not a downstream eval surprise.
+
 ## Coherence curator (v3a)
 
 Third curator. Runs inline inside the learning curator's tick:

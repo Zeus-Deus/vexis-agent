@@ -48,12 +48,27 @@ from pathlib import Path
 #     compressor's contract is referenced from the docstring of
 #     ``core.brain.compressor.SUMMARY_PREFIX`` and pinned by
 #     ``tests/test_compressor.py``.
+#   - +25 (254 → 279): two-part bump landing Issues #9 + #10.
+#     +4 of it extends the existing "Aux subsystems route through
+#     ``brain.spawn_aux``" Invariant to include the new
+#     ``allowed_tools`` allowlist contract from #10 — same bullet,
+#     not a new entry, so the Invariants bullet count stays at 7.
+#     The remaining +21 is a brand-new feature section
+#     "File-mutation verifier footer (Issue #9)" — ~20 lines, well
+#     inside the ~30-line per-feature ceiling. Invariants is now
+#     ~49 lines (over the ~40 target); per established escape
+#     hatch (see the compression bump above) the #9 contracts
+#     (verifier-marker / recursion-guard interaction, hot-reload
+#     flag semantics) live in the feature section's TL;DR rather
+#     than growing Invariants further. Pinned by
+#     ``tests/test_brain_spawn_aux_allowlist.py`` and
+#     ``tests/test_brain_file_mutation_footer.py``.
 # Bump only when the growth comes from new cross-feature
 # contracts in the Invariants section AND that section is
 # itself still under ~40 lines, OR a genuinely new feature
 # section that respects the ~30-line per-section ceiling.
 # Never bump for per-feature bloat in existing sections.
-CLAUDE_MD_MAX_LINES = 254
+CLAUDE_MD_MAX_LINES = 279
 
 
 def test_claude_md_stays_under_size_limit() -> None:
