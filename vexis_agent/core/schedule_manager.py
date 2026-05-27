@@ -27,11 +27,16 @@ loop, Fire mechanism, Restart safety), Day 2.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+from vexis_agent.core.paths import schedules_scripts_dir
 from vexis_agent.core.running_tasks import RunningTasks
 
 
@@ -60,6 +65,359 @@ log = logging.getLogger(__name__)
 # bumped forward. Defends against ``* * * * *`` firing on every tick
 # of a fast-cadence manager.
 MIN_REFIRE_GAP_SECONDS = 60
+
+
+# ──────────────────────────────────────────────────────────────────
+# Pre-run script (Issue #12) — wake-gate constants
+# ──────────────────────────────────────────────────────────────────
+
+# Sentinel key on the script's last stdout line. ``{"wakeAgent": false}``
+# tells the manager to skip the brain turn entirely; any other value
+# (``true``, missing, invalid JSON, empty stdout) means "go ahead and
+# wake the brain". Default-to-wake is deliberate — a typo in a user's
+# script must not silently disable their monitor.
+_WAKE_GATE_KEY = "wakeAgent"
+
+# Markers wrapping the script's stdout when we prepend it to the
+# schedule prompt. Distinct from CURATOR_REVIEW_PROMPT_PREFIX /
+# SUMMARY_PREFIX / KANBAN_WORKER_PREFIX so the content-prefix
+# recursion guard (CLAUDE.md Invariants) does NOT catch these as
+# aux-fork transcripts — a scheduled fire whose prompt was enriched
+# by a script is still a foreground user-shaped turn the curator
+# may legitimately review for lessons.
+_SCRIPT_OUTPUT_OPEN = "[script output]"
+_SCRIPT_OUTPUT_CLOSE = "[end script output]"
+
+
+class ScriptExecutionError(Exception):
+    """Pre-run script failed in a way the manager treats as ``skip the
+    brain turn``. Carries a short reason for the schedule's
+    ``last_error`` field.
+
+    Subclassed exceptions distinguish the failure modes but the manager
+    treats them uniformly: skip the brain, advance next_fire_at, record
+    the error in ``last_error``. We do NOT count script failures
+    against ``consecutive_errors`` because the user's script breaking
+    is a different signal from the brain failing — auto-pausing a
+    legitimate schedule because a buggy gate keeps timing out would
+    be hostile.
+    """
+
+
+class ScriptPathError(ScriptExecutionError):
+    """Script path resolved outside ``~/.vexis/scripts/`` — rejected
+    without running anything. Defense against ``--script ../etc/foo``
+    and symlink-out shenanigans."""
+
+
+class ScriptTimeoutError(ScriptExecutionError):
+    """Script exceeded ``script_timeout_seconds``. Subprocess killed,
+    brain skipped. A hung script must not pin an LLM turn open."""
+
+
+class ScriptGatedError(ScriptExecutionError):
+    """Sentinel — script's last stdout line was ``{"wakeAgent": false}``.
+    Brain skipped on purpose; this is the happy-path of the wake gate
+    (the whole point of the feature). Logged at INFO, not ERROR."""
+
+
+def _resolve_script_path(script: str) -> Path:
+    """Resolve ``script`` against ``~/.vexis/scripts/`` and assert it
+    stays inside that directory.
+
+    ``script`` is a name (``check_mail.sh``) or a relative path
+    (``email/check_mail.sh``). Absolute paths, ``..`` traversal, and
+    symlinks pointing outside are all rejected. ``resolve()`` follows
+    symlinks; ``is_relative_to`` is the post-resolution containment
+    check — combined this is the standard chroot-style guard.
+
+    Raises :class:`ScriptPathError` if the script is missing or escapes
+    the scripts dir.
+    """
+    base = schedules_scripts_dir().resolve()
+    raw = script.strip()
+    if not raw:
+        raise ScriptPathError("script path is empty")
+
+    # Absolute paths are rejected outright — even if they'd happen to
+    # land inside the scripts dir (the user passed the full
+    # ~/.vexis/scripts/foo.sh form), forcing the name-relative shape
+    # keeps schedule definitions portable across daemon hosts where
+    # $HOME might differ.
+    if os.path.isabs(raw):
+        raise ScriptPathError(
+            f"script path must be relative to ~/.vexis/scripts/, got {raw!r}"
+        )
+
+    candidate = (base / raw).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError as exc:
+        raise ScriptPathError(
+            f"script {raw!r} resolves outside ~/.vexis/scripts/ "
+            f"({candidate}) — refusing to execute"
+        ) from exc
+
+    if not candidate.exists():
+        raise ScriptPathError(
+            f"script {raw!r} not found under ~/.vexis/scripts/"
+        )
+    if not candidate.is_file():
+        raise ScriptPathError(
+            f"script {raw!r} is not a regular file"
+        )
+    return candidate
+
+
+def _build_script_command(path: Path) -> list[str]:
+    """Pick interpreter by extension. ``.sh`` → bash, ``.py`` → python.
+
+    Anything else falls back to executing the file directly (relying
+    on the user's shebang + executable bit). Keeping the interpreter
+    map small avoids reinventing a runner registry — the user can
+    always write a ``.sh`` wrapper that calls something exotic.
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".sh":
+        return ["bash", str(path)]
+    if suffix == ".py":
+        # ``sys.executable`` would pin the daemon's python; the
+        # user's script may want a different env. Use ``python3`` so
+        # the system PATH resolution wins.
+        return ["python3", str(path)]
+    return [str(path)]
+
+
+def _build_script_env(
+    *, schedule_id: str, schedule_name: str | None, tick_ts: datetime,
+) -> dict[str, str]:
+    """Build the curated env dict passed to the subprocess.
+
+    Deliberately NOT passing the daemon's full ``os.environ`` —
+    schedules' scripts run as the same uid as vexis but the cost of
+    leaking ``TELEGRAM_BOT_TOKEN`` / ``ANTHROPIC_API_KEY`` to a buggy
+    script that ``env | curl ...`` is too high. Pass only what a
+    typical monitor script actually needs.
+    """
+    env: dict[str, str] = {
+        "PATH": os.environ.get(
+            "PATH", "/usr/local/bin:/usr/bin:/bin"
+        ),
+        "HOME": os.environ.get("HOME", str(Path.home())),
+        "VEXIS_SCHEDULE_ID": schedule_id,
+        "VEXIS_SCHEDULE_NAME": schedule_name or "",
+        "VEXIS_SCHEDULE_TICK_TS": tick_ts.astimezone(timezone.utc).isoformat(),
+    }
+    # LANG / LC_ALL pass through if set — without them many CLIs
+    # default to ASCII which mangles unicode in stdout.
+    for k in ("LANG", "LC_ALL", "LC_CTYPE"):
+        v = os.environ.get(k)
+        if v:
+            env[k] = v
+    return env
+
+
+def _parse_wake_gate(stdout: str) -> tuple[bool, str]:
+    """Inspect the last non-empty line of ``stdout`` for the wake-gate
+    sentinel. Returns ``(wake, gate_line_text)``.
+
+    Contract (matches Hermes upstream + issue spec):
+
+      * Last non-empty line parses as JSON dict with ``wakeAgent: false``
+        → ``(False, <that line>)``. SKIP.
+      * Last non-empty line parses as JSON dict with ``wakeAgent: true``
+        → ``(True, <that line>)``. WAKE. Drop the gate line when
+        prepending so the brain doesn't see the literal JSON.
+      * Last line is not JSON, not a dict, or missing ``wakeAgent``
+        → ``(True, "")``. WAKE. The whole stdout is prepended.
+      * Empty stdout → ``(True, "")``. WAKE with empty preamble.
+
+    The empty-string gate signals to the caller "no gate line was
+    present" so it knows whether to strip the last line from the
+    prepended output.
+    """
+    if not stdout or not stdout.strip():
+        return True, ""
+    # Walk lines in reverse to find the last non-empty one. The
+    # script may have trailing newlines or blank lines (some
+    # subprocesses append a final newline; some don't).
+    last_line = ""
+    for raw_line in reversed(stdout.splitlines()):
+        line = raw_line.strip()
+        if line:
+            last_line = line
+            break
+    if not last_line:
+        return True, ""
+    try:
+        parsed = json.loads(last_line)
+    except (json.JSONDecodeError, ValueError):
+        return True, ""
+    if not isinstance(parsed, dict):
+        return True, ""
+    if _WAKE_GATE_KEY not in parsed:
+        return True, ""
+    return bool(parsed.get(_WAKE_GATE_KEY)), last_line
+
+
+def _strip_gate_line(stdout: str, gate_line: str) -> str:
+    """Remove the trailing gate line from ``stdout`` if present.
+
+    The script's ``echo '{"wakeAgent": true}'`` IS the gate, not
+    payload — the brain should not see that literal JSON line in its
+    prepended context (it'd be noise that could confuse the model
+    about what to do). Strip it but preserve everything above.
+    """
+    if not gate_line or not stdout:
+        return stdout
+    lines = stdout.splitlines()
+    # Walk from the end, drop the first non-blank match.
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip() == gate_line:
+            del lines[i]
+            break
+    # Trailing blank lines were noise from the script; collapse them.
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
+def run_pre_run_script(
+    schedule_id: str,
+    *,
+    script: str,
+    timeout_seconds: float,
+    schedule_name: str | None,
+    tick_ts: datetime,
+) -> tuple[str, bool]:
+    """Execute the schedule's pre-run script and return ``(stdout, wake)``.
+
+    The blocking subprocess is called synchronously — the schedule
+    manager already runs on a daemon thread so blocking on a 120s
+    timeout there is fine, and it keeps the wiring simple (no
+    ``asyncio.create_subprocess_exec`` hop, no thread/event-loop
+    handoff).
+
+    ``stdout`` is the captured script output with the gate line (if
+    any) stripped — ready to prepend to the prompt. ``wake`` is
+    ``False`` if the gate explicitly vetoed the brain turn.
+
+    Raises :class:`ScriptPathError` on path-confinement failure (the
+    script never runs in this case), :class:`ScriptTimeoutError` if
+    the script ran but exceeded the timeout, or
+    :class:`ScriptExecutionError` for non-zero exit / subprocess
+    failure. Non-zero exit defaults to WAKE+log so a script that
+    crashes still fires the brain — silent skip on crash would mask
+    monitoring outages.
+    """
+    path = _resolve_script_path(script)
+    cmd = _build_script_command(path)
+    env = _build_script_env(
+        schedule_id=schedule_id,
+        schedule_name=schedule_name,
+        tick_ts=tick_ts,
+    )
+
+    log.info(
+        "schedule %s: running pre-run script %s (timeout=%.0fs)",
+        schedule_id, path, timeout_seconds,
+    )
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env=env,
+            cwd=str(path.parent),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # ``run()`` already killed the child process before raising.
+        # Preserve any captured stdout for the log so the user can see
+        # what the script printed before hanging.
+        partial = ""
+        if exc.stdout:
+            partial = exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode("utf-8", "replace")
+        log.warning(
+            "schedule %s: pre-run script timed out after %.0fs; brain SKIPPED. "
+            "Partial stdout: %s",
+            schedule_id, timeout_seconds, partial[:500],
+        )
+        raise ScriptTimeoutError(
+            f"script timed out after {timeout_seconds:.0f}s"
+        ) from exc
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        raise ScriptExecutionError(
+            f"script execution failed: {exc}"
+        ) from exc
+
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    rc = completed.returncode
+
+    if stderr:
+        # Stderr always goes to the daemon log so the user can debug.
+        log.info(
+            "schedule %s: pre-run script stderr: %s",
+            schedule_id, stderr.strip()[:1000],
+        )
+
+    if rc != 0:
+        # Non-zero exit → log and WAKE the brain anyway. A monitor
+        # script that errors out is a real signal the user wants to
+        # know about (the monitored system might be broken). Skipping
+        # on rc!=0 would silently mask outages.
+        log.warning(
+            "schedule %s: pre-run script exited %d; waking brain with "
+            "stderr included so the user can see the failure",
+            schedule_id, rc,
+        )
+        combined = stdout
+        if stderr:
+            combined = (
+                f"{stdout}\n[script exited {rc}; stderr:]\n{stderr}".lstrip(
+                    "\n"
+                )
+            )
+        return combined, True
+
+    wake, gate_line = _parse_wake_gate(stdout)
+    if not wake:
+        log.info(
+            "schedule %s: pre-run script gated wake (wakeAgent: false); "
+            "brain SKIPPED",
+            schedule_id,
+        )
+        raise ScriptGatedError("wakeAgent: false")
+
+    cleaned = _strip_gate_line(stdout, gate_line)
+    return cleaned, True
+
+
+def prepend_script_output(prompt: str, script_stdout: str) -> str:
+    """Wrap and prepend the script's stdout to the schedule's prompt.
+
+    Format mirrors the issue spec:
+
+        [script output]
+        <stdout>
+        [end script output]
+
+        <original prompt>
+
+    Blank stdout returns the original prompt unchanged (no point in
+    showing the brain an empty banner). This lets the gate "wake but
+    say nothing" pattern work cleanly — e.g. the script does a heavy
+    check, the only verdict is "yes wake" with no payload.
+    """
+    if not script_stdout or not script_stdout.strip():
+        return prompt
+    return (
+        f"{_SCRIPT_OUTPUT_OPEN}\n{script_stdout.rstrip()}\n"
+        f"{_SCRIPT_OUTPUT_CLOSE}\n\n{prompt}"
+    )
 
 
 def _utc_now() -> datetime:
@@ -283,6 +641,61 @@ class ScheduleManager:
             # a non-fire.
             return False
 
+        # Step 1.5 (Issue #12): pre-run script + wake gate.
+        # When ``schedule.script`` is set, run it BEFORE deciding to
+        # spawn the brain turn. The wake-gate sentinel
+        # ``{"wakeAgent": false}`` on the script's last stdout line
+        # vetoes the brain — the schedule still counts as "fired" for
+        # bookkeeping (last_fire_at advances, last_status="ok") but no
+        # expensive LLM turn happens. Other script failures (timeout,
+        # path-traversal) skip the brain but record an error in
+        # ``last_error`` so the dashboard surfaces what went wrong.
+        prompt_text = schedule.prompt
+        if schedule.script:
+            try:
+                script_stdout, _wake = run_pre_run_script(
+                    schedule.id,
+                    script=schedule.script,
+                    timeout_seconds=float(schedule.script_timeout_seconds),
+                    schedule_name=schedule.name,
+                    tick_ts=now,
+                )
+            except ScriptGatedError:
+                # Happy path of the wake gate — script returned
+                # ``wakeAgent: false``. Mark the fire as gated (ok,
+                # not error) so the user can see in the dashboard /
+                # `vexis-agent schedule show` how often the gate fires.
+                self._record_gated_fire(schedule.id, fired_at=now)
+                return False
+            except ScriptPathError as exc:
+                log.error(
+                    "schedule %s: script path rejected (%s); brain SKIPPED",
+                    schedule.id, exc,
+                )
+                self._record_script_failure(
+                    schedule.id, fired_at=now, reason=f"script: {exc}",
+                )
+                return False
+            except ScriptTimeoutError as exc:
+                self._record_script_failure(
+                    schedule.id, fired_at=now, reason=f"script: {exc}",
+                )
+                return False
+            except ScriptExecutionError as exc:
+                # Generic execution failure (subprocess crashed, file
+                # not executable, etc.). Still skip the brain — we
+                # don't trust unrecognised state.
+                log.warning(
+                    "schedule %s: script execution failed (%s); brain SKIPPED",
+                    schedule.id, exc,
+                )
+                self._record_script_failure(
+                    schedule.id, fired_at=now, reason=f"script: {exc}",
+                )
+                return False
+
+            prompt_text = prepend_script_output(schedule.prompt, script_stdout)
+
         # Step 2: enqueue the synthetic user message.
         # Done from the daemon thread via run_coroutine_threadsafe;
         # the asyncio loop owns RunningTasks. ``schedule.id`` rides
@@ -290,7 +703,7 @@ class ScheduleManager:
         # with the real brain result.
         success = self._enqueue_synthetic(
             chat_id=schedule.chat_id,
-            text=schedule.prompt,
+            text=prompt_text,
             schedule_id=schedule.id,
         )
 
@@ -482,6 +895,67 @@ class ScheduleManager:
                 exc,
             )
             return False
+
+    def _record_gated_fire(self, schedule_id: str, *, fired_at: datetime) -> None:
+        """Record a "script gated the wake" outcome — Issue #12.
+
+        Treated as a successful fire for accounting (last_status=ok,
+        consecutive_errors reset, last_fire_at advanced) because the
+        whole point of the wake gate is that "no change → no LLM
+        turn" is the expected steady state for monitoring schedules.
+        Counting a gated fire as an error would auto-pause every
+        well-behaved monitor at the threshold.
+
+        The ``running_at`` marker is cleared since no brain turn is in
+        flight. ``last_error`` is cleared too — the gate is not an
+        error.
+        """
+        from dataclasses import replace
+        try:
+            self._store.update_atomic(
+                schedule_id,
+                lambda s: replace(
+                    s,
+                    last_fire_at=fired_at,
+                    last_status="ok",
+                    last_error=None,
+                    consecutive_errors=0,
+                    running_at=None,
+                ),
+                refuse_terminal=False,
+            )
+        except KeyError:
+            pass
+
+    def _record_script_failure(
+        self, schedule_id: str, *, fired_at: datetime, reason: str,
+    ) -> None:
+        """Record a script-side failure (timeout, path-traversal,
+        subprocess crash) — Issue #12.
+
+        Distinct from the brain-side error path: script failures do
+        NOT count toward ``consecutive_errors`` because the user's
+        gate breaking is a different signal from the brain failing.
+        Auto-pausing a legitimate schedule because a buggy gate keeps
+        timing out would be hostile — we'd hide their monitor from
+        them. ``last_status`` is set to ``error`` and ``last_error``
+        carries the reason so the dashboard surfaces it.
+        """
+        from dataclasses import replace
+        try:
+            self._store.update_atomic(
+                schedule_id,
+                lambda s: replace(
+                    s,
+                    last_fire_at=fired_at,
+                    last_status="error",
+                    last_error=reason[:240],
+                    running_at=None,
+                ),
+                refuse_terminal=False,
+            )
+        except KeyError:
+            pass
 
     def _is_drain_cancelled(self, chat_id: int) -> bool:
         """Peek at the RunningTasks drain-cancelled flag for ``chat_id``.
@@ -705,4 +1179,10 @@ __all__ = [
     "DispatchFn",
     "MIN_REFIRE_GAP_SECONDS",
     "ScheduleManager",
+    "ScriptExecutionError",
+    "ScriptGatedError",
+    "ScriptPathError",
+    "ScriptTimeoutError",
+    "prepend_script_output",
+    "run_pre_run_script",
 ]

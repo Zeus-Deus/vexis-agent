@@ -145,14 +145,24 @@ class ScheduleState:
     upstream fields we DROPPED (out of scope for v1):
       * ``skills`` / ``model`` / ``provider`` / ``base_url`` — vexis is
         single-brain per daemon; per-schedule model override deferred.
-      * ``script`` / ``no_agent`` / ``context_from`` / ``enabled_toolsets``
-        / ``workdir`` — productivity-suite features; vexis fires into
-        the existing chat.
+      * ``no_agent`` / ``context_from`` / ``enabled_toolsets`` /
+        ``workdir`` — productivity-suite features; vexis fires into
+        the existing chat. (``script`` was DROPPED in v1 and ADDED
+        back in Issue #12 — the wake-gate cost case proved it.)
       * ``deliver`` — vexis has one delivery target (the chat), so the
         field is implicit.
       * ``repeat`` — the upstream "fire N times then stop" is one-shot's
         natural fall-out plus recurring's natural infinite; the in-
         between case isn't worth the dataclass field for v1.
+
+    Issue #12 ADDED (pre-run script + wake gate):
+      * ``script`` — name of a script under ``~/.vexis/scripts/`` that
+        runs before the brain turn. If its last stdout line is
+        ``{"wakeAgent": false}`` the brain turn is skipped — cheap
+        polling. Otherwise stdout is prepended to the prompt so the
+        brain sees what the script found.
+      * ``script_timeout_seconds`` — hard kill after this many seconds
+        (default 120). Skips the brain turn on timeout.
 
     Status flow:
 
@@ -181,6 +191,16 @@ class ScheduleState:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     owner_session_uuid: str | None = None
+    # Issue #12 — optional pre-run script + wake gate. ``script`` is a
+    # name (or relative path) under ``~/.vexis/scripts/``; the manager
+    # path-confines via ``resolve()`` + ``is_relative_to`` so symlink-
+    # out and ``../foo`` are rejected. ``None`` preserves v1 behaviour
+    # exactly — no script, every fire wakes the brain.
+    script: str | None = None
+    # Hard timeout (seconds) for the pre-run script. On timeout the
+    # subprocess is killed and the brain turn is SKIPPED — a hung
+    # script must not wake an expensive LLM turn.
+    script_timeout_seconds: float = 120.0
     # Free-form metadata sink for future fields without bumping schema.
     # Day 1 leaves this empty; Day 2+ may add e.g. ``goal_uuid`` or
     # ``brain_kind_at_create`` here.
@@ -227,6 +247,29 @@ class ScheduleState:
         meta_raw = raw.get("meta")
         meta = meta_raw if isinstance(meta_raw, dict) else {}
 
+        # Issue #12: script is optional, must be a non-empty string to
+        # be honoured. Anything else (None, 0, []) → no script. The
+        # path-confinement check happens at execution time, not here —
+        # we don't want a stale schedule to fail load just because the
+        # scripts dir was deleted.
+        script_raw = raw.get("script")
+        script: str | None = (
+            script_raw.strip() if isinstance(script_raw, str) and script_raw.strip() else None
+        )
+
+        # Timeout: float, default 120s, clamp to (0, 3600] so a typo
+        # like ``-1`` or ``999999`` can't strand a fire. Upstream
+        # Hermes uses 120s as the same hard cap; matched for
+        # comparative-review consistency.
+        try:
+            timeout_raw = float(raw.get("script_timeout_seconds", 120.0))
+        except (TypeError, ValueError):
+            timeout_raw = 120.0
+        if timeout_raw <= 0:
+            timeout_raw = 120.0
+        if timeout_raw > 3600.0:
+            timeout_raw = 3600.0
+
         return cls(
             id=str(raw.get("id", "") or ""),
             chat_id=chat_id,
@@ -245,6 +288,8 @@ class ScheduleState:
             created_at=_parse_iso(raw.get("created_at")),
             updated_at=_parse_iso(raw.get("updated_at")),
             owner_session_uuid=raw.get("owner_session_uuid") or None,
+            script=script,
+            script_timeout_seconds=timeout_raw,
             meta=meta,
         )
 
