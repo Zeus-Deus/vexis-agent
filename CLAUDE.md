@@ -277,3 +277,24 @@ NOT in the recursion-guard prefix set — verifier-footered
 turns remain visible to the learning curator.
 
 **Pointers:** `docs/file-mutation-verifier.md`.
+
+## Codemux orchestration watcher
+
+`vexis-watch register` enrolls a long-running Codemux workspace
+(today; raw PTY + tmux plugins land later). A polling loop reads
+recent terminal bytes via the Codemux MCP, content-hash diffs them,
+and fires ONE Telegram ping when the inner agent goes idle for
+`idle_after_seconds` (default 30s). Oscillation debounced with a
+60s window so a flickering agent doesn't spam the chat. Per-session
+system-prompt header is one short line — `Active Codemux work: N
+workspaces — run 'vexis-watch status' for details.` — scales flat.
+
+Conditional activation: the controller, /codemux slash command,
+and header injection are all wired only when the user has the
+`codemux` MCP in `~/.vexis/mcp-servers.yaml`. Absent → zero cost,
+`vexis-watch` exits 0 with a clear message. Sources plug in by
+subclassing `core.watcher.sources.Source` and calling
+`register_source`; the registry, poller, and notification code
+never change.
+
+**Pointers:** `docs/codemux-watcher.md`.

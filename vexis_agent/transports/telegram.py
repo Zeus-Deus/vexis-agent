@@ -475,6 +475,15 @@ def _parse_schedule_script_flags(
     return cleaned, script, script_timeout
 
 
+def _fmt_elapsed_short(seconds: float) -> str:
+    """``19m``, ``2h``, ``5s`` — single-token elapsed for /codemux output."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    return f"{seconds / 3600:.1f}h"
+
+
 def split_for_telegram(text: str, max_len: int = _MAX_CHUNK) -> list[str]:
     """Split text into Telegram-safe chunks, preferring paragraph/line boundaries."""
     if len(text) <= max_len:
@@ -807,6 +816,7 @@ class TelegramTransport:
         dashboard: "WebDashboard | None" = None,
         schedule_store: "object | None" = None,  # ScheduleStore; weak-typed to avoid import cycle
         kanban_store: "object | None" = None,  # KanbanStore; weak-typed to avoid import cycle
+        watcher: "object | None" = None,  # WatcherController; weak-typed to avoid import cycle
     ) -> None:
         self._handler = handler
         self._running_tasks = running_tasks
@@ -818,6 +828,12 @@ class TelegramTransport:
         self._dashboard = dashboard
         self._schedule_store = schedule_store
         self._kanban_store = kanban_store
+        # Codemux orchestration watcher. None when the Codemux MCP isn't
+        # wired (see watcher LAYER 1f conditional activation). All of
+        # ``/codemux`` registration, the inline-reply commands, and the
+        # peek/tail/mute/unwatch verbs are gated on this being non-None
+        # so non-Codemux users see no surface change.
+        self._watcher = watcher
         # Wire the kanban command facade. The provider closure lets
         # us swap kanban_store at runtime without re-wiring the handler
         # (a future toggle could enable/disable kanban via dashboard).
@@ -905,6 +921,12 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("dashboard", self._on_dashboard))
         self._app.add_handler(CommandHandler("tailscale", self._on_tailscale))
         self._app.add_handler(CommandHandler("kanban", self._on_kanban))
+        # /codemux is gated on the Codemux MCP being wired (LAYER 1f).
+        # Registering the handler when the MCP is absent would expose
+        # a slash command that always errors — the spec is "invisible
+        # unless the MCP is on," so we skip registration entirely.
+        if self._watcher is not None:
+            self._app.add_handler(CommandHandler("codemux", self._on_codemux))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
 
     async def _on_kanban(
@@ -920,6 +942,157 @@ class TelegramTransport:
             log.warning("Rejected /kanban from user_id=%s", user.id)
             return
         await self._kanban.handle(update, ctx)
+
+    async def _on_codemux(
+        self, update: "Update", ctx: "ContextTypes.DEFAULT_TYPE",
+    ) -> None:
+        """/codemux — print the watcher registry (LAYER 3a of the spec).
+
+        One line per watched workspace: name, agent kind, status,
+        elapsed-since-last-output, last-line. Auth-gated. Registered
+        only when the watcher controller is active — see __init__.
+        """
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /codemux from user_id=%s", user.id)
+            return
+        if self._watcher is None:
+            # Defence-in-depth — this handler isn't even registered
+            # when the watcher is off, but keep the guard so an
+            # accidental wiring change can't expose a confusing error.
+            await msg.reply_text(
+                "Codemux MCP not configured; the watcher is inactive."
+            )
+            return
+        agents = self._watcher.list_agents()
+        if not agents:
+            await msg.reply_text(
+                "No Codemux workspaces watched. Vexis (or you) can "
+                "register one via `vexis-watch register --name <h> "
+                "--workspace <id> --agent-kind <kind>`."
+            )
+            return
+        lines = [f"*Watched Codemux workspaces ({len(agents)}):*"]
+        now = datetime.now(timezone.utc)
+        for agent in agents:
+            elapsed = "—"
+            if agent.last_output_at:
+                try:
+                    last = datetime.fromisoformat(agent.last_output_at)
+                    seconds = max(0, (now - last).total_seconds())
+                    elapsed = _fmt_elapsed_short(seconds)
+                except ValueError:
+                    pass
+            tag = "muted" if agent.muted else agent.status
+            line = (
+                f"`{agent.name}` — {agent.agent_kind} — {tag} — "
+                f"last activity {elapsed} ago"
+            )
+            if agent.last_line:
+                line += f"\n   `{agent.last_line[:140]}`"
+            lines.append(line)
+        lines.append(
+            "Reply `tail <name>` / `peek <name>` / `mute <name>` / "
+            "`unwatch <name>`."
+        )
+        await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    async def _maybe_handle_watch_reply(
+        self, update: "Update", user_id: int,
+    ) -> bool:
+        """Intercept inline-reply commands for the watcher.
+
+        Returns True iff we handled the message (caller should NOT
+        forward it to the brain). Matches ``<verb> <name>`` where
+        verb is tail/peek/mute/unmute/unwatch AND name is currently
+        in the watcher registry — anything else falls through.
+
+        ``getattr`` defence: some test fixtures construct
+        ``TelegramTransport`` via ``__new__`` to bypass the
+        PTB-binding init, so attributes added in ``__init__`` may be
+        absent. The same pattern is used elsewhere in this transport
+        (search for ``test fixtures construct``). Falling through
+        early as "not handled" is the safe default for fixtures that
+        never wire a watcher.
+        """
+        watcher = getattr(self, "_watcher", None)
+        if watcher is None:
+            return False
+        msg = update.message
+        if msg is None or msg.text is None:
+            return False
+        if not is_allowed(user_id, self._allowed_user_id):
+            return False
+        parts = msg.text.strip().split(maxsplit=1)
+        if len(parts) != 2:
+            return False
+        verb = parts[0].lower()
+        name = parts[1].strip()
+        if verb not in {"tail", "peek", "mute", "unmute", "unwatch"}:
+            return False
+        # Treat ``<verb> <name>`` as a watcher command ONLY when the
+        # second token is a known agent name. This is what prevents
+        # the regex from eating user sentences like "tail of the
+        # distribution" — there's no agent called "of".
+        if watcher.get_agent(name) is None:
+            return False
+        try:
+            if verb == "tail":
+                text = await watcher.tail(name, lines=20)
+                body = text or "(no output yet)"
+                await msg.reply_text(
+                    f"`{name}` last 20 lines:\n```\n{body[-3500:]}\n```",
+                    parse_mode="Markdown",
+                )
+                return True
+            if verb == "peek":
+                # Synthesise a user turn for the brain. Goes through
+                # the normal dispatch path so it threads through the
+                # claim/drain machinery like any other message.
+                synthetic = (
+                    f"Summarize what the watched workspace '{name}' is "
+                    f"doing right now. Use `vexis-watch tail {name}` "
+                    f"to read the scrollback and report a one-paragraph "
+                    f"status."
+                )
+                await msg.reply_text(f"Peeking at `{name}`…", parse_mode="Markdown")
+                await self._dispatch_to_brain(
+                    msg.get_bot(), msg.chat_id, user_id, synthetic,
+                )
+                return True
+            if verb == "mute":
+                await watcher.mute_agent(name, True)
+                await msg.reply_text(
+                    f"Muted `{name}` — no more idle pings until "
+                    f"`unmute {name}`.",
+                    parse_mode="Markdown",
+                )
+                return True
+            if verb == "unmute":
+                await watcher.mute_agent(name, False)
+                await msg.reply_text(
+                    f"Un-muted `{name}` — idle pings re-armed.",
+                    parse_mode="Markdown",
+                )
+                return True
+            if verb == "unwatch":
+                await watcher.unregister_agent(name)
+                await msg.reply_text(
+                    f"Stopped watching `{name}`.",
+                    parse_mode="Markdown",
+                )
+                return True
+        except Exception:
+            log.exception("watcher inline reply for %r failed", verb)
+            await msg.reply_text(
+                f"⚠️ Couldn't run `{verb} {name}` — logs have details.",
+                parse_mode="Markdown",
+            )
+            return True
+        return False
 
     async def _run_relationships_hook(
         self, bot, chat_id: int, text: str
@@ -1005,6 +1178,15 @@ class TelegramTransport:
         # this next text message IS the block reason / comment body
         # — don't forward it to the brain.
         if await self._kanban.maybe_capture_pending_input(update, ctx):
+            return
+        # Watcher inline-reply commands (LAYER 3b of the watcher spec).
+        # ``tail <name>`` / ``peek <name>`` / ``mute <name>`` /
+        # ``unwatch <name>`` are matched here ONLY when the watcher
+        # is active AND the second token matches a registered agent
+        # name — otherwise the text falls through to the brain.
+        # Intercepting purely on first-word would steal real user
+        # sentences that happen to start with "tail" or "peek".
+        if await self._maybe_handle_watch_reply(update, user.id):
             return
         # Preempt any pending goal continuations so the user's message
         # runs after the current in-flight turn — not behind a backlog
@@ -4444,7 +4626,9 @@ class TelegramTransport:
 
     async def run(self) -> None:
         await self._app.initialize()
-        await _register_commands(self._app)
+        await _register_commands(
+            self._app, include_codemux=self._watcher is not None,
+        )
         # Sweep status files left behind by a previous daemon's brain
         # that exited via SIGKILL (its finally never ran). Without this
         # /status would show stale "Working for 3 days" data forever.
@@ -4699,16 +4883,28 @@ def _format_tailscale_reply(
     return "\n".join(lines)
 
 
-async def _register_commands(application: Application) -> None:
+async def _register_commands(
+    application: Application,
+    *,
+    include_codemux: bool = False,
+) -> None:
     """Mirror the canonical COMMANDS list to Telegram's slash menu.
 
     Failure here (network error, bad token, API hiccup) must not block
     daemon startup — the menu would just stay stale until the next
     successful restart.
+
+    ``include_codemux`` toggles the conditional ``/codemux`` entry —
+    on only when the watcher controller is active (the spec's LAYER 1f
+    conditional activation contract).
     """
     bot_commands = [
         TelegramBotCommand(cmd.command, cmd.description) for cmd in COMMANDS
     ]
+    if include_codemux:
+        bot_commands.append(
+            TelegramBotCommand("codemux", "Status of watched Codemux workspaces")
+        )
     try:
         await application.bot.set_my_commands(bot_commands)
     except Exception as exc:

@@ -63,12 +63,21 @@ from pathlib import Path
 #     than growing Invariants further. Pinned by
 #     ``tests/test_brain_spawn_aux_allowlist.py`` and
 #     ``tests/test_brain_file_mutation_footer.py``.
+#   - +21 (279 → 300): new feature section "Codemux orchestration
+#     watcher" — ~20 lines, well inside the ~30-line per-section
+#     ceiling. No Invariants growth this time; the conditional-
+#     activation + plug-in source contracts live in the feature
+#     section's TL;DR rather than being promoted to Invariants
+#     because Invariants is already past the ~40-line target.
+#     Pinned by ``tests/test_watcher.py``,
+#     ``tests/test_watcher_prompt_injection.py``, and
+#     ``tests/test_watcher_dispatch.py``.
 # Bump only when the growth comes from new cross-feature
 # contracts in the Invariants section AND that section is
 # itself still under ~40 lines, OR a genuinely new feature
 # section that respects the ~30-line per-section ceiling.
 # Never bump for per-feature bloat in existing sections.
-CLAUDE_MD_MAX_LINES = 279
+CLAUDE_MD_MAX_LINES = 300
 
 
 def test_claude_md_stays_under_size_limit() -> None:
