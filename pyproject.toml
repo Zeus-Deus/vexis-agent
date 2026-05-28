@@ -108,6 +108,10 @@ vexis_agent = [
     "web_dist/vad/*",
     "_bundled_skills/**/*.md",
     "_bundled_skills/**/*.json",
+    # Bundled add-ons (see docs/addons.md). Ship every file in
+    # every add-on subdirectory so the manifest, register entry
+    # point, and any skills/docs reach pipx-installed users.
+    "addons/**/*",
 ]
 
 [tool.pytest.ini_options]
