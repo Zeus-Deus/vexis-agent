@@ -169,7 +169,7 @@ def acquire_daemon_lock(pid_path: Path | None = None) -> int:
     return fd
 
 
-async def _run() -> None:
+async def _run() -> bool:
     config = load_config()
     setup_logging(config.log_level)
 
@@ -687,6 +687,11 @@ async def _run() -> None:
         await control_socket.stop()
         await background_tasks.shutdown()
         await browser_manager.stop()
+    # By here every socket the daemon owns (control socket, dashboard,
+    # Telegram long-poll) is closed, so a re-exec'd image can re-bind
+    # cleanly. ``main()`` performs the execv when this is True; a normal
+    # SIGTERM/SIGINT shutdown leaves it False and the process exits.
+    return bool(getattr(transport, "_restart_requested", False))
 
 
 def _resolve_web_dist() -> Path:
@@ -1148,13 +1153,45 @@ def _build_dispatch(
     return dispatch
 
 
+def _restart_argv() -> list[str]:
+    """argv for the in-place daemon re-exec.
+
+    We re-exec via ``python -m vexis_agent.main`` rather than reusing
+    ``sys.argv`` because the daemon is launched several ways (the
+    ``vexis-agent`` console script, ``python -m``, systemd ExecStart) and
+    the module entry point is the one form stable across all of them.
+    Pure + side-effect-free so it can be unit-tested without execv."""
+    return [sys.executable, "-m", "vexis_agent.main"]
+
+
+def _exec_restart() -> None:
+    """Re-exec the daemon in place (same PID) for the /restart command.
+
+    Called by ``main()`` only after ``_run()``'s graceful teardown has
+    closed the control socket, dashboard, and Telegram polling, so the
+    fresh image re-binds cleanly. The PID-lock fd is O_CLOEXEC (Python
+    fds are non-inheritable since PEP 446), so the flock releases at the
+    execv boundary and the new image re-acquires it; the PID is
+    unchanged, so the lock's stale-vs-alive check (``existing ==
+    getpid()``) passes rather than tripping the already-running guard.
+    Sessions live on disk, so the chat resumes on the next message —
+    with whatever brain CLI version / model / ``brain.kind`` is now
+    configured. Under systemd the MainPID is preserved, so the unit
+    stays active across the swap."""
+    log.info("Re-executing daemon for /restart (pid=%d)", os.getpid())
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, _restart_argv())
+
+
 def main() -> None:
     """Daemon entry. Used by ``python -m vexis_agent.main``, by the
     ``vexis-agent run`` Typer command, and by direct ``python main.py``
     invocations during dev. Pre-Phase-2 callers expect side-effects on
     invocation, not a returned coroutine — keep that contract."""
+    restart_requested = False
     try:
-        asyncio.run(_run())
+        restart_requested = asyncio.run(_run())
     except DaemonAlreadyRunning as exc:
         # Distinct exit code so a supervisor (systemd, nohup loop,
         # whatever) can tell "another instance owns this" apart from
@@ -1167,7 +1204,12 @@ def main() -> None:
         print(f"vexis-agent: {exc}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
-        pass
+        return
+    if restart_requested:
+        # Never returns — replaces the process image. Must run AFTER
+        # asyncio.run() has fully unwound the loop so no fd survives
+        # except the (CLOEXEC) lock fd, which the execv drops for us.
+        _exec_restart()
 
 
 if __name__ == "__main__":

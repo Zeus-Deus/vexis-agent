@@ -305,6 +305,15 @@ _MODEL_REFRESH_EMPTY_TMPL = (
 )
 
 
+# /restart acknowledgement. Sent before the run-loop tears down so the
+# user sees confirmation; the re-exec then resumes this chat from disk.
+_RESTART_ACK = (
+    "🔄 Restarting now — our conversation is saved. Give me a few "
+    "seconds, then send a message and I'll pick up right where we left "
+    "off, running whatever brain CLI / model version is configured now."
+)
+
+
 _GOAL_DISABLED_NOTE = (
     "/goal is disabled. Set goals.enabled: true in ~/.vexis/config.yaml "
     "to turn it on."
@@ -852,6 +861,16 @@ class TelegramTransport:
         self._background_tasks = background_tasks
         self._notifier = notifier
         self._allowed_user_id = allowed_user_id
+        # /restart self-restart support. ``request_restart`` flips this
+        # flag and trips ``_shutdown_event`` so ``run()`` returns; the
+        # run-loop's finally tears down sockets and ``main.py`` re-execs
+        # the process. The chat resumes with zero state hand-off because
+        # sessions live on disk (claude ``--resume`` / opencode.db) — the
+        # next message continues where we left off. Event is created
+        # eagerly (asyncio.Event needs no running loop since 3.10) so a
+        # restart requested before ``run()`` reaches its wait still trips.
+        self._restart_requested = False
+        self._shutdown_event = asyncio.Event()
         self._curator = curator
         self._learning_curator = learning_curator
         self._dashboard = dashboard
@@ -955,6 +974,7 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("dashboard", self._on_dashboard))
         self._app.add_handler(CommandHandler("tailscale", self._on_tailscale))
         self._app.add_handler(CommandHandler("kanban", self._on_kanban))
+        self._app.add_handler(CommandHandler("restart", self._on_restart))
         # /codemux moved into the codemux bundled add-on (Phase B).
         # The add-on registers via ctx.register_telegram_command,
         # which surfaces below in _register_addon_commands.
@@ -2143,6 +2163,43 @@ class TelegramTransport:
         except Exception:
             log.exception("goal auto-pause on /cancel failed for chat %d", msg.chat_id)
         await msg.reply_text(reply_text)
+
+    async def _on_restart(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected /restart from user_id=%s", user.id)
+            return
+        log.info(
+            "Received /restart from chat %d — scheduling daemon re-exec",
+            msg.chat_id,
+        )
+        # Acknowledge BEFORE tripping the shutdown so the user sees the
+        # confirmation while polling is still live. request_restart()
+        # defers the actual trip a tick (see below), so this reply lands.
+        await msg.reply_text(_RESTART_ACK)
+        self.request_restart()
+
+    def request_restart(self) -> None:
+        """Flag a graceful daemon self-restart and trip the run-loop's
+        shutdown event so ``run()`` returns. ``main.py`` then re-execs
+        the process (see ``_exec_restart``) after the run-loop's finally
+        closes the control socket, dashboard, and Telegram polling.
+
+        The trip is deferred one event-loop tick via ``call_soon`` so the
+        calling PTB update handler fully returns before teardown begins —
+        ``Application.stop()`` joins in-flight handlers, and tripping
+        synchronously from inside one could deadlock that join. Idempotent
+        and safe to call from a non-async context (used by tests)."""
+        self._restart_requested = True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._shutdown_event.set()
+            return
+        loop.call_soon(self._shutdown_event.set)
 
     async def _on_tasks(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
@@ -4858,7 +4915,11 @@ class TelegramTransport:
         log.info("Telegram polling started")
         cleanup_task = asyncio.create_task(_incoming_image_cleanup_loop())
         try:
-            await asyncio.Event().wait()
+            # Blocks until SIGTERM/SIGINT cancels this coroutine OR
+            # ``request_restart`` (the /restart command) trips the event.
+            # On a restart trip we return normally; main.py reads
+            # ``_restart_requested`` after teardown and re-execs.
+            await self._shutdown_event.wait()
         finally:
             cleanup_task.cancel()
             try:

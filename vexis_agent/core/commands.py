@@ -65,4 +65,8 @@ COMMANDS: tuple[BotCommand, ...] = (
     ),
     BotCommand("dashboard", "Open the web dashboard (Tailscale URL + token)"),
     BotCommand("tailscale", "Show Tailscale status (serves, funnels, peers)"),
+    # Restarts the daemon in place (re-exec) to pick up a new brain CLI
+    # version / model / brain.kind. The chat resumes from disk, so the
+    # conversation continues seamlessly. See docs/restart.md.
+    BotCommand("restart", "Restart the agent; resumes this chat with the latest CLI/config"),
 )

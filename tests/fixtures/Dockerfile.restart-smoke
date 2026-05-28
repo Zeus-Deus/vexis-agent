@@ -1,0 +1,26 @@
+# Containerized smoke for the /restart self-restart primitive.
+#
+# Build context = repo root:
+#   docker build -f tests/fixtures/Dockerfile.restart-smoke -t vexis-restart-smoke .
+#   docker run --rm vexis-restart-smoke
+#
+# Runs the restart unit tests AND scripts/restart_smoke.py (real
+# acquire_daemon_lock + ControlSocket + os.execv) inside a clean Linux
+# container, proving the daemon re-execs in place, re-acquires its PID
+# lock, and re-binds its control socket — i.e. the chat-resume restart
+# comes back up cleanly.
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY . /app
+
+RUN pip install --no-cache-dir -e . && pip install --no-cache-dir pytest
+
+ENV PYTHONUNBUFFERED=1 \
+    SMOKE_STATE_DIR=/tmp/vexis-restart-smoke
+
+CMD set -e; \
+    echo "=== restart unit tests ==="; \
+    python -m pytest tests/test_restart_command.py -q; \
+    echo "=== execv + lock + socket smoke ==="; \
+    python scripts/restart_smoke.py
