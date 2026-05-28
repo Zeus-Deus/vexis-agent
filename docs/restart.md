@@ -45,7 +45,9 @@ bot:  <the new model>
    every socket the daemon owns (Telegram polling, control socket,
    dashboard, watcher, curators, background tasks).
 3. `_run()` returns `True`; `main()` calls `_exec_restart()`, which
-   `os.execv`s `python -m vexis_agent.main`. The PID is unchanged.
+   `os.execv`s `python -m vexis_agent.cli run` — byte-for-byte the
+   systemd unit's `ExecStart`, so the restart lands on the same launch
+   path production already uses. The PID is unchanged.
 4. The daemon PID-lock fd is `O_CLOEXEC` (Python fds are non-inheritable
    since PEP 446), so the `flock` releases at the execv boundary and the
    fresh image re-acquires it. Because the PID is unchanged, the lock's
@@ -55,6 +57,22 @@ bot:  <the new model>
 Under systemd the MainPID is preserved, so the unit stays `active`
 across the swap. `vexis-agent service restart` (full `systemctl`
 restart) remains available and is equivalent in effect.
+
+### If the re-exec ever fails
+
+`os.execv` only returns on failure (success replaces the image). On the
+rare failure, `_exec_restart` logs loudly and re-raises so the process
+exits non-zero — under systemd that trips the unit's
+`Restart=on-failure` (`RestartSec=5`) and the daemon respawns within a
+few seconds. So the daemon never ends up silently dead-but-not-
+responding under the supervised (systemd) path. A foreground
+`vexis-agent run` has no supervisor, so the loud log is the operator's
+signal to relaunch.
+
+The re-exec target booting real daemon code (rather than no-opping) is
+verified by `scripts/restart_smoke.py` and the Dockerfile's third stage,
+which runs the exact `python -m vexis_agent.cli run` command and asserts
+it reaches `_run()` startup.
 
 ## Tests
 

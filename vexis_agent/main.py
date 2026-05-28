@@ -1156,12 +1156,15 @@ def _build_dispatch(
 def _restart_argv() -> list[str]:
     """argv for the in-place daemon re-exec.
 
-    We re-exec via ``python -m vexis_agent.main`` rather than reusing
-    ``sys.argv`` because the daemon is launched several ways (the
-    ``vexis-agent`` console script, ``python -m``, systemd ExecStart) and
-    the module entry point is the one form stable across all of them.
-    Pure + side-effect-free so it can be unit-tested without execv."""
-    return [sys.executable, "-m", "vexis_agent.main"]
+    Re-exec via ``python -m vexis_agent.cli run`` — byte-for-byte the
+    command the systemd unit's ``ExecStart`` uses (see
+    ``daemon/systemd.py``), so the restart lands on the same battle-
+    tested launch path rather than reusing ``sys.argv`` (which differs
+    across the console script, ``python -m``, and systemd). Verified to
+    reach real daemon startup (it fails only on missing secrets, never on
+    module resolution). Pure + side-effect-free so it's unit-testable
+    without execv."""
+    return [sys.executable, "-m", "vexis_agent.cli", "run"]
 
 
 def _exec_restart() -> None:
@@ -1177,11 +1180,28 @@ def _exec_restart() -> None:
     Sessions live on disk, so the chat resumes on the next message —
     with whatever brain CLI version / model / ``brain.kind`` is now
     configured. Under systemd the MainPID is preserved, so the unit
-    stays active across the swap."""
-    log.info("Re-executing daemon for /restart (pid=%d)", os.getpid())
+    stays active across the swap.
+
+    ``os.execv`` only returns if it FAILS (it never returns on success —
+    the image is replaced). On the rare failure (e.g. a vanished
+    interpreter) we log loudly and re-raise so the process exits
+    non-zero: under systemd that trips ``Restart=on-failure`` and the
+    unit respawns within ``RestartSec``, so the daemon never ends up
+    silently dead-but-not-responding. (A foreground ``vexis-agent run``
+    has no supervisor, so the loud log is the user's signal.)"""
+    argv = _restart_argv()
+    log.info("Re-executing daemon for /restart (pid=%d): %s", os.getpid(), argv)
     sys.stdout.flush()
     sys.stderr.flush()
-    os.execv(sys.executable, _restart_argv())
+    try:
+        os.execv(sys.executable, argv)
+    except OSError:
+        log.exception(
+            "Daemon re-exec FAILED (pid=%d) — process will exit non-zero so "
+            "a supervisor (systemd Restart=on-failure) can respawn it.",
+            os.getpid(),
+        )
+        raise
 
 
 def main() -> None:

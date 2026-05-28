@@ -20,6 +20,7 @@ import sys
 from typing import Any
 
 import vexis_agent.main as main_mod
+import vexis_agent.transports.telegram as telegram_mod
 from vexis_agent.transports.telegram import TelegramTransport, _RESTART_ACK
 
 
@@ -68,9 +69,12 @@ def _make_transport() -> TelegramTransport:
 # --- _restart_argv ---------------------------------------------------------
 
 
-def test_restart_argv_uses_module_entry_and_current_interpreter():
+def test_restart_argv_matches_systemd_execstart():
+    # Must mirror the systemd unit's ExecStart (daemon/systemd.py:
+    # "{python} -m vexis_agent.cli run") so the restart lands on the
+    # same launch path production uses.
     argv = main_mod._restart_argv()
-    assert argv == [sys.executable, "-m", "vexis_agent.main"]
+    assert argv == [sys.executable, "-m", "vexis_agent.cli", "run"]
 
 
 def test_restart_argv_is_pure():
@@ -158,3 +162,113 @@ def test_on_restart_ignores_update_without_message():
 
     asyncio.run(transport._on_restart(_NoMsg(), None))
     assert transport._restart_requested is False
+
+
+# --- run() shuts down cleanly on a restart trip (no hang) ------------------
+#
+# The failure the user fears is "it shuts down but never comes back / never
+# responds." That has two halves: (a) does run() actually RETURN when a
+# restart is requested, completing its teardown without hanging, and (b)
+# does the re-exec target boot real daemon code. (b) is covered by the
+# Docker smoke + the verified `_restart_argv` entry point. This test nails
+# (a): the REAL run() body runs against a faked PTB Application (we don't
+# own PTB, we own the wiring), and we assert run() returns and tears the
+# transport fully down — updater, app stop, and app shutdown all fire.
+
+
+class _FakeBotApi:
+    async def set_my_commands(self, _cmds: Any) -> None:
+        pass
+
+
+class _FakeUpdater:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    async def start_polling(self) -> None:
+        self._events.append("updater.start_polling")
+
+    async def stop(self) -> None:
+        self._events.append("updater.stop")
+
+
+class _FakeApp:
+    """Minimal stand-in for PTB's Application — just the lifecycle hooks
+    TelegramTransport.run() calls, recording order so we can assert a
+    clean start→serve→teardown."""
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self.bot = _FakeBotApi()
+        self.updater = _FakeUpdater(events)
+
+    async def initialize(self) -> None:
+        self._events.append("initialize")
+
+    async def start(self) -> None:
+        self._events.append("start")
+
+    async def stop(self) -> None:
+        self._events.append("stop")
+
+    async def shutdown(self) -> None:
+        self._events.append("shutdown")
+
+
+class _FakeNotifier:
+    def bind_app(self, _app: Any) -> None:
+        pass
+
+    async def send(self, *_a: Any, **_kw: Any) -> None:
+        pass
+
+
+class _FakeBackgroundTasks:
+    def set_notify(self, _fn: Any) -> None:
+        pass
+
+    async def detect_lost_from_previous_run(self) -> list:
+        return []
+
+
+def test_run_returns_and_tears_down_on_restart_trip(monkeypatch):
+    events: list[str] = []
+    transport = _make_transport()
+    transport._app = _FakeApp(events)  # type: ignore[attr-defined]
+    transport._addon_runtime = None  # type: ignore[attr-defined]
+    transport._notifier = _FakeNotifier()  # type: ignore[attr-defined]
+    transport._background_tasks = _FakeBackgroundTasks()  # type: ignore[attr-defined]
+
+    # Neutralize the two real side-effecting helpers run() invokes so the
+    # test stays hermetic (they touch the runtime dir / /tmp otherwise).
+    monkeypatch.setattr(telegram_mod, "cleanup_status_files", lambda: 0)
+
+    async def _never() -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(telegram_mod, "_incoming_image_cleanup_loop", _never)
+
+    async def scenario() -> None:
+        run_task = asyncio.create_task(transport.run())
+        # Wait until run() has fully started (polling began).
+        for _ in range(200):
+            if "updater.start_polling" in events:
+                break
+            await asyncio.sleep(0.01)
+        assert "updater.start_polling" in events, "run() never finished startup"
+
+        # Trip the restart exactly like /restart does.
+        transport.request_restart()
+
+        # run() must RETURN (no hang) once the event trips.
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+    # Full clean lifecycle: started, then every teardown hook fired.
+    assert events[:4] == ["initialize", "start", "updater.start_polling", "updater.stop"] or (
+        events.index("start") < events.index("updater.stop")
+    )
+    for hook in ("updater.stop", "stop", "shutdown"):
+        assert hook in events, f"teardown hook {hook!r} never ran — restart would hang/leak"
+    assert transport._restart_requested is True

@@ -23,4 +23,9 @@ CMD set -e; \
     echo "=== restart unit tests ==="; \
     python -m pytest tests/test_restart_command.py -q; \
     echo "=== execv + lock + socket smoke ==="; \
-    python scripts/restart_smoke.py
+    python scripts/restart_smoke.py; \
+    echo "=== re-exec target boots real daemon code ==="; \
+    out=$(python -m vexis_agent.cli run 2>&1 || true); \
+    echo "$out" | grep -q TELEGRAM_BOT_TOKEN \
+      && echo "ENTRY OK: 'python -m vexis_agent.cli run' reached _run startup (failed only on missing secret)" \
+      || { echo "ENTRY BROKEN: re-exec target did not reach daemon startup:"; echo "$out"; exit 1; }
