@@ -71,6 +71,10 @@ vexis-dispatch = "vexis_agent.tools.desktop_control_cli:main_dispatch"
 vexis-focus-wait = "vexis_agent.tools.desktop_control_cli:main_focus_wait"
 vexis-key = "vexis_agent.tools.desktop_control_cli:main_key"
 vexis-type = "vexis_agent.tools.desktop_control_cli:main_type"
+# Add-on management. vexis-addons list/enable/disable/inspect/doctor/install
+# — see docs/addons.md for the manifest format and lifecycle. Read-only
+# against the daemon (no IPC); a restart picks up enable/disable changes.
+vexis-addons = "vexis_agent.tools.addons_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
