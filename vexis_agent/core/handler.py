@@ -280,6 +280,7 @@ class MessageHandler:
         model, reasoning_level = self._apply_computer_use_override(
             model, reasoning_level,
         )
+        model = self._resolve_foreground_model(model)
         message = await self._inject_context(chat_id, text)
 
         # Issue #11 — pre-turn conversation compression. Best-effort:
@@ -387,6 +388,7 @@ class MessageHandler:
         model, reasoning_level = self._apply_computer_use_override(
             model, reasoning_level,
         )
+        model = self._resolve_foreground_model(model)
         message = await self._inject_context(chat_id, text)
 
         # Issue #11 — same pre-turn compression hook as :meth:`handle`.
@@ -519,6 +521,45 @@ class MessageHandler:
             )
             return cu_model, cu_reasoning
         return model, reasoning_level
+
+    def _resolve_foreground_model(self, model: str | None) -> str | None:
+        """Fall back to the configured foreground (chat) model when no
+        per-turn override applies.
+
+        Both foreground entrypoints (:meth:`handle` and the streaming
+        method) call this AFTER :meth:`_apply_computer_use_override`, so
+        an explicit caller override (voice call mode) or a computer-use
+        substitution has already taken precedence — those leave ``model``
+        non-None and we pass straight through. Only a plain Telegram /
+        text-chat turn (``model is None``) consults ``models.brain``.
+
+        ``models.brain`` is resolved tier-or-raw like every other model
+        knob (``model_for_tier``): an abstract tier maps to the brain's
+        native id, a raw model id passes through, and ``default`` (the
+        unset case — ``model_brain()`` returns ``"default"``) resolves to
+        ``None`` → no ``--model`` flag → the brain's account default,
+        i.e. the historical behavior. Reads disk each turn so a config
+        edit hot-reloads at the next turn (matches subsystem tiers).
+        """
+        if model is not None:
+            return model
+        try:
+            from vexis_agent.core.model_validator import (
+                brain_instance_to_kind,
+            )
+            from vexis_agent.core.yaml_config import (
+                model_brain,
+                model_for_tier,
+            )
+
+            kind = brain_instance_to_kind(self._brain)
+            return model_for_tier(kind, model_brain())
+        except Exception:  # pragma: no cover - defensive
+            log.debug(
+                "foreground model resolution failed; using brain default",
+                exc_info=True,
+            )
+            return None
 
     async def _maybe_compress(self) -> None:
         """Call :meth:`Brain.compress_if_needed` on the active session.

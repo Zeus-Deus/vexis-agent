@@ -86,10 +86,13 @@ brain:
   kind: opencode
 
 models:
-  brain: default                  # foreground brain — leave as default
-                                  # (display-only on the dashboard;
-                                  # the foreground turn never passes
-                                  # --model to the brain)
+  brain: default                  # foreground (chat) model. `default`
+                                  # = the brain's account default. On
+                                  # opencode there's no meaningful
+                                  # account default, so set a concrete
+                                  # id here (e.g. anthropic/claude-
+                                  # sonnet-4) or via /model set
+                                  # foreground / the dashboard.
 
   # NEW abstract-tier schema. Each subsystem picks a size tier;
   # `models.tiers.opencode.<tier>` (or the built-in

@@ -3001,6 +3001,11 @@ class WebDashboard:
             # dashboard renders a clean error state instead of 500.
             return {
                 "brain_kind": "claude-code",
+                "foreground": {
+                    "configured": None,
+                    "resolved_model_id": None,
+                    "findings": [],
+                },
                 "subsystems": [],
                 "tier_overrides": {},
                 "brain_inventory": [],
@@ -3084,18 +3089,33 @@ class WebDashboard:
                 status_code=400,
                 detail="payload requires {subsystem: str, value: str}",
             )
-        if subsystem not in DEFAULT_SUBSYSTEM_TIERS:
+
+        # Foreground (chat) model target — writes the top-level
+        # ``models.brain`` knob that drives the foreground turn (see
+        # ``MessageHandler._resolve_foreground_model``), NOT a
+        # ``models.subsystems.<name>`` aux assignment. Distinct from
+        # POST /api/v1/models/brain, which sets ``brain.kind`` (which
+        # agent CLI). Validated by rule 8 in the shared validator.
+        is_foreground = subsystem in ("foreground", "chat", "brain")
+
+        if not is_foreground and subsystem not in DEFAULT_SUBSYSTEM_TIERS:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"unknown subsystem '{subsystem}'. Known: "
-                    f"{', '.join(sorted(DEFAULT_SUBSYSTEM_TIERS))}"
+                    f"{', '.join(sorted(DEFAULT_SUBSYSTEM_TIERS))}, "
+                    f"or 'foreground' for the chat model"
                 ),
             )
 
         cfg_path = vexis_dir() / "config.yaml"
         current = _read_raw()
-        proposed = self._proposed_set_subsystem(current, subsystem, value)
+        if is_foreground:
+            models = dict(current.get("models") or {})
+            models["brain"] = value
+            proposed = {**current, "models": models}
+        else:
+            proposed = self._proposed_set_subsystem(current, subsystem, value)
 
         available = discovery_for_validator(VALID_BRAIN_KINDS)
         findings = validate_models_config(
@@ -3116,12 +3136,20 @@ class WebDashboard:
         )
         atomic_write_yaml(cfg_path, proposed)
 
-        resolved_tier = subsystem_tier_from_config(
-            proposed.get("models"), subsystem,
-        )
-        resolved_id = model_for_tier_from_config(
-            proposed.get("models"), brain_kind(), resolved_tier,
-        )
+        if is_foreground:
+            # Foreground resolves the raw value tier-or-raw directly;
+            # there's no subsystem tier indirection.
+            resolved_tier = None
+            resolved_id = model_for_tier_from_config(
+                proposed.get("models"), brain_kind(), value,
+            )
+        else:
+            resolved_tier = subsystem_tier_from_config(
+                proposed.get("models"), subsystem,
+            )
+            resolved_id = model_for_tier_from_config(
+                proposed.get("models"), brain_kind(), resolved_tier,
+            )
         return {
             "ok": True,
             "subsystem": subsystem,
@@ -3162,12 +3190,18 @@ class WebDashboard:
                 status_code=400,
                 detail="subsystem must be a string or omitted",
             )
-        if target is not None and target not in DEFAULT_SUBSYSTEM_TIERS:
+        is_foreground = target in ("foreground", "chat", "brain")
+        if (
+            target is not None
+            and not is_foreground
+            and target not in DEFAULT_SUBSYSTEM_TIERS
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"unknown subsystem '{target}'. Known: "
-                    f"{', '.join(sorted(DEFAULT_SUBSYSTEM_TIERS))}"
+                    f"{', '.join(sorted(DEFAULT_SUBSYSTEM_TIERS))}, "
+                    f"or 'foreground' for the chat model"
                 ),
             )
 
@@ -3175,7 +3209,12 @@ class WebDashboard:
         current = _read_raw()
         models = dict(current.get("models") or {})
 
-        if target is None:
+        if is_foreground:
+            # Reset the foreground (chat) model to the brain's account
+            # default by dropping models.brain.
+            models.pop("brain", None)
+            scope = "foreground (chat)"
+        elif target is None:
             # Drop every subsystem assignment (legacy + new schema)
             # but leave models.tiers and models.brain alone.
             models.pop("subsystems", None)

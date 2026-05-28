@@ -36,6 +36,7 @@ from vexis_agent.core.model_validator import (
     ValidationFinding,
     _live_subsystem_callers,
     _reset_live_callers_cache,
+    build_resolution_table,
     log_findings,
     validate_models_config,
 )
@@ -811,3 +812,103 @@ def test_findings_order_is_deterministic():
     ] == [
         (f.severity, f.subsystem, f.problem) for f in b
     ]
+
+
+# ──────────────────────────────────────────────────────────────────
+# Rule 8 — foreground (chat) model validity (models.brain)
+#
+# models.brain drives the foreground turn since the model-switching
+# UX work (it was display-only before). A bogus value breaks every
+# chat turn, so it earns the same model-existence checks subsystems
+# get (rules 4/5/6). Findings carry subsystem="brain".
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_rule8_default_foreground_silent():
+    """``models.brain: default`` (account default) fires nothing."""
+    config = {"models": {"brain": "default"}}
+    findings = validate_models_config(config, "claude-code")
+    assert not _has_finding(findings, subsystem="brain")
+
+
+def test_rule8_unset_foreground_silent():
+    """No models.brain key at all → account default → silent."""
+    findings = validate_models_config({}, "claude-code")
+    assert not _has_finding(findings, subsystem="brain")
+
+
+def test_rule8_valid_tier_foreground_silent():
+    """An abstract tier resolves cleanly and fires nothing."""
+    config = {"models": {"brain": "large"}}
+    findings = validate_models_config(config, "claude-code")
+    assert not _has_finding(findings, subsystem="brain")
+
+
+def test_rule8_bare_alias_on_opencode_is_error():
+    """Same trap as rule 4 but for the chat model: a bare alias on
+    opencode would crash the foreground turn with 'Model not found'."""
+    config = {
+        "brain": {"kind": "opencode"},
+        "models": {"brain": "sonnet"},
+    }
+    findings = validate_models_config(config, "opencode")
+    assert _has_finding(
+        findings, severity="error", subsystem="brain",
+        problem_substring="bare alias",
+    )
+
+
+def test_rule8_provider_model_shape_on_opencode_passes():
+    config = {
+        "brain": {"kind": "opencode"},
+        "models": {"brain": "anthropic/claude-haiku-3-5"},
+    }
+    findings = validate_models_config(config, "opencode")
+    assert not _has_finding(
+        findings, severity="error", subsystem="brain",
+    )
+
+
+def test_rule8_unknown_model_on_opencode_is_error_with_shared_fix():
+    """A typo'd model id, when discovery data is supplied, is a
+    hard error on opencode and carries the shared suggested_fix copy
+    (same source as subsystems + the spawn-site backstop)."""
+    config = {
+        "brain": {"kind": "opencode"},
+        "models": {"brain": "anthropic/made-up-model"},
+    }
+    findings = validate_models_config(
+        config, "opencode",
+        available_models_per_brain={
+            "opencode": {"anthropic/claude-haiku-3-5"},
+        },
+    )
+    brain_errors = [
+        f for f in findings
+        if f.subsystem == "brain" and f.severity == "error"
+    ]
+    assert brain_errors
+    assert brain_errors[0].suggested_fix == UNKNOWN_MODEL_FIX_TEMPLATE.format(
+        model_id="anthropic/made-up-model", brain_kind="opencode",
+    )
+
+
+def test_rule8_resolution_table_surfaces_foreground_block():
+    """build_resolution_table carries a foreground block with the raw
+    configured value, resolved id, and its own findings."""
+    config = {"models": {"brain": "sonnet"}}
+    table = build_resolution_table(config, "claude-code")
+    assert "foreground" in table
+    fg = table["foreground"]
+    assert fg["configured"] == "sonnet"
+    assert fg["resolved_model_id"] == "sonnet"  # raw passthrough on cc
+    assert isinstance(fg["findings"], list)
+
+
+def test_rule8_resolution_table_foreground_default_resolves_none():
+    """Unset models.brain → configured None, resolved None (= account
+    default / no --model flag)."""
+    table = build_resolution_table({}, "claude-code")
+    fg = table["foreground"]
+    assert fg["configured"] is None
+    assert fg["resolved_model_id"] is None

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import type {
+  ModelForegroundRow,
   ModelSubsystemRow,
   ModelValidationFinding,
   ModelsState,
@@ -167,6 +168,43 @@ export function ModelsPage({ token, onAuthFail }: ModelsPageProps) {
     [token, runMutation, state?.has_comments],
   );
 
+  // Foreground (chat) model — writes models.brain via the same
+  // /api/v1/models/set endpoint with the "foreground" target. Same
+  // optimistic-swap + comment-gate pattern as subsystems.
+  const onSetForeground = useCallback(
+    (value: string) => {
+      setState((s) =>
+        s === null
+          ? s
+          : { ...s, foreground: { ...s.foreground, configured: value } },
+      );
+      const action = () =>
+        runMutation(
+          `set foreground → ${value}`,
+          () => api.setModel(token, { subsystem: "foreground", value }),
+        );
+      if (state?.has_comments) {
+        setModal({ kind: "comment-confirm", pendingAction: action });
+      } else {
+        void action();
+      }
+    },
+    [token, runMutation, state?.has_comments],
+  );
+
+  const onResetForeground = useCallback(() => {
+    const action = () =>
+      runMutation(
+        `reset foreground`,
+        () => api.resetModel(token, { subsystem: "foreground" }),
+      );
+    if (state?.has_comments) {
+      setModal({ kind: "comment-confirm", pendingAction: action });
+    } else {
+      void action();
+    }
+  }, [token, runMutation, state?.has_comments]);
+
   const onSwitchBrain = useCallback(
     (targetKind: string) => {
       setModal({ kind: "brain", targetKind });
@@ -234,6 +272,16 @@ export function ModelsPage({ token, onAuthFail }: ModelsPageProps) {
         onSwitch={onSwitchBrain}
       />
       <GlobalFindings findings={state.global_findings} />
+      <ForegroundCard
+        foreground={state.foreground}
+        brain={state.brain_kind}
+        availableModelsByProvider={
+          state.available_models_by_provider[state.brain_kind] ?? {}
+        }
+        editable={state.model_ux_enabled}
+        onSet={onSetForeground}
+        onReset={onResetForeground}
+      />
       <ResolutionTable
         rows={state.subsystems}
         brain={state.brain_kind}
@@ -285,10 +333,11 @@ function Header() {
         ⊕ <span className="ml-1">Models</span>
       </h1>
       <p className="text-xs text-[var(--color-fg-dim)] font-data leading-relaxed max-w-[60ch]">
-        How each subsystem's auxiliary spawn resolves to a native
-        model id under the active brain. Edit per-subsystem
-        assignments inline; the validator runs pre-write and
-        refuses error-severity changes with the suggested fix.
+        The foreground (chat) model you talk to, plus how each
+        subsystem's auxiliary spawn resolves to a native model id
+        under the active brain. Edit assignments inline; the validator
+        runs pre-write and refuses error-severity changes with the
+        suggested fix.
       </p>
     </div>
   );
@@ -427,6 +476,141 @@ function GlobalFindings({ findings }: { findings: ModelValidationFinding[] }) {
             <FindingRow key={idx} finding={f} />
           ))}
         </ul>
+      </Card>
+    </Section>
+  );
+}
+
+
+// ---- Foreground (chat) model ------------------------------------
+
+// The model you actually chat with — models.brain. Distinct from
+// the Brain banner (brain.kind = which agent CLI) and from the aux
+// subsystems below (background spawns). Resolved tier-or-raw and
+// passed as --model on the foreground turn; "(default)" = the
+// brain's account default (no --model flag), which is the historical
+// behavior. This row is the fix for "you can configure every
+// behind-the-scenes model but not the one you talk to" — acute on
+// opencode, which has no meaningful single account default.
+function ForegroundCard({
+  foreground,
+  brain,
+  availableModelsByProvider,
+  editable,
+  onSet,
+  onReset,
+}: {
+  foreground: ModelForegroundRow;
+  brain: string;
+  availableModelsByProvider: Record<string, string[]>;
+  editable: boolean;
+  onSet: (value: string) => void;
+  onReset: () => void;
+}) {
+  const worst = pickWorst(foreground.findings);
+  const [searchQuery, setSearchQuery] = useState("");
+  const debouncedQuery = useDebounced(searchQuery, PICKER_SEARCH_DEBOUNCE_MS);
+
+  const filteredByProvider = filterAliases(availableModelsByProvider);
+  const showSearch =
+    totalOptionCount(filteredByProvider) > PICKER_SEARCH_THRESHOLD;
+  const visibleByProvider = applySearchFilter(filteredByProvider, debouncedQuery);
+  const providerEntries = Object.entries(visibleByProvider);
+
+  const currentNeedsBucket =
+    foreground.configured !== null &&
+    !configuredAlreadyVisible(foreground.configured, filteredByProvider);
+
+  return (
+    <Section title="Foreground (chat) model" trailing={`on ${brain}`}>
+      <Card>
+        <div className="px-3 sm:px-4 py-3 font-data text-[12px]">
+          <div className="grid grid-cols-1 sm:grid-cols-[1.5fr_1.5fr_1fr_0.4fr] items-baseline gap-x-4 gap-y-1">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[var(--color-fg)]">chat</span>
+              <span className="sm:hidden">
+                <StatusBadge worst={worst} findings={foreground.findings} />
+              </span>
+            </div>
+            <div className="text-[var(--color-fg-2)] flex flex-col items-stretch gap-1">
+              <span className="sm:hidden text-[10px] uppercase-tight text-[var(--color-fg-dim)]">
+                configured
+              </span>
+              {editable ? (
+                <>
+                  {showSearch && (
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="filter models…"
+                      aria-label="Filter models for foreground"
+                      className="font-data text-[11px] bg-[var(--color-base)] border border-[var(--color-border)] px-1.5 py-0.5 text-[var(--color-fg)]"
+                    />
+                  )}
+                  <div className="flex items-center gap-2">
+                    <select
+                      aria-label="Set foreground (chat) model"
+                      value={foreground.configured ?? ""}
+                      onChange={(e) => onSet(e.target.value)}
+                      className="flex-1 sm:flex-none font-data text-[12px] bg-[var(--color-base)] border border-[var(--color-border)] px-1.5 py-1 sm:py-0.5 text-[var(--color-fg)] min-w-0"
+                    >
+                      <option value="" disabled>
+                        (default)
+                      </option>
+                      {currentNeedsBucket && foreground.configured !== null && (
+                        <optgroup label="Current">
+                          <option value={foreground.configured}>
+                            {foreground.configured}
+                          </option>
+                        </optgroup>
+                      )}
+                      {providerEntries.map(([provider, models]) => (
+                        <optgroup key={provider} label={provider}>
+                          {models.map((m) => (
+                            <option key={m} value={m}>
+                              {m}
+                            </option>
+                          ))}
+                        </optgroup>
+                      ))}
+                    </select>
+                    {foreground.configured !== null && (
+                      <button
+                        type="button"
+                        onClick={onReset}
+                        title="reset to account default"
+                        aria-label="Reset foreground model"
+                        className="text-[10px] uppercase-tight text-[var(--color-fg-dim)] hover:text-[var(--color-error)] shrink-0"
+                      >
+                        reset
+                      </button>
+                    )}
+                  </div>
+                </>
+              ) : (
+                foreground.configured ?? <Dim>(default)</Dim>
+              )}
+            </div>
+            <div className="text-[var(--color-fg-2)] break-all">
+              <span className="sm:hidden text-[10px] uppercase-tight text-[var(--color-fg-dim)] block">
+                resolves to
+              </span>
+              {formatResolvesToCell(
+                foreground.configured,
+                foreground.resolved_model_id,
+              )}
+            </div>
+            <span className="hidden sm:block sm:text-right">
+              <StatusBadge worst={worst} findings={foreground.findings} />
+            </span>
+          </div>
+        </div>
+        <p className="px-4 pb-3 font-data text-[10.5px] text-[var(--color-fg-dim)]">
+          The model you chat with (models.brain). "(default)" = the
+          brain's account default (no --model flag). Hot-reloads at the
+          next turn — no restart.
+        </p>
       </Card>
     </Section>
   );

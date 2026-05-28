@@ -447,6 +447,87 @@ def test_sequential_voice_with_then_without(
 
 
 # ──────────────────────────────────────────────────────────────────
+# Foreground (chat) model — models.brain drives the chat turn
+#
+# The fix for "you can configure every behind-the-scenes model but
+# not the one you chat with". A plain /chat/send (model=None from the
+# caller) now resolves models.brain before reaching the brain.
+# ``default`` / unset → None (account default, historical behavior).
+# Per-turn overrides (voice) still win because they pass non-None.
+# ──────────────────────────────────────────────────────────────────
+
+
+def _patch_config(monkeypatch: pytest.MonkeyPatch, path: Path, body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(
+        "vexis_agent.core.yaml_config._config_path", lambda: path,
+    )
+
+
+def test_chat_send_uses_configured_foreground_model(
+    client: TestClient, brain: BrainNull, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With models.brain set to a raw model id, a plain /chat/send
+    resolves it and passes it to the brain (no caller override)."""
+    _patch_config(
+        monkeypatch, tmp_path / "cfg-fg.yaml",
+        "models:\n  brain: claude-haiku-4-5\n",
+    )
+    r = client.post(
+        "/api/v1/chat/send", headers=_auth(),
+        json={"text": "hello"},
+    )
+    assert r.status_code == 200
+    _msg, _chat_id, model, reasoning = brain.calls()[0]
+    # Raw model id passes through model_for_tier untranslated (null
+    # brain leaves non-tier values as-is).
+    assert model == "claude-haiku-4-5"
+    assert reasoning is None
+
+
+def test_chat_send_default_foreground_passes_none(
+    client: TestClient, brain: BrainNull, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """models.brain: default (the unset behavior) → model=None →
+    no --model flag → the brain's account default. Bit-for-bit the
+    historical contract."""
+    _patch_config(
+        monkeypatch, tmp_path / "cfg-default.yaml",
+        "models:\n  brain: default\n",
+    )
+    r = client.post(
+        "/api/v1/chat/send", headers=_auth(),
+        json={"text": "hello"},
+    )
+    assert r.status_code == 200
+    _msg, _chat_id, model, _reasoning = brain.calls()[0]
+    assert model is None
+
+
+def test_voice_override_beats_configured_foreground(
+    client: TestClient, brain: BrainNull, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-turn voice override must still win over the configured
+    foreground default — the foreground fallback only fires when the
+    caller passed None."""
+    _patch_config(
+        monkeypatch, tmp_path / "cfg-fg2.yaml",
+        "models:\n  brain: claude-haiku-4-5\n",
+    )
+    r = client.post(
+        "/api/v1/chat/voice", headers=_auth(),
+        files={"audio": ("v.wav", b"fake-audio", "audio/wav")},
+        data={"model": "claude-opus-4-7"},
+    )
+    assert r.status_code == 200
+    _msg, _chat_id, model, _reasoning = brain.calls()[0]
+    assert model == "claude-opus-4-7"
+
+
+# ──────────────────────────────────────────────────────────────────
 # Bare-alias filter — the picker must not surface short aliases
 # ──────────────────────────────────────────────────────────────────
 

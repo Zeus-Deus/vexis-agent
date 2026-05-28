@@ -47,6 +47,9 @@ curator:
 # --model flag (sentinel "default") unless overridden by voice call
 # mode. See docs/model-ux.md for the resolution table.
 models:
+  # Foreground (chat) model — the one you talk to. tier-or-raw;
+  # `default`/unset = the brain's account default (no --model flag).
+  # Set via `/model set foreground` or the dashboard Models tab.
   brain: default
   subsystems:
     learning_review: small

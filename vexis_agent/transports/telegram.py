@@ -189,11 +189,27 @@ _MODEL_USAGE = (
     "/model — show current resolution\n"
     "/model list — enumerate subsystems + brains\n"
     "/model list <brain> — list models for that brain\n"
+    "/model set foreground <tier-or-name> — set the chat model\n"
     "/model set brain <name> — change brain.kind (restart required)\n"
     "/model set <subsystem> <tier-or-name> — set subsystem assignment\n"
     "/model set <subsystem> — picker: tap a provider then a model\n"
     "/model refresh — refresh opencode discovery cache\n"
-    "/model reset [<subsystem>] — back to defaults"
+    "/model reset [foreground|<subsystem>] — back to defaults"
+)
+# Foreground (chat) model set/reset replies. ``foreground`` is the
+# model you talk to (``models.brain``), resolved tier-or-raw and passed
+# as ``--model`` on the chat turn; distinct from ``brain.kind`` (which
+# agent CLI). Hot-reloads at the next turn — no restart.
+_MODEL_SET_FOREGROUND_OK_TMPL = (
+    "✓ foreground (chat) → {value} (resolves to {resolved} on {brain})\n"
+    "Takes effect on the next chat turn."
+)
+_MODEL_FOREGROUND_USAGE = (
+    "/model set foreground <tier-or-name> — set the chat model "
+    "(e.g. 'sonnet', 'large', or a provider/model id on opencode). "
+    "Use 'default' or /model reset foreground for the account default. "
+    "See /model list <brain> for valid ids, or use the dashboard "
+    "Models tab for a picker."
 )
 _MODEL_INVALID_BRAIN_KIND_TMPL = (
     "Won't write — '{kind}' is not a valid brain.kind. "
@@ -2992,6 +3008,11 @@ class TelegramTransport:
                     if sub_name in DEFAULT_SUBSYSTEM_TIERS:
                         models.pop(sub_name)
                 scope = "all subsystems"
+            elif target in ("foreground", "chat"):
+                # Reset the foreground (chat) model back to the brain's
+                # account default by dropping models.brain.
+                models.pop("brain", None)
+                scope = "foreground (chat)"
             else:
                 if target not in DEFAULT_SUBSYSTEM_TIERS:
                     await msg.reply_text(
@@ -3078,6 +3099,18 @@ class TelegramTransport:
                 await msg.reply_text(_MODEL_USAGE)
                 return
             key = args[1].lower()
+
+            # Foreground (chat) model — ``models.brain``. Distinct from
+            # ``brain`` (brain.kind) below. Typed-arg only; the rich
+            # picker lives on the dashboard Models tab. ``default`` /
+            # /model reset foreground restores the account default.
+            if key in ("foreground", "chat"):
+                if len(args) < 3:
+                    await msg.reply_text(_MODEL_FOREGROUND_USAGE)
+                    return
+                _ok, reply = self._apply_foreground_set(args[2])
+                await msg.reply_text(reply)
+                return
 
             picker_trigger = (
                 key != "brain"
@@ -3266,6 +3299,105 @@ class TelegramTransport:
             True,
             _MODEL_SET_OK_TMPL.format(
                 key=subsystem, value=value + reasoning_suffix,
+                resolved=resolved or "<brain default>",
+                brain=brain_kind(),
+            ) + backup_msg,
+        )
+
+    def _apply_foreground_set(self, value: str) -> tuple[bool, str]:
+        """Validate + write + render the reply for the foreground
+        (chat) model mutation ``models.brain = <value>``.
+
+        Mirrors :meth:`_apply_subsystem_set` (cross-brain refusal,
+        validator pre-write, comment-preservation backup, atomic
+        write) but targets the top-level ``models.brain`` knob that
+        drives the foreground turn (see
+        ``MessageHandler._resolve_foreground_model``) rather than an
+        aux subsystem. ``value`` may be an abstract tier, a raw model
+        id, or the ``default`` sentinel (account default). Hot-reloads
+        at the next chat turn — no restart. Returns
+        ``(success, reply_text)``.
+        """
+        from vexis_agent.core.model_discovery import (
+            discovery_for_validator,
+            is_brain_configured,
+            model_belongs_to_brain,
+        )
+        from vexis_agent.core.model_validator import validate_models_config
+        from vexis_agent.core.yaml_config import (
+            ABSTRACT_TIERS,
+            VALID_BRAIN_KINDS,
+            _read_raw,
+            brain_kind,
+            model_for_tier_from_config,
+        )
+        from vexis_agent.core.yaml_config_writer import (
+            atomic_write_yaml,
+            backup_if_commented,
+        )
+        from vexis_agent.core.paths import vexis_dir
+
+        cfg_path = vexis_dir() / "config.yaml"
+        current = _read_raw()
+
+        # Cross-brain refusal: a raw model id owned by an unconfigured
+        # brain would be written into a config the chat turn later
+        # rejects. Same guard as the subsystem path; skipped for
+        # abstract tiers and the ``default`` sentinel.
+        if value not in ABSTRACT_TIERS and value.lower() != "default":
+            owner = model_belongs_to_brain(value)
+            current_kind = brain_kind()
+            if (
+                owner is not None
+                and owner != current_kind
+                and not is_brain_configured(owner)
+            ):
+                install_hint = (
+                    _INSTALL_HINT_CLAUDE_CODE if owner == "claude-code"
+                    else _INSTALL_HINT_OPENCODE
+                )
+                return (
+                    False,
+                    _MODEL_CROSS_BRAIN_BRAIN_NOT_CONFIGURED_TMPL.format(
+                        model=value, required=owner, install=install_hint,
+                    ),
+                )
+
+        models = dict(current.get("models") or {})
+        models["brain"] = value
+        proposed = {**current, "models": models}
+
+        available = discovery_for_validator(VALID_BRAIN_KINDS)
+        findings = validate_models_config(
+            proposed, brain_kind(),
+            available_models_per_brain=available,
+        )
+        errors = [f for f in findings if f.severity == "error"]
+        if errors:
+            problems = "\n".join(
+                f"  • [{f.subsystem or '<global>'}] "
+                f"{f.problem}\n    → {f.suggested_fix}"
+                for f in errors
+            )
+            return (
+                False,
+                _MODEL_VALIDATOR_ERROR_TMPL.format(problems=problems),
+            )
+
+        backup_msg = ""
+        if cfg_path.exists():
+            bak = backup_if_commented(cfg_path)
+            if bak is not None:
+                backup_msg = "\n" + _MODEL_BACKUP_REPLY_TMPL
+        atomic_write_yaml(cfg_path, proposed)
+
+        resolved = model_for_tier_from_config(
+            proposed.get("models"), brain_kind(), value,
+        )
+        return (
+            True,
+            _MODEL_SET_FOREGROUND_OK_TMPL.format(
+                value=value,
                 resolved=resolved or "<brain default>",
                 brain=brain_kind(),
             ) + backup_msg,
@@ -3997,6 +4129,16 @@ class TelegramTransport:
         )
         kind = table["brain_kind"]
         lines = [f"Current resolution (brain: {kind}):"]
+        # Foreground (chat) model — the one you talk to. Distinct from
+        # brain.kind (which CLI) and the aux subsystems below. Resolved
+        # from models.brain; "(default → …)" means the brain's account
+        # default (no --model flag).
+        fg = table.get("foreground") or {}
+        fg_display = format_resolution_display(
+            fg.get("configured"), fg.get("resolved_model_id"),
+        )
+        lines.append(f"  foreground (chat)  {fg_display}")
+        lines.append("")
         max_name = max(len(n) for n in DEFAULT_SUBSYSTEM_TIERS)
         for row in table["subsystems"]:
             # Polish-pass display rules (2026-05-08): use
@@ -4012,7 +4154,7 @@ class TelegramTransport:
                 f"  {row['name'].ljust(max_name)}  {display}"
             )
         non_info = [
-            f for f in (table["global_findings"] + [
+            f for f in (table["global_findings"] + fg.get("findings", []) + [
                 f for row in table["subsystems"] for f in row["findings"]
             ])
             if f["severity"] != "info"

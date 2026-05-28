@@ -50,6 +50,11 @@ const PICKER_SEARCH_DEBOUNCE_MS_TEST = 150;
 function buildFixture(overrides: Partial<ModelsState> = {}): ModelsState {
   return {
     brain_kind: "claude-code",
+    foreground: {
+      configured: null,
+      resolved_model_id: null,
+      findings: [],
+    },
     subsystems: [
       {
         name: "curator",

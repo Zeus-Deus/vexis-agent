@@ -122,17 +122,17 @@ Two-step resolution: subsystems pick an abstract size tier
 (`tiny` / `small` / `medium` / `large`) via
 `subsystem_tier(<name>)`; the active brain translates tier →
 native model id via `models.tiers.<brain-kind>.<tier>` config
-or `DEFAULT_TIER_MAP_<BRAIN>`. Foreground turn uses the brain's
-account default (no `--model` flag) unless a per-turn override
-applies: voice call mode (`voice.call_mode.model`) or the
-computer-use selector (`computer_use.*` — a pinned model plus
-an optional dynamic fast-model layer, gated on recent
-`vexis-ui` activity). Telegram/text-chat pass `None`; the
-handler may then substitute a computer-use model. Per-subsystem
-override under `models.subsystems.<name>` in
-`~/.vexis/config.yaml`. Legacy raw-string keys (e.g.
+or `DEFAULT_TIER_MAP_<BRAIN>`. Foreground (chat) turn — the model
+you talk to — resolves `models.brain` tier-or-raw per turn;
+`default`/unset → no `--model` flag → account default. Settable via
+`/model set foreground` + dashboard (the chat-model knob; matters
+most on opencode, no account default). Per-turn overrides beat it: voice
+call mode (`voice.call_mode.model`) or the computer-use selector
+(`computer_use.*` — pinned model + optional dynamic fast-model
+layer, gated on recent `vexis-ui` activity). Per-subsystem override
+under `models.subsystems.<name>`. Legacy raw-string keys (e.g.
 `models.coherence_judge: sonnet`) work on claude-code via
-back-compat, break on opencode. `default` = no `--model` flag.
+back-compat, break on opencode. `default` = no flag.
 
 **Pointers:** `docs/model-ux.md` (resolution, slash, dashboard,
 hot-reload matrix) · `docs/migration.md` (legacy-keys trap) ·
