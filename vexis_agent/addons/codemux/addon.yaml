@@ -1,0 +1,40 @@
+name: codemux
+version: 1.0.0
+description: "Codemux orchestration watcher — registers long-running terminal-attached agents and pings Telegram when the inner agent idles."
+author: "Zeus-Deus"
+kind: standalone
+
+requires:
+  vexis_agent: ">=0.9.0"
+  python: ">=3.11"
+  mcp_servers:
+    - name: codemux
+      optional: false
+
+provides:
+  telegram_commands: ["codemux"]
+  watcher_sources: ["codemux"]
+  background_tasks: ["codemux-watcher-poller"]
+  dispatch_handlers:
+    - watch_register
+    - watch_unregister
+    - watch_list
+    - watch_status
+    - watch_mute
+    - watch_tail
+  skills: ["codemux.md"]
+  header_blocks: ["codemux-active-work"]
+
+config_schema:
+  poll_interval_seconds:
+    type: float
+    default: 5.0
+    description: "How often the watcher polls each registered source."
+  oscillation_window_seconds:
+    type: float
+    default: 60.0
+    description: "Debounce window for idle re-notifications."
+  idle_after_seconds:
+    type: int
+    default: 30
+    description: "Quiet duration before firing the idle Telegram ping."

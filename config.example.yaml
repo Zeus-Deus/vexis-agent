@@ -73,7 +73,7 @@ relationships:
   explicit_consent_enabled: false
   approval_hint_enabled: true
 
-# ── codemux orchestration watcher (see docs/codemux-watcher.md) ─────
+# ── codemux orchestration watcher (see vexis_agent/addons/codemux/docs/codemux-watcher.md) ─────
 # Active ONLY when the `codemux` MCP is wired into mcp-servers.yaml;
 # otherwise the entire section is ignored.
 #

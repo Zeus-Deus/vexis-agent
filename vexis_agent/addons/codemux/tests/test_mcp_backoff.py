@@ -18,7 +18,7 @@ docstring and pin is a bug.
 
 from __future__ import annotations
 
-from vexis_agent.core.watcher.mcp_client import (
+from vexis_agent.addons.codemux.mcp_client import (
     _RESPAWN_BACKOFF_BASE_SECONDS,
     _RESPAWN_BACKOFF_MAX_SECONDS,
     CodemuxMcpClient,
@@ -81,7 +81,7 @@ def test_cap_log_latched_so_we_dont_spam_warnings(caplog):
     """Hitting 60s many times in a row must produce ONE warning, not N."""
     import logging
     c = _client()
-    with caplog.at_level(logging.WARNING, logger="vexis_agent.core.watcher.mcp_client"):
+    with caplog.at_level(logging.WARNING, logger="vexis_agent.addons.codemux.mcp_client"):
         for _ in range(20):
             c._record_failure()
     cap_lines = [

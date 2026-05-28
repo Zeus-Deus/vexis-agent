@@ -28,7 +28,7 @@ import asyncio
 import pytest
 
 from vexis_agent.core.watcher.sources import SourceUnavailable
-from vexis_agent.core.watcher.sources.codemux import (
+from vexis_agent.addons.codemux.source import (
     DIALECT_DESKTOP,
     DIALECT_REMOTE,
     CodemuxSource,
@@ -199,7 +199,7 @@ def test_detect_dialect_remote():
 
 
 def test_detect_dialect_surfaces_mcp_failure_as_source_unavailable():
-    from vexis_agent.core.watcher.mcp_client import CodemuxMcpError
+    from vexis_agent.addons.codemux.mcp_client import CodemuxMcpError
 
     class _Broken:
         async def call(self, tool: str, args: dict):
@@ -288,7 +288,7 @@ def test_remote_workspace_not_found_raises_without_listing_terminals():
     """A daemon ``not_found`` propagates as ``CodemuxMcpError`` whose
     text contains "workspace not found" — we collapse it to
     SourceUnavailable and short-circuit before terminal_list."""
-    from vexis_agent.core.watcher.mcp_client import CodemuxMcpError
+    from vexis_agent.addons.codemux.mcp_client import CodemuxMcpError
 
     client = _RemoteMcp(
         info=CodemuxMcpError("workspace_info failed: workspace not found: ws-42"),
@@ -442,7 +442,7 @@ def test_is_alive_recognises_remote_not_found_error_shape():
     (the JSON-encoded structured error code). ``is_alive`` MUST
     return False for that shape — otherwise a poll loop will never
     mark a dead PTY dead and the user gets stale watchers."""
-    from vexis_agent.core.watcher.mcp_client import CodemuxMcpError
+    from vexis_agent.addons.codemux.mcp_client import CodemuxMcpError
 
     class _Dead(_RemoteMcp):
         def __init__(self) -> None:
@@ -464,7 +464,7 @@ def test_is_alive_recognises_desktop_session_not_found():
     """Desktop dialect raises a prose error containing "session not
     found" / "no active terminal session". is_alive must read that
     too."""
-    from vexis_agent.core.watcher.mcp_client import CodemuxMcpError
+    from vexis_agent.addons.codemux.mcp_client import CodemuxMcpError
 
     class _Dead(_DesktopMcp):
         def __init__(self) -> None:
@@ -485,7 +485,7 @@ def test_is_alive_keeps_alive_when_mcp_is_unavailable():
     """Conservative: if the whole MCP is unreachable, every watched
     agent would otherwise look dead. Keep them alive so a flapping
     daemon doesn't mass-reap watchers."""
-    from vexis_agent.core.watcher.mcp_client import CodemuxMcpUnavailable
+    from vexis_agent.addons.codemux.mcp_client import CodemuxMcpUnavailable
 
     class _Down:
         async def call(self, tool: str, args: dict):
@@ -500,7 +500,7 @@ def test_is_alive_keeps_alive_when_mcp_is_unavailable():
 # ---------------------------------------------------------------------------
 
 def test_mcp_call_failure_at_dispatch_probe_surfaces_as_source_unavailable():
-    from vexis_agent.core.watcher.mcp_client import CodemuxMcpError
+    from vexis_agent.addons.codemux.mcp_client import CodemuxMcpError
 
     class _Broken:
         async def call(self, tool: str, args: dict):

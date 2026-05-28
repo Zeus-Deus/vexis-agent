@@ -44,7 +44,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from vexis_agent.core.watcher.mcp_client import (
+from vexis_agent.addons.codemux.mcp_client import (
     CodemuxMcpClient,
     CodemuxMcpError,
     CodemuxMcpUnavailable,

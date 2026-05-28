@@ -236,7 +236,7 @@ idle. `vexis-watch register --name my-build --workspace
 <workspace-id> --agent-kind claude-code` enrols a build; walk away;
 get a single Telegram message when the inner agent stops emitting
 bytes for ~30s. `/codemux` from the phone lists what's watched.
-See `docs/codemux-watcher.md`. Without the `codemux` MCP wired,
+See `vexis_agent/addons/codemux/docs/codemux-watcher.md`. Without the `codemux` MCP wired,
 nothing changes — zero cost.
 
 ## Choosing your brain

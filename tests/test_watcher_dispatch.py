@@ -65,7 +65,7 @@ class _NoBrowser:
 def _controller(tmp_path: Path) -> WatcherController:
     return WatcherController(
         registry=WatcherRegistry(state_path=tmp_path / "wr.json"),
-        register_codemux_source=False,
+        
     )
 
 
