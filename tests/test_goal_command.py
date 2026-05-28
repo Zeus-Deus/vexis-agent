@@ -195,6 +195,12 @@ def transport(goals_file: Path) -> TelegramTransport:
             return False
 
     t._kanban = _NoopKanban()  # type: ignore[attr-defined]
+    # New /goal --bg branch reads ``self._kanban_store`` to file the
+    # goal as a kanban task. Default ``None`` so existing tests that
+    # don't exercise the flag get the "kanban unavailable" branch
+    # without surprise; the --bg test overrides with a real
+    # KanbanStore on a tmp DB.
+    t._kanban_store = None  # type: ignore[attr-defined]
     return t
 
 
@@ -321,8 +327,24 @@ def test_pause_with_no_goal_replies_no_goal(
 
 
 def test_resume_resets_turns_used(
-    transport: TelegramTransport, goals_on: None, goals_file: Path
+    transport: TelegramTransport, goals_on: None, goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """``/goal resume`` flips status → active and zeros ``turns_used``.
+
+    The post-fix resume ALSO spawns a background brain turn to actually
+    advance the loop (otherwise the chat stays idle until the user
+    types a fresh message — the v3d UX regression the user reported).
+    The kickoff behaviour is pinned by
+    :func:`test_resume_spawns_background_dispatch`; here we monkeypatch
+    the spawn to isolate the state-flip side of resume, which is what
+    this test exists to cover.
+    """
+    monkeypatch.setattr(
+        transport, "_spawn_background_dispatch",
+        lambda *a, **kw: None,
+    )
+
     store = GoalStateStore(goals_file)
     mgr = GoalManager(session_uuid=_SESSION, workspace=Path("/tmp"), store=store)
     mgr.set("g")
@@ -1732,3 +1754,323 @@ def test_telegram_resume_after_done_replies_already_done(
     final = store.load(_SESSION)
     assert final is not None
     assert final.status == "done"
+
+
+# ──────────────────────────────────────────────────────────────────
+# v3d UX revisit — /goal resume actually fires the brain
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_resume_spawns_background_dispatch(
+    transport: TelegramTransport, goals_on: None, goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression pin for the "/goal resume doesn't restart the loop"
+    bug. ``mgr.resume()`` flips state to active on disk — that part
+    works — but for resume to actually advance, the transport must
+    spawn a fresh background dispatch the same way the /goal <text>
+    kickoff does. Without that, the brain never runs again until the
+    user types a separate message, which is exactly what the user
+    saw in the Telegram screenshot.
+
+    We spy on ``_spawn_background_dispatch`` to confirm it fires
+    with ``queue_origin="goal_continuation"`` (so the FIFO,
+    suppression, and preempt machinery treat the resumed turn as a
+    continuation rather than a fresh user message).
+    """
+    store = GoalStateStore(goals_file)
+    mgr = GoalManager(session_uuid=_SESSION, workspace=Path("/tmp"), store=store)
+    mgr.set("ship the rocket")
+    # Burn budget then pause — the exact scenario the user hit.
+    state = mgr.state
+    assert state is not None
+    state.turns_used = 20
+    state.status = "paused"
+    state.paused_reason = "turn budget exhausted (20/20)"
+    store.save(_SESSION, state)
+
+    calls: list[dict[str, Any]] = []
+
+    def _spy(bot, chat_id, user_id, text, *, queue_origin="user",
+             label="", **kw):
+        calls.append({
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "text": text,
+            "queue_origin": queue_origin,
+            "label": label,
+        })
+
+    monkeypatch.setattr(transport, "_spawn_background_dispatch", _spy)
+
+    upd, _bot, msg = _update("/goal resume")
+    asyncio.run(transport._on_goal(upd, _ctx("resume")))
+
+    # State on disk is active again.
+    after = store.load(_SESSION)
+    assert after is not None
+    assert after.status == "active"
+    assert after.turns_used == 0
+    # User got the resume ack.
+    assert any("resumed" in r.lower() for r in msg.reply_log)
+    # And — the actual regression pin — a background dispatch was
+    # spawned to advance the loop.
+    assert len(calls) == 1, (
+        f"resume must spawn exactly one background dispatch; got {calls!r}"
+    )
+    spawn = calls[0]
+    assert spawn["chat_id"] == _CHAT
+    assert spawn["queue_origin"] == "goal_continuation"
+    assert spawn["label"] == "goal_resume"
+    # The text fed to the brain on resume is the standard
+    # continuation prompt — we don't pin the full template here
+    # (that's owned by GoalManager.next_continuation_prompt and
+    # has its own tests) but the goal text MUST appear in it.
+    assert "ship the rocket" in spawn["text"]
+
+
+def test_resume_with_drain_running_skips_kickoff(
+    transport: TelegramTransport, goals_on: None, goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a drain is still alive when /goal resume fires (rare —
+    would mean the user paused during an in-flight turn), we must
+    NOT spawn a second dispatch. The existing hook will pick up the
+    active goal at the end of the in-flight turn. Double-spawn
+    would race the in-flight turn for the FIFO claim."""
+    store = GoalStateStore(goals_file)
+    mgr = GoalManager(session_uuid=_SESSION, workspace=Path("/tmp"), store=store)
+    mgr.set("g")
+    state = mgr.state
+    assert state is not None
+    state.status = "paused"
+    store.save(_SESSION, state)
+
+    # Mark the chat as in-flight.
+    async def seed() -> None:
+        await transport._running_tasks.claim(_CHAT)
+    asyncio.run(seed())
+
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        transport, "_spawn_background_dispatch",
+        lambda *a, **kw: calls.append((a, kw)),
+    )
+
+    upd, _bot, msg = _update("/goal resume")
+    asyncio.run(transport._on_goal(upd, _ctx("resume")))
+
+    # Resume ack still sent, state still flipped — but NO spawn.
+    assert any("resumed" in r.lower() for r in msg.reply_log)
+    assert calls == [], "resume must not double-spawn during in-flight drain"
+
+
+# ──────────────────────────────────────────────────────────────────
+# v3d UX revisit — notify_policy default ``done_only``
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_goal_hook_done_only_suppresses_continue_status(
+    transport: TelegramTransport, goals_on: None, goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under the default ``done_only`` policy, a ``continue`` verdict
+    must NOT push the ``↻ Continuing toward goal (N/M)`` status line
+    to Telegram. The continuation IS enqueued (the loop still
+    advances); the chat just stays quiet.
+    """
+    store = GoalStateStore(goals_file)
+    mgr = GoalManager(session_uuid=_SESSION, workspace=Path("/tmp"), store=store)
+    mgr.set("port the goal command")
+
+    monkeypatch.setattr(
+        "vexis_agent.core.yaml_config.goals_notify_policy",
+        lambda: "done_only",
+    )
+
+    bot = _FakeBot()
+
+    async def scenario() -> None:
+        await transport._running_tasks.claim(_CHAT)
+        with mock.patch(
+            "vexis_agent.core.goal_manager.judge_goal",
+            new=mock.AsyncMock(return_value=("continue", "more work", False)),
+        ):
+            await transport._run_goal_hook(
+                bot, _CHAT, "brain reply",
+                origin="goal_continuation",
+            )
+
+    asyncio.run(scenario())
+
+    # No "Continuing toward goal" status pinged to Telegram.
+    assert not any(
+        "Continuing toward goal" in text for _cid, text in bot.sent_messages
+    ), (
+        f"done_only policy must suppress per-continuation status pings; "
+        f"got: {bot.sent_messages!r}"
+    )
+    # Continuation IS enqueued — the goal loop still advances.
+    assert transport._running_tasks.queue_depth(_CHAT) == 1
+    popped = asyncio.run(transport._running_tasks.pop_or_release(_CHAT))
+    assert popped is not None
+    assert popped.origin == "goal_continuation"
+
+
+def test_goal_hook_done_only_flushes_reply_on_done(
+    transport: TelegramTransport, goals_on: None, goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the judge marks the goal done on a goal_continuation turn,
+    the brain's reply for that turn (which was suppressed at the
+    send-site under done_only) must be flushed inline with the
+    terminal ✓ status. Otherwise the user only sees "✓ Goal
+    achieved: <reason>" with no context on what was actually done.
+    """
+    store = GoalStateStore(goals_file)
+    mgr = GoalManager(session_uuid=_SESSION, workspace=Path("/tmp"), store=store)
+    mgr.set("port the goal command")
+
+    monkeypatch.setattr(
+        "vexis_agent.core.yaml_config.goals_notify_policy",
+        lambda: "done_only",
+    )
+
+    bot = _FakeBot()
+    flushed: list[str] = []
+
+    async def _capture_reply(_bot, _chat_id, reply: str) -> None:
+        flushed.append(reply)
+
+    monkeypatch.setattr(transport, "_send_brain_reply", _capture_reply)
+
+    async def scenario() -> None:
+        with mock.patch(
+            "vexis_agent.core.goal_manager.judge_goal",
+            new=mock.AsyncMock(return_value=("done", "shipped", False)),
+        ):
+            await transport._run_goal_hook(
+                bot, _CHAT, "final brain output: PR opened at #123",
+                origin="goal_continuation",
+            )
+
+    asyncio.run(scenario())
+
+    # The suppressed reply was flushed.
+    assert flushed == ["final brain output: PR opened at #123"], (
+        "done_only + terminal verdict must flush the suppressed reply"
+    )
+    # The terminal ✓ status was sent too.
+    terminal = [t for _c, t in bot.sent_messages if "Goal achieved" in t]
+    assert terminal, f"expected ✓ Goal achieved status; got {bot.sent_messages!r}"
+
+
+def test_goal_hook_all_policy_restores_status_send(
+    transport: TelegramTransport, goals_on: None, goals_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``all`` policy = pre-revisit behaviour. The ↻ Continuing
+    status line gets sent on every continue verdict."""
+    store = GoalStateStore(goals_file)
+    mgr = GoalManager(session_uuid=_SESSION, workspace=Path("/tmp"), store=store)
+    mgr.set("port the goal command")
+
+    monkeypatch.setattr(
+        "vexis_agent.core.yaml_config.goals_notify_policy",
+        lambda: "all",
+    )
+
+    bot = _FakeBot()
+
+    async def scenario() -> None:
+        await transport._running_tasks.claim(_CHAT)
+        with mock.patch(
+            "vexis_agent.core.goal_manager.judge_goal",
+            new=mock.AsyncMock(return_value=("continue", "step done", False)),
+        ):
+            await transport._run_goal_hook(
+                bot, _CHAT, "brain reply",
+                origin="goal_continuation",
+            )
+
+    asyncio.run(scenario())
+    assert any(
+        "Continuing toward goal" in text for _cid, text in bot.sent_messages
+    ), f"all policy must send the status line; got {bot.sent_messages!r}"
+
+
+# ──────────────────────────────────────────────────────────────────
+# v3d UX revisit — /goal --bg routes to kanban
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_goal_bg_no_kanban_replies_with_disabled_note(
+    transport: TelegramTransport, goals_on: None,
+) -> None:
+    """/goal --bg requires the kanban store. The default test
+    transport has ``_kanban_store=None``, so the user sees a
+    helpful "kanban unavailable" reply instead of a crash."""
+    upd, _bot, msg = _update("/goal --bg ship the rocket")
+    asyncio.run(transport._on_goal(upd, _ctx("--bg", "ship", "the", "rocket")))
+    assert msg.reply_log
+    assert "kanban" in msg.reply_log[0].lower()
+
+
+def test_goal_bg_files_kanban_task_and_skips_foreground(
+    transport: TelegramTransport, goals_on: None, goals_file: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/goal --bg files the goal as a ready-state kanban task, does
+    NOT touch the GoalManager / GoalStateStore, and does NOT spawn
+    a foreground background dispatch. The kanban dispatcher's
+    spawn_aux worker takes it from there."""
+    from vexis_agent.core.kanban.db import KanbanStore
+
+    store = KanbanStore(tmp_path / "kanban.db")
+    transport._kanban_store = store  # type: ignore[attr-defined]
+
+    # Spy on _spawn_background_dispatch — it MUST NOT fire.
+    spawn_calls: list[Any] = []
+    monkeypatch.setattr(
+        transport, "_spawn_background_dispatch",
+        lambda *a, **kw: spawn_calls.append((a, kw)),
+    )
+
+    upd, _bot, msg = _update("/goal --bg port the goal command to vexis")
+    asyncio.run(transport._on_goal(
+        upd, _ctx("--bg", "port", "the", "goal", "command", "to", "vexis"),
+    ))
+
+    # Reply mentions kanban + carries a task id.
+    assert msg.reply_log
+    reply = msg.reply_log[0]
+    assert "kanban" in reply.lower()
+    # No foreground dispatch fired.
+    assert spawn_calls == [], (
+        "--bg must not spawn the foreground goal loop"
+    )
+    # No goal record in the goals store (foreground path is
+    # bypassed entirely).
+    goals_store = GoalStateStore(goals_file)
+    assert goals_store.load(_SESSION) is None
+    # A kanban task was created with ready status, containing the
+    # goal text in title and body.
+    tasks = store.list_tasks()
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.status == "ready"
+    assert "port the goal command to vexis" in task.title
+    assert task.body == "port the goal command to vexis"
+    assert task.lane == "implementation"
+    assert task.created_by == "user:/goal --bg"
+
+
+def test_goal_bg_empty_after_flag_rejects(
+    transport: TelegramTransport, goals_on: None,
+) -> None:
+    """/goal --bg <empty> with nothing after the flag is invalid —
+    user gets a clear error instead of filing an empty kanban task."""
+    upd, _bot, msg = _update("/goal --bg")
+    asyncio.run(transport._on_goal(upd, _ctx("--bg")))
+    assert msg.reply_log
+    assert "empty" in msg.reply_log[0].lower()

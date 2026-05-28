@@ -133,6 +133,18 @@ DEFAULT_LEARNING_MAX_ENTRIES_PER_SESSION = 2
 # ``core.goal_state.DEFAULT_MAX_TURNS``.
 DEFAULT_GOALS_ENABLED = True
 DEFAULT_GOALS_MAX_TURNS = 20
+# Notification policy controlling how chatty the goal loop is on
+# Telegram. Default ``done_only`` after the v3d-UX revisit: users
+# complained the per-continuation status pings + full brain-reply
+# echo for every continuation turn flooded the chat, making the
+# foreground UX unusable while a goal ran. ``done_only`` keeps the
+# chat quiet during work and surfaces only terminal verdicts (done,
+# budget-paused, parse-failure-paused). ``all`` restores the
+# pre-revisit behaviour (one status + one full reply per turn) for
+# users who want forensic visibility. See ``docs/goals.md`` for the
+# matrix and the per-policy send/suppress decisions.
+DEFAULT_GOALS_NOTIFY_POLICY = "done_only"
+_GOALS_NOTIFY_POLICY_VALUES = frozenset({"all", "done_only"})
 # /schedule feature defaults. Off through Day 1-3 dev; Day 4 flips
 # DEFAULT_SCHEDULES_ENABLED to True after the eval gate (no LLM eval —
 # integration test only; see tests/test_schedule_eval.py).
@@ -409,6 +421,35 @@ def goals_max_turns() -> int:
         DEFAULT_GOALS_MAX_TURNS,
         minimum=1,
     )
+
+
+def goals_notify_policy() -> str:
+    """How chatty the goal loop is on Telegram.
+
+    Returns one of:
+
+      * ``"all"`` — pre-revisit behaviour: send the ``↻ Continuing
+        toward goal (N/M): <reason>`` status line after every
+        continue verdict AND echo the brain's reply text for every
+        continuation turn to Telegram.
+      * ``"done_only"`` (DEFAULT) — suppress both per-continuation
+        sends; only ping the user on terminal verdicts (``done``,
+        budget-paused, parse-failure-paused). The brain reply for
+        the terminal turn is flushed inline with the terminal status
+        so the user sees the final output that produced the verdict.
+
+    Reads disk per call — same posture as :func:`subsystem_tier`,
+    so policy edits hot-reload at the next goal-hook invocation
+    without a daemon restart. Garbage / unknown values fall through
+    to ``DEFAULT_GOALS_NOTIFY_POLICY``.
+    """
+    raw = _section("goals").get("notify_policy", DEFAULT_GOALS_NOTIFY_POLICY)
+    if not isinstance(raw, str):
+        return DEFAULT_GOALS_NOTIFY_POLICY
+    candidate = raw.strip().lower()
+    if candidate not in _GOALS_NOTIFY_POLICY_VALUES:
+        return DEFAULT_GOALS_NOTIFY_POLICY
+    return candidate
 
 
 def schedules_enabled() -> bool:

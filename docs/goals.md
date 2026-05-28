@@ -15,15 +15,17 @@ adapted to Vexis's Telegram + `claude -p` shape.
 | Command | What it does |
 |---|---|
 | `/goal <text>` | Set a standing goal and kick off the first turn. |
+| `/goal --bg <text>` | File the goal as a kanban task — runs in the background, foreground chat stays free. See [Background goals](#background-goals-via-kanban) below. |
 | `/goal` (or `/goal status`) | Show current state. |
 | `/goal pause` | Soft pause — the in-flight turn finishes, loop won't auto-continue after. |
-| `/goal resume` | Resume the loop and reset the turn budget to a fresh 20. |
+| `/goal resume` | Resume the loop AND immediately advance one turn (resets the turn budget to a fresh 20). |
 | `/goal clear` | Drop the goal. Subsequent messages are normal turns. |
 
 Quick examples:
 
 ```
 /goal port the goal command to Vexis
+/goal --bg ship the rocket and write the release notes
 /goal status
 /goal pause
 /goal resume
@@ -146,6 +148,59 @@ before the restart.
 your active session UUID. The old session's goal record is
 orphaned but stays on disk for audit. The new session has no goal
 until you `/goal <text>` again.
+
+## Notification policy
+
+How chatty the loop is on Telegram is controlled by
+`goals.notify_policy` in `~/.vexis/config.yaml`:
+
+| Value | Behaviour |
+|---|---|
+| `done_only` (default) | Suppress per-continuation pings. The chat stays quiet while the goal runs; you only see output on terminal verdicts: `✓ Goal achieved`, `⏸ Goal paused — N/N turns used`, or `⏸ Goal paused — judge model returning unparseable output`. On the terminal turn the brain's reply is flushed inline with the ✓/⏸ status so you still see the final output that produced the verdict. |
+| `all` | Pre-v3d-UX behaviour. Every continue verdict pushes a `↻ Continuing toward goal (N/M): <reason>` line AND echoes the brain's reply text for that turn. Forensic but noisy — good for one-off debugging. |
+
+```yaml
+# ~/.vexis/config.yaml
+goals:
+  notify_policy: done_only  # the default; set to "all" for the old chatty mode
+```
+
+The policy reads disk per turn, so an edit takes effect at the
+next continuation without a daemon restart.
+
+## Background goals (via kanban)
+
+`/goal <text>` is the **short-horizon** surface: it runs in your
+foreground chat, capped at the 20-turn budget, with the judge
+firing after every turn. Anything that could legitimately take
+hours or days should run in the background instead:
+
+```
+/goal --bg refactor the goal manager and ship a release PR
+```
+
+This files the goal as a single `ready`-state kanban task in the
+`implementation` lane. The kanban dispatcher picks it up, spawns a
+worker in a detached aux session, and runs it there. Your
+foreground Telegram chat is left completely free — you can keep
+chatting, asking for screenshots, kicking off other tasks. Check
+on the background goal with:
+
+```
+/kanban show <task_id>     # full status + recent activity
+/kanban list               # the whole board
+/kanban complete <task_id> # mark done early if needed
+```
+
+You can mix surfaces: a foreground `/goal` for a quick objective
+while a `/goal --bg` task chugs along, with the kanban event bus
+pinging you on done/blocked. The two paths don't share state — a
+foreground goal's pause/clear/resume controls don't affect a
+background kanban task and vice versa.
+
+Background goals don't use `goals.notify_policy` — they use
+kanban's own notification rules (only ping on done / blocked /
+needs-input; see `docs/kanban.md`).
 
 ## Configuration cheat sheet
 

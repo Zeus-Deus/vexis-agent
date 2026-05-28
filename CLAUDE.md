@@ -180,18 +180,18 @@ sonnet-flip context) · `.plans/relationships-v3c-research.md`.
 
 ## Goals (v3d)
 
-`/goal <text>` kicks off a multi-step task Vexis works on
-across turns until done, paused, or the budget runs out. After
-each brain turn an auxiliary judge
-(`subsystem_tier("goal_judge")`, default `large`) decides
-whether the goal is satisfied; if not and the budget remains,
-Vexis enqueues a continuation through the same per-chat FIFO
-real user messages use.
-
-Subcommands: `/goal status|pause|resume|clear`. `/cancel` while
-active flips to paused with `paused_reason="user-cancelled"`.
-Budget defaults to 20 turns (`goals.max_turns`); disable via
-`goals.enabled: false`.
+`/goal <text>` kicks off a multi-step foreground task. After each
+turn an aux judge (`subsystem_tier("goal_judge")`) decides done;
+if not and budget remains, a continuation enqueues through the
+same per-chat FIFO real user messages use. `/goal resume` ALSO
+spawns a background dispatch — pure state-flips leave the loop
+idle (the v3d UX bug). `/cancel` mid-loop → paused. Budget
+default 20 (`goals.max_turns`); disable: `goals.enabled: false`.
+Two UX knobs: `goals.notify_policy` (`done_only` default —
+suppresses per-continuation pings, terminal-only delivery with
+the brain reply flushed inline; `all` restores pre-revisit noise).
+`/goal --bg <text>` routes long-horizon work to kanban (detached
+aux worker, foreground chat stays free).
 
 **Pointers:** `docs/goals.md` · `.plans/goal-command-research.md`.
 
