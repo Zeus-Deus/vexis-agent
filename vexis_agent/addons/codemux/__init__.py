@@ -35,19 +35,31 @@ def register(ctx: PluginContext) -> None:
     if skill_file.is_file():
         ctx.register_skill(skill_file)
 
-    # NOTE: This first cut of the codemux add-on is intentionally
-    # minimal. Subsequent commits in Phase B add:
-    #
-    #   * watcher_source registration (CodemuxSource → register_watcher_source)
+    # Watcher source registration into the AddonRuntime registry.
+    # The CodemuxSource code now physically lives in this add-on
+    # (mcp_client.py and source.py moved out of core/watcher/ in
+    # this commit). The in-core ``register_source`` global registry
+    # is still populated by WatcherController in main.py — the
+    # B3-B4 cut flips that responsibility to the addon and lets us
+    # delete the codemux auto-registration from WatcherController.
+    # For now, ``ctx.register_watcher_source`` only updates the
+    # AddonRuntime tracker (used by ``vexis-addons inspect`` and the
+    # dashboard) — no conflict with the in-core registry.
+    from vexis_agent.addons.codemux.mcp_client import CodemuxMcpClient
+    from vexis_agent.addons.codemux.source import CodemuxSource
+
+    _client = CodemuxMcpClient()
+    ctx.register_watcher_source("codemux", CodemuxSource(_client))
+
+    # NOTE: Still pending Phase B completion:
     #   * /codemux telegram command (moved from transports/telegram.py)
     #   * watch_register / watch_list / etc. dispatch handlers
     #   * codemux-watcher-poller background task
     #   * codemux-active-work header block
     #
-    # Each of those gets added once the corresponding hardcoded path
-    # in core/main.py and transports/telegram.py is reviewed and
-    # safe to delete. Today the hardcoded paths still own the
-    # behaviour; this add-on just installs the skill and proves the
-    # discovery + load + register pipeline works end-to-end for a
-    # bundled add-on.
-    ctx.log.info("codemux add-on loaded (skill-only stage)")
+    # Each one moves over once its hardcoded counterpart in
+    # core/main.py or transports/telegram.py is reviewed and safe
+    # to delete. Until then the hardcoded paths and this add-on
+    # coexist — the watcher source is the only piece that's been
+    # extracted cleanly so far.
+    ctx.log.info("codemux add-on loaded (source-registered stage)")

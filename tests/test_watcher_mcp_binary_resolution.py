@@ -28,7 +28,7 @@ from typing import Optional
 
 import pytest
 
-from vexis_agent.core.watcher.mcp_client import (
+from vexis_agent.addons.codemux.mcp_client import (
     CODEMUX_BINARY,
     VEXIS_CODEMUX_BINARY_ENV,
     CodemuxMcpClient,
@@ -228,7 +228,7 @@ def test_ensure_running_spawns_resolved_binary_with_mcp_subcommand(
     place so the post-init check (returncode None) doesn't fire.
     """
     monkeypatch.setattr(
-        "vexis_agent.core.watcher.mcp_client.shutil.which",
+        "vexis_agent.addons.codemux.mcp_client.shutil.which",
         lambda b: f"/usr/local/bin/{b}",
     )
 
@@ -239,7 +239,7 @@ def test_ensure_running_spawns_resolved_binary_with_mcp_subcommand(
         return _FakeProc()
 
     monkeypatch.setattr(
-        "vexis_agent.core.watcher.mcp_client.asyncio.create_subprocess_exec",
+        "vexis_agent.addons.codemux.mcp_client.asyncio.create_subprocess_exec",
         _fake_spawn,
     )
 
@@ -271,11 +271,11 @@ def test_ensure_running_preflight_uses_resolved_binary_in_error_message(
     saying ``'codemux' not on PATH`` even when the user pointed at
     ``codemux-remote``."""
     monkeypatch.setattr(
-        "vexis_agent.core.watcher.mcp_client.shutil.which",
+        "vexis_agent.addons.codemux.mcp_client.shutil.which",
         lambda b: None,
     )
 
-    from vexis_agent.core.watcher.mcp_client import CodemuxMcpUnavailable
+    from vexis_agent.addons.codemux.mcp_client import CodemuxMcpUnavailable
 
     client = CodemuxMcpClient(binary="codemux-remote")
 

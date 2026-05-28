@@ -30,9 +30,14 @@ import logging
 from pathlib import Path
 from typing import Callable, Optional
 
-from vexis_agent.core.watcher.mcp_client import (
+from vexis_agent.addons.codemux.mcp_client import (
     CODEMUX_BINARY,
     CodemuxMcpClient,
+)
+from vexis_agent.addons.codemux.source import (
+    CodemuxSource,
+    WorkspaceResolution,
+    resolve_workspace_to_session,
 )
 from vexis_agent.core.watcher.poller import (
     DEFAULT_OSCILLATION_WINDOW_SECONDS,
@@ -57,11 +62,6 @@ from vexis_agent.core.watcher.sources import (
     get_source,
     list_source_types,
     register_source,
-)
-from vexis_agent.core.watcher.sources.codemux import (
-    CodemuxSource,
-    WorkspaceResolution,
-    resolve_workspace_to_session,
 )
 
 log = logging.getLogger(__name__)
