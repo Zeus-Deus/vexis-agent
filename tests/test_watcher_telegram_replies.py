@@ -107,7 +107,7 @@ def _make_transport(
     if with_watcher:
         watcher = WatcherController(
             registry=WatcherRegistry(state_path=tmp_path / "wr.json"),
-            register_codemux_source=False,
+            
         )
         asyncio.run(watcher.register_agent(
             name="my-build", source_type="fake", identifier="ws-7",

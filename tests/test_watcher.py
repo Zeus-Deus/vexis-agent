@@ -38,12 +38,10 @@ from typing import Optional
 import pytest
 
 from vexis_agent.core.watcher import (
-    CODEMUX_MCP_NAME,
     UNAVAILABLE_MESSAGE,
     WatchStatus,
     WatcherController,
     WatcherRegistry,
-    codemux_mcp_configured,
     render_idle_notification,
 )
 from vexis_agent.core.watcher.poller import WatcherPoller, _AgentRuntimeState
@@ -119,28 +117,15 @@ def _register(
     return agent
 
 
-# ---------- conditional-activation ------------------------------------------
-
-
-def test_codemux_mcp_absent_means_gate_returns_false(monkeypatch):
-    """Spec acceptance 6: a fresh install with no Codemux MCP yields False."""
-    monkeypatch.setattr(
-        "vexis_agent.setup_wizard.detect_mcp_servers",
-        lambda: [{"name": "omarchy-kb", "command": "omarchy-kb"}],
-    )
-    assert codemux_mcp_configured() is False
-
-
-def test_codemux_mcp_present_means_gate_returns_true(monkeypatch):
-    monkeypatch.setattr(
-        "vexis_agent.setup_wizard.detect_mcp_servers",
-        lambda: [{"name": CODEMUX_MCP_NAME, "command": "codemux"}],
-    )
-    assert codemux_mcp_configured() is True
+# ---------- legacy "unavailable" message ------------------------------------
+# The codemux_mcp_configured() gate was removed in Phase B — the codemux
+# add-on's manifest now declares the MCP requirement, and ``vexis-addons
+# doctor`` surfaces the missing MCP. UNAVAILABLE_MESSAGE remains for
+# back-compat with vexis-watch CLI callers.
 
 
 def test_unavailable_message_is_user_facing():
-    assert "Codemux MCP not configured" in UNAVAILABLE_MESSAGE
+    assert "codemux" in UNAVAILABLE_MESSAGE.lower()
 
 
 # ---------- registry persistence --------------------------------------------
@@ -321,43 +306,11 @@ def test_source_unavailable_marks_dead(tmp_path):
     assert notifs == []
 
 
-# ---------- header injection (LAYER 2) --------------------------------------
-
-
-def test_header_block_none_when_registry_empty(tmp_path):
-    reg = _make_registry(tmp_path)
-    controller = WatcherController(
-        registry=reg, register_codemux_source=False,
-    )
-    assert controller.header_block() is None
-
-
-def test_header_block_one_line_for_any_count(tmp_path):
-    reg = _make_registry(tmp_path)
-    _register(reg, name="ws-a")
-    _register(reg, name="ws-b")
-    _register(reg, name="ws-c")
-    controller = WatcherController(
-        registry=reg, register_codemux_source=False,
-    )
-    block = controller.header_block()
-    assert block is not None
-    assert "3 workspaces" in block
-    assert block.count("\n") == 0, f"header must be ONE line; got {block!r}"
-    assert "vexis-watch status" in block
-
-
-def test_header_block_excludes_dead_agents(tmp_path):
-    reg = _make_registry(tmp_path)
-    _register(reg, name="ws-alive")
-    _register(reg, name="ws-dead")
-    asyncio.run(reg.update_status("ws-dead", status=WatchStatus.DEAD))
-    controller = WatcherController(
-        registry=reg, register_codemux_source=False,
-    )
-    block = controller.header_block()
-    assert block is not None
-    assert "1 workspace" in block
+# ---------- header injection -----------------------------------------------
+# WatcherController.header_block was removed in Phase B; the codemux
+# add-on now supplies its own header via
+# ctx.register_system_prompt_block. Equivalent coverage lives in
+# tests/test_codemux_addon_header.py (added in Phase B).
 
 
 # ---------- end-to-end via WatcherController.tail --------------------------
@@ -370,7 +323,7 @@ def test_tail_reads_through_source_plugin(tmp_path):
     fake.bytes_to_return["workspace-7"] = (b"a\nb\nc\nd\ne\nf\n")
     register_source(fake)
     controller = WatcherController(
-        registry=reg, register_codemux_source=False,
+        registry=reg,
     )
     text = asyncio.run(controller.tail("ws-a", lines=3))
     assert text == "d\ne\nf"
@@ -393,7 +346,7 @@ def test_new_source_plugs_in_with_zero_core_changes(tmp_path):
     register_source(PtyFake())
     reg = _make_registry(tmp_path)
     controller = WatcherController(
-        registry=reg, register_codemux_source=False,
+        registry=reg,
     )
 
     async def go():

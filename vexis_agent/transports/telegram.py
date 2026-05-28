@@ -955,14 +955,9 @@ class TelegramTransport:
         self._app.add_handler(CommandHandler("dashboard", self._on_dashboard))
         self._app.add_handler(CommandHandler("tailscale", self._on_tailscale))
         self._app.add_handler(CommandHandler("kanban", self._on_kanban))
-        # /codemux is gated on the Codemux MCP being wired (LAYER 1f).
-        # Registering the handler when the MCP is absent would expose
-        # a slash command that always errors — the spec is "invisible
-        # unless the MCP is on," so we skip registration entirely.
-        # Phase B will move this into the codemux add-on; until then
-        # both the hardcoded handler and the add-on hook below coexist.
-        if self._watcher is not None:
-            self._app.add_handler(CommandHandler("codemux", self._on_codemux))
+        # /codemux moved into the codemux bundled add-on (Phase B).
+        # The add-on registers via ctx.register_telegram_command,
+        # which surfaces below in _register_addon_commands.
         # Add-on-registered slash commands. Generic loop, no per-command
         # branching in core — every add-on that called
         # ``ctx.register_telegram_command`` gets its handler wired here.
@@ -1030,62 +1025,11 @@ class TelegramTransport:
             return
         await self._kanban.handle(update, ctx)
 
-    async def _on_codemux(
-        self, update: "Update", ctx: "ContextTypes.DEFAULT_TYPE",
-    ) -> None:
-        """/codemux — print the watcher registry (LAYER 3a of the spec).
-
-        One line per watched workspace: name, agent kind, status,
-        elapsed-since-last-output, last-line. Auth-gated. Registered
-        only when the watcher controller is active — see __init__.
-        """
-        msg = update.message
-        user = update.effective_user
-        if msg is None or user is None:
-            return
-        if not is_allowed(user.id, self._allowed_user_id):
-            log.warning("Rejected /codemux from user_id=%s", user.id)
-            return
-        if self._watcher is None:
-            # Defence-in-depth — this handler isn't even registered
-            # when the watcher is off, but keep the guard so an
-            # accidental wiring change can't expose a confusing error.
-            await msg.reply_text(
-                "Codemux MCP not configured; the watcher is inactive."
-            )
-            return
-        agents = self._watcher.list_agents()
-        if not agents:
-            await msg.reply_text(
-                "No Codemux workspaces watched. Vexis (or you) can "
-                "register one via `vexis-watch register --name <h> "
-                "--workspace <id> --agent-kind <kind>`."
-            )
-            return
-        lines = [f"*Watched Codemux workspaces ({len(agents)}):*"]
-        now = datetime.now(timezone.utc)
-        for agent in agents:
-            elapsed = "—"
-            if agent.last_output_at:
-                try:
-                    last = datetime.fromisoformat(agent.last_output_at)
-                    seconds = max(0, (now - last).total_seconds())
-                    elapsed = _fmt_elapsed_short(seconds)
-                except ValueError:
-                    pass
-            tag = "muted" if agent.muted else agent.status
-            line = (
-                f"`{agent.name}` — {agent.agent_kind} — {tag} — "
-                f"last activity {elapsed} ago"
-            )
-            if agent.last_line:
-                line += f"\n   `{agent.last_line[:140]}`"
-            lines.append(line)
-        lines.append(
-            "Reply `tail <name>` / `peek <name>` / `mute <name>` / "
-            "`unwatch <name>`."
-        )
-        await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+    # /codemux handler moved to vexis_agent/addons/codemux/telegram.py
+    # in Phase B. The inline-reply intercept below (tail / peek /
+    # mute / unwatch verbs) stays in core because it's generic
+    # across watcher sources — any future PTY / tmux source's verbs
+    # plug in here without a code change.
 
     async def _maybe_handle_watch_reply(
         self, update: "Update", user_id: int,
@@ -4890,7 +4834,6 @@ class TelegramTransport:
                     addon_menu_entries.append((reg.name, reg.menu_description))
         await _register_commands(
             self._app,
-            include_codemux=self._watcher is not None,
             addon_entries=addon_menu_entries,
         )
         # Sweep status files left behind by a previous daemon's brain
@@ -5150,8 +5093,8 @@ def _format_tailscale_reply(
 async def _register_commands(
     application: Application,
     *,
-    include_codemux: bool = False,
     addon_entries: "list[tuple[str, str]] | None" = None,
+    include_codemux: bool = False,  # deprecated; kept for back-compat callers
 ) -> None:
     """Mirror the canonical COMMANDS list to Telegram's slash menu.
 
@@ -5159,25 +5102,21 @@ async def _register_commands(
     daemon startup — the menu would just stay stale until the next
     successful restart.
 
-    ``include_codemux`` toggles the conditional ``/codemux`` entry —
-    on only when the watcher controller is active (the spec's LAYER 1f
-    conditional activation contract). Phase B moves this entry into
-    the codemux add-on; until then it stays alongside the add-on
-    surface.
-
     ``addon_entries`` is a list of ``(name, description)`` pairs
     contributed by loaded add-ons via ``ctx.register_telegram_command``.
     The menu order is: canonical COMMANDS first, then add-on entries
     in registration order — predictable for users who memorise
     positions in the slash autocomplete.
+
+    ``include_codemux`` is deprecated and ignored — the codemux
+    bundled add-on now supplies its own ``/codemux`` entry via
+    the standard ``addon_entries`` path. Kept as a no-op kwarg so
+    older test fixtures that pass it don't break.
     """
+    del include_codemux  # noqa: ARG (deprecated kwarg)
     bot_commands = [
         TelegramBotCommand(cmd.command, cmd.description) for cmd in COMMANDS
     ]
-    if include_codemux:
-        bot_commands.append(
-            TelegramBotCommand("codemux", "Status of watched Codemux workspaces")
-        )
     if addon_entries:
         for name, desc in addon_entries:
             bot_commands.append(TelegramBotCommand(name, desc))

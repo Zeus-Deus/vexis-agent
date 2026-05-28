@@ -165,10 +165,11 @@ def test_register_commands_no_addon_entries() -> None:
     app.bot.set_my_commands.assert_awaited_once()
 
 
-def test_register_commands_codemux_still_works() -> None:
-    """``include_codemux`` legacy parameter still appends /codemux,
-    alongside any add-on entries. (Phase B retires this path; until
-    then both surfaces coexist.)"""
+def test_register_commands_include_codemux_kwarg_is_noop() -> None:
+    """``include_codemux=True`` is a no-op since Phase B (the codemux
+    add-on supplies the /codemux entry via the normal ``addon_entries``
+    path). The kwarg is retained for back-compat with older test
+    fixtures; passing it neither adds nor removes a codemux entry."""
     app = MagicMock()
     app.bot.set_my_commands = AsyncMock()
 
@@ -182,5 +183,7 @@ def test_register_commands_codemux_still_works() -> None:
 
     bot_commands = app.bot.set_my_commands.call_args.args[0]
     cmd_names = [c.command for c in bot_commands]
-    assert "codemux" in cmd_names
+    # /codemux is NOT auto-added by include_codemux any more.
+    assert "codemux" not in cmd_names
+    # /hello (addon entry) still appears.
     assert "hello" in cmd_names

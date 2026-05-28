@@ -339,13 +339,38 @@ async def _run() -> None:
     browser_manager = get_browser_manager()
     browser_tools = BrowserTools(browser_manager, workspace)
 
+    # Watcher subsystem (generic registry + polling loop). Always
+    # instantiated; source plugins are supplied by add-ons via
+    # ``ctx.register_watcher_source`` + the in-core register_source
+    # registry. The codemux add-on supplies the only shipping source;
+    # future PTY / tmux sources plug in the same way through their
+    # own add-ons. With no sources registered the registry sits empty
+    # and the poller does nothing — zero cost for users who haven't
+    # enabled a watcher source.
+    from vexis_agent.core.watcher import WatcherController
+    from vexis_agent.core.yaml_config import (
+        watcher_oscillation_window_seconds as _watcher_osc,
+        watcher_poll_interval_seconds as _watcher_poll,
+    )
+    watcher = WatcherController(
+        poll_interval_seconds=_watcher_poll(),
+        oscillation_window_seconds=_watcher_osc(),
+    )
+    log.info(
+        "watcher: controller active (poll=%.1fs, oscillation_window=%.1fs); "
+        "sources supplied by enabled add-ons",
+        _watcher_poll(), _watcher_osc(),
+    )
+
     # Add-on system (see docs/addons.md). Discover everything the
     # user opted into via ``addons.enabled`` in ~/.vexis/config.yaml,
     # load each via ``register(ctx)``, and hold the runtime so the
-    # rest of the daemon can consult its registrations. Today this
-    # runs alongside the hardcoded codemux wiring below; Phase B
-    # moves codemux into a bundled add-on and deletes the hardcoded
-    # paths. ``user_id`` is the multi-user seam — always "default"
+    # rest of the daemon can consult its registrations. The watcher
+    # is attached as a shared service BEFORE addons load so add-ons
+    # that need to talk to it (codemux's /codemux handler, the
+    # watch_register dispatcher) can look it up via
+    # ``ctx.get_service("watcher")`` at call time.
+    # ``user_id`` is the multi-user seam — always "default"
     # in single-user mode, parameterised when multi-user lands.
     from vexis_agent.core.yaml_config import (
         addon_config as _addon_config,
@@ -353,6 +378,7 @@ async def _run() -> None:
         addons_enabled as _addons_enabled,
     )
     addon_runtime = AddonRuntime()
+    addon_runtime.attach_service("watcher", watcher)
     for _discovered in discover_addons(
         enabled=_addons_enabled(),
         disabled=_addons_disabled(),
@@ -365,41 +391,6 @@ async def _run() -> None:
     _loaded_count = sum(1 for a in addon_runtime.loaded_addons() if a.register_ok)
     if _loaded_count:
         log.info("addons: loaded %d add-on(s)", _loaded_count)
-
-    # Codemux orchestration watcher. Conditional activation: present
-    # only when the Codemux MCP is wired into ~/.vexis/mcp-servers.yaml,
-    # so users without Codemux pay zero cost (no poll loop, no slash
-    # command registration, no system-prompt header). See LAYER 1f /
-    # NON-NEGOTIABLES in the watcher spec and docs/codemux-watcher.md.
-    from vexis_agent.core.watcher import (
-        WatcherController,
-        codemux_mcp_configured,
-    )
-    watcher: WatcherController | None = None
-    if codemux_mcp_configured():
-        # Per-deployment cadence knobs (see yaml_config.watcher_*).
-        # Read once at construction; restart to change. The defaults
-        # (5s poll, 60s oscillation window) give ≤35s notification
-        # latency at the default 30s idle threshold without spamming
-        # terminal_read.
-        from vexis_agent.core.yaml_config import (
-            watcher_oscillation_window_seconds as _watcher_osc,
-            watcher_poll_interval_seconds as _watcher_poll,
-        )
-        watcher = WatcherController(
-            poll_interval_seconds=_watcher_poll(),
-            oscillation_window_seconds=_watcher_osc(),
-        )
-        log.info(
-            "watcher: Codemux MCP detected — controller active "
-            "(poll=%.1fs, oscillation_window=%.1fs)",
-            _watcher_poll(), _watcher_osc(),
-        )
-    else:
-        log.info(
-            "watcher: Codemux MCP not configured; skipping "
-            "controller, /codemux slash command, and system-prompt header"
-        )
 
     control_socket = ControlSocket(
         default_socket_path(),
@@ -456,15 +447,28 @@ async def _run() -> None:
         # Never let validator failures block daemon startup.
         log.exception("model_validator startup pass raised; continuing")
 
-    # Watcher's header_block() is called once per session-prompt build
-    # (cached in ClaudeCodeBrain._system_prompt_for so prefix-cache
-    # stays stable for the rest of the session). Returning None means
-    # "no header line." Wired only when the controller exists so the
-    # zero-cost contract for non-Codemux users holds.
-    extra_prompt_blocks = (
-        (lambda: ([watcher.header_block()] if watcher.header_block() else []))
-        if watcher is not None else None
-    )
+    # System-prompt header blocks are now supplied by add-ons via
+    # ``ctx.register_system_prompt_block``. The codemux add-on's
+    # "Active Codemux work: N workspaces" line lives there; future
+    # add-ons add their own. Each provider returns either a string
+    # (injected verbatim) or None (skip for this session). Wired
+    # unconditionally — the runtime returns an empty list when no
+    # add-ons registered blocks.
+    def _addon_header_blocks() -> list[str]:
+        out: list[str] = []
+        for reg in addon_runtime.header_blocks():
+            try:
+                value = reg.provider()
+            except Exception:
+                log.exception(
+                    "addon %r header-block provider %r raised; skipping",
+                    reg.addon_name, reg.name,
+                )
+                continue
+            if value:
+                out.append(value)
+        return out
+    extra_prompt_blocks = _addon_header_blocks
 
     if _kind == "opencode":
         from vexis_agent.core.brain.opencode import OpenCodeBrain
@@ -603,8 +607,7 @@ async def _run() -> None:
     # The watcher pushes its idle pings through the same notifier the
     # rest of the daemon uses — same per-chat context buffer, same
     # Markdown fall-back, same retry shape as vexis-bg's exit pings.
-    if watcher is not None:
-        watcher.set_notify(notifier.send)
+    watcher.set_notify(notifier.send)
 
     # Wire the dispatch callback so ScheduleManager fires route through
     # the transport's ``claim() ? drain : enqueue`` protocol instead of
@@ -630,8 +633,7 @@ async def _run() -> None:
     schedule_manager.start(asyncio.get_running_loop())
     if kanban_controller is not None:
         kanban_controller.start(asyncio.get_running_loop())
-    if watcher is not None:
-        await watcher.start()
+    await watcher.start()
     # Add-on background tasks come last so they boot against a daemon
     # that's already serving (control socket up, dashboard up, brain
     # ready). They get cancelled FIRST in the finally block for the
@@ -641,8 +643,7 @@ async def _run() -> None:
         await transport.run()
     finally:
         await addon_runtime.stop_all_background_tasks()
-        if watcher is not None:
-            await watcher.stop()
+        await watcher.stop()
         if kanban_controller is not None:
             await kanban_controller.stop()
         if kanban_store is not None:
@@ -959,16 +960,17 @@ def _build_dispatch(
                 include_base64=include_b64,
             )
         if op == "watch_register":
+            # The codemux add-on owns the resolver path (workspace_id
+            # → session_id) and registers its own watch_register
+            # handler — which the addon-dispatch-first check at the
+            # top of dispatch() routes to BEFORE this branch. We only
+            # reach this fallback when NO add-on registered
+            # watch_register, which today means no codemux add-on is
+            # loaded. The generic register path still works for
+            # future non-codemux source plugins that supply their
+            # own ``identifier``.
             if watcher is None:
                 return _watcher_unavailable()
-            # ``identifier`` (source-specific id) and ``workspace_id``
-            # (Codemux user-facing handle) can BOTH appear in args:
-            # the CLI's ``--workspace`` flag fills ``workspace_id``
-            # for codemux registrations, and the dispatch then auto-
-            # resolves to a session id. Direct callers (raw control-
-            # socket clients, tests) may pass ``identifier`` and skip
-            # the resolution step. Backward-compatible with the
-            # earlier-shipping dispatch shape.
             try:
                 name = str(args["name"])
                 source_type = str(args.get("source", "codemux"))
@@ -1004,50 +1006,29 @@ def _build_dispatch(
             identifier = (
                 identifier_raw if isinstance(identifier_raw, str) else None
             )
+            if not identifier:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"source {source_type!r} requires 'identifier'; "
+                        f"if you wanted workspace_id auto-resolution, "
+                        f"enable the codemux add-on "
+                        f"(``vexis-addons enable codemux``)."
+                    ),
+                    "kind": "BadRequest",
+                }
             try:
-                if (
-                    source_type == "codemux"
-                    and workspace_id
-                    and not identifier
-                ):
-                    # Auto-resolve workspace_id → session_id. The
-                    # daemon owns the live MCP client; the CLI just
-                    # ships the workspace_id and trusts us to do the
-                    # mapping. This is the happy-path call from a
-                    # Vexis skill inside the workspace it wants to
-                    # watch.
-                    agent = await watcher.register_codemux_workspace(
-                        name=name,
-                        workspace_id=workspace_id,
-                        agent_kind=agent_kind,
-                        chat_id=chat_id,
-                        idle_after_seconds=idle_after_int,
-                        goal_hint=goal_hint,
-                    )
-                else:
-                    # Direct path: caller already knows the right
-                    # source-specific identifier (a session id for
-                    # codemux, a pid for a future PTY plugin, etc.).
-                    if not identifier:
-                        return {
-                            "ok": False,
-                            "error": (
-                                "missing 'identifier' (or 'workspace_id' "
-                                "for codemux source)"
-                            ),
-                            "kind": "BadRequest",
-                        }
-                    agent = await watcher.register_agent(
-                        name=name,
-                        source_type=source_type,
-                        identifier=identifier,
-                        agent_kind=agent_kind,
-                        chat_id=chat_id,
-                        idle_after_seconds=idle_after_int,
-                        goal_hint=goal_hint,
-                        repo_path=repo_path,
-                        workspace_id=workspace_id,
-                    )
+                agent = await watcher.register_agent(
+                    name=name,
+                    source_type=source_type,
+                    identifier=identifier,
+                    agent_kind=agent_kind,
+                    chat_id=chat_id,
+                    idle_after_seconds=idle_after_int,
+                    goal_hint=goal_hint,
+                    repo_path=repo_path,
+                    workspace_id=workspace_id,
+                )
             except _WDuplicate as exc:
                 return {"ok": False, "error": str(exc), "kind": "DuplicateName"}
             except _WSrcGone as exc:

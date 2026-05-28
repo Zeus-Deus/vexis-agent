@@ -254,6 +254,26 @@ class PluginContext:
             )
         )
 
+    def get_service(self, name: str) -> Any:
+        """Lookup a daemon-supplied service by name.
+
+        Common services attached today:
+
+        * ``"watcher"`` — :class:`WatcherController`. Available after
+          daemon startup completes; ``None`` if the watcher subsystem
+          isn't wired in this build. Add-ons that need to inspect
+          watched agents (the codemux add-on's ``/codemux`` handler)
+          look it up here at call time, not registration time.
+
+        Returns ``None`` if no service is attached under that name —
+        add-ons should defend against this and degrade gracefully.
+        Service attachment happens in main.py AFTER ``register()``
+        runs, so calling ``get_service`` from inside ``register()``
+        will likely return ``None``; defer to the handlers / tasks
+        you registered.
+        """
+        return self._runtime.get_service(name)
+
     def register_dashboard_page(self, manifest: dict[str, Any]) -> None:
         """Add a tab to the web dashboard.
 

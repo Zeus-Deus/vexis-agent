@@ -164,6 +164,13 @@ class AddonRuntime:
         # the event loop may not exist when register() fires.
         self._running_tasks: list[asyncio.Task] = []
 
+        # Shared services keyed by name (e.g. "watcher"). Daemon
+        # singletons that add-ons need to look up at call time —
+        # NOT at register() time, because the daemon may build them
+        # after the addon loads. PluginContext.get_service(name)
+        # exposes the lookup. See ``attach_service`` / ``get_service``.
+        self._services: dict[str, Any] = {}
+
     # ---------- loaded-addon bookkeeping --------------------------------
 
     def record_loaded(self, addon: LoadedAddon) -> None:
@@ -260,6 +267,28 @@ class AddonRuntime:
     def add_dashboard_page(self, reg: DashboardPageRegistration) -> None:
         # List-additive; dashboard merges all pages into its tab list.
         self._dashboard_pages.append(reg)
+
+    # ---------- shared services -----------------------------------------
+
+    def attach_service(self, name: str, obj: Any) -> None:
+        """Make a daemon singleton (e.g. the watcher) available to
+        add-ons via ``ctx.get_service(name)``.
+
+        Called by main.py at startup, AFTER the singleton is built
+        but BEFORE the add-on's background tasks start. Re-attaching
+        an existing name is allowed — the latest wins; useful for
+        tests that wire a fake then swap in the real instance.
+        """
+        self._services[name] = obj
+
+    def get_service(self, name: str) -> Any:
+        """Lookup a service by name. ``None`` if not attached.
+
+        Add-ons calling ``ctx.get_service`` should defend against
+        ``None`` — it means the daemon never wired the service this
+        version. Don't crash; degrade or log + skip.
+        """
+        return self._services.get(name)
 
     # ---------- read-only accessors (consumed by main / telegram / …) ---
 
