@@ -392,6 +392,30 @@ async def _run() -> None:
     if _loaded_count:
         log.info("addons: loaded %d add-on(s)", _loaded_count)
 
+    # Upgrade-UX warning: users who had codemux working pre-Phase-B may
+    # see it silently stop on first restart because the add-on system
+    # is explicit-allow-list. Detect the common case (codemux MCP wired
+    # but add-on not enabled) and log a clear "run this to fix" line.
+    # Single log line, no auto-mutation — touching the user's config
+    # without asking is the kind of thing that bites people.
+    _enabled_set = set(_addons_enabled())
+    if "codemux" not in _enabled_set:
+        try:
+            from vexis_agent.setup_wizard import detect_mcp_servers
+            _servers = detect_mcp_servers()
+            if any(
+                isinstance(s, dict) and s.get("name") == "codemux"
+                for s in _servers
+            ):
+                log.warning(
+                    "addons: codemux MCP is configured but the codemux "
+                    "add-on is not enabled. Run `vexis-addons enable "
+                    "codemux` and restart to restore /codemux + the "
+                    "watcher pings."
+                )
+        except Exception:
+            pass  # best-effort; never block startup on this hint
+
     # Install add-on-shipped skills into the workspace so the brain's
     # session-start skill discovery picks them up. Idempotent — only
     # writes files whose content differs from disk. See
