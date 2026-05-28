@@ -1620,3 +1620,53 @@ def watcher_oscillation_window_seconds() -> float:
         ceiling=_WATCHER_OSCILLATION_WINDOW_CEILING,
         label="watcher.oscillation_window_seconds",
     )
+
+
+# ────────────────────────── add-on system ────────────────────────────────────
+# See docs/addons.md for the manifest schema and lifecycle. The daemon reads
+# these on startup; restart required to change. Strictly opt-in: even bundled
+# add-ons must be named under ``addons.enabled`` to load — keeps core simple
+# and stable, matches CLAUDE.md's "core stays add-on-agnostic" invariant.
+
+
+def addons_enabled() -> list[str]:
+    """Names of add-ons the user has opted into.
+
+    Returns ``[]`` when ``addons.enabled`` is missing or malformed —
+    no add-ons load by default, matching the explicit-allow-list
+    discovery policy in ``core.addons.loader``. Non-string entries
+    are silently dropped (so a stray ``- 99`` in YAML doesn't crash
+    discovery; the resulting "addon 99 not found" log line points
+    the user at their typo).
+    """
+    raw = _section("addons").get("enabled", [])
+    if not isinstance(raw, list):
+        return []
+    return [name for name in raw if isinstance(name, str) and name]
+
+
+def addons_disabled() -> list[str]:
+    """Names of add-ons explicitly blocked from loading.
+
+    ``disabled`` wins over ``enabled`` — listing a name in both
+    sections keeps the add-on off, which is the right semantics for
+    "I think this add-on is broken; turn it off without forgetting
+    I wanted it enabled in principle."
+    """
+    raw = _section("addons").get("disabled", [])
+    if not isinstance(raw, list):
+        return []
+    return [name for name in raw if isinstance(name, str) and name]
+
+
+def addon_config(name: str) -> dict[str, Any]:
+    """One add-on's user-provided config slice (``addons.<name>.*``).
+
+    Returned dict is whatever the user wrote in YAML — the add-on
+    loader merges in the manifest's ``config_schema`` defaults on
+    top of this before handing it to ``register(ctx)``. Returns an
+    empty dict when the section is missing, so add-ons with no
+    user config see ``ctx.config.get("key", default)`` Just Work.
+    """
+    section = _section("addons").get(name)
+    return section if isinstance(section, dict) else {}

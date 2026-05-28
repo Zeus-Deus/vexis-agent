@@ -845,6 +845,7 @@ class TelegramTransport:
         schedule_store: "object | None" = None,  # ScheduleStore; weak-typed to avoid import cycle
         kanban_store: "object | None" = None,  # KanbanStore; weak-typed to avoid import cycle
         watcher: "object | None" = None,  # WatcherController; weak-typed to avoid import cycle
+        addon_runtime: "object | None" = None,  # AddonRuntime; weak-typed to avoid import cycle
     ) -> None:
         self._handler = handler
         self._running_tasks = running_tasks
@@ -862,6 +863,11 @@ class TelegramTransport:
         # peek/tail/mute/unwatch verbs are gated on this being non-None
         # so non-Codemux users see no surface change.
         self._watcher = watcher
+        # Add-on system. None in tests that don't care; production
+        # always passes a runtime. Telegram commands registered by
+        # add-ons are wired below in ``_register_addon_commands``;
+        # see docs/addons.md for the full plugin context API.
+        self._addon_runtime = addon_runtime
         # Wire the kanban command facade. The provider closure lets
         # us swap kanban_store at runtime without re-wiring the handler
         # (a future toggle could enable/disable kanban via dashboard).
@@ -953,9 +959,62 @@ class TelegramTransport:
         # Registering the handler when the MCP is absent would expose
         # a slash command that always errors — the spec is "invisible
         # unless the MCP is on," so we skip registration entirely.
+        # Phase B will move this into the codemux add-on; until then
+        # both the hardcoded handler and the add-on hook below coexist.
         if self._watcher is not None:
             self._app.add_handler(CommandHandler("codemux", self._on_codemux))
+        # Add-on-registered slash commands. Generic loop, no per-command
+        # branching in core — every add-on that called
+        # ``ctx.register_telegram_command`` gets its handler wired here.
+        # Conflicts with hardcoded names above are surfaced by the
+        # AddonRuntime at registration time, not here.
+        self._register_addon_commands()
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
+
+    def _register_addon_commands(self) -> None:
+        """Wire every Telegram command an add-on registered.
+
+        Wraps each handler in an auth gate so add-on authors don't
+        each have to repeat the ``is_allowed(user.id, ...)`` check —
+        the contract is "your handler only sees requests from the
+        configured ``telegram_allowed_user_id``." Add-ons that need
+        unauthenticated access (none today) can register raw via the
+        future ``register_telegram_command(..., auth=False)`` option.
+        """
+        if self._addon_runtime is None:
+            return
+        for reg in self._addon_runtime.telegram_commands():
+            self._app.add_handler(
+                CommandHandler(reg.name, self._wrap_addon_handler(reg))
+            )
+        log.info(
+            "telegram: registered %d add-on slash command(s)",
+            len(list(self._addon_runtime.telegram_commands())),
+        )
+
+    def _wrap_addon_handler(self, reg):
+        """Return an auth-gated wrapper around an add-on's command handler.
+
+        Mirrors the gate every hardcoded slash command applies
+        (``_on_kanban``, ``_on_codemux``, etc.). A rejected request
+        is logged but produces no Telegram reply — same posture as
+        the hardcoded handlers, so a misbehaving caller can't make
+        the bot chatty.
+        """
+        async def _wrapped(update, ctx):  # noqa: ANN001
+            user = update.effective_user
+            if user is None:
+                return
+            if not is_allowed(user.id, self._allowed_user_id):
+                log.warning(
+                    "Rejected /%s (addon=%r) from user_id=%s",
+                    reg.name, reg.addon_name, user.id,
+                )
+                return
+            await reg.handler(update, ctx)
+        # Preserve the original handler's qualname for tracebacks.
+        _wrapped.__name__ = f"_addon_{reg.addon_name}_{reg.name}"
+        return _wrapped
 
     async def _on_kanban(
         self, update: "Update", ctx: "ContextTypes.DEFAULT_TYPE",
@@ -4819,8 +4878,20 @@ class TelegramTransport:
 
     async def run(self) -> None:
         await self._app.initialize()
+        # Collect add-on-supplied menu descriptions so they appear in
+        # Telegram's slash-command picker alongside the canonical
+        # COMMANDS list. Add-ons that omitted ``menu_description`` get
+        # a working slash command but no menu entry — same shape as
+        # debug-only commands that we deliberately hide from the menu.
+        addon_menu_entries: list[tuple[str, str]] = []
+        if self._addon_runtime is not None:
+            for reg in self._addon_runtime.telegram_commands():
+                if reg.menu_description:
+                    addon_menu_entries.append((reg.name, reg.menu_description))
         await _register_commands(
-            self._app, include_codemux=self._watcher is not None,
+            self._app,
+            include_codemux=self._watcher is not None,
+            addon_entries=addon_menu_entries,
         )
         # Sweep status files left behind by a previous daemon's brain
         # that exited via SIGKILL (its finally never ran). Without this
@@ -5080,6 +5151,7 @@ async def _register_commands(
     application: Application,
     *,
     include_codemux: bool = False,
+    addon_entries: "list[tuple[str, str]] | None" = None,
 ) -> None:
     """Mirror the canonical COMMANDS list to Telegram's slash menu.
 
@@ -5089,7 +5161,15 @@ async def _register_commands(
 
     ``include_codemux`` toggles the conditional ``/codemux`` entry —
     on only when the watcher controller is active (the spec's LAYER 1f
-    conditional activation contract).
+    conditional activation contract). Phase B moves this entry into
+    the codemux add-on; until then it stays alongside the add-on
+    surface.
+
+    ``addon_entries`` is a list of ``(name, description)`` pairs
+    contributed by loaded add-ons via ``ctx.register_telegram_command``.
+    The menu order is: canonical COMMANDS first, then add-on entries
+    in registration order — predictable for users who memorise
+    positions in the slash autocomplete.
     """
     bot_commands = [
         TelegramBotCommand(cmd.command, cmd.description) for cmd in COMMANDS
@@ -5098,6 +5178,9 @@ async def _register_commands(
         bot_commands.append(
             TelegramBotCommand("codemux", "Status of watched Codemux workspaces")
         )
+    if addon_entries:
+        for name, desc in addon_entries:
+            bot_commands.append(TelegramBotCommand(name, desc))
     try:
         await application.bot.set_my_commands(bot_commands)
     except Exception as exc:

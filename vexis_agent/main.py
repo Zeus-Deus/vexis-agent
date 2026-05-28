@@ -13,6 +13,11 @@ import signal
 import sys
 from pathlib import Path
 
+from vexis_agent.core.addons import (
+    AddonRuntime,
+    discover_addons,
+    load_addon,
+)
 from vexis_agent.core.brain.claude_code import ClaudeCodeBrain, build_system_prompt
 from vexis_agent.core.background_tasks import (
     BackgroundTaskError,
@@ -333,6 +338,34 @@ async def _run() -> None:
     )
     browser_manager = get_browser_manager()
     browser_tools = BrowserTools(browser_manager, workspace)
+
+    # Add-on system (see docs/addons.md). Discover everything the
+    # user opted into via ``addons.enabled`` in ~/.vexis/config.yaml,
+    # load each via ``register(ctx)``, and hold the runtime so the
+    # rest of the daemon can consult its registrations. Today this
+    # runs alongside the hardcoded codemux wiring below; Phase B
+    # moves codemux into a bundled add-on and deletes the hardcoded
+    # paths. ``user_id`` is the multi-user seam — always "default"
+    # in single-user mode, parameterised when multi-user lands.
+    from vexis_agent.core.yaml_config import (
+        addon_config as _addon_config,
+        addons_disabled as _addons_disabled,
+        addons_enabled as _addons_enabled,
+    )
+    addon_runtime = AddonRuntime()
+    for _discovered in discover_addons(
+        enabled=_addons_enabled(),
+        disabled=_addons_disabled(),
+    ):
+        load_addon(
+            _discovered,
+            addon_runtime,
+            user_config=_addon_config(_discovered.manifest.name),
+        )
+    _loaded_count = sum(1 for a in addon_runtime.loaded_addons() if a.register_ok)
+    if _loaded_count:
+        log.info("addons: loaded %d add-on(s)", _loaded_count)
+
     # Codemux orchestration watcher. Conditional activation: present
     # only when the Codemux MCP is wired into ~/.vexis/mcp-servers.yaml,
     # so users without Codemux pay zero cost (no poll loop, no slash
@@ -370,7 +403,12 @@ async def _run() -> None:
 
     control_socket = ControlSocket(
         default_socket_path(),
-        _build_dispatch(background_tasks, browser_tools, watcher),
+        _build_dispatch(
+            background_tasks,
+            browser_tools,
+            watcher,
+            addon_runtime=addon_runtime,
+        ),
     )
 
     # Phase C Day 3: ``brain.kind`` selects the agent CLI to spawn
@@ -560,6 +598,7 @@ async def _run() -> None:
         schedule_store=schedule_store,
         kanban_store=kanban_store,
         watcher=watcher,
+        addon_runtime=addon_runtime,
     )
     # The watcher pushes its idle pings through the same notifier the
     # rest of the daemon uses — same per-chat context buffer, same
@@ -593,9 +632,15 @@ async def _run() -> None:
         kanban_controller.start(asyncio.get_running_loop())
     if watcher is not None:
         await watcher.start()
+    # Add-on background tasks come last so they boot against a daemon
+    # that's already serving (control socket up, dashboard up, brain
+    # ready). They get cancelled FIRST in the finally block for the
+    # symmetric reason — let them drain before core subsystems vanish.
+    await addon_runtime.start_all_background_tasks()
     try:
         await transport.run()
     finally:
+        await addon_runtime.stop_all_background_tasks()
         if watcher is not None:
             await watcher.stop()
         if kanban_controller is not None:
@@ -684,6 +729,7 @@ def _build_dispatch(
     bg: BackgroundTasks,
     browser: BrowserTools,
     watcher: "object | None" = None,  # WatcherController; weak-typed to avoid import cycle
+    addon_runtime: "AddonRuntime | None" = None,
 ):
     """Wire control-socket ops to in-daemon singletons.
 
@@ -696,6 +742,12 @@ def _build_dispatch(
     ``vexis-watch`` can print the conditional-activation message and
     exit cleanly. The op surface is otherwise identical, which keeps
     the CLI / spec stable across MCP-on / MCP-off states.
+
+    ``addon_runtime`` is checked FIRST when dispatching: an add-on
+    that registered an op via ``ctx.register_dispatch_handler`` wins
+    over the hardcoded branches below. This lets Phase B move
+    ``watch_*`` ops into the codemux add-on without changing the
+    control-socket protocol or the ``vexis-watch`` CLI.
     """
     # Lazy import keeps tests of _build_dispatch that don't care about
     # the watcher path independent of the watcher import side effects.
@@ -726,6 +778,29 @@ def _build_dispatch(
         }
 
     async def dispatch(op: str, args: dict) -> dict:
+        # Add-on dispatch handlers win over hardcoded branches —
+        # Phase B will use this to extract ``watch_*`` into the
+        # codemux add-on without changing the control-socket
+        # protocol. The hardcoded branches below still answer for
+        # any op not claimed by an add-on, so nothing breaks until
+        # the codemux extraction actually lands.
+        if addon_runtime is not None:
+            _addon_handlers = addon_runtime.dispatch_handlers()
+            _reg = _addon_handlers.get(op)
+            if _reg is not None:
+                try:
+                    return await _reg.handler(args)
+                except Exception as exc:  # noqa: BLE001
+                    log.exception(
+                        "addon %r dispatch handler for %r raised",
+                        _reg.addon_name, op,
+                    )
+                    return {
+                        "ok": False,
+                        "error": f"addon dispatch error: {exc}",
+                        "kind": "AddonDispatchError",
+                    }
+
         if op == "bg_spawn":
             try:
                 chat_id = int(args["chat_id"])

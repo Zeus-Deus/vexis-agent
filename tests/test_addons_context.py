@@ -345,3 +345,95 @@ def test_dispatch_handler_invokable(tmp_path: Path) -> None:
     # full-suite runner doesn't guarantee a fresh loop per test.
     result = asyncio.run(reg.handler({"x": 42}))
     assert result == {"got": 42}
+
+
+# ---------- background-task lifecycle --------------------------------------
+
+
+def test_start_and_stop_background_tasks(tmp_path: Path) -> None:
+    """``start_all_background_tasks`` spawns each registered factory;
+    ``stop_all_background_tasks`` cancels them cleanly."""
+    runtime = AddonRuntime()
+    ctx = _ctx(tmp_path, runtime)
+
+    started: list[str] = []
+    cancelled: list[str] = []
+
+    def make_factory(label: str):
+        async def _run() -> None:
+            started.append(label)
+            try:
+                await asyncio.Event().wait()  # park forever
+            except asyncio.CancelledError:
+                cancelled.append(label)
+                raise
+
+        return _run
+
+    ctx.register_background_task("a", make_factory("a"))
+    ctx.register_background_task("b", make_factory("b"))
+
+    async def go() -> None:
+        tasks = await runtime.start_all_background_tasks()
+        assert len(tasks) == 2
+        # Give the tasks a tick to enter their bodies.
+        await asyncio.sleep(0.01)
+        assert set(started) == {"a", "b"}
+        await runtime.stop_all_background_tasks(timeout_seconds=1.0)
+        assert set(cancelled) == {"a", "b"}
+
+    asyncio.run(go())
+
+
+def test_start_background_tasks_swallows_factory_crashes(
+    tmp_path: Path, caplog
+) -> None:
+    """A crashing background task is logged but doesn't surface to
+    callers or take down sibling tasks."""
+    runtime = AddonRuntime()
+    ctx = _ctx(tmp_path, runtime)
+
+    async def crashy() -> None:
+        raise RuntimeError("boom")
+
+    survivor_started = asyncio.Event()
+
+    async def survivor() -> None:
+        survivor_started.set()
+        await asyncio.Event().wait()
+
+    ctx.register_background_task("crashy", crashy)
+    ctx.register_background_task("survivor", survivor)
+
+    async def go() -> None:
+        await runtime.start_all_background_tasks()
+        await asyncio.wait_for(survivor_started.wait(), timeout=1.0)
+        await runtime.stop_all_background_tasks(timeout_seconds=1.0)
+
+    import logging
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(go())
+
+    assert any("crashy" in rec.message for rec in caplog.records)
+
+
+def test_start_background_tasks_twice_raises(tmp_path: Path) -> None:
+    """Calling start twice is a programming error — task lifecycle
+    is start-once-per-daemon-instance."""
+    runtime = AddonRuntime()
+    ctx = _ctx(tmp_path, runtime)
+
+    async def park() -> None:
+        await asyncio.Event().wait()
+
+    ctx.register_background_task("p", park)
+
+    async def go() -> None:
+        await runtime.start_all_background_tasks()
+        try:
+            with pytest.raises(RuntimeError, match="already called"):
+                await runtime.start_all_background_tasks()
+        finally:
+            await runtime.stop_all_background_tasks(timeout_seconds=1.0)
+
+    asyncio.run(go())

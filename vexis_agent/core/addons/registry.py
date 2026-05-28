@@ -23,6 +23,7 @@ file shipped by two add-ons is fine, they just both copy.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
@@ -158,6 +159,11 @@ class AddonRuntime:
         self._skills: list[SkillRegistration] = []
         self._dashboard_pages: list[DashboardPageRegistration] = []
 
+        # Running asyncio tasks spawned by start_all_background_tasks.
+        # Populated AFTER register() ran, NOT at registration time —
+        # the event loop may not exist when register() fires.
+        self._running_tasks: list[asyncio.Task] = []
+
     # ---------- loaded-addon bookkeeping --------------------------------
 
     def record_loaded(self, addon: LoadedAddon) -> None:
@@ -281,3 +287,82 @@ class AddonRuntime:
 
     def dashboard_pages(self) -> Iterable[DashboardPageRegistration]:
         return list(self._dashboard_pages)
+
+    # ---------- background-task lifecycle -------------------------------
+
+    async def start_all_background_tasks(self) -> list[asyncio.Task]:
+        """Spawn every registered background task as an ``asyncio.Task``.
+
+        Called once from ``main.py`` after the event loop is running
+        (NOT during ``register()`` — the loop may not exist yet at
+        registration time). Each task is wrapped in a sentinel that
+        catches and logs exceptions, so a crashed task in one add-on
+        can't take down the daemon. Returns the spawned tasks so the
+        caller can cancel them on shutdown via
+        :meth:`stop_all_background_tasks`.
+
+        Calling more than once is a programming error and raises —
+        background tasks are start-once-per-daemon-instance.
+        """
+        if self._running_tasks:
+            raise RuntimeError(
+                "start_all_background_tasks already called; "
+                f"{len(self._running_tasks)} tasks are running"
+            )
+        for reg in self._background_tasks:
+            task = asyncio.create_task(
+                self._guarded_run(reg),
+                name=f"addon:{reg.addon_name}:{reg.name}",
+            )
+            self._running_tasks.append(task)
+        self._log.info(
+            "addons: started %d background task(s)", len(self._running_tasks)
+        )
+        return list(self._running_tasks)
+
+    async def stop_all_background_tasks(
+        self, *, timeout_seconds: float = 5.0
+    ) -> None:
+        """Cancel every running task, wait for clean shutdown.
+
+        Called from the daemon's shutdown path. ``timeout_seconds`` is
+        an upper bound — tasks that ignore cancellation get logged
+        and forced; we don't block daemon shutdown indefinitely on a
+        misbehaving add-on.
+        """
+        if not self._running_tasks:
+            return
+        for task in self._running_tasks:
+            task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self._running_tasks, return_exceptions=True),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            self._log.warning(
+                "addons: %d background task(s) did not stop within %.1fs",
+                sum(1 for t in self._running_tasks if not t.done()),
+                timeout_seconds,
+            )
+        self._running_tasks.clear()
+
+    async def _guarded_run(
+        self, reg: BackgroundTaskRegistration
+    ) -> None:
+        """Run one task's factory, log any exception that escapes.
+
+        The factory itself returns a coroutine that runs until
+        cancellation — we await it here. ``CancelledError`` flows
+        through cleanly so daemon shutdown is silent; any other
+        exception is logged with full traceback then swallowed.
+        """
+        try:
+            await reg.factory()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._log.exception(
+                "addons: background task %r from add-on %r crashed",
+                reg.name, reg.addon_name,
+            )
