@@ -347,6 +347,34 @@ _GOAL_ALREADY_TERMINAL_TMPL = (
     "Goal is already {status} — no action taken. /goal status to confirm, "
     "or /goal <text> to start a new one."
 )
+# Long-form / background goals route to kanban. Matches the hermes
+# pattern (their /goal stays short-horizon; hours-long work goes to
+# cron/kanban with quiet-by-default delivery). Vexis already has
+# the kanban surface (`docs/kanban.md`), so this is a routing
+# question, not a new feature: ``/goal --bg <text>`` files the goal
+# as a single ``ready`` kanban task so the dispatcher's spawn_aux
+# worker runs it in a detached aux session — foreground chat
+# stays free, notifications fire on done/blocked only.
+_GOAL_BG_FLAGS = frozenset({"--bg", "--background"})
+_GOAL_BG_KANBAN_DISABLED = (
+    "/goal --bg needs the kanban store, but it's not available. "
+    "Make sure kanban is enabled (it is by default; check "
+    "~/.vexis/config.yaml hasn't disabled it)."
+)
+_GOAL_BG_REPLY_TMPL = (
+    "📋 Filed as kanban task `{task_id}`: {title}\n"
+    "Working in the background — /kanban show {task_id} for live status, "
+    "/kanban list for the board."
+)
+# Kanban lane the background goal lands in. ``implementation`` is
+# the default work lane (see ``docs/kanban.md``); user can rename
+# via ``/kanban assign <id> @<lane>`` if they want a different hat
+# on the worker.
+_GOAL_BG_DEFAULT_LANE = "implementation"
+# Title truncation cap. Kanban displays the title in summary lines
+# and the dashboard board card; keep it short. The full goal text
+# lands in the task body.
+_GOAL_BG_TITLE_MAX_CHARS = 80
 _CANCEL_OK_GOAL_PAUSED_TMPL = (
     "Cancelled, sir. (Goal paused at {turns}/{budget} turns — "
     "/goal resume to keep going.)"
@@ -1485,6 +1513,7 @@ class TelegramTransport:
             reply = await self._dispatch_brain_turn(
                 bot, chat_id, user_id, text,
                 outcome=turn_outcome,
+                origin=origin,
             )
             # Report the outcome BEFORE the goal hook so the schedule
             # manager learns about it even if the goal hook raises.
@@ -1510,7 +1539,7 @@ class TelegramTransport:
             # (if not + under budget) enqueue a continuation. No-op
             # when goals.enabled is False or no active goal is set
             # for the current session UUID.
-            await self._run_goal_hook(bot, chat_id, reply or "")
+            await self._run_goal_hook(bot, chat_id, reply or "", origin=origin)
             next_msg = await self._running_tasks.pop_or_release(chat_id)
             if next_msg is None:
                 # If pop_or_release released because /cancel fired and a
@@ -2393,6 +2422,36 @@ class TelegramTransport:
                 await msg.reply_text(_GOAL_NO_GOAL_TO_RESUME)
                 return
             await msg.reply_text(_GOAL_RESUME_REPLY_TMPL.format(goal=state.goal))
+            # Re-fire the brain so resume actually advances. Without
+            # this, ``mgr.resume()`` just flips the on-disk state to
+            # active and the chat goes idle — the goal loop is gated
+            # on a brain turn finishing (``_drain_chat:1513`` →
+            # ``_run_goal_hook``), so nothing happens until the user
+            # types a fresh message. Matches the kickoff path at the
+            # bottom of this handler.
+            #
+            # If a drain is already alive (rare — would mean the user
+            # paused during an in-flight turn that's still running),
+            # skip the kickoff. The existing hook will see the
+            # active goal at the end of the in-flight turn and
+            # enqueue a continuation through the normal path.
+            #
+            # The kickoff text is the standard continuation prompt
+            # template (not the bare goal text) because we're picking
+            # up mid-goal, not setting a new one. ``queue_origin=
+            # "goal_continuation"`` keeps the FIFO machinery
+            # (preempt, picking-up-ack suppression, notify_policy
+            # gating) on the same code path real continuations use.
+            if not self._running_tasks.is_running(msg.chat_id):
+                resume_prompt = mgr.next_continuation_prompt() or state.goal
+                self._spawn_background_dispatch(
+                    msg.get_bot(),
+                    msg.chat_id,
+                    user.id,
+                    resume_prompt,
+                    queue_origin="goal_continuation",
+                    label="goal_resume",
+                )
             return
 
         if sub == "clear":
@@ -2421,12 +2480,66 @@ class TelegramTransport:
             await msg.reply_text(_GOAL_INVALID_TMPL.format(reason="goal text is empty"))
             return
 
+        # ``--bg`` / ``--background`` as a leading flag routes the goal
+        # to kanban instead of the foreground drain loop. Matches the
+        # hermes architectural split (their /goal stays short-horizon,
+        # long-running work files as a cron/kanban task). Strip the
+        # flag from goal_text before falling through to the rest of
+        # the handler so the kickoff/judge see clean goal text.
+        background_mode = False
+        tokens = goal_text.split()
+        if tokens and tokens[0].lower() in _GOAL_BG_FLAGS:
+            background_mode = True
+            goal_text = " ".join(tokens[1:]).strip()
+            if not goal_text:
+                await msg.reply_text(
+                    _GOAL_INVALID_TMPL.format(
+                        reason="goal text is empty after stripping --bg"
+                    )
+                )
+                return
+
         # Bareword-typo guard. /goal cancel / /goal stop / etc. is
         # almost always a typo for /cancel — never a real goal.
         # Caught BEFORE the mid-run reject so the user gets the
         # right hint regardless of drain state.
         if goal_text.lower() in _GOAL_BAREWORD_CANCEL_LIKE:
             await msg.reply_text(_GOAL_BAREWORD_HINT)
+            return
+
+        # Background-mode route: file as a kanban task and return
+        # early. We deliberately do NOT touch the GoalManager / the
+        # FIFO drain — the kanban dispatcher owns the lifecycle
+        # (claim → spawn_aux worker → emit task_events → archive)
+        # and reuses the workspace+brain the daemon already has. The
+        # foreground Telegram chat is left completely free.
+        if background_mode:
+            store = self._kanban_store
+            if store is None:
+                await msg.reply_text(_GOAL_BG_KANBAN_DISABLED)
+                return
+            title = goal_text.replace("\n", " ").strip()
+            if len(title) > _GOAL_BG_TITLE_MAX_CHARS:
+                title = title[: _GOAL_BG_TITLE_MAX_CHARS - 1].rstrip() + "…"
+            from vexis_agent.tools.kanban import api as kanban_api
+            result = kanban_api.create_task(
+                store,
+                title=title,
+                body=goal_text,
+                lane=_GOAL_BG_DEFAULT_LANE,
+                status="ready",
+                created_by="user:/goal --bg",
+            )
+            if not result.get("ok"):
+                await msg.reply_text(
+                    f"Couldn't file goal: {result.get('error', 'unknown error')}"
+                )
+                return
+            task = result.get("data") or {}
+            task_id = task.get("id", "<unknown>")
+            await msg.reply_text(
+                _GOAL_BG_REPLY_TMPL.format(task_id=task_id, title=title)
+            )
             return
 
         # Mid-run reject: a drain is already processing this chat.
@@ -3891,7 +4004,14 @@ class TelegramTransport:
             )
         return f"Unknown brain '{target_brain}'. Known: {', '.join(sorted(VALID_BRAIN_KINDS))}"
 
-    async def _run_goal_hook(self, bot, chat_id: int, last_response: str) -> None:
+    async def _run_goal_hook(
+        self,
+        bot,
+        chat_id: int,
+        last_response: str,
+        *,
+        origin: str = "user",
+    ) -> None:
         """After-each-turn hook called inside ``_drain_chat``.
 
         Skipped entirely when ``goals.enabled`` is False (so the
@@ -3901,6 +4021,19 @@ class TelegramTransport:
         sends the user-visible status line, and enqueues the
         continuation prompt (tagged ``origin="goal_continuation"``)
         when the judge says continue.
+
+        ``origin`` is the origin of the brain turn that just finished
+        (``"user"``, ``"goal_continuation"``, ``"scheduled_fire"``,
+        etc., as tagged in the FIFO ``QueuedMessage``). It drives the
+        ``notify_policy`` gate: under ``done_only`` (default), the
+        per-continuation ``↻ Continuing`` line is suppressed, and the
+        brain reply for a continuation turn was suppressed at the
+        send-site (see ``_dispatch_brain_turn``) — so on a terminal
+        verdict (done / budget-paused / parse-failure-paused) we
+        flush the suppressed reply HERE, inline with the terminal
+        status, so the user sees the final output that produced the
+        verdict. ``"all"`` policy is a no-op for these gates and
+        matches pre-revisit behaviour.
 
         Two race guards protect the user from surprise continuations:
 
@@ -3968,11 +4101,33 @@ class TelegramTransport:
         msg_text = decision.get("message") or ""
         should_continue = decision.get("should_continue", False)
 
+        from vexis_agent.core.yaml_config import goals_notify_policy
+        policy = goals_notify_policy()
+        suppressed_reply = (
+            policy != "all"
+            and origin == "goal_continuation"
+            and bool(last_response.strip())
+        )
+
         # Terminal branch (done / budget-exhausted): send the status
         # message and stop. No reload needed — the reload guard only
         # exists to suppress continuations that would race a
         # concurrent pause/clear, not terminal status updates.
         if not should_continue:
+            # Under ``done_only`` the brain reply for goal_continuation
+            # turns was suppressed at the send-site. On a terminal
+            # verdict we flush it inline here so the user sees the
+            # final output that produced the done/paused state. Sent
+            # BEFORE the terminal status line so the chat reads
+            # naturally: "<final output>\n\n✓ Goal achieved: ...".
+            if suppressed_reply:
+                try:
+                    await self._send_brain_reply(bot, chat_id, last_response)
+                except Exception:
+                    log.exception(
+                        "goal hook: terminal reply flush failed for chat %s",
+                        chat_id,
+                    )
             if msg_text:
                 try:
                     await bot.send_message(
@@ -4022,7 +4177,13 @@ class TelegramTransport:
             )
             return
 
-        if msg_text:
+        # Under ``done_only`` (the default) the per-continuation
+        # ``↻ Continuing toward goal (N/M): <reason>`` line is
+        # suppressed — the user explicitly asked for quiet-by-default
+        # so the goal loop doesn't flood Telegram with status pings.
+        # ``all`` policy restores the old behaviour. Terminal verdicts
+        # always send (handled above).
+        if msg_text and policy == "all":
             try:
                 await bot.send_message(
                     chat_id=chat_id, text=msg_text, parse_mode=None
@@ -4161,6 +4322,7 @@ class TelegramTransport:
         self, bot, chat_id: int, user_id: int, text: str,
         *,
         outcome=None,
+        origin: str = "user",
     ) -> str | None:
         """One brain turn for the drain loop.
 
@@ -4172,6 +4334,16 @@ class TelegramTransport:
         the turn — or :data:`_DRAIN_TURN_BROKE` on an unexpected
         exception in either path so the goal judge sees the same
         "broken turn" string the user sees.
+
+        ``origin`` mirrors the FIFO ``QueuedMessage.origin`` field
+        for the turn being dispatched. Under ``goals.notify_policy``
+        = ``done_only`` (default), turns tagged
+        ``"goal_continuation"`` skip the per-turn ``_send_brain_reply``
+        so the chat doesn't flood with intermediate goal-loop output.
+        The goal hook re-sends the suppressed reply on terminal
+        verdicts so the user still sees the final output. ``"all"``
+        policy bypasses this gate and sends every turn's reply as
+        before.
 
         Both paths preserve the historical "send-error swallow"
         semantics: a Telegram-side send/edit failure logs but
@@ -4186,7 +4358,28 @@ class TelegramTransport:
         behaviour without forcing every fixture to be touched
         every time a new transport-level flag lands.
         """
-        if not getattr(self, "_streaming_enabled", False):
+        # notify_policy gate. ``done_only`` (default) suppresses
+        # the per-turn brain reply for goal_continuation turns; the
+        # goal hook will flush it on a terminal verdict. Read once
+        # per turn so a mid-goal config edit takes effect at the
+        # next turn (no daemon restart).
+        from vexis_agent.core.yaml_config import goals_notify_policy
+        suppress_reply_for_goal = (
+            origin == "goal_continuation"
+            and goals_notify_policy() != "all"
+        )
+
+        # Force the buffered path when we're about to suppress the
+        # reply. Streaming would have already emitted incremental
+        # ``edit_message_text`` updates by the time we'd want to
+        # discard the output, so there's no clean suppression hook
+        # on that path. The buffered path returns the full reply
+        # text without sending anything, so we can drop it cleanly.
+        use_buffered = (
+            suppress_reply_for_goal
+            or not getattr(self, "_streaming_enabled", False)
+        )
+        if use_buffered:
             try:
                 # Only pass ``outcome`` when the caller actually wants
                 # it — test fakes and older handler signatures don't
@@ -4213,7 +4406,7 @@ class TelegramTransport:
                         outcome.error_message or str(exc) or "drain turn raised"
                     )
                 reply = _DRAIN_TURN_BROKE
-            if reply is not None:
+            if reply is not None and not suppress_reply_for_goal:
                 try:
                     await self._send_brain_reply(bot, chat_id, reply)
                 except Exception:
