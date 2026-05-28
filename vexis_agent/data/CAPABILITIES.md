@@ -997,4 +997,4 @@ NOT in the prompt; the CLI is where you go for details.
 The CLI emits JSON to stdout. When the Codemux MCP isn't wired the
 daemon returns "Codemux MCP not configured" and the CLI exits 0 —
 safe to call from any skill without a pre-check. See
-`docs/codemux-watcher.md` for the full reference.
+`vexis_agent/addons/codemux/docs/codemux-watcher.md` for the full reference.

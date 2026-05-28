@@ -392,6 +392,14 @@ async def _run() -> None:
     if _loaded_count:
         log.info("addons: loaded %d add-on(s)", _loaded_count)
 
+    # Install add-on-shipped skills into the workspace so the brain's
+    # session-start skill discovery picks them up. Idempotent — only
+    # writes files whose content differs from disk. See
+    # core/addon_skills.py for the layout and provenance-sidecar
+    # convention.
+    from vexis_agent.core.addon_skills import install_addon_skills
+    install_addon_skills(workspace, addon_runtime)
+
     control_socket = ControlSocket(
         default_socket_path(),
         _build_dispatch(

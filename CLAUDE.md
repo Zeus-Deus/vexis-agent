@@ -106,6 +106,15 @@ section — violating them is breaking the codebase.
   call the same pure router. Sandbox capture moves the PNG to
   `/tmp/vexis-screenshot-<ts>.png` so the Telegram path regex stays
   source-agnostic. See `docs/screenshot-routing.md`.
+- **Add-ons own their integration; core stays add-on-agnostic.**
+  No file under `vexis_agent/core/` may import from
+  `vexis_agent.addons.*`. Add-ons register via `PluginContext`
+  hooks (telegram_command, dispatch_handler, watcher_source,
+  header_block, skill, etc.) — never by patching core. Guarded
+  by `tests/test_codemux_extraction_invariant.py`. The one
+  sanctioned exception is the watcher's back-compat re-export of
+  `UNAVAILABLE_MESSAGE` from the codemux add-on, allowlisted in
+  the test.
 
 ## Model selection
 
@@ -278,23 +287,14 @@ turns remain visible to the learning curator.
 
 **Pointers:** `docs/file-mutation-verifier.md`.
 
-## Codemux orchestration watcher
+## Add-on system
 
-`vexis-watch register` enrolls a long-running Codemux workspace
-(today; raw PTY + tmux plugins land later). A polling loop reads
-recent terminal bytes via the Codemux MCP, content-hash diffs them,
-and fires ONE Telegram ping when the inner agent goes idle for
-`idle_after_seconds` (default 30s). Oscillation debounced with a
-60s window so a flickering agent doesn't spam the chat. Per-session
-system-prompt header is one short line — `Active Codemux work: N
-workspaces — run 'vexis-watch status' for details.` — scales flat.
+Vexis features that aren't part of core ship as add-ons under
+`vexis_agent/addons/<name>/`. Each add-on is a folder with
+`addon.yaml` + `__init__.py` defining `register(ctx)`. Codemux is
+the first bundled add-on; future watcher sources / dashboards /
+slash commands plug in the same way.
 
-Conditional activation: the controller, /codemux slash command,
-and header injection are all wired only when the user has the
-`codemux` MCP in `~/.vexis/mcp-servers.yaml`. Absent → zero cost,
-`vexis-watch` exits 0 with a clear message. Sources plug in by
-subclassing `core.watcher.sources.Source` and calling
-`register_source`; the registry, poller, and notification code
-never change.
-
-**Pointers:** `docs/codemux-watcher.md`.
+**Pointers:** `docs/addons.md` (full author guide) ·
+`vexis_agent/addons/codemux/docs/codemux-watcher.md` (codemux
+specifics).

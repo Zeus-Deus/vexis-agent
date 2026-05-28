@@ -115,7 +115,7 @@ vexis_agent = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "vexis_agent/addons"]
 # Repo root on sys.path so `from scripts.* import ...` resolves under
 # CI's pip-install-of-the-package layout (scripts/ is excluded from
 # the wheel — see [tool.setuptools.packages.find].exclude — but the
