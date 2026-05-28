@@ -169,7 +169,7 @@ def acquire_daemon_lock(pid_path: Path | None = None) -> int:
     return fd
 
 
-async def _run() -> None:
+async def _run() -> bool:
     config = load_config()
     setup_logging(config.log_level)
 
@@ -687,6 +687,11 @@ async def _run() -> None:
         await control_socket.stop()
         await background_tasks.shutdown()
         await browser_manager.stop()
+    # By here every socket the daemon owns (control socket, dashboard,
+    # Telegram long-poll) is closed, so a re-exec'd image can re-bind
+    # cleanly. ``main()`` performs the execv when this is True; a normal
+    # SIGTERM/SIGINT shutdown leaves it False and the process exits.
+    return bool(getattr(transport, "_restart_requested", False))
 
 
 def _resolve_web_dist() -> Path:
@@ -1148,13 +1153,65 @@ def _build_dispatch(
     return dispatch
 
 
+def _restart_argv() -> list[str]:
+    """argv for the in-place daemon re-exec.
+
+    Re-exec via ``python -m vexis_agent.cli run`` — byte-for-byte the
+    command the systemd unit's ``ExecStart`` uses (see
+    ``daemon/systemd.py``), so the restart lands on the same battle-
+    tested launch path rather than reusing ``sys.argv`` (which differs
+    across the console script, ``python -m``, and systemd). Verified to
+    reach real daemon startup (it fails only on missing secrets, never on
+    module resolution). Pure + side-effect-free so it's unit-testable
+    without execv."""
+    return [sys.executable, "-m", "vexis_agent.cli", "run"]
+
+
+def _exec_restart() -> None:
+    """Re-exec the daemon in place (same PID) for the /restart command.
+
+    Called by ``main()`` only after ``_run()``'s graceful teardown has
+    closed the control socket, dashboard, and Telegram polling, so the
+    fresh image re-binds cleanly. The PID-lock fd is O_CLOEXEC (Python
+    fds are non-inheritable since PEP 446), so the flock releases at the
+    execv boundary and the new image re-acquires it; the PID is
+    unchanged, so the lock's stale-vs-alive check (``existing ==
+    getpid()``) passes rather than tripping the already-running guard.
+    Sessions live on disk, so the chat resumes on the next message —
+    with whatever brain CLI version / model / ``brain.kind`` is now
+    configured. Under systemd the MainPID is preserved, so the unit
+    stays active across the swap.
+
+    ``os.execv`` only returns if it FAILS (it never returns on success —
+    the image is replaced). On the rare failure (e.g. a vanished
+    interpreter) we log loudly and re-raise so the process exits
+    non-zero: under systemd that trips ``Restart=on-failure`` and the
+    unit respawns within ``RestartSec``, so the daemon never ends up
+    silently dead-but-not-responding. (A foreground ``vexis-agent run``
+    has no supervisor, so the loud log is the user's signal.)"""
+    argv = _restart_argv()
+    log.info("Re-executing daemon for /restart (pid=%d): %s", os.getpid(), argv)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.execv(sys.executable, argv)
+    except OSError:
+        log.exception(
+            "Daemon re-exec FAILED (pid=%d) — process will exit non-zero so "
+            "a supervisor (systemd Restart=on-failure) can respawn it.",
+            os.getpid(),
+        )
+        raise
+
+
 def main() -> None:
     """Daemon entry. Used by ``python -m vexis_agent.main``, by the
     ``vexis-agent run`` Typer command, and by direct ``python main.py``
     invocations during dev. Pre-Phase-2 callers expect side-effects on
     invocation, not a returned coroutine — keep that contract."""
+    restart_requested = False
     try:
-        asyncio.run(_run())
+        restart_requested = asyncio.run(_run())
     except DaemonAlreadyRunning as exc:
         # Distinct exit code so a supervisor (systemd, nohup loop,
         # whatever) can tell "another instance owns this" apart from
@@ -1167,7 +1224,12 @@ def main() -> None:
         print(f"vexis-agent: {exc}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
-        pass
+        return
+    if restart_requested:
+        # Never returns — replaces the process image. Must run AFTER
+        # asyncio.run() has fully unwound the loop so no fd survives
+        # except the (CLOEXEC) lock fd, which the execv drops for us.
+        _exec_restart()
 
 
 if __name__ == "__main__":
