@@ -552,6 +552,16 @@ export interface ModelSubsystemRow {
   findings: ModelValidationFinding[];
 }
 
+export interface ModelForegroundRow {
+  // Raw models.brain value, or null when unset (= account default).
+  configured: string | null;
+  // Native model id the foreground (chat) turn receives. null = no
+  // --model flag passed (the brain's account default).
+  resolved_model_id: string | null;
+  // Validator findings for the foreground model (rule 8 hits).
+  findings: ModelValidationFinding[];
+}
+
 export interface ModelTierOverride {
   // User-set value via models.tiers.<brain>.<tier>, or null.
   configured: string | null;
@@ -563,6 +573,9 @@ export interface ModelTierOverride {
 export interface ModelsState {
   // The brain currently active (read-once at daemon startup).
   brain_kind: string;
+  // The foreground (chat) model — models.brain. The one you talk to,
+  // distinct from brain_kind (which agent CLI) and the aux subsystems.
+  foreground: ModelForegroundRow;
   // 8 rows — one per known subsystem in DEFAULT_SUBSYSTEM_TIERS.
   subsystems: ModelSubsystemRow[];
   // Per-tier overrides for the active brain. Day 4 adds an editor.

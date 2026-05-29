@@ -168,12 +168,15 @@ DEAD_KNOB_FIX_TEMPLATE = (
 
 
 # Note ``brain`` is here rather than in ``DEFAULT_SUBSYSTEM_TIERS``
-# because it's a foreground-display-only knob (read by
-# ``model_brain()`` for the dashboard, never by ``subsystem_tier``
-# for an aux spawn). The validator treats it as a known special key
-# so ``models.brain: default`` doesn't trip rule 2.
+# because it's the foreground (chat) model knob, not an aux subsystem
+# — it's read by ``model_brain()`` and resolved tier-or-raw into the
+# ``--model`` flag the foreground turn passes (see
+# ``MessageHandler._resolve_foreground_model``), NOT by
+# ``subsystem_tier`` for an aux spawn. Listed here so it doesn't trip
+# rule 2 (unknown-subsystem); its model-existence validation is rule 8
+# (:func:`_check_foreground`), which mirrors rules 4/5/6.
 LEGACY_TOP_LEVEL_KEYS: frozenset[str] = frozenset({
-    "brain",        # foreground-display only
+    "brain",        # foreground (chat) model knob — validated by rule 8
     "subsystems",   # new-schema sub-block
     "tiers",        # per-brain tier override sub-block
 })
@@ -473,6 +476,108 @@ def _check_per_subsystem(
     return findings
 
 
+def _check_foreground(
+    config: dict,
+    brain_kind: str,
+    available_models_per_brain: dict[str, set[str]] | None,
+) -> list[ValidationFinding]:
+    """Rule 8: foreground (chat) model validity — ``models.brain``.
+
+    ``models.brain`` drives the foreground turn (the model you chat
+    with). It's resolved tier-or-raw like a subsystem and passed as
+    ``--model`` when non-None (see
+    ``MessageHandler._resolve_foreground_model``). Before the
+    model-switching UX work it was display-only and exempt here; now a
+    bogus value breaks every chat turn, so it earns the same
+    model-existence checks subsystems get (rules 4/5/6). ``default`` /
+    unset resolves to ``None`` (account default) and fires nothing.
+
+    Findings carry ``subsystem="brain"`` so the resolution table can
+    attach them to the foreground row (see :func:`build_resolution_table`).
+    """
+    findings: list[ValidationFinding] = []
+    models = config.get("models") if isinstance(config, dict) else None
+    models_section = models if isinstance(models, dict) else {}
+
+    raw = models_section.get("brain")
+    configured = (
+        raw.strip() if isinstance(raw, str) and raw.strip() else None
+    )
+    # Unset or explicit ``default`` → account default; nothing to check.
+    if configured is None or configured.lower() == "default":
+        return findings
+
+    resolved = model_for_tier_from_config(
+        models_section, brain_kind, configured,
+    )
+    if resolved is None:
+        return findings
+
+    discovered = (
+        available_models_per_brain.get(brain_kind, set())
+        if available_models_per_brain
+        else set()
+    )
+
+    # Rule 4-analog: opencode requires provider/model shape.
+    if brain_kind == "opencode" and "/" not in resolved:
+        findings.append(
+            ValidationFinding(
+                severity="error",
+                subsystem="brain",
+                problem=(
+                    f"foreground (models.brain) resolves to bare alias "
+                    f"{resolved!r} on opencode; the chat turn would fail "
+                    f"with 'Model not found: {resolved}/.'."
+                ),
+                suggested_fix=OPENCODE_FORMAT_FIX_TEMPLATE.format(
+                    model_id=resolved, subsystem="brain",
+                ),
+            )
+        )
+        return findings
+
+    # Rule 5-analog: claude-code with provider/model shape is suspicious.
+    if brain_kind == "claude-code" and "/" in resolved:
+        findings.append(
+            ValidationFinding(
+                severity="warning",
+                subsystem="brain",
+                problem=(
+                    f"foreground (models.brain) resolves to {resolved!r} "
+                    f"(provider/model shape) on claude-code; unusual."
+                ),
+                suggested_fix=CLAUDE_CODE_FORMAT_FIX_TEMPLATE.format(
+                    model_id=resolved,
+                ),
+            )
+        )
+
+    # Rule 6-analog: available-models membership.
+    if (
+        discovered
+        and resolved not in discovered
+        and resolved not in ABSTRACT_TIERS
+    ):
+        severity = "error" if brain_kind == "opencode" else "warning"
+        findings.append(
+            ValidationFinding(
+                severity=severity,
+                subsystem="brain",
+                problem=(
+                    f"foreground (models.brain) resolves to {resolved!r} "
+                    f"but that id isn't in the discovered set for "
+                    f"{brain_kind}."
+                ),
+                suggested_fix=UNKNOWN_MODEL_FIX_TEMPLATE.format(
+                    model_id=resolved, brain_kind=brain_kind,
+                ),
+            )
+        )
+
+    return findings
+
+
 def _check_dead_knobs(
     config: dict, brain_kind: str,
 ) -> list[ValidationFinding]:
@@ -549,6 +654,11 @@ def validate_models_config(
     findings.extend(_check_known_subsystems(config, brain_kind))
     findings.extend(
         _check_per_subsystem(
+            config, brain_kind, available_models_per_brain,
+        )
+    )
+    findings.extend(
+        _check_foreground(
             config, brain_kind, available_models_per_brain,
         )
     )
@@ -670,6 +780,11 @@ def build_resolution_table(
 
         {
             "brain_kind": "claude-code",
+            "foreground": {                 # the chat model (models.brain)
+                "configured": "sonnet",     # raw value or None (unset)
+                "resolved_model_id": "sonnet",  # None = account default
+                "findings": [...],
+            },
             "subsystems": [
                 {
                     "name": "curator",
@@ -787,6 +902,34 @@ def build_resolution_table(
             "default": default_map.get(tier),
         }
 
+    # Foreground (chat) model row — ``models.brain``. Distinct from the
+    # subsystem rows (those are aux spawns) and from ``brain.kind``
+    # (which agent CLI). ``configured`` is the raw value (None when
+    # unset); ``resolved_model_id`` is None for unset/``default`` (=
+    # account default / no ``--model`` flag). Findings come from rule 8
+    # (:func:`_check_foreground`), bucketed under subsystem="brain".
+    fg_raw = models_section.get("brain")
+    fg_configured = (
+        fg_raw.strip() if isinstance(fg_raw, str) and fg_raw.strip() else None
+    )
+    # The ``default`` sentinel is semantically identical to unset (both
+    # = the brain's account default, no --model flag). Normalize it to
+    # None so every surface renders the clean "(default)" state with no
+    # spurious reset affordance — the shipped config.example.yaml writes
+    # ``brain: default`` literally, so this is the common case.
+    if fg_configured is not None and fg_configured.lower() == "default":
+        fg_configured = None
+    fg_resolved = model_for_tier_from_config(
+        models_section, brain_kind, fg_configured,
+    )
+    foreground = {
+        "configured": fg_configured,
+        "resolved_model_id": fg_resolved,
+        "findings": [
+            _finding_dict(f) for f in by_subsystem.get("brain", [])
+        ],
+    }
+
     # Whole-config findings (subsystem=None) — brain.kind validity,
     # unknown-legacy-key warnings, etc.
     global_findings = [
@@ -807,6 +950,7 @@ def build_resolution_table(
 
     return {
         "brain_kind": brain_kind,
+        "foreground": foreground,
         "subsystems": subsystem_rows,
         "tier_overrides": tier_overrides,
         "brain_inventory": sorted(VALID_BRAIN_KINDS),

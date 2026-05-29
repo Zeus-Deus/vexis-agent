@@ -21,7 +21,7 @@ for the recommended path).
 | `models.subsystems.<name>` | str | NEW (Phase B+) per-subsystem tier override. Value is one of `tiny` / `small` / `medium` / `large`, OR a raw model id for power users. Wins over the legacy `models.<name>` key when both are set. | Hot |
 | `models.tiers.<brain-kind>.<tier>` | str | Per-brain tier→native-id override. Example: `models.tiers.opencode.large: openai/gpt-4o`. | Hot |
 | `models.<subsystem-name>` | str | LEGACY raw-string passthrough (pre-Phase-B). Works on claude-code via passthrough; breaks on opencode (which requires `provider/model` shape). The slash + dashboard surface a rule-4 warning when this combo would crash. See [`docs/migration.md`](migration.md). | Hot (when valid) |
-| `models.brain` | str | Foreground-display only. The dashboard renders this in the resolution table; the foreground turn never passes `--model` to the brain CLI. | Hot for display |
+| `models.brain` | str | **Foreground (chat) model** — the model you talk to. Resolved tier-or-raw like a subsystem and passed as `--model` on the foreground turn (`MessageHandler._resolve_foreground_model`). `default` / unset → no `--model` flag → the brain's account default. Settable via `/model set foreground` and the dashboard's Foreground (chat) row. Acute on opencode, which has no meaningful account default. Per-turn overrides (voice, computer-use) still win. | Hot (per turn) |
 | `model_ux.enabled` | bool | Gates the `/model` slash command and the dashboard's edit affordances. Default `true` (Day 5 release flip). Set `false` to silence both surfaces without code changes. | Restart required |
 
 ### Why `brain.kind` needs a restart
@@ -45,9 +45,13 @@ the literal restart command in the suggested-fix text.
 `core/yaml_config.py:_read_raw` — no module-level cache). Every aux
 spawn (curator, judges, extractors, classifier) goes through
 `brain.spawn_aux(prompt, model_tier=subsystem_tier(name))`, so the
-next aux call after your edit sees the new value. Foreground turns
-don't pass `--model` (use the brain's account default), so they're
-unaffected by tier changes.
+next aux call after your edit sees the new value. The foreground
+(chat) turn resolves `models.brain` the same way — read fresh each
+turn via `MessageHandler._resolve_foreground_model`, so editing the
+chat model hot-reloads at the next turn. Subsystem *tier* changes
+don't affect the foreground turn (it reads `models.brain`, not the
+per-subsystem tiers); `models.brain: default`/unset keeps the old
+"no `--model` flag, use the brain's account default" behavior.
 
 ## Why model name is the primary input now
 

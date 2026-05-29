@@ -402,6 +402,57 @@ def test_set_subsystem_unknown_name_refused(
 
 
 # ──────────────────────────────────────────────────────────────────
+# /model set foreground — the chat model (models.brain)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_status_shows_foreground_line(transport, model_ux_on, vexis_home):
+    """The bare /model status renders the foreground (chat) model
+    line — distinct from the subsystem rows and the brain kind."""
+    upd, _bot, msg = _update("/model")
+    asyncio.run(transport._on_model(upd, _ctx()))
+    assert "foreground (chat)" in msg.reply_log[0]
+
+
+def test_set_foreground_writes_models_brain(
+    transport, model_ux_on, vexis_home,
+):
+    """``/model set foreground <model>`` writes the top-level
+    models.brain knob, not a subsystems entry."""
+    upd, _bot, msg = _update("/model set foreground sonnet")
+    asyncio.run(transport._on_model(upd, _ctx("set", "foreground", "sonnet")))
+    import yaml
+    parsed = yaml.safe_load(
+        (vexis_home / "config.yaml").read_text(encoding="utf-8")
+    )
+    assert parsed["models"]["brain"] == "sonnet"
+    assert "subsystems" not in (parsed.get("models") or {})
+    assert any("foreground" in r and "sonnet" in r for r in msg.reply_log)
+
+
+def test_set_foreground_no_value_shows_usage(
+    transport, model_ux_on, vexis_home,
+):
+    upd, _bot, msg = _update("/model set foreground")
+    asyncio.run(transport._on_model(upd, _ctx("set", "foreground")))
+    assert "chat model" in msg.reply_log[0]
+    assert not (vexis_home / "config.yaml").exists()
+
+
+def test_reset_foreground_drops_models_brain(
+    transport, model_ux_on, vexis_home,
+):
+    _seed_config(vexis_home / "config.yaml", "models:\n  brain: sonnet\n")
+    upd, _bot, msg = _update("/model reset foreground")
+    asyncio.run(transport._on_model(upd, _ctx("reset", "foreground")))
+    import yaml
+    parsed = yaml.safe_load(
+        (vexis_home / "config.yaml").read_text(encoding="utf-8")
+    ) or {}
+    assert "brain" not in (parsed.get("models") or {})
+
+
+# ──────────────────────────────────────────────────────────────────
 # /model set <subsystem> — validator refuses on errors
 # ──────────────────────────────────────────────────────────────────
 

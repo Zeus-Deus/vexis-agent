@@ -46,9 +46,11 @@ Canonical schema reference (every block is optional; missing file
     # to opencode: minimal config" for the legacy raw-string
     # back-compat shim and migration recipe.
     models:
-      brain: default              # foreground display only;
-                                  # foreground spawn never passes
-                                  # --model
+      brain: default              # foreground (chat) model — the one
+                                  # you talk to. tier-or-raw; default/
+                                  # unset = brain account default (no
+                                  # --model). /model set foreground or
+                                  # the dashboard set it.
       subsystems:                 # NEW (Phase B+): abstract tiers
         learning_review: small
         learning_triage: tiny

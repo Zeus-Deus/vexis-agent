@@ -203,6 +203,60 @@ def test_post_set_writes_subsystem(client: TestClient, cfg_path: Path):
     assert parsed["models"]["subsystems"]["goal_judge"] == "large"
 
 
+def test_post_set_writes_foreground(client: TestClient, cfg_path: Path):
+    """The 'foreground' target writes the top-level models.brain knob
+    (the chat model), NOT a models.subsystems.<name> entry."""
+    r = client.post(
+        "/api/v1/models/set",
+        json={"subsystem": "foreground", "value": "sonnet"},
+        headers=_hdr(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["subsystem"] == "foreground"
+    assert body["value"] == "sonnet"
+    assert body["resolved_model_id"] == "sonnet"
+
+    parsed = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert parsed["models"]["brain"] == "sonnet"
+    # Did NOT leak into the subsystems block.
+    assert "subsystems" not in (parsed.get("models") or {})
+
+
+def test_post_set_foreground_validator_refuses(
+    client: TestClient, cfg_path: Path,
+):
+    """A bare alias as the foreground model on opencode is rejected
+    pre-write (rule 8) — the chat turn would otherwise crash."""
+    _seed_config(cfg_path, "brain:\n  kind: opencode\n")
+    r = client.post(
+        "/api/v1/models/set",
+        json={"subsystem": "foreground", "value": "sonnet"},
+        headers=_hdr(),
+    )
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "bare alias" in detail
+    # No write — models.brain not set.
+    parsed = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert "brain" not in (parsed.get("models") or {})
+
+
+def test_post_reset_foreground(client: TestClient, cfg_path: Path):
+    """Reset 'foreground' drops models.brain back to account default."""
+    _seed_config(cfg_path, "models:\n  brain: sonnet\n")
+    r = client.post(
+        "/api/v1/models/reset",
+        json={"subsystem": "foreground"},
+        headers=_hdr(),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["scope"] == "foreground (chat)"
+    parsed = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    assert "brain" not in (parsed.get("models") or {})
+
+
 def test_post_set_unknown_subsystem_400(client: TestClient):
     r = client.post(
         "/api/v1/models/set",

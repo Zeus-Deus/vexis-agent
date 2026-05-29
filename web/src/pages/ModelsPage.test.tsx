@@ -30,6 +30,11 @@ function buildFixture(
 ): ModelsState {
   return {
     brain_kind: "claude-code",
+    foreground: {
+      configured: null,
+      resolved_model_id: null,
+      findings: [],
+    },
     subsystems: [
       {
         name: "coherence_judge",
