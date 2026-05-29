@@ -950,7 +950,16 @@ def _build_dispatch(
                     "error": "'index' must be an integer",
                     "kind": "BadRequest",
                 }
-            return await browser.click(index)
+            return await browser.click(index, bool(args.get("js", False)))
+        if op == "browser_read":
+            sel = args.get("selector")
+            if sel is not None and not isinstance(sel, str):
+                return {
+                    "ok": False,
+                    "error": "'selector' must be a string",
+                    "kind": "BadRequest",
+                }
+            return await browser.read(sel)
         if op == "browser_type":
             try:
                 index = int(args.get("index"))

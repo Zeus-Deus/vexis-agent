@@ -188,6 +188,68 @@ def test_e2e_navigate_snapshot_click_type_screenshot(tmp_path):
 
 
 @pytest.mark.skipif(not E2E, reason="set VEXIS_BROWSER_E2E=1 to run real browser e2e")
+def test_e2e_read_recovers_text_and_js_click_beats_overlay(tmp_path):
+    # The #29 gap: a results page rendered as plain <div> text plus a
+    # full-screen overlay. snapshot sees ~nothing; read() recovers it; a
+    # normal click is swallowed by the overlay while a --js click fires.
+    import asyncio
+    import re
+
+    page_html = tmp_path / "catalog.html"
+    page_html.write_text(
+        "<html><body>"
+        "<div id='results'>"
+        "<div class='row'>11427512300 Oliefilterelement</div>"
+        "<div class='row'>34116858652 Remblok set voor</div>"
+        "</div>"
+        "<button id='accept' onclick=\"document.title='ACCEPTED'\">Accept</button>"
+        "<div style='position:fixed;top:0;left:0;right:0;bottom:0;"
+        "background:rgba(0,0,0,.4);z-index:99999'></div>"
+        "</body></html>"
+    )
+    url = page_html.as_uri()
+
+    async def go():
+        mgr = SessionManager()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            nav = await bt.navigate(url)
+            assert nav["ok"] is True, nav
+            # OE numbers live in non-interactive divs -> absent from snapshot
+            assert "11427512300" not in nav["snapshot"]
+
+            read = await bt.read()
+            assert read["ok"] is True, read
+            assert "11427512300" in read["text"]
+            assert "34116858652" in read["text"]
+            assert read["chars"] == len(read["text"])
+            assert read["selector"] == "body"
+
+            # scoped read by selector
+            scoped = await bt.read("#results")
+            assert scoped["ok"] is True and "Oliefilterelement" in scoped["text"]
+
+            # missing selector -> clean error, not a 120s hang
+            miss = await bt.read("#nope")
+            assert miss["ok"] is False
+
+            snap = await bt.snapshot()
+            m = re.search(r"\[(\d+)\]<button", snap["snapshot"])
+            assert m, snap["snapshot"]
+            idx = int(m.group(1))
+
+            # normal click is intercepted by the overlay -> times out (error)
+            blocked = await bt.click(idx)
+            assert blocked["ok"] is False, blocked
+            # js click goes straight to the element
+            assert (await bt.click(idx, js=True))["ok"] is True
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+@pytest.mark.skipif(not E2E, reason="set VEXIS_BROWSER_E2E=1 to run real browser e2e")
 def test_e2e_cookie_persists_across_restart(tmp_path, monkeypatch):
     # Point the profile dir at a temp location and prove a cookie set in
     # one session survives a full session teardown + restart.

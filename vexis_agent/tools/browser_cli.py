@@ -91,8 +91,15 @@ def _cmd_snapshot(full: bool) -> int:
     return _print_and_exit(_send("browser_snapshot", {"full": full}))
 
 
-def _cmd_click(index: int) -> int:
-    return _print_and_exit(_send("browser_click", {"index": index}))
+def _cmd_click(index: int, js: bool) -> int:
+    return _print_and_exit(_send("browser_click", {"index": index, "js": js}))
+
+
+def _cmd_read(selector: str | None) -> int:
+    args: dict = {}
+    if selector:
+        args["selector"] = selector
+    return _print_and_exit(_send("browser_read", args))
 
 
 def _cmd_type(index: int, text: str, clear: bool) -> int:
@@ -146,6 +153,30 @@ def main() -> int:
 
     p_click = sub.add_parser("click", help="Click element by index.")
     p_click.add_argument("index", type=int)
+    p_click.add_argument(
+        "--js",
+        action="store_true",
+        help=(
+            "Fire the element's click() from JS, bypassing actionability "
+            "checks. Use when a normal click hangs on a cookie/consent "
+            "overlay that intercepts the hit-test."
+        ),
+    )
+
+    p_read = sub.add_parser(
+        "read",
+        help=(
+            "Return the rendered text of the page (or a CSS selector). Fast, "
+            "lossless alternative to a screenshot for div/table-heavy result "
+            "pages the snapshot DSL leaves empty."
+        ),
+    )
+    p_read.add_argument(
+        "selector",
+        nargs="?",
+        default=None,
+        help="Optional CSS selector; defaults to the whole <body>.",
+    )
 
     p_type = sub.add_parser("type", help="Type text into element by index.")
     p_type.add_argument("index", type=int)
@@ -202,7 +233,9 @@ def main() -> int:
     if args.cmd == "snapshot":
         return _cmd_snapshot(args.full)
     if args.cmd == "click":
-        return _cmd_click(args.index)
+        return _cmd_click(args.index, args.js)
+    if args.cmd == "read":
+        return _cmd_read(args.selector)
     if args.cmd == "type":
         return _cmd_type(args.index, args.text, args.clear)
     if args.cmd == "press":

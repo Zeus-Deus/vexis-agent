@@ -128,12 +128,54 @@ class BrowserTools:
             self._update_current_page(result)
         return result
 
-    async def click(self, index: int) -> dict[str, Any]:
+    async def click(self, index: int, js: bool = False) -> dict[str, Any]:
         if not isinstance(index, int):
             return error_payload("'index' must be an integer")
-        return await self._run_indexed_action(
-            "click", index, lambda loc: loc.click()
-        )
+        # js=True fires the element's own click() handler from JS, bypassing
+        # Playwright's actionability checks. A normal click is hit-tested
+        # against the topmost element at the target point, so a full-screen
+        # consent/cookie overlay swallows it and the click times out; the JS
+        # path goes straight to the element. Use it when a normal click hangs
+        # on an overlay-covered page.
+        if js:
+            op = lambda loc: loc.evaluate("el => el.click()")
+        else:
+            op = lambda loc: loc.click()
+        return await self._run_indexed_action("click", index, op)
+
+    async def read(self, selector: str | None = None) -> dict[str, Any]:
+        """Return the rendered text of ``selector`` (default ``body``).
+
+        The snapshot DSL only serializes interactive/visible elements, so a
+        page that renders its payload as plain ``<div>``/``<tr>`` text comes
+        back nearly empty and the brain wrongly falls back to a screenshot.
+        ``read`` is the fast, lossless escape hatch: ``page.inner_text`` of
+        the body (or a CSS selector) returns the same text a vanilla driver
+        would, in a few ms, no vision round-trip.
+        """
+        if selector is not None and not isinstance(selector, str):
+            return error_payload("'selector' must be a string")
+        sel = (selector or "").strip() or "body"
+
+        async def op(page: Any) -> dict[str, Any]:
+            if sel != "body":
+                if await page.locator(sel).count() == 0:
+                    raise ValueError(f"no element matches selector {sel!r}")
+                text = await page.locator(sel).first.inner_text()
+            else:
+                text = await page.inner_text("body")
+            text = text or ""
+            return {
+                "text": text,
+                "selector": sel,
+                "chars": len(text),
+                "url": page.url or "",
+            }
+
+        result = await self._run_action("read", op)
+        if result.get("ok"):
+            self._update_current_page(result)
+        return result
 
     async def type(
         self, index: int, text: str, clear: bool = True
