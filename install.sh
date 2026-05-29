@@ -371,12 +371,12 @@ if [[ "$DRY_RUN" -ne 1 ]]; then
         if "$venv_py" -m camoufox fetch >/dev/null 2>&1; then
             ok "Camoufox browser installed."
         else
-            warn "Camoufox fetch failed — run '${venv_py} -m camoufox fetch' later."
-            info "Browser actions stay unavailable until the binary is present."
+            warn "WARNING: camoufox browser download failed. Run"
+            warn "'${venv_py} -m camoufox fetch' manually before using vexis-browse."
         fi
     else
-        warn "Could not locate the vexis-agent venv to fetch Camoufox."
-        info "Run 'python -m camoufox fetch' in that venv to enable browsing."
+        warn "WARNING: camoufox browser download failed (vexis-agent venv not found)."
+        warn "Run 'python -m camoufox fetch' in that venv before using vexis-browse."
     fi
 fi
 
