@@ -26,9 +26,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any
-
-from scrapling.fetchers import AsyncStealthySession  # noqa: E402
+from typing import TYPE_CHECKING, Any
 
 from vexis_agent.core.logging import redact_sensitive_logs
 from vexis_agent.tools.browser.profile import (
@@ -37,6 +35,9 @@ from vexis_agent.tools.browser.profile import (
     inactivity_timeout_seconds,
     session_kwargs,
 )
+
+if TYPE_CHECKING:  # import only for type hints — see acquire() for why
+    from scrapling.fetchers import AsyncStealthySession
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,16 @@ class SessionManager:
         called ``window.close()``); recreates the whole session if it was
         swept while idle.
         """
+        # Lazy import: scrapling 0.3.x evaluates camoufox_version() at module
+        # import time, which raises FileNotFoundError until `camoufox fetch`
+        # has downloaded the browser binary. Importing at module top would
+        # then break importing the whole browser package — and transitively
+        # the daemon (web_server/main import it) — on a host where the binary
+        # isn't fetched yet. Deferring it here keeps the package importable
+        # everywhere; a missing binary instead surfaces as a clean error on
+        # the first actual navigate (callers wrap acquire() and normalize it).
+        from scrapling.fetchers import AsyncStealthySession
+
         async with self._start_lock:
             if self._session is None:
                 kwargs = session_kwargs()
