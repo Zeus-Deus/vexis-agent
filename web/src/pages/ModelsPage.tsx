@@ -1048,8 +1048,8 @@ function AvailableModelsHint({
 }
 
 const CLAUDE_CODE_HINT = [
-  "Aliases: sonnet, opus, haiku",
-  "Full names: claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-1",
+  "Aliases: sonnet, opus, haiku (track the current model — no pinning)",
+  "Full names are version-pinned; hit refresh for your account's live list",
   "Reference: https://docs.anthropic.com/claude/models",
 ];
 const OPENCODE_HINT = [

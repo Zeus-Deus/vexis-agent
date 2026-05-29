@@ -4191,9 +4191,10 @@ class TelegramTransport:
         if target_brain == "claude-code":
             return (
                 "claude-code accepts:\n"
-                "  Aliases: sonnet, opus, haiku\n"
-                "  Full names: claude-haiku-4-5, claude-sonnet-4-6, "
-                "claude-opus-4-1, etc.\n"
+                "  Aliases: sonnet, opus, haiku (track the current "
+                "model — no pinning)\n"
+                "  Full names are version-pinned; /model refresh for "
+                "your account's live list\n"
                 "  Reference: https://docs.anthropic.com/claude/models"
             )
         if target_brain == "opencode":
