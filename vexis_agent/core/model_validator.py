@@ -912,6 +912,13 @@ def build_resolution_table(
     fg_configured = (
         fg_raw.strip() if isinstance(fg_raw, str) and fg_raw.strip() else None
     )
+    # The ``default`` sentinel is semantically identical to unset (both
+    # = the brain's account default, no --model flag). Normalize it to
+    # None so every surface renders the clean "(default)" state with no
+    # spurious reset affordance — the shipped config.example.yaml writes
+    # ``brain: default`` literally, so this is the common case.
+    if fg_configured is not None and fg_configured.lower() == "default":
+        fg_configured = None
     fg_resolved = model_for_tier_from_config(
         models_section, brain_kind, fg_configured,
     )
