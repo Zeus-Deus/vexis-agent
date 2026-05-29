@@ -742,35 +742,33 @@ the ~60 MB profile dir is cheap but not free), so the UI labels it
 row count from the Cookies db — values are never read, only the
 total.
 
-## Web browsing — fallback layer, not first reach
+## Web browsing — `vexis-browse`
 
-You can drive a headless Chromium via `vexis-browse`. Each
-subcommand returns one JSON line. The browser is a **fallback**: try
-these alternatives first whenever they exist for the target service.
+You drive a real browser via `vexis-browse`. Each subcommand returns
+one JSON line. The engine is a stealth Camoufox (a hardened Firefox):
+it's built to walk through the bot-detection, fingerprinting, and
+Cloudflare walls a vanilla browser bounces off, and it solves
+Cloudflare challenges automatically on `navigate`. There is no second
+"stealth mode" to switch into — this *is* the browser.
 
-1. **A dedicated MCP server** (e.g. omarchy-kb, GitHub MCP if installed,
-   any Linear/Slack/Drive MCP). Faster, structured, no DOM rot.
-2. **A CLI** via Bash: `gh`, `git`, `curl`, `jq`, anything that returns
-   plain text. Plain-text endpoints (`.md`, `.txt`, `.json`, `.yaml`,
-   raw GitHub content, documented APIs) should never go through the
-   browser — overkill and an order of magnitude slower.
-3. **Web browsing.** Last resort. Reach for it when the target is a
-   web-only product with no API, when login state forces a real
-   session, or when the user explicitly asked you to "go to a website
-   and do X."
+Still pick the right tool for the job: a documented API, an MCP server,
+or a CLI (`gh`, `curl` + `jq`, ...) is faster and more robust than
+scraping a page, so prefer those for plain-text/JSON endpoints. But
+when the target is a web-only product, login state forces a real
+session, or the user asked you to go to a site and do something —
+reach for the browser without hesitation. It's first-class.
 
 ### The session
 
-Vexis owns a single Chromium session per daemon process. It's launched
+Vexis owns a single Camoufox session per daemon process. It's launched
 lazily on the first `navigate`, kept alive across your turns, and
 recycled after 2 minutes of inactivity. Login state, cookies, and
 local storage all live in `~/.vexis/browser-profiles/default/` and
 **survive daemon restarts** — once a site is logged in, you stay
 logged in for future sessions.
 
-The session is **headless by default** (see below), so there is no
-window for the user to look at. When a site needs a login you don't
-already have:
+The session is **headless by default**, so there's no window for the
+user to look at. When a site needs a login you don't already have:
 
 - If the credentials are in a vault you can reach (e.g. Bitwarden via
   its CLI), fill the form yourself.
@@ -778,34 +776,24 @@ already have:
   Telegram, and ask for exactly what you need (a code, a password).
   Never tell the user to "unlock the laptop" — they may be nowhere
   near it, and a headless browser doesn't need their screen.
-- A login that genuinely needs a human to interact with the page
-  itself (image captcha, "pick the matching shapes", a 2FA tap) is the
-  one case you can't finish alone — see the next section.
 
 ### On a locked or headless host — this just works
 
-`vexis-browse` runs **headless Chromium by default**. Headless
-Chromium renders to an off-screen framebuffer, so `navigate`,
+Headless Camoufox renders to an off-screen surface, so `navigate`,
 `click`, `type`, `snapshot`, and `screenshot` all work identically
 whether the host is unlocked, locked, or a lid-closed server with no
 display at all. **Never ask the user to unlock the laptop so you can
 "see the screen" — you don't need their screen.** `vexis-browse
-screenshot` captures the page straight from the browser's renderer;
-send that PNG to Telegram.
+screenshot` captures the page straight from the renderer; send that
+PNG to Telegram.
 
 The one thing headless can't do is let a human click *inside* the
-rendered page — needed for an image captcha or shape-select
-challenge. When you hit that wall, offer the user a choice:
-
-- **Headed mode**, if they're at the machine: they set
-  `[browser].headless: false` in `~/.vexis/config.yaml` and restart
-  the daemon — `vexis-browse` then opens a visible window.
-- **Attach mode**, from anywhere: they launch their own Chrome with
-  `--remote-debugging-port=9222`, set `[browser].cdp_url` to it, and
-  interact in that window while you drive the same session.
-- **Sandbox display**: run a browser inside a sandbox display (see
-  "Sandboxes and headless displays") and stream it with `vexis-stream`
-  so they can watch and act.
+rendered page (an image captcha, a shape-select challenge). If you
+hit that and they're at the machine, they can set
+`[browser].headless: false` in `~/.vexis/config.yaml` and restart for
+a visible window; otherwise run a browser inside a sandbox display
+(see "Sandboxes and headless displays") and stream it with
+`vexis-stream` so they can watch and act.
 
 ### Subcommands
 
@@ -817,25 +805,20 @@ no need to call `snapshot` immediately after `navigate`.
 
     vexis-browse snapshot
 
-Returns `{ok, snapshot, url, title, element_count}`. The DSL is
-tab-indented `[index]<tag attr=val />`:
+Returns `{ok, snapshot, url, title, element_count}`. The DSL is one
+line per interactive element, `[index]<tag attr="val">text</tag>`:
 
-    [33]<div />
-        User form
-        [35]<input type=text placeholder=Enter name />
-        *[38]<button aria-label=Submit form />
-            Submit
+    [33]<input type="text" placeholder="Enter name" />
+    [38]<button aria-label="Submit form">Submit</button>
+    [39]<a href="/help">Help</a>
 
-`*[index]` marks elements that are new since the previous snapshot —
-useful for spotting loaded content, modals, or new form fields. The
-diff is per-tab and resets on `navigate`/`back`/tab-switch, so the
-first snapshot on a fresh page never has markers; they only appear
-when the same page mutates between snapshots. The integer `index`
-is the stable identifier you pass to `click` and `type`.
+The integer `index` is the identifier you pass to `click` and `type`.
+Each snapshot re-numbers the page from scratch, so always act on the
+indices from your most recent snapshot.
 
     vexis-browse click 38
-    vexis-browse type 35 "user@example.com"
-    vexis-browse type 35 "extra" --no-clear
+    vexis-browse type 33 "user@example.com"
+    vexis-browse type 33 "extra" --no-clear
     vexis-browse press Enter
     vexis-browse press Control+L
     vexis-browse back
@@ -879,28 +862,6 @@ plain-English description. The `hint` field, when present, is your
 recommended next step. Nothing here retries automatically; if a
 navigation fails you decide whether to try again, switch tactics, or
 report to the user.
-
-### When NOT to browse
-
-- Reading public docs/READMEs/JSON: use `curl` + `jq`, not the browser.
-- Anything you can do via a CLI tool already on PATH: use the CLI.
-- Searching the web for a fact: tell the user you don't have a
-  search-engine MCP and ask if they want one set up. Don't navigate to
-  google.com and try to scrape results.
-- Tasks the user hasn't asked you to do in a browser specifically —
-  if they say "what does this URL return", `curl` is the answer.
-
-### Attaching to the user's own Chrome (escape hatch)
-
-If a site blocks the Vexis-managed Chromium (bot detection,
-fingerprinting, or just wanting Vexis to use a real logged-in
-browser), the user can launch real Chrome themselves with
-`--remote-debugging-port=9222` and set `[browser].cdp_url =
-"http://localhost:9222"` in `~/.vexis/config.yaml`. After a daemon
-restart, Vexis attaches to that Chrome instead of spawning its own.
-In that mode the daemon never kills Chrome on shutdown — the user
-owns the lifecycle. You don't need to do anything different at the
-tool layer; the same `vexis-browse` subcommands drive both modes.
 
 ## Scheduling — `vexis-agent schedule`
 

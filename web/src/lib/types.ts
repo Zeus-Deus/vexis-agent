@@ -177,7 +177,7 @@ export interface BrowserSessionInfo {
   started_at: string | null;
   last_activity_at: string | null;
   headless: boolean;
-  attach_mode: "owned-chromium" | "cdp-attach";
+  engine: "camoufox";
 }
 
 export interface BrowserProfileInfo {
@@ -205,8 +205,7 @@ export interface BrowserConfigSnapshot {
   headless: boolean;
   inactivity_timeout_seconds: number;
   action_timeout_seconds: number;
-  chromium_path: string | null;
-  cdp_url: string | null;
+  solve_cloudflare: boolean;
   screenshot_include_base64: boolean;
 }
 

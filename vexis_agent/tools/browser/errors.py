@@ -5,26 +5,16 @@ Two shapes leave this module:
 - Success: ``{"ok": True, ...tool-specific fields...}``
 - Failure: ``{"ok": False, "error": "<one-liner>", "hint": "<optional>"}``
 
-A third soft-hint shape rides on a successful action when the snapshot
-went stale mid-call (``ok: True, snapshot_stale: True, suggestion: ...``)
-— matches browser-use's ``extracted_content`` convention so the brain
-treats it as "snapshot, then retry" instead of an error.
+A third soft-hint shape rides on a successful action when the element
+index handed out by the last snapshot no longer resolves to anything on
+the page (``ok: True, snapshot_stale: True, suggestion: ...``) — the brain
+treats it as "snapshot, then retry" instead of a hard error.
 """
 
 from __future__ import annotations
 
 import asyncio
 from typing import Any
-
-# Stale-index probe pattern (browser_use/tools/service.py emits this
-# verbatim from four call sites — substring is the stable bit).
-_STALE_INDEX_FRAGMENT = "not available - page may have changed"
-
-
-def is_stale_index_hint(extracted_content: str | None) -> bool:
-    if not extracted_content:
-        return False
-    return _STALE_INDEX_FRAGMENT in extracted_content
 
 
 def stale_index_payload(extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -56,4 +46,7 @@ def normalize_exception(exc: BaseException, *, action: str) -> dict[str, Any]:
         )
     name = type(exc).__name__
     msg = str(exc).strip() or name
+    # Playwright stuffs a multi-line "Call log:" into the message; keep
+    # the first line so the brain gets a clean one-liner.
+    msg = msg.splitlines()[0].strip()
     return error_payload(f"{action} failed: {msg}")

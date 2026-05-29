@@ -184,11 +184,7 @@ function SessionHeader({
           <Badge tone={session.headless ? "subtle" : "neutral"}>
             {session.headless ? "headless" : "headed"}
           </Badge>
-          <Badge
-            tone={session.attach_mode === "cdp-attach" ? "accent" : "subtle"}
-          >
-            {session.attach_mode}
-          </Badge>
+          <Badge tone="accent">{session.engine}</Badge>
           {sinceStart !== null && (
             <span className="font-data text-[12.5px] text-[var(--color-fg-2)]">
               <span className="text-[var(--color-fg-dim)] uppercase-tight text-[10px] mr-2">
@@ -228,9 +224,9 @@ function SessionHeader({
           />
         ) : (
           <p className="font-data text-[12px] text-[var(--color-fg-dim)]">
-            No browser session yet. The first navigate launches Chromium —
-            either via the brain (Vexis on Telegram) or via the action
-            above for a manual login.
+            No browser session yet. The first navigate launches the stealth
+            Camoufox browser — either via the brain (Vexis on Telegram) or
+            via the action above for a manual login.
           </p>
         )}
         {actionMessage && (
@@ -371,8 +367,7 @@ function ConfigCard({ config }: { config: BrowserConfigSnapshot }) {
     ["headless", String(config.headless)],
     ["inactivity_timeout", `${config.inactivity_timeout_seconds}s`],
     ["action_timeout", `${config.action_timeout_seconds}s`],
-    ["chromium_path", config.chromium_path ?? "(default)"],
-    ["cdp_url", config.cdp_url ?? "(none)"],
+    ["solve_cloudflare", String(config.solve_cloudflare)],
     ["screenshot_include_base64", String(config.screenshot_include_base64)],
   ];
   return (

@@ -299,19 +299,15 @@ def browser_action_timeout_seconds() -> int:
     )
 
 
-def browser_chromium_path() -> str | None:
-    return _str_or_none(_section("browser").get("chromium_path"))
+def browser_solve_cloudflare() -> bool:
+    """Whether navigation auto-solves Cloudflare challenges. Default True.
 
-
-def browser_cdp_url() -> str | None:
-    """When set, attach to a user-launched Chrome instead of spawning one.
-
-    Example value: ``http://localhost:9222``. The user is responsible
-    for launching Chrome with ``--remote-debugging-port=9222`` and
-    keeping it alive; Vexis will not kill the externally-launched
-    process on shutdown.
+    The Camoufox engine exists to walk through bot walls; solving is on
+    out of the box. Costs time only when a challenge is actually present.
+    Disable via ``[browser].solve_cloudflare: false``.
     """
-    return _str_or_none(_section("browser").get("cdp_url"))
+    raw = _section("browser").get("solve_cloudflare", True)
+    return bool(raw)
 
 
 def learning_enabled() -> bool:
