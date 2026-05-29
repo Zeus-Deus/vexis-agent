@@ -122,6 +122,9 @@ DEFAULT_CURATOR_STALE_AFTER_DAYS = 30
 DEFAULT_CURATOR_ARCHIVE_AFTER_DAYS = 90
 DEFAULT_BROWSER_INACTIVITY_TIMEOUT_SECONDS = 120
 DEFAULT_BROWSER_ACTION_TIMEOUT_SECONDS = 120
+DEFAULT_BROWSER_CAPTCHA_SOLVER = "none"
+# Providers the pluggable captcha-solver layer accepts. "none" disables it.
+VALID_BROWSER_CAPTCHA_SOLVERS = ("none", "capsolver", "twocaptcha")
 DEFAULT_LEARNING_TICK_INTERVAL_MINUTES = 5
 DEFAULT_LEARNING_IDLE_THRESHOLD_MINUTES = 25
 DEFAULT_LEARNING_FAILURE_COOLDOWN_HOURS = 1
@@ -308,6 +311,29 @@ def browser_solve_cloudflare() -> bool:
     """
     raw = _section("browser").get("solve_cloudflare", True)
     return bool(raw)
+
+
+def browser_captcha_solver() -> str:
+    """Selected captcha solver provider: ``none`` | ``capsolver`` |
+    ``twocaptcha``. Default ``none`` (no third-party solving).
+
+    scrapling walks Cloudflare interstitials for free; this knob only governs
+    the paid solver that handles hCaptcha / reCAPTCHA / standalone Turnstile.
+    An unrecognized value falls back to ``none``.
+    """
+    raw = _section("browser").get("captcha_solver", DEFAULT_BROWSER_CAPTCHA_SOLVER)
+    value = str(raw).strip().lower() if raw is not None else DEFAULT_BROWSER_CAPTCHA_SOLVER
+    return value if value in VALID_BROWSER_CAPTCHA_SOLVERS else DEFAULT_BROWSER_CAPTCHA_SOLVER
+
+
+def browser_captcha_solver_api_key() -> str | None:
+    """API key for the selected captcha solver, or ``None``.
+
+    Stored plaintext under ``[browser].captcha_solver_api_key`` in the user's
+    gitignored ``~/.vexis/config.yaml`` (not a committed secret). Never echoed
+    back to the dashboard — the web layer masks it.
+    """
+    return _str_or_none(_section("browser").get("captcha_solver_api_key"))
 
 
 def learning_enabled() -> bool:

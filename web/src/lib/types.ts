@@ -199,6 +199,8 @@ export interface BrowserScreenshotEntry {
   mtime: string;
 }
 
+export type CaptchaProvider = "none" | "capsolver" | "twocaptcha";
+
 export interface BrowserConfigSnapshot {
   profiles_dir: string;
   default_profile: string;
@@ -207,6 +209,15 @@ export interface BrowserConfigSnapshot {
   action_timeout_seconds: number;
   solve_cloudflare: boolean;
   screenshot_include_base64: boolean;
+  captcha_solver: CaptchaProvider;
+  // Masked form only — the raw key never reaches the UI.
+  captcha_solver_key_masked: string;
+}
+
+export interface BrowserCaptchaStatus {
+  provider: CaptchaProvider;
+  configured: boolean;
+  status: "configured" | "not_configured";
 }
 
 export interface BrowserState {
@@ -215,6 +226,22 @@ export interface BrowserState {
   recent_navigations: BrowserNavigationEntry[];
   recent_screenshots: BrowserScreenshotEntry[];
   config: BrowserConfigSnapshot;
+  captcha: BrowserCaptchaStatus;
+}
+
+export interface BrowserCaptchaConfigResponse {
+  ok: boolean;
+  provider: CaptchaProvider;
+  captcha_solver_key_masked: string;
+  backup_path: string | null;
+}
+
+export interface BrowserCaptchaTestResponse {
+  ok: boolean;
+  provider?: CaptchaProvider;
+  balance?: number;
+  low_balance?: boolean;
+  error?: string;
 }
 
 // ---- Learning tab (Step 15) ------------------------------------

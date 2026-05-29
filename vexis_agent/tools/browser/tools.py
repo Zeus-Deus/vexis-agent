@@ -32,6 +32,7 @@ from typing import Any, Awaitable, Callable
 
 from vexis_agent.core import yaml_config
 from vexis_agent.tools.browser import snapshot as snapshot_mod
+from vexis_agent.tools.browser.captcha import apply_captcha
 from vexis_agent.tools.browser.errors import (
     error_payload,
     normalize_exception,
@@ -97,7 +98,17 @@ class BrowserTools:
                     await self._manager.solve_cloudflare(page)
                 except Exception as exc:  # solver is best-effort
                     log.warning("[browser] cloudflare solve note: %s", exc)
-            return await snapshot_mod.render(page)
+            result = await snapshot_mod.render(page)
+            # Pluggable third-party captcha layer (CapSolver / 2Captcha) for
+            # the families scrapling's Cloudflare pass doesn't cover. Detects
+            # the captcha and either solves it (when configured) or attaches a
+            # hint pointing at the dashboard. Best-effort: a solver fault must
+            # not fail a navigation that otherwise loaded.
+            try:
+                result = await apply_captcha(page, target, result)
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("[browser] captcha layer note: %s", exc)
+            return result
 
         result = await self._run_action("navigate", op)
         if result.get("ok"):
