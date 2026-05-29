@@ -141,7 +141,7 @@ def main() -> int:
     p_snap.add_argument(
         "--full",
         action="store_true",
-        help="Reserved (no-op today; browser-use serializes one DSL form).",
+        help="Reserved (no-op today; the snapshot serializes one DSL form).",
     )
 
     p_click = sub.add_parser("click", help="Click element by index.")

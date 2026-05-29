@@ -1,16 +1,19 @@
-"""``BrowserTools`` — the six Phase 2 browser actions.
+"""``BrowserTools`` — the browser actions the brain drives via Bash.
 
-Each method is the in-process implementation behind one
-``browser_*`` op the control socket dispatches. The CLI client
-(``tools.browser_cli``) is the thin shell that gets these results
-back to the brain via JSON over a Unix socket.
+Each method is the in-process implementation behind one ``browser_*`` op
+the control socket dispatches. The CLI client (``tools.browser_cli``) is
+the thin shell that gets these results back to the brain via JSON over a
+Unix socket.
 
-Every method returns a JSON-able dict:
+The engine underneath is scrapling's Camoufox ``StealthySession`` — we
+hold one persistent page (see ``session.SessionManager``) and drive it
+with the Playwright API directly. The public surface and JSON shapes are
+unchanged from the browser-use era:
 
 - success: ``{"ok": True, ...}``
 - failure: ``{"ok": False, "error": "...", "hint": "..."}``
 - soft hint: ``{"ok": True, "snapshot_stale": True, "suggestion": "..."}``
-  (only on click/type/press/back when browser-use signals a stale index)
+  (on click/type/press when the indexed element has vanished)
 
 Per-action wall-clock timeout comes from
 ``profile.action_timeout_seconds()`` (default 120s, configurable in
@@ -25,21 +28,18 @@ import logging
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
-from browser_use import Tools
-
+from vexis_agent.core import yaml_config
 from vexis_agent.tools.browser import snapshot as snapshot_mod
 from vexis_agent.tools.browser.errors import (
     error_payload,
-    is_stale_index_hint,
     normalize_exception,
     stale_index_payload,
 )
-from vexis_agent.core import yaml_config
-
 from vexis_agent.tools.browser.profile import action_timeout_seconds, screenshots_dir
 from vexis_agent.tools.browser.session import SessionManager
+from vexis_agent.tools.browser.snapshot import INDEX_ATTR
 
 log = logging.getLogger(__name__)
 
@@ -51,17 +51,15 @@ class BrowserTools:
 
     def __init__(self, manager: SessionManager, workspace: Path) -> None:
         self._manager = manager
-        self._tools = Tools()
         self._workspace = workspace
         # Cached page metadata, refreshed on every action that returns a
         # snapshot. The dashboard reads these without touching the live
-        # session — that way an inspection request can't race with a
-        # click in flight.
+        # session — so an inspection request can't race with a click in
+        # flight.
         self._current_url: str | None = None
         self._current_title: str | None = None
         # Recent URL ring buffer. Append on successful navigate/back;
-        # newest entry first when serialized. The deque enforces the
-        # cap automatically.
+        # newest entry first when serialized. The deque enforces the cap.
         self._recent_navigations: deque[dict[str, str]] = deque(
             maxlen=_RECENT_NAVIGATIONS_MAX
         )
@@ -90,46 +88,40 @@ class BrowserTools:
         if not isinstance(url, str) or not url.strip():
             return error_payload("missing or empty 'url'")
         target = url.strip()
-        result = await self._run_action(
-            "navigate",
-            lambda session: self._tools.navigate(
-                url=target, browser_session=session
-            ),
-            include_snapshot=True,
-        )
+
+        async def op(page: Any) -> dict[str, Any]:
+            await page.goto(target, wait_until="domcontentloaded")
+            await self._manager.wait_stable(page)
+            if self._manager.solves_cloudflare:
+                try:
+                    await self._manager.solve_cloudflare(page)
+                except Exception as exc:  # solver is best-effort
+                    log.warning("[browser] cloudflare solve note: %s", exc)
+            return await snapshot_mod.render(page)
+
+        result = await self._run_action("navigate", op)
         if result.get("ok"):
             self._update_current_page(result)
             self._record_navigation(result.get("url") or target)
         return result
 
     async def snapshot(self, full: bool = False) -> dict[str, Any]:
-        # ``full`` is accepted for forward-compat with the v1 spec but
-        # browser-use's ``get_state_as_text`` already produces the same
-        # serialized DSL regardless — there's no separate full mode in
-        # the underlying library. Kept for API stability.
+        # ``full`` is accepted for forward-compat with the v1 spec but the
+        # serializer already emits one DSL form regardless. Kept for API
+        # stability.
         del full
-        try:
-            session = await self._manager.get()
-        except Exception as exc:
-            log.exception("[browser] session start failed")
-            return normalize_exception(exc, action="browser_snapshot")
-        try:
-            snap = await asyncio.wait_for(
-                snapshot_mod.render(session), timeout=action_timeout_seconds()
-            )
-        except Exception as exc:
-            log.exception("[browser] snapshot failed")
-            return normalize_exception(exc, action="browser_snapshot")
-        self._manager.mark_activity()
-        self._update_current_page(snap)
-        return {"ok": True, **snap}
+        result = await self._run_action(
+            "snapshot", lambda page: snapshot_mod.render(page)
+        )
+        if result.get("ok"):
+            self._update_current_page(result)
+        return result
 
     async def click(self, index: int) -> dict[str, Any]:
         if not isinstance(index, int):
             return error_payload("'index' must be an integer")
-        return await self._run_action(
-            "click",
-            lambda session: self._tools.click(index=index, browser_session=session),
+        return await self._run_indexed_action(
+            "click", index, lambda loc: loc.click()
         )
 
     async def type(
@@ -139,32 +131,31 @@ class BrowserTools:
             return error_payload("'index' must be an integer")
         if not isinstance(text, str):
             return error_payload("'text' must be a string")
-        return await self._run_action(
-            "type",
-            lambda session: self._tools.input(
-                index=index,
-                text=text,
-                clear_existing=clear,
-                browser_session=session,
-            ),
-        )
+
+        async def op(loc: Any) -> None:
+            if clear:
+                await loc.fill(text)
+            else:
+                await loc.click()
+                await loc.press_sequentially(text)
+
+        return await self._run_indexed_action("type", index, op)
 
     async def press(self, key: str) -> dict[str, Any]:
         if not isinstance(key, str) or not key.strip():
             return error_payload("missing or empty 'key'")
+        chord = key.strip()
         return await self._run_action(
-            "press",
-            lambda session: self._tools.send_keys(
-                keys=key.strip(), browser_session=session
-            ),
+            "press", lambda page: page.keyboard.press(chord)
         )
 
     async def back(self) -> dict[str, Any]:
-        result = await self._run_action(
-            "back",
-            lambda session: self._tools.go_back(browser_session=session),
-            include_url=True,
-        )
+        async def op(page: Any) -> dict[str, Any]:
+            await page.go_back(wait_until="domcontentloaded")
+            await self._manager.wait_stable(page)
+            return {"url": page.url or ""}
+
+        result = await self._run_action("back", op)
         if result.get("ok"):
             self._update_current_page(result)
             url = result.get("url")
@@ -181,13 +172,15 @@ class BrowserTools:
             return error_payload("'pages' must be a number")
         if pages_f <= 0:
             return error_payload("'pages' must be > 0")
-        down = direction == "down"
-        return await self._run_action(
-            "scroll",
-            lambda session: self._tools.scroll(
-                down=down, pages=pages_f, browser_session=session
-            ),
-        )
+
+        async def op(page: Any) -> dict[str, Any]:
+            # One "page" == one viewport height. Negative dy scrolls up.
+            height = await page.evaluate("() => window.innerHeight") or 720
+            dy = int(height * pages_f) * (1 if direction == "down" else -1)
+            await page.mouse.wheel(0, dy)
+            return {}
+
+        return await self._run_action("scroll", op)
 
     async def screenshot(
         self,
@@ -197,23 +190,20 @@ class BrowserTools:
         """Save a PNG to ``<workspace>/browser/screenshots/<ts>.png``.
 
         ``image_base64`` is OPT-IN: omitted by default to keep the JSON
-        line under the brain's stream buffer. A 4 MB base64 string in a
-        single stream-json line crashes the asyncio StreamReader unless
-        it's been bumped — and even then, the brain doesn't use it
-        (the path + Read tool is the canonical image flow). Pass
-        ``include_base64=True`` (CLI: ``--include-base64``) when the
-        consumer actually needs the bytes inline. Default tracks
+        line under the brain's stream buffer. Pass ``include_base64=True``
+        (CLI: ``--include-base64``) when the consumer needs the bytes
+        inline. Default tracks
         ``yaml_config.browser_screenshot_include_base64()``.
         """
         try:
-            session = await self._manager.get()
+            _session, page = await self._manager.acquire()
         except Exception as exc:
             log.exception("[browser] session start failed for screenshot")
             return normalize_exception(exc, action="browser_screenshot")
         async with self._manager.action_lock:
             try:
-                data = await asyncio.wait_for(
-                    session.take_screenshot(full_page=bool(full_page), format="png"),
+                raw = await asyncio.wait_for(
+                    page.screenshot(full_page=bool(full_page), type="png"),
                     timeout=action_timeout_seconds(),
                 )
             except Exception as exc:
@@ -221,17 +211,7 @@ class BrowserTools:
                 return normalize_exception(exc, action="browser_screenshot")
             finally:
                 self._manager.mark_activity()
-        # browser-use returns either raw bytes or a base64-encoded
-        # string depending on internal codepaths; tolerate both.
-        if isinstance(data, str):
-            try:
-                raw = base64.b64decode(data)
-            except (ValueError, TypeError):
-                return error_payload("screenshot returned a non-base64 string")
-            b64: str | None = data
-        else:
-            raw = bytes(data)
-            b64 = None
+        raw = bytes(raw)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         out_dir = screenshots_dir(self._workspace)
         path = out_dir / f"{ts}.png"
@@ -248,60 +228,63 @@ class BrowserTools:
             "mime_type": "image/png",
         }
         if include_base64:
-            if b64 is None:
-                b64 = base64.b64encode(raw).decode("ascii")
-            payload["image_base64"] = b64
+            payload["image_base64"] = base64.b64encode(raw).decode("ascii")
         return payload
 
     async def _run_action(
         self,
         name: str,
-        op,
-        *,
-        include_snapshot: bool = False,
-        include_url: bool = False,
+        op: Callable[[Any], Awaitable[Any]],
     ) -> dict[str, Any]:
+        """Acquire the page under the action lock, run ``op(page)``, merge
+        any dict it returns into the success payload."""
         try:
-            session = await self._manager.get()
+            _session, page = await self._manager.acquire()
         except Exception as exc:
             log.exception("[browser] session start failed for %s", name)
             return normalize_exception(exc, action=f"browser_{name}")
         async with self._manager.action_lock:
             try:
                 result = await asyncio.wait_for(
-                    op(session), timeout=action_timeout_seconds()
+                    op(page), timeout=action_timeout_seconds()
                 )
             except Exception as exc:
                 log.warning("[browser] %s raised: %s", name, exc)
                 return normalize_exception(exc, action=f"browser_{name}")
             finally:
                 self._manager.mark_activity()
-        # ``Tools`` actions return ActionResult; some return None for
-        # method-style invocations that just dispatch an event. Treat
-        # None as success.
-        extra: dict[str, Any] = {}
-        if result is not None:
-            error = getattr(result, "error", None)
-            if error:
-                return error_payload(f"browser_{name} failed: {error}")
-            extracted = getattr(result, "extracted_content", None)
-            if is_stale_index_hint(extracted):
-                return stale_index_payload()
-        if include_snapshot:
-            try:
-                snap = await asyncio.wait_for(
-                    snapshot_mod.render(session),
-                    timeout=action_timeout_seconds(),
-                )
-                extra.update(snap)
-            except Exception as exc:
-                log.warning("[browser] post-%s snapshot failed: %s", name, exc)
-        if include_url and "url" not in extra:
-            try:
-                extra["url"] = await session.get_current_page_url() or ""
-            except Exception:
-                extra["url"] = ""
+        extra = result if isinstance(result, dict) else {}
         return {"ok": True, **extra}
+
+    async def _run_indexed_action(
+        self,
+        name: str,
+        index: int,
+        op: Callable[[Any], Awaitable[Any]],
+    ) -> dict[str, Any]:
+        """Resolve ``index`` to the element the last snapshot stamped, then
+        run ``op(locator)``. A vanished index is a soft stale-index hint,
+        not an error."""
+        try:
+            _session, page = await self._manager.acquire()
+        except Exception as exc:
+            log.exception("[browser] session start failed for %s", name)
+            return normalize_exception(exc, action=f"browser_{name}")
+        selector = f'[{INDEX_ATTR}="{index}"]'
+        async with self._manager.action_lock:
+            try:
+                locator = page.locator(selector)
+                if await locator.count() == 0:
+                    return stale_index_payload()
+                await asyncio.wait_for(
+                    op(locator.first), timeout=action_timeout_seconds()
+                )
+            except Exception as exc:
+                log.warning("[browser] %s raised: %s", name, exc)
+                return normalize_exception(exc, action=f"browser_{name}")
+            finally:
+                self._manager.mark_activity()
+        return {"ok": True}
 
     def _update_current_page(self, result: dict[str, Any]) -> None:
         url = result.get("url")

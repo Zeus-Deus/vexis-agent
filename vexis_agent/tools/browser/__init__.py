@@ -1,9 +1,11 @@
 """Vexis browser-control package.
 
-Wraps `browser-use` (https://browser-use.com) into a small set of
-Vexis tools the brain can call via Bash. The package is structured
-around a singleton ``SessionManager`` that holds at most one live
-``BrowserSession`` per Vexis daemon process.
+Wraps scrapling's Camoufox-backed ``StealthySession``
+(https://github.com/D4Vinci/Scrapling) into a small set of Vexis tools
+the brain can call via Bash. The package is structured around a singleton
+``SessionManager`` that holds at most one live stealth session — and one
+persistent page on top of it — per Vexis daemon process. This is the
+browser, not a fallback: it's stealthy by default.
 
 Public entry points:
 

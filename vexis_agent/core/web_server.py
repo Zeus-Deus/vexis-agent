@@ -3728,9 +3728,6 @@ class WebDashboard:
         session_state = manager.state_for_dashboard()
         page_state = self._browser.state_for_dashboard()
 
-        attach_mode = "cdp-attach" if session_state["attached_to_cdp"] else "owned-chromium"
-        cdp_url = yaml_config.browser_cdp_url()
-
         profile_path = browser_profile_dir()
         size_bytes, size_at = self._browser_profile_size(profile_path)
         cookie_count = _count_cookies(profile_path)
@@ -3743,7 +3740,7 @@ class WebDashboard:
                 "started_at": session_state["started_at"],
                 "last_activity_at": session_state["last_activity_at"],
                 "headless": session_state["headless"],
-                "attach_mode": attach_mode,
+                "engine": "camoufox",
             },
             "profile": {
                 "path": str(profile_path),
@@ -3767,8 +3764,7 @@ class WebDashboard:
                 "action_timeout_seconds": (
                     yaml_config.browser_action_timeout_seconds()
                 ),
-                "chromium_path": yaml_config.browser_chromium_path(),
-                "cdp_url": cdp_url,
+                "solve_cloudflare": yaml_config.browser_solve_cloudflare(),
                 "screenshot_include_base64": (
                     yaml_config.browser_screenshot_include_base64()
                 ),
@@ -3920,28 +3916,25 @@ def _walk_dir_size(root: Path) -> int:
 
 
 def _count_cookies(profile_path: Path) -> int | None:
-    """Read row count from the Chromium Cookies SQLite file.
+    """Read row count from the Camoufox (Firefox) ``cookies.sqlite``.
 
-    One try/except wraps everything: path resolution, sqlite connect,
-    query. Newer Chromium uses ``Default/Network/Cookies``; older
-    versions used ``Default/Cookies``. We try both. Any failure (file
-    missing, schema change, lock contention, permission, ...) returns
-    ``None`` and the UI renders ``—``. Discriminating failure modes
-    is not useful — it's a count, either we got one or we didn't.
+    Camoufox is a Firefox build, so its persistent profile stores cookies
+    in ``cookies.sqlite`` (table ``moz_cookies``) at the profile root —
+    not the Chromium ``Cookies`` layout. One try/except wraps everything:
+    path resolution, sqlite connect, query. Any failure (file missing,
+    schema change, lock contention, permission, ...) returns ``None`` and
+    the UI renders ``—``. Discriminating failure modes is not useful —
+    it's a count, either we got one or we didn't.
     """
     try:
-        candidates = [
-            profile_path / "Default" / "Network" / "Cookies",
-            profile_path / "Default" / "Cookies",
-        ]
-        cookie_db = next((c for c in candidates if c.is_file()), None)
-        if cookie_db is None:
+        cookie_db = profile_path / "cookies.sqlite"
+        if not cookie_db.is_file():
             return None
         # Read-only URI plus immutable=1 so SQLite doesn't try to acquire
-        # a write lock on a file Chromium may have open.
+        # a write lock on a file Firefox may have open.
         uri = f"file:{cookie_db}?mode=ro&immutable=1"
         with sqlite3.connect(uri, uri=True, timeout=0.5) as conn:
-            row = conn.execute("SELECT COUNT(*) FROM cookies").fetchone()
+            row = conn.execute("SELECT COUNT(*) FROM moz_cookies").fetchone()
         return int(row[0]) if row else None
     except Exception:
         return None

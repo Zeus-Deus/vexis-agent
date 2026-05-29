@@ -1,41 +1,43 @@
-"""Singleton ``SessionManager`` for the Vexis browser-use BrowserSession.
+"""Singleton ``SessionManager`` for the Vexis Camoufox browser session.
 
-Holds at most one live ``BrowserSession`` per daemon process. Lazy
-start on the first action; idle sweep recycles the session after the
-configured inactivity window so a quiet daemon doesn't keep Chromium
-resident. Login state lives in ``user_data_dir`` so recycling is
-cheap — cookies and storage survive on disk regardless.
+Holds at most one live ``AsyncStealthySession`` per daemon process, plus
+the single long-lived page we drive across actions. scrapling's own
+``fetch()`` opens and closes a page per call — that's right for scrape-
+and-go, wrong for an interactive navigate → snapshot → click loop where
+element indices must stay valid between calls. So we take the persistent
+Camoufox context scrapling launches (``session.context``) and keep one
+page open on top of it; the context owns the ``user_data_dir`` profile, so
+cookies and storage persist regardless of when we recycle the page.
 
-Concurrency: ``action_lock`` serializes browser actions. browser-use's
-own dispatch is async, but multiple concurrent clicks against one
-session race over selector_map state. The Telegram message queue
-already serializes turns of one chat; the lock here protects against
-the (rare) case where Vexis fires multiple browser tools in parallel
-inside one turn.
+Lazy start on the first action; an idle sweep recycles the session after
+the configured inactivity window so a quiet daemon doesn't keep Firefox
+resident. Login state lives in ``user_data_dir`` on disk, so recycling is
+cheap — cookies survive.
 
-Telemetry: ``ANONYMIZED_TELEMETRY=false`` is set at module import per
-§10 of the browser-research doc.
+Concurrency: ``action_lock`` serializes browser actions. The Telegram
+message queue already serializes turns of one chat; the lock guards the
+rarer case where one turn fires multiple browser tools, which would race
+over the shared page.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
 
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
-
-from browser_use import BrowserSession  # noqa: E402
-
-from vexis_agent.core.logging import redact_sensitive_logs  # noqa: E402
-from vexis_agent.tools.browser.profile import (  # noqa: E402
-    build_profile,
-    cdp_url,
+from vexis_agent.core.logging import redact_sensitive_logs
+from vexis_agent.tools.browser.profile import (
+    action_timeout_seconds,
     headless,
     inactivity_timeout_seconds,
+    session_kwargs,
 )
+
+if TYPE_CHECKING:  # import only for type hints — see acquire() for why
+    from scrapling.fetchers import AsyncStealthySession
 
 log = logging.getLogger(__name__)
 
@@ -43,19 +45,16 @@ _SWEEP_INTERVAL_SECONDS = 30.0
 
 
 class SessionManager:
-    """Owns the live browser-use session (or holds None when idle)."""
+    """Owns the live Camoufox session + persistent page (or None when idle)."""
 
     def __init__(self) -> None:
-        self._session: BrowserSession | None = None
+        self._session: AsyncStealthySession | None = None
+        self._page: Any | None = None
         self._start_lock = asyncio.Lock()
         self._action_lock = asyncio.Lock()
         self._last_activity: float = 0.0
         self._sweeper: asyncio.Task | None = None
         self._stopping = False
-        # True when the live session is attached to an externally-
-        # launched Chrome via CDP. In that mode we never kill the
-        # process and skip the idle sweep — the user owns lifecycle.
-        self._attached_to_cdp = False
         # Wall-clock counterparts of _last_activity (monotonic). The
         # monotonic value drives the inactivity sweep; the wall-clock
         # value powers the dashboard's "X minutes ago" rendering.
@@ -66,41 +65,85 @@ class SessionManager:
     def action_lock(self) -> asyncio.Lock:
         return self._action_lock
 
-    async def get(self) -> BrowserSession:
-        """Return the live session, lazy-starting if necessary."""
+    async def acquire(self) -> tuple[AsyncStealthySession, Any]:
+        """Return ``(session, page)``, lazy-starting both if necessary.
+
+        Recreates the page if it was closed underneath us (e.g. a site
+        called ``window.close()``); recreates the whole session if it was
+        swept while idle.
+        """
+        # Lazy import: scrapling 0.3.x evaluates camoufox_version() at module
+        # import time, which raises FileNotFoundError until `camoufox fetch`
+        # has downloaded the browser binary. Importing at module top would
+        # then break importing the whole browser package — and transitively
+        # the daemon (web_server/main import it) — on a host where the binary
+        # isn't fetched yet. Deferring it here keeps the package importable
+        # everywhere; a missing binary instead surfaces as a clean error on
+        # the first actual navigate (callers wrap acquire() and normalize it).
+        from scrapling.fetchers import AsyncStealthySession
+
         async with self._start_lock:
             if self._session is None:
-                profile = build_profile()
-                attaching = bool(cdp_url())
+                kwargs = session_kwargs()
                 log.info(
-                    "[browser] starting session (cdp_url=%s, profile=%s, headless=%s)",
-                    cdp_url() or "(none)",
-                    profile.user_data_dir or "(cdp-attach)",
-                    profile.headless,
+                    "[browser] starting Camoufox session (profile=%s, headless=%s, "
+                    "solve_cloudflare=%s)",
+                    kwargs.get("user_data_dir"),
+                    kwargs.get("headless"),
+                    kwargs.get("solve_cloudflare"),
                 )
-                session = BrowserSession(browser_profile=profile)
+                session = AsyncStealthySession(**kwargs)
                 await session.start()
-                # browser-use logs the literal text typed into form
-                # fields at INFO and only masks it when the caller
-                # pre-flagged the field sensitive — which Vexis can't do
-                # for agent-driven logins, so passwords would otherwise
-                # land in the journal. Re-attach the redaction filter on
-                # every session start so it survives idle-recycle and
-                # any browser-use logging reconfiguration.
-                redact_sensitive_logs("browser_use")
+                # scrapling/Playwright log the literal text typed into form
+                # fields; re-attach the redaction filter on every start so a
+                # password typed during an agent-driven login never lands in
+                # the journal, surviving idle-recycle.
+                redact_sensitive_logs("scrapling")
                 self._session = session
-                self._attached_to_cdp = attaching
+                self._page = None
                 self._started_at_wall = datetime.now(timezone.utc)
+            if self._page is None or self._page.is_closed():
+                page = await self._session.context.new_page()
+                # scrapling's own _get_page sets these; we bypass it by
+                # taking the context directly, so apply them here. Gives
+                # goto/click the full configured budget instead of
+                # Playwright's 30s default, which would otherwise fire
+                # before the action-timeout wrapper on a slow page.
+                timeout_ms = action_timeout_seconds() * 1000
+                page.set_default_navigation_timeout(timeout_ms)
+                page.set_default_timeout(timeout_ms)
+                self._page = page
             self._last_activity = time.monotonic()
             self._last_activity_at_wall = datetime.now(timezone.utc)
-            # Don't run the inactivity sweep when attached: the user
-            # owns the Chrome process and we shouldn't be poking at
-            # its lifecycle from a timer.
-            if not self._attached_to_cdp and (
-                self._sweeper is None or self._sweeper.done()
-            ):
+            if self._sweeper is None or self._sweeper.done():
                 self._sweeper = asyncio.create_task(self._sweep_loop())
-            return self._session
+            return self._session, self._page
+
+    async def wait_stable(self, page: Any) -> None:
+        """Wait for load / DOMContentLoaded / network-idle on ``page``.
+
+        Delegates to scrapling's own page-stability helper so we wait
+        exactly the way its ``fetch()`` does.
+        """
+        if self._session is None:
+            return
+        await self._session._wait_for_page_stability(page, True, True)
+
+    async def solve_cloudflare(self, page: Any) -> None:
+        """Run scrapling's Cloudflare solver against ``page`` (best-effort).
+
+        Same solver ``StealthySession.fetch`` invokes; no-ops when no
+        challenge is present. Wrapped here so the scrapling-private call
+        lives in one place.
+        """
+        if self._session is None:
+            return
+        await self._session._cloudflare_solver(page)
+        await self.wait_stable(page)
+
+    @property
+    def solves_cloudflare(self) -> bool:
+        return bool(getattr(self._session, "_solve_cloudflare", False))
 
     def mark_activity(self) -> None:
         self._last_activity = time.monotonic()
@@ -116,7 +159,6 @@ class SessionManager:
                 "state": "not_started",
                 "started_at": None,
                 "last_activity_at": None,
-                "attached_to_cdp": False,
                 "headless": headless(),
             }
         return {
@@ -131,23 +173,16 @@ class SessionManager:
                 if self._last_activity_at_wall is not None
                 else None
             ),
-            "attached_to_cdp": self._attached_to_cdp,
             "headless": headless(),
         }
 
     async def stop(self) -> None:
-        """Tear down the live session, if any. Idempotent.
-
-        When attached to an externally-launched Chrome via ``cdp_url``,
-        we ``session.stop()`` (disconnect, leave the process alive)
-        instead of ``session.kill()`` — the user owns that process.
-        """
+        """Tear down the live session, if any. Idempotent."""
         async with self._start_lock:
             self._stopping = True
             sess = self._session
-            attached = self._attached_to_cdp
             self._session = None
-            self._attached_to_cdp = False
+            self._page = None
             self._started_at_wall = None
             self._last_activity_at_wall = None
         sweeper = self._sweeper
@@ -160,31 +195,23 @@ class SessionManager:
                 pass
         if sess is not None:
             try:
-                if attached:
-                    await sess.stop()
-                    log.info("[browser] CDP session detached (Chrome left running)")
-                else:
-                    await sess.kill()
-                    log.info("[browser] session killed")
+                await sess.close()
+                log.info("[browser] session closed")
             except Exception:
                 log.exception("[browser] error tearing down session")
-        # Reset _stopping so a subsequent get() re-arms the sweep loop.
-        # Without this, a recycle-then-reopen sequence (e.g. via the
-        # dashboard) leaves the new session without an inactivity sweep.
+        # Reset _stopping so a subsequent acquire() re-arms the sweep loop.
         self._stopping = False
 
     async def _sweep_loop(self) -> None:
-        # Read inactivity_timeout each tick so test harnesses (and
-        # later config reloads) can adjust on the fly.
-        # Sweep tick: min(30s, half the timeout) so a 30s test
-        # timeout doesn't sit idle for a full 30s before the first
-        # check. For the production 120s timeout this resolves to 30s.
+        # Read inactivity_timeout each tick so test harnesses (and config
+        # reloads) can adjust on the fly. Tick: min(30s, half the timeout)
+        # so a short test timeout doesn't sit idle for a full 30s.
         try:
             while not self._stopping:
                 timeout = inactivity_timeout_seconds()
                 tick = min(_SWEEP_INTERVAL_SECONDS, max(1.0, timeout / 2))
                 await asyncio.sleep(tick)
-                if self._session is None or self._attached_to_cdp:
+                if self._session is None:
                     continue
                 idle = time.monotonic() - self._last_activity
                 if idle >= timeout:
@@ -195,10 +222,13 @@ class SessionManager:
                     )
                     sess = self._session
                     self._session = None
+                    self._page = None
+                    self._started_at_wall = None
+                    self._last_activity_at_wall = None
                     try:
-                        await sess.kill()
+                        await sess.close()
                     except Exception:
-                        log.exception("[browser] error killing idle session")
+                        log.exception("[browser] error closing idle session")
         except asyncio.CancelledError:
             return
 

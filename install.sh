@@ -353,6 +353,33 @@ if [[ "$DRY_RUN" -ne 1 ]]; then
     esac
 fi
 
+# ── stealth browser binary (Camoufox) ───────────────────────────────
+# The `scrapling` Python package installs as a normal pipx dependency,
+# but the Camoufox (Firefox) *browser binary* is a separate one-time
+# download. scrapling's own `scrapling install` also runs
+# `playwright install-deps` — Debian/apt-only, so it fails on Arch and
+# would abort this installer under `set -e`. We fetch the binary
+# directly via `camoufox fetch` inside the vexis-agent venv instead.
+# Non-fatal: the daemon still installs if this is offline/slow, and the
+# first browser navigate will surface a clear error to rerun against.
+if [[ "$DRY_RUN" -ne 1 ]]; then
+    section "Stealth browser"
+    venv_py="$(pipx environment --value PIPX_LOCAL_VENVS 2>/dev/null)/vexis-agent/bin/python"
+    [[ -x "$venv_py" ]] || venv_py="$HOME/.local/share/pipx/venvs/vexis-agent/bin/python"
+    if [[ -x "$venv_py" ]]; then
+        info "Fetching the Camoufox browser binary (~700MB, one time)…"
+        if "$venv_py" -m camoufox fetch >/dev/null 2>&1; then
+            ok "Camoufox browser installed."
+        else
+            warn "WARNING: camoufox browser download failed. Run"
+            warn "'${venv_py} -m camoufox fetch' manually before using vexis-browse."
+        fi
+    else
+        warn "WARNING: camoufox browser download failed (vexis-agent venv not found)."
+        warn "Run 'python -m camoufox fetch' in that venv before using vexis-browse."
+    fi
+fi
+
 # ── soft-dependency advice ──────────────────────────────────────────
 section "Soft dependencies"
 info "The daemon only requires a brain CLI to run. Other tools enable"
