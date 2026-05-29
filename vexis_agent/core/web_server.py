@@ -99,6 +99,12 @@ from vexis_agent.core.voice import (
 )
 from vexis_agent.tools.browser import BrowserTools
 from vexis_agent.transports.web import WebChatTransport
+from vexis_agent.tools.browser.captcha import (
+    VALID_PROVIDERS as CAPTCHA_PROVIDERS,
+    get_solver as captcha_get_solver,
+    mask_key as captcha_mask_key,
+)
+from vexis_agent.tools.browser.captcha.base import CaptchaSolverError
 from vexis_agent.tools.browser.profile import (
     default_profile_name as browser_default_profile_name,
     profile_dir as browser_profile_dir,
@@ -960,6 +966,20 @@ class WebDashboard:
             was_running = self._browser.manager.is_running()
             await self._browser.manager.stop()
             return {"ok": True, "was_running": was_running}
+
+        @app.post(
+            "/api/v1/browser/captcha/config",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_browser_captcha_config(payload: dict) -> dict:
+            return self._browser_captcha_config(payload)
+
+        @app.post(
+            "/api/v1/browser/captcha/test",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def post_browser_captcha_test() -> dict:
+            return await self._browser_captcha_test()
 
         # ----- Step 15: learning tab -----
 
@@ -3768,7 +3788,109 @@ class WebDashboard:
                 "screenshot_include_base64": (
                     yaml_config.browser_screenshot_include_base64()
                 ),
+                "captcha_solver": yaml_config.browser_captcha_solver(),
+                # Masked form only — the raw key never leaves the daemon.
+                "captcha_solver_key_masked": captcha_mask_key(
+                    yaml_config.browser_captcha_solver_api_key()
+                ),
             },
+            "captcha": self._captcha_status(),
+        }
+
+    def _captcha_status(self) -> dict:
+        """Captcha-solver status for the dashboard chip. Never returns the key.
+
+        ``status`` is ``configured`` when a provider is selected AND a key is
+        present, else ``not_configured``. ``low_balance`` is surfaced by the
+        Test endpoint, not here (this is a pure config read — no network)."""
+        provider = yaml_config.browser_captcha_solver()
+        has_key = bool(yaml_config.browser_captcha_solver_api_key())
+        configured = provider != "none" and has_key
+        return {
+            "provider": provider,
+            "configured": configured,
+            "status": "configured" if configured else "not_configured",
+        }
+
+    def _browser_captcha_config(self, payload: dict) -> dict:
+        """POST /api/v1/browser/captcha/config — set provider + (optional) key.
+
+        Body: ``{"provider": str, "api_key"?: str}``. Writes
+        ``[browser].captcha_solver`` and, when a non-empty ``api_key`` is
+        supplied, ``[browser].captcha_solver_api_key``. An omitted/blank key
+        keeps the existing one (so the masked-field UX doesn't wipe it). Same
+        write path as the model-UX endpoints: read-modify-write with a
+        comment-preserving backup and an atomic rewrite. Never returns the raw
+        key — only the masked form."""
+        from fastapi import HTTPException
+
+        from vexis_agent.core.paths import vexis_dir
+        from vexis_agent.core.yaml_config import _read_raw
+        from vexis_agent.core.yaml_config_writer import (
+            atomic_write_yaml,
+            backup_if_commented,
+        )
+
+        provider = payload.get("provider")
+        if not isinstance(provider, str) or provider not in CAPTCHA_PROVIDERS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"provider must be one of {', '.join(CAPTCHA_PROVIDERS)}"
+                ),
+            )
+        api_key = payload.get("api_key")
+        if api_key is not None and not isinstance(api_key, str):
+            raise HTTPException(status_code=400, detail="api_key must be a string")
+
+        cfg_path = vexis_dir() / "config.yaml"
+        current = _read_raw()
+        browser = dict(current.get("browser") or {})
+        browser["captcha_solver"] = provider
+        if isinstance(api_key, str) and api_key.strip():
+            browser["captcha_solver_api_key"] = api_key.strip()
+        proposed = {**current, "browser": browser}
+
+        backup_path = (
+            backup_if_commented(cfg_path) if cfg_path.exists() else None
+        )
+        atomic_write_yaml(cfg_path, proposed)
+
+        return {
+            "ok": True,
+            "provider": provider,
+            "captcha_solver_key_masked": captcha_mask_key(
+                browser.get("captcha_solver_api_key")
+            ),
+            "backup_path": str(backup_path) if backup_path else None,
+        }
+
+    async def _browser_captcha_test(self) -> dict:
+        """POST /api/v1/browser/captcha/test — call the provider's getBalance.
+
+        Returns ``{ok, provider, balance, low_balance}`` on success, or
+        ``{ok: False, error}`` carrying the provider's verbatim response so the
+        dashboard can render exactly why a key/network/balance check failed."""
+        solver = captcha_get_solver()
+        if solver is None:
+            return {
+                "ok": False,
+                "error": (
+                    "No captcha solver configured. Select a provider and save "
+                    "an API key first."
+                ),
+            }
+        try:
+            balance = await solver.get_balance()
+        except CaptchaSolverError as exc:
+            return {"ok": False, "provider": solver.name, "error": exc.detail}
+        except Exception as exc:  # pragma: no cover - defensive
+            return {"ok": False, "provider": solver.name, "error": str(exc)}
+        return {
+            "ok": True,
+            "provider": solver.name,
+            "balance": balance,
+            "low_balance": balance <= 0,
         }
 
     def _browser_profile_size(self, profile_path: Path) -> tuple[int | None, str | None]:

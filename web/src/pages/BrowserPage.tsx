@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { api, ApiError, browserScreenshotUrl } from "../lib/api";
 import type {
+  BrowserCaptchaStatus,
   BrowserConfigSnapshot,
   BrowserNavigationEntry,
   BrowserProfileInfo,
   BrowserScreenshotEntry,
   BrowserSessionInfo,
   BrowserState,
+  CaptchaProvider,
 } from "../lib/types";
 import { formatBytes, relativeTime, uptime } from "../lib/format";
 import { Badge } from "../components/Badge";
@@ -29,6 +31,9 @@ export function BrowserPage({ token, onAuthFail }: BrowserPageProps) {
     recycle: boolean;
   }>({ open: false, recycle: false });
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+  // Set from the most recent "Test" result; drives the low-balance chip. Null
+  // until a test runs (a pure config read can't know the balance).
+  const [lowBalance, setLowBalance] = useState<boolean | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -129,6 +134,8 @@ export function BrowserPage({ token, onAuthFail }: BrowserPageProps) {
     <div className="space-y-8">
       <SessionHeader
         session={state.session}
+        captcha={state.captcha}
+        lowBalance={lowBalance}
         pending={pending}
         actionMessage={actionMessage}
         onOpenBlank={handleOpenBlank}
@@ -139,6 +146,13 @@ export function BrowserPage({ token, onAuthFail }: BrowserPageProps) {
         <ProfileCard profile={state.profile} />
       </div>
       <ConfigCard config={state.config} />
+      <CaptchaSolverCard
+        token={token}
+        config={state.config}
+        onAuthFail={onAuthFail}
+        onRefresh={refresh}
+        onBalanceTested={setLowBalance}
+      />
       <RecentScreenshots
         token={token}
         entries={state.recent_screenshots}
@@ -147,14 +161,48 @@ export function BrowserPage({ token, onAuthFail }: BrowserPageProps) {
   );
 }
 
+function CaptchaChip({
+  captcha,
+  lowBalance,
+}: {
+  captcha: BrowserCaptchaStatus;
+  lowBalance: boolean | null;
+}) {
+  // Low-balance overrides the configured/not-configured state — a configured
+  // solver with no funds is the more urgent thing to surface.
+  if (captcha.configured && lowBalance) {
+    return (
+      <Badge tone="neutral" glyph="▲">
+        captcha: low balance
+      </Badge>
+    );
+  }
+  if (captcha.configured) {
+    return (
+      <Badge tone="active" glyph="●">
+        captcha: {captcha.provider}
+      </Badge>
+    );
+  }
+  return (
+    <Badge tone="subtle" glyph="○">
+      captcha: not configured
+    </Badge>
+  );
+}
+
 function SessionHeader({
   session,
+  captcha,
+  lowBalance,
   pending,
   actionMessage,
   onOpenBlank,
   onRecycle,
 }: {
   session: BrowserSessionInfo;
+  captcha: BrowserCaptchaStatus;
+  lowBalance: boolean | null;
   pending: { open: boolean; recycle: boolean };
   actionMessage: string | null;
   onOpenBlank: () => void;
@@ -185,6 +233,7 @@ function SessionHeader({
             {session.headless ? "headless" : "headed"}
           </Badge>
           <Badge tone="accent">{session.engine}</Badge>
+          <CaptchaChip captcha={captcha} lowBalance={lowBalance} />
           {sinceStart !== null && (
             <span className="font-data text-[12.5px] text-[var(--color-fg-2)]">
               <span className="text-[var(--color-fg-dim)] uppercase-tight text-[10px] mr-2">
@@ -382,6 +431,186 @@ function ConfigCard({ config }: { config: BrowserConfigSnapshot }) {
           edit ~/.vexis/config.yaml [browser] and restart the daemon to
           change.
         </p>
+      </Card>
+    </Section>
+  );
+}
+
+const CAPTCHA_PROVIDERS: { value: CaptchaProvider; label: string }[] = [
+  { value: "none", label: "None (disabled)" },
+  { value: "capsolver", label: "CapSolver" },
+  { value: "twocaptcha", label: "2Captcha" },
+];
+
+function CaptchaSolverCard({
+  token,
+  config,
+  onAuthFail,
+  onRefresh,
+  onBalanceTested,
+}: {
+  token: string;
+  config: BrowserConfigSnapshot;
+  onAuthFail: () => void;
+  onRefresh: () => Promise<unknown>;
+  onBalanceTested: (low: boolean | null) => void;
+}) {
+  const [provider, setProvider] = useState<CaptchaProvider>(
+    config.captcha_solver,
+  );
+  const [apiKey, setApiKey] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [testMessage, setTestMessage] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
+
+  // Keep the dropdown in sync when the polled config changes (e.g. another
+  // client saved). The key field stays empty — we never receive the raw key.
+  useEffect(() => {
+    setProvider(config.captcha_solver);
+  }, [config.captcha_solver]);
+
+  const handleSave = useCallback(async () => {
+    setSaving(true);
+    setMessage(null);
+    try {
+      const res = await api.browserCaptchaConfig(token, {
+        provider,
+        api_key: apiKey.trim() ? apiKey.trim() : undefined,
+      });
+      setApiKey("");
+      setMessage(
+        `Saved. Provider: ${res.provider}, key: ${res.captcha_solver_key_masked}` +
+          (res.backup_path ? " (config backed up)" : ""),
+      );
+      await onRefresh();
+    } catch (exc) {
+      if (exc instanceof ApiError && exc.status === 401) onAuthFail();
+      else
+        setMessage(
+          `Save failed: ${exc instanceof Error ? exc.message : String(exc)}`,
+        );
+    } finally {
+      setSaving(false);
+    }
+  }, [token, provider, apiKey, onRefresh, onAuthFail]);
+
+  const handleTest = useCallback(async () => {
+    setTesting(true);
+    setTestMessage(null);
+    try {
+      const res = await api.browserCaptchaTest(token);
+      if (res.ok) {
+        onBalanceTested(Boolean(res.low_balance));
+        setTestMessage({
+          ok: true,
+          text: `${res.provider} balance: ${res.balance}${
+            res.low_balance ? " — low balance!" : ""
+          }`,
+        });
+      } else {
+        onBalanceTested(null);
+        setTestMessage({
+          ok: false,
+          text: res.error ?? "Test failed.",
+        });
+      }
+    } catch (exc) {
+      if (exc instanceof ApiError && exc.status === 401) onAuthFail();
+      else
+        setTestMessage({
+          ok: false,
+          text: exc instanceof Error ? exc.message : String(exc),
+        });
+    } finally {
+      setTesting(false);
+    }
+  }, [token, onBalanceTested, onAuthFail]);
+
+  const inputCls =
+    "font-data text-[12.5px] bg-[var(--color-base)] hairline px-2.5 py-1.5 " +
+    "text-[var(--color-fg)] outline-none focus:border-[var(--color-accent)]/60";
+
+  return (
+    <Section title="Captcha solver">
+      <Card>
+        <div className="px-5 py-4 space-y-4">
+          <p className="font-data text-[11.5px] text-[var(--color-fg-dim)] leading-relaxed">
+            Camoufox walks Cloudflare interstitials for free. A solver here adds
+            hCaptcha, reCAPTCHA v2/v3 and standalone Turnstile — it fires
+            automatically when one is detected during a navigation. The key is
+            stored in ~/.vexis/config.yaml and never shown again after save.
+          </p>
+          <div className="flex flex-wrap items-end gap-4">
+            <label className="flex flex-col gap-1">
+              <span className="text-[var(--color-fg-dim)] uppercase-tight text-[10px]">
+                Provider
+              </span>
+              <select
+                className={inputCls}
+                value={provider}
+                onChange={(e) =>
+                  setProvider(e.target.value as CaptchaProvider)
+                }
+              >
+                {CAPTCHA_PROVIDERS.map((p) => (
+                  <option key={p.value} value={p.value}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-1 flex-1 min-w-[220px]">
+              <span className="text-[var(--color-fg-dim)] uppercase-tight text-[10px]">
+                API key{" "}
+                <span className="normal-case text-[var(--color-fg-dim)]">
+                  (current: {config.captcha_solver_key_masked})
+                </span>
+              </span>
+              <input
+                type="password"
+                className={inputCls}
+                placeholder="leave blank to keep existing key"
+                value={apiKey}
+                autoComplete="off"
+                onChange={(e) => setApiKey(e.target.value)}
+              />
+            </label>
+            <div className="flex items-center gap-2">
+              <Button variant="primary" loading={saving} onClick={handleSave}>
+                Save
+              </Button>
+              <Button
+                variant="ghost"
+                loading={testing}
+                onClick={handleTest}
+                disabled={config.captcha_solver === "none"}
+              >
+                Test
+              </Button>
+            </div>
+          </div>
+          {message && (
+            <p className="font-data text-[12px] text-[var(--color-accent)]">
+              {message}
+            </p>
+          )}
+          {testMessage && (
+            <p
+              className={
+                "font-data text-[12px] " +
+                (testMessage.ok
+                  ? "text-[var(--color-accent)]"
+                  : "text-[var(--color-error)]")
+              }
+            >
+              {testMessage.text}
+            </p>
+          )}
+        </div>
       </Card>
     </Section>
   );

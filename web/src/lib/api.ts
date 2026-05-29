@@ -6,6 +6,9 @@ import type {
   ApproveOkResponse,
   ApproveSensitivePayload,
   BrowserState,
+  BrowserCaptchaConfigResponse,
+  BrowserCaptchaTestResponse,
+  CaptchaProvider,
   AttachmentRef,
   ChatHistoryState,
   ChatReply,
@@ -258,6 +261,18 @@ export const api = {
     ),
   browserRecycle: (token: string) =>
     call<{ ok: boolean; was_running: boolean }>(token, "/browser/recycle", {
+      method: "POST",
+    }),
+  browserCaptchaConfig: (
+    token: string,
+    body: { provider: CaptchaProvider; api_key?: string },
+  ) =>
+    call<BrowserCaptchaConfigResponse>(token, "/browser/captcha/config", {
+      method: "POST",
+      body,
+    }),
+  browserCaptchaTest: (token: string) =>
+    call<BrowserCaptchaTestResponse>(token, "/browser/captcha/test", {
       method: "POST",
     }),
   learning: (token: string) => call<LearningState>(token, "/learning"),

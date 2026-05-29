@@ -76,6 +76,18 @@ def solve_cloudflare() -> bool:
     return yaml_config.browser_solve_cloudflare()
 
 
+def captcha_solver() -> str:
+    """Selected captcha solver provider (``none`` | ``capsolver`` |
+    ``twocaptcha``). Default ``none``. See
+    ``vexis_agent.tools.browser.captcha`` for the solver layer."""
+    return yaml_config.browser_captcha_solver()
+
+
+def captcha_solver_api_key() -> str | None:
+    """API key for the selected captcha solver, or ``None`` when unset."""
+    return yaml_config.browser_captcha_solver_api_key()
+
+
 def screenshots_dir(workspace: Path) -> Path:
     """``<workspace>/browser/screenshots/`` — created lazily."""
     path = workspace / "browser" / "screenshots"
