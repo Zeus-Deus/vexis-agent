@@ -34,7 +34,8 @@ once and reuses it for every turn of that session. Mid-session
 the tool response, but the system-prompt block stays byte-identical
 for the whole session — preserves Anthropic's prefix cache. The
 trade-off (model can't see its own writes re-injected mid-session) is
-documented in CAPABILITIES.md so the model knows.
+documented in the memory capability block
+(``tools/memory_capability.py``, issue #30) so the model knows.
 """
 
 from __future__ import annotations

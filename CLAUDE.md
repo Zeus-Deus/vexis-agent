@@ -298,3 +298,24 @@ slash commands plug in the same way.
 **Pointers:** `docs/addons.md` (full author guide) ·
 `vexis_agent/addons/codemux/docs/codemux-watcher.md` (codemux
 specifics).
+
+## Capability prompt blocks
+
+The system-prompt "Capabilities" section is no longer a monolith.
+Each core capability owns its how-to as a `*_capability.py` next to
+its tool and self-registers via `register_capability_block(name,
+order=, provider=)`. `core/capabilities.assemble_capability_docs()`
+(called by BOTH brain prompt builders) sorts blocks by `order` and
+joins them. `CAPABILITIES.md` shrank to the stable core (identity +
+the add-on model) and is block 0. Change a tool, change its block —
+same PR, no monolith drift.
+
+**Byte-identity is load-bearing.** `assemble_capability_docs()` must
+equal `tests/data/capabilities_golden.md`. Intentional prose edits
+mean regenerating that golden in the same PR — don't drift it
+silently. Add a capability: drop a `*_capability.py`, register a
+fresh `order`, list it in `_BUILTIN_CAPABILITY_MODULES`, update the
+golden. Never edit `CAPABILITIES.md` for a new tool.
+
+**Pointers:** `docs/capabilities.md` (author guide, ownership map,
+codemux-in-core rationale).

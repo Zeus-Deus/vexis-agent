@@ -33,8 +33,10 @@ lost" errors, cumulative context).
 ## 3. Tool call
 
 Ask the brain to do something tool-shaped ("read CAPABILITIES.md and
-tell me what's in section 3"); verify the tool fires and the response
-is grounded.
+tell me how I should add a new ability"); verify the tool fires and
+the response is grounded. (Per-tool how-to no longer lives in that
+file — it's in per-capability modules, issue #30 — so don't ask about
+a specific tool's section there.)
 
 ## 4. MCP server tool
 

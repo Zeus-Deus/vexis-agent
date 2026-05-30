@@ -573,7 +573,8 @@ class Brain(ABC):
     @abstractmethod
     def build_system_prompt(self) -> str:
         """Compose the full system prompt for this brain. Default
-        composition: SOUL.md + CAPABILITIES.md + memory blocks +
+        composition: SOUL.md + assembled capability docs (CAPABILITIES.md
+        core + per-tool prompt blocks, issue #30) + memory blocks +
         relationships block + skills index. Subclasses MAY drop
         sections that the brain duplicates natively (e.g.
         ``BrainOpenCode`` skips the skills index because OpenCode

@@ -72,12 +72,21 @@ from pathlib import Path
 #     Pinned by ``tests/test_watcher.py``,
 #     ``tests/test_watcher_prompt_injection.py``, and
 #     ``tests/test_watcher_dispatch.py``.
+#   - +21 (300 → 321): new feature section "Capability prompt
+#     blocks (Issue #30)" — ~21 lines, inside the ~30-line
+#     per-section ceiling. Documents the decomposition of the
+#     CAPABILITIES.md monolith into per-tool prompt blocks. No
+#     Invariants growth; the byte-identity contract
+#     (assemble_capability_docs() == the golden snapshot) lives in
+#     the feature section's TL;DR per the established escape hatch
+#     (Invariants is already ≥40 lines). Pinned by
+#     ``tests/test_capability_blocks.py``.
 # Bump only when the growth comes from new cross-feature
 # contracts in the Invariants section AND that section is
 # itself still under ~40 lines, OR a genuinely new feature
 # section that respects the ~30-line per-section ceiling.
 # Never bump for per-feature bloat in existing sections.
-CLAUDE_MD_MAX_LINES = 300
+CLAUDE_MD_MAX_LINES = 321
 
 
 def test_claude_md_stays_under_size_limit() -> None:

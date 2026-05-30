@@ -255,7 +255,8 @@ def _build_system_prompt_for_workspace(workspace: Path) -> str:
     """Compose vexis's system prompt for OpenCode.
 
     Layered like ``core.brain.claude_code.build_system_prompt`` —
-    SOUL.md (or default), CAPABILITIES.md, MEMORY.md block,
+    SOUL.md (or default), the assembled capability docs (issue #30;
+    see vexis_agent.core.capabilities), MEMORY.md block,
     USER.md block, RELATIONSHIPS.md block — but DROPS the
     ``<available_skills>`` index because OpenCode auto-discovers
     skills under ``<workspace>/skills/**/SKILL.md`` and emits its
@@ -277,14 +278,16 @@ def _build_system_prompt_for_workspace(workspace: Path) -> str:
         format_relationships_for_system_prompt,
     )
 
-    # CAPABILITIES.md ships as package data — see brain/claude_code.py
-    # for the matching read site; both adapters use the same source.
-    from vexis_agent.data import read_capabilities
+    # Capability docs are assembled from per-capability blocks that
+    # live next to their tools (issue #30) — see brain/claude_code.py
+    # for the matching call site; both adapters share the same
+    # assembler so the decomposition holds for every brain.
+    from vexis_agent.core.capabilities import assemble_capability_docs
 
     soul = _read_markdown(workspace / "SOUL.md") or DEFAULT_SOUL
-    capabilities = read_capabilities()
+    capabilities = assemble_capability_docs()
     parts: list[str] = [soul]
-    if capabilities:
+    if capabilities.strip():
         parts.append(capabilities)
 
     # agent-platform-style skill self-authoring guidance — same call site

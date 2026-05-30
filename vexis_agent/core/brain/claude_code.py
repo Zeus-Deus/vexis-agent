@@ -318,9 +318,11 @@ def _read_markdown(path: Path) -> str | None:
 def build_system_prompt(workspace: Path) -> str:
     """Compose the system prompt fed to claude -p.
 
-    Layers (top → bottom): SOUL.md (or default), CAPABILITIES.md,
-    MEMORY.md block, USER.md block, RELATIONSHIPS.md block, skills
-    index. Each layer is independent and dropped if empty.
+    Layers (top → bottom): SOUL.md (or default), the assembled
+    capability docs (CAPABILITIES.md core + per-tool prompt blocks —
+    see vexis_agent.core.capabilities, issue #30), MEMORY.md block,
+    USER.md block, RELATIONSHIPS.md block, skills index. Each layer is
+    independent and dropped if empty.
     Re-reads from disk on every call so file edits take effect on
     the next spawn without restarting the daemon — the foreground
     brain caches the result per session UUID for prefix-cache
@@ -343,14 +345,20 @@ def build_system_prompt(workspace: Path) -> str:
         format_relationships_for_system_prompt,
     )
 
-    # CAPABILITIES.md ships as package data — readable identically
-    # under pipx-installed wheels and editable source checkouts.
-    from vexis_agent.data import read_capabilities
+    # Capability docs are assembled from per-capability blocks that
+    # live next to the code they document (issue #30). The shrunk
+    # CAPABILITIES.md (identity + the add-on/skill/MCP model) is block
+    # 0; each core tool (browser, desktop, sandbox, …) contributes its
+    # own section so an engine change updates its own guidance in the
+    # same PR. Byte-identical to the old monolith — guarded by
+    # tests/test_capability_blocks.py. Ships as package data + Python
+    # modules, readable identically under wheels and source checkouts.
+    from vexis_agent.core.capabilities import assemble_capability_docs
 
     soul = _read_markdown(workspace / "SOUL.md") or DEFAULT_SOUL
-    capabilities = read_capabilities()
+    capabilities = assemble_capability_docs()
     parts: list[str] = [soul]
-    if capabilities:
+    if capabilities.strip():
         parts.append(capabilities)
 
     # agent-platform-style in-session skill self-authoring guidance. Injected
@@ -506,7 +514,8 @@ class ClaudeCodeBrain(Brain):
         # or a SessionLost recovery) naturally invalidates the cache
         # entry without explicit eviction. Mid-session memory/skills
         # writes mutate disk but are NOT visible to this cache —
-        # by design, see CAPABILITIES.md for the model-facing
+        # by design, see the memory/skills capability blocks
+        # (tools/memory_capability.py, issue #30) for the model-facing
         # documentation of this trap.
         self._system_prompt_cache: dict[str, str] = {}
         # Issue #9: per-chat buffer of files mutated during the most
