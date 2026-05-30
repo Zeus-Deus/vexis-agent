@@ -13,7 +13,9 @@ Public entry points:
 - ``BrowserTools``: the six action methods wired to control-socket ops.
 
 CLI access is via ``scripts/vexis-browse``; daemon registration is in
-``main.py``. See ``CAPABILITIES.md`` for the brain-facing docs.
+``main.py``. The brain-facing docs live next door in ``capability.py``
+(the self-registered web-browsing prompt block, issue #30) — update
+them there in the same PR when the browser's command surface changes.
 """
 
 from __future__ import annotations

@@ -629,7 +629,9 @@ def _format_incoming_images_message(
     given — album order for a media group), then the single shared
     caption if there is one. The brain reads each path with its file
     tool, so multiple prefixes in one message just means "look at all
-    of these, then answer the caption" — see data/CAPABILITIES.md.
+    of these, then answer the caption" — documented for the brain in
+    the inbound-images capability block
+    (``core/capabilities/builtin.py``, issue #30).
     """
     prefix = " ".join(_INCOMING_BRAIN_PREFIX.format(path=p) for p in image_paths)
     body = (caption or "").strip()

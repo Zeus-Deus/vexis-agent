@@ -240,12 +240,18 @@ def test_authoring_block_position_after_capabilities_before_memory(
 
 
 def test_capabilities_md_carries_patch_on_use_imperative():
-    """CAPABILITIES.md is the longer-form companion to the
-    authoring guidance constant. The "don't wait to be asked"
-    imperative on PATCH must appear there too — otherwise a
-    future contributor who only reads CAPABILITIES.md and not
+    """The assembled capability docs are the longer-form companion
+    to the authoring guidance constant. The "don't wait to be
+    asked" imperative on PATCH must appear there too — otherwise a
+    future contributor who only reads the capability prose and not
     ``core/skills.py`` could legitimately delete the constant
-    thinking it duplicates the file.
+    thinking it duplicates the docs.
+
+    Issue #30: this rule lives in the Skills capability block
+    (``tools/skills_capability.py``) now, not the shrunk
+    CAPABILITIES.md core — so we assert against the assembled docs
+    (what the brain actually sees), which is byte-identical to the
+    old monolith.
 
     Whitespace-normalized search: the markdown body wraps long
     lines at ~70 chars, so the phrase often spans a newline. The
@@ -254,12 +260,12 @@ def test_capabilities_md_carries_patch_on_use_imperative():
     """
     import re
 
-    from vexis_agent.data import read_capabilities
+    from vexis_agent.core.capabilities import assemble_capability_docs
 
-    body = read_capabilities() or ""
+    body = assemble_capability_docs()
     flat = re.sub(r"\s+", " ", body)
     assert "don't wait to be asked" in flat, (
-        "CAPABILITIES.md lost the patch-on-use imperative. The "
+        "The capability docs lost the patch-on-use imperative. The "
         "long-form text and the authoring guidance constant are "
         "intentionally redundant — defense in depth against either "
         "being edited without the other."
@@ -269,12 +275,14 @@ def test_capabilities_md_carries_patch_on_use_imperative():
 def test_capabilities_md_carries_save_the_shortcut_hint():
     """The shortcut-vs-discovery distinction is the punchline of
     the upstream browser demo (102s → 35s, 23 turns → 8 turns). It
-    must be present in CAPABILITIES.md so even a brain that
-    skipped the authoring block on a long-context turn still has
-    the rule available when it goes looking."""
-    from vexis_agent.data import read_capabilities
+    must be present in the assembled capability docs so even a brain
+    that skipped the authoring block on a long-context turn still
+    has the rule available when it goes looking. (Issue #30: the
+    rule now lives in the Skills capability block; the assembled
+    docs are byte-identical to the old monolith.)"""
+    from vexis_agent.core.capabilities import assemble_capability_docs
 
-    body = read_capabilities() or ""
+    body = assemble_capability_docs()
     # Lowercase match — the markdown uses "Save the shortcut, not
     # the discovery path." with mixed case in the body.
     assert "shortcut" in body.lower()

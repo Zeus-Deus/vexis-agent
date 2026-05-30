@@ -6,10 +6,13 @@
   pinned to byte-for-byte parity by
   ``tests/test_data_examples_consistency.py``.
 
-* **Runtime resources** (``CAPABILITIES.md``): read on every brain
-  system-prompt build. Lives here — not at the repo root — so
-  pipx-installed users (no source checkout) still get the file via
-  the wheel.
+* **Runtime resources** (``CAPABILITIES.md``): the stable-core
+  capability block (identity + the add-on/skill/MCP model). Read on
+  every brain system-prompt build as block 0 of
+  ``core.capabilities.assemble_capability_docs`` (issue #30); per-tool
+  how-to now lives in per-capability modules next to each tool. Lives
+  here — not at the repo root — so pipx-installed users (no source
+  checkout) still get the file via the wheel.
 
 Read via ``importlib.resources``; never assume a source-checkout path.
 """

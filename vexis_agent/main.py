@@ -298,16 +298,20 @@ async def _run() -> bool:
         log.exception("relationships USER.md seed install raised")
 
     # CAPABILITIES.md ships as package data (vexis_agent/data/) so
-    # pipx-installed users without a source checkout still get it.
-    # The startup warning fires only if the wheel build dropped the
+    # pipx-installed users without a source checkout still get it. It
+    # is now the stable-core block (identity + the add-on/skill/MCP
+    # model); per-tool how-to is assembled from per-capability modules
+    # next to each tool (issue #30, vexis_agent.core.capabilities). The
+    # startup warning fires only if the wheel build dropped the core
     # file — a packaging regression, not an end-user problem.
     from vexis_agent.data import read_capabilities
 
     if read_capabilities() is None:
         log.warning(
-            "CAPABILITIES.md missing from package data. "
-            "Vexis won't know which tools are available — likely a "
-            "packaging build issue; reinstall with 'vexis-agent update'."
+            "CAPABILITIES.md (capability core block) missing from package "
+            "data. Vexis's system prompt will lose its identity + add-on "
+            "model section — likely a packaging build issue; reinstall "
+            "with 'vexis-agent update'."
         )
 
     sessions = SessionStore(state_path=state_dir() / "session.json")
