@@ -69,10 +69,17 @@ the host has both `docker` and `vexis-sandbox` on PATH. The runner is
 used opportunistically — `vexis-bg spawn` calls it only when the task's
 sandbox decision (heuristic or explicit) resolves to True.
 
-Three flags on `vexis-bg spawn`:
+Flags on `vexis-bg spawn`:
 
 * `--sandbox` / `--no-sandbox` — force the decision.
 * `--verify <path>` — point at a YAML check spec. Implies `--sandbox`.
+* `--model <id>` — per-task model override (alias `haiku`/`sonnet`/
+  `opus`, full model name, or abstract tier `small`/`medium`/`large`).
+  Resolved through `model_for_tier("claude-code", …)` at launch and
+  appended to `claude -p` as `--model <native-id>`; omitted (the
+  default) means no flag, so the task runs on the account default.
+  A bad id makes the task exit non-zero → it's marked `FAILED` and the
+  user gets the failure notification.
 
 The agent's system prompt is automatically augmented with a short
 "## Build-and-test sandbox" section telling it to run filesystem

@@ -467,3 +467,109 @@ def test_detect_lost_returns_empty_when_no_state(tmp_path):
         return await bg.detect_lost_from_previous_run()
 
     assert asyncio.run(scenario()) == []
+
+
+# ──────────────────────────────────────────────────────────────────
+# Per-task model override (vexis-bg spawn --model)
+#
+# The launch path is hardcoded ``claude -p``; these pin that an
+# explicit model becomes a ``--model <id>`` flag (alias passes through,
+# abstract tier translates via ``model_for_tier``) while the default —
+# no model — emits no flag so the task keeps the account-default model.
+# ──────────────────────────────────────────────────────────────────
+
+
+def _spawn_and_capture_argv(
+    monkeypatch, tmp_path, patch_killpg, *, model, pid=2200,
+) -> tuple[list[str], "Any"]:
+    """Spawn one task, capture the argv handed to claude, and return
+    (argv, task). Finishes the proc so no watcher leaks."""
+    captured: dict[str, tuple[str, ...]] = {}
+    proc = FakeProc(pid=pid)
+    patch_killpg[pid] = proc
+
+    async def fake_spawn(*argv, **_kwargs) -> FakeProc:
+        captured["argv"] = argv
+        return proc
+
+    _patch_spawn_factory(monkeypatch, fake_spawn)
+    bg = _build_bg(tmp_path)
+
+    async def scenario():
+        kwargs = {} if model is _SENTINEL else {"model": model}
+        task = await bg.spawn(chat_id=5, name="model-task", prompt="go", **kwargs)
+        proc.finish(returncode=0)
+        for _ in range(100):
+            cur = await bg.get("model-task")
+            if cur is not None and cur.status == TaskStatus.FINISHED:
+                break
+            await asyncio.sleep(0.01)
+        return task
+
+    task = asyncio.run(scenario())
+    return list(captured["argv"]), task
+
+
+_SENTINEL = object()
+
+
+def _model_flag(argv: list[str]) -> str | None:
+    """Return the value following ``--model`` in argv, or None if absent."""
+    if "--model" not in argv:
+        return None
+    return argv[argv.index("--model") + 1]
+
+
+def test_spawn_without_model_omits_flag(monkeypatch, tmp_path, patch_killpg):
+    argv, task = _spawn_and_capture_argv(
+        monkeypatch, tmp_path, patch_killpg, model=_SENTINEL,
+    )
+    assert "--model" not in argv
+    assert task.model is None
+    assert task.to_summary()["model"] is None
+
+
+def test_spawn_model_alias_passes_through(monkeypatch, tmp_path, patch_killpg):
+    # A bare alias is not an abstract tier, so model_for_tier passes it
+    # straight through — config-independent.
+    argv, task = _spawn_and_capture_argv(
+        monkeypatch, tmp_path, patch_killpg, model="opus",
+    )
+    assert _model_flag(argv) == "opus"
+    assert task.model == "opus"
+    assert task.to_summary()["model"] == "opus"
+
+
+def test_spawn_model_abstract_tier_translates(monkeypatch, tmp_path, patch_killpg):
+    # An abstract tier is resolved via model_for_tier. Compute the
+    # expectation the same way so the test tracks whatever the active
+    # config / default tier-map yields.
+    from vexis_agent.core.yaml_config import model_for_tier
+
+    expected = model_for_tier("claude-code", "large")
+    assert expected, "precondition: 'large' must resolve to a model id"
+    argv, task = _spawn_and_capture_argv(
+        monkeypatch, tmp_path, patch_killpg, model="large",
+    )
+    assert _model_flag(argv) == expected
+    # The raw tier string is what we persist; translation happens only
+    # at the argv boundary.
+    assert task.model == "large"
+
+
+def test_spawn_model_default_sentinel_omits_flag(
+    monkeypatch, tmp_path, patch_killpg,
+):
+    argv, task = _spawn_and_capture_argv(
+        monkeypatch, tmp_path, patch_killpg, model="default",
+    )
+    assert "--model" not in argv
+    assert task.model is None
+
+
+def test_spawn_model_blank_omits_flag(monkeypatch, tmp_path, patch_killpg):
+    argv, task = _spawn_and_capture_argv(
+        monkeypatch, tmp_path, patch_killpg, model="   ",
+    )
+    assert "--model" not in argv
+    assert task.model is None

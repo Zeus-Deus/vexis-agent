@@ -107,16 +107,19 @@ def _cmd_spawn(
     *,
     sandbox: bool | None,
     verify_checks: str | None,
+    model: str | None,
 ) -> int:
     chat_id = _resolve_chat_id()
     args: dict = {"chat_id": chat_id, "name": name, "prompt": prompt}
-    # Only forward sandbox/verify when set so the daemon's default
-    # (heuristic-based) path stays the implicit fast path. The dispatch
-    # layer treats absent keys as "use defaults."
+    # Only forward sandbox/verify/model when set so the daemon's default
+    # (heuristic-based, account-default-model) path stays the implicit
+    # fast path. The dispatch layer treats absent keys as "use defaults."
     if sandbox is not None:
         args["sandbox"] = sandbox
     if verify_checks:
         args["verify_checks"] = verify_checks
+    if model:
+        args["model"] = model
     return _print_result_or_exit(_send("bg_spawn", args))
 
 
@@ -177,6 +180,16 @@ def main() -> int:
             "runs it after the agent exits. Implies --sandbox."
         ),
     )
+    sp.add_argument(
+        "--model",
+        dest="model",
+        default=None,
+        help=(
+            "Model for this background task. An alias (haiku/sonnet/opus), "
+            "a full model name, or an abstract tier (small/medium/large). "
+            "Omit to use the account default."
+        ),
+    )
 
     st = sub.add_parser("status", help="Show one or all task summaries.")
     st.add_argument("--name", default=None, help="Limit output to this task.")
@@ -201,6 +214,7 @@ def main() -> int:
             args.prompt,
             sandbox=sandbox,
             verify_checks=args.verify_checks,
+            model=args.model,
         )
     if args.cmd == "status":
         return _cmd_status(args.name)
