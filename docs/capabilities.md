@@ -38,12 +38,12 @@ used to sit (after SOUL, before the skill-authoring block).
   of the old `read_capabilities()`.
 
 `order` is a capability's position in the assembled doc. The blocks
-extracted from the monolith kept their original chunk indices, with two
+extracted from the monolith kept their original chunk indices, with
 deliberate post-decomposition changes: `self-extension` was added at
-order 1, and `codemux-orchestration` (order 15) moved out to the
-codemux add-on. `order` 0 is the shrunk `CAPABILITIES.md` itself
-(identity + the add-on/skill/MCP model), re-read from package data each
-build.
+order 1, and both `web-browsing` (order 13) and `codemux-orchestration`
+(order 15) moved out to their add-ons (`browser`, `codemux`). `order` 0
+is the shrunk `CAPABILITIES.md` itself (identity + the add-on/skill/MCP
+model), re-read from package data each build.
 
 ## The golden contract
 
@@ -106,10 +106,10 @@ Add-ons don't touch `_BUILTIN_CAPABILITY_MODULES`; they call
 registry at add-on load time, so add-on blocks share the global
 `order` space and conflict checks with the core blocks and are merged
 transparently by `assemble_capability_docs()` — there is no separate
-add-on assembly path. Pick an `order` clear of the core builtins (0–14
-today); the codemux add-on already owns 15. Add-on blocks are absent
-from the builtins-only golden — they assemble only when the add-on is
-enabled.
+add-on assembly path. Pick an `order` clear of the ones already taken
+(core builtins use 0–12 and 14; the browser add-on owns 13 and codemux
+owns 15). Add-on blocks are absent from the builtins-only golden — they
+assemble only when the add-on is enabled.
 
 ## Ownership map
 
@@ -126,7 +126,6 @@ enabled.
 | background tasks | `tools/background_capability.py` | 9 |
 | memory | `tools/memory_capability.py` | 10 |
 | skills | `tools/skills_capability.py` | 11 |
-| web browsing | `tools/browser/capability.py` | 13 |
 | scheduling | `tools/schedule_tool/capability.py` | 14 |
 
 ### Add-on blocks — NOT in the golden
@@ -137,7 +136,13 @@ builtins-only golden. They share the same global `order` space.
 
 | Block | Module | order | Add-on |
 |---|---|---|---|
+| web browsing | `addons/browser/capability.py` | 13 | browser |
 | codemux orchestration | `addons/codemux/capability.py` | 15 | codemux |
+
+`web-browsing` documents the `vexis-browser` MCP server (the bundled
+`browser` add-on); since the add-on is default-on it assembles in
+practice, but it's add-on-owned and so deliberately excluded from the
+builtins-only golden.
 
 ### self-extension (order 1)
 

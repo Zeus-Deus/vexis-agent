@@ -8,9 +8,11 @@ MCP server defaults, skills, and dashboard pages — all via a
 single `PluginContext` facade.
 
 Add-ons live in folders, are discovered at daemon startup, and
-load only when explicitly enabled in `~/.vexis/config.yaml`. A bad
-add-on cannot kill the daemon — failures are logged and the
-loader continues.
+load only when explicitly enabled in `~/.vexis/config.yaml` —
+except bundled core features (the **browser**), which are on by
+default so an upgrade never silently drops them (see Discovery
+roots). A bad add-on cannot kill the daemon — failures are logged
+and the loader continues.
 
 ## Quick start
 
@@ -56,6 +58,15 @@ name wins (with a warning logged for shadowed entries):
 To override a bundled add-on with your fork: disable the bundled
 name (`vexis-addons disable codemux`) and drop your fork under
 `~/.vexis/addons/codemux/`.
+
+**Default-on bundled add-ons.** A bundled add-on whose name is in
+`DEFAULT_ENABLED_BUNDLED` (`core/addons/loader.py` — currently just
+`browser`) loads even when `addons.enabled` doesn't list it. This is
+the upgrade-safety carve-out: a capability extracted from core into a
+bundled add-on (the browser, which used to be hardcoded) must not
+vanish for an existing user whose config has no `addons.enabled`
+entry. `addons.disabled` still wins — listing `browser` there turns it
+off.
 
 ## Manifest schema (`addon.yaml`)
 
@@ -241,6 +252,56 @@ The CLI does NOT touch the running daemon — every command is a
 read or write against `~/.vexis/config.yaml` and the on-disk
 add-on directories. Restart `vexis-agent` to pick up enable /
 disable / install changes.
+
+## MCP server defaults — shipping a tool the brain calls
+
+`register_mcp_server_default(spec)` is how an add-on gives the brain a
+new tool. `spec` is a `core.brain.base.McpServerSpec` — a local stdio
+server (`command`/`args`) or a remote `url`. At startup
+`core.addon_mcp.merge_addon_mcp_defaults` folds every registered
+default into the active brain's native MCP config via
+`brain.write_mcp_config`, so **both brains** are served (claude-code's
+`.mcp.json`, opencode's `opencode.json`). The brain re-reads that file
+each turn, so it picks up the server on its **next turn** with no
+daemon restart.
+
+Precedence: a same-named entry in the user's
+`~/.vexis/mcp-servers.yaml` always wins — an add-on default only fills
+a gap. That is exactly what makes a bundled default **swappable**: drop
+a same-named server in `mcp-servers.yaml` pointing somewhere else and
+the brain uses yours, no code change.
+
+This is how the **browser** ships. The bundled `browser` add-on
+registers a `vexis-browser` stdio MCP server (the `vexis-browser-mcp`
+console script):
+
+```python
+from vexis_agent.core.brain.base import McpServerSpec
+
+def register(ctx):
+    ctx.register_mcp_server_default(
+        McpServerSpec(name="vexis-browser", command="vexis-browser-mcp"),
+    )
+```
+
+so the brain gets native `browser_*` MCP tools. Because the
+brain↔browser boundary is plain MCP, swapping to a different browser
+server (the official Playwright MCP, a cloud browser, a new engine) is
+a config-level change in `mcp-servers.yaml` — no daemon edit, no
+release. (The `vexis-browse` CLI remains as an equivalent back-compat
+front-end; both drive the same persistent session.)
+
+## Bundled add-ons
+
+- **browser** — the stealth Camoufox browser, shipped to the brain as
+  the `vexis-browser` MCP server (above). Default-on; owns the
+  `browser_*` dispatch ops, the `web-browsing` capability block, and
+  the dashboard's browser service. Config under `addons.browser.*`
+  (legacy top-level `[browser]` still honoured).
+- **codemux** — orchestration watcher for terminal-attached agents.
+  Needs the codemux MCP wired in `mcp-servers.yaml`. Owns `/codemux`,
+  the `watch_*` ops, the codemux watcher source, and the
+  `codemux-orchestration` capability block.
 
 ## Limitations (v1)
 
