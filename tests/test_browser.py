@@ -2,15 +2,17 @@
 
 Pin counts (update when adding cases): 1 DSL-format case group, the
 error/stale payload shapes, the dashboard-state contract, and the config
-surface. The pure-logic tests run anywhere. The real-browser end-to-end
-test (``test_e2e_*``) launches Camoufox and is gated behind
-``VEXIS_BROWSER_E2E=1`` — it needs the browser binary (``camoufox fetch``)
-and a host that lets a Firefox subprocess spawn, so it's opt-in rather
-than a default CI step.
+surface (incl. the navigation-vs-action timeout split). The pure-logic
+tests run anywhere. The real-browser end-to-end tests (``test_e2e_*``)
+launch Camoufox and are gated behind ``VEXIS_BROWSER_E2E=1`` — they need
+the browser binary (``camoufox fetch``) and a host that lets a Firefox
+subprocess spawn, so they're opt-in rather than a default CI step.
 
-The e2e drives a ``file://`` page, exercising navigate → snapshot →
-click → type → press → scroll → screenshot → back end-to-end against the
-real engine without any network. Run it on a real machine with:
+The e2e cases drive ``file://`` pages: the core flow (navigate → snapshot
+→ click → type → press → scroll → screenshot → back), the read/JS-click
+recovery path, the shadow-DOM + cursor:pointer snapshot reach, and cookie
+persistence across restart — all against the real engine, no network. Run
+them on a real machine with:
 
     VEXIS_BROWSER_E2E=1 pytest tests/test_browser.py -k e2e -s
 """
@@ -132,6 +134,19 @@ def test_session_kwargs_targets_camoufox_persistent_profile():
     assert kw["block_webrtc"] is True
 
 
+def test_navigation_timeout_is_separate_and_shorter_than_action_timeout():
+    # The page-settle budget (goto + load + networkidle) is a distinct knob
+    # from the per-action ceiling, and deliberately much shorter — so a
+    # socket-heavy page that never reaches networkidle can't drag a single
+    # navigation out to the full action timeout. See session.wait_stable.
+    from vexis_agent.tools.browser import profile
+    nav = profile.navigation_timeout_seconds()
+    act = profile.action_timeout_seconds()
+    assert nav == 30
+    assert act == 120
+    assert nav < act
+
+
 # --- real-browser end-to-end (opt-in) -------------------------------
 
 E2E = os.environ.get("VEXIS_BROWSER_E2E") == "1"
@@ -243,6 +258,60 @@ def test_e2e_read_recovers_text_and_js_click_beats_overlay(tmp_path):
             assert blocked["ok"] is False, blocked
             # js click goes straight to the element
             assert (await bt.click(idx, js=True))["ok"] is True
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+@pytest.mark.skipif(not E2E, reason="set VEXIS_BROWSER_E2E=1 to run real browser e2e")
+def test_e2e_snapshot_indexes_shadow_dom_and_cursor_pointer(tmp_path):
+    # Modern-web reach beyond a flat querySelectorAll: a clickable custom
+    # control is a cursor:pointer <div> with no role/onclick, and a real
+    # control can live inside an open shadow root. Both must appear in the
+    # snapshot, the shadow control must be clickable by index (Playwright
+    # pierces open shadow DOM), and a pointer-styled wrapper around a real
+    # button must NOT add a second, redundant entry.
+    import asyncio
+    import re
+
+    page_html = tmp_path / "modern.html"
+    page_html.write_text(
+        "<html><body>"
+        "<div id='custom' style='cursor:pointer'>Custom Control</div>"
+        "<div style='cursor:pointer'><button id='real'>Inner Button</button></div>"
+        "<my-widget></my-widget>"
+        "<script>"
+        "class MyWidget extends HTMLElement {"
+        "  connectedCallback(){"
+        "    const r=this.attachShadow({mode:'open'});"
+        "    r.innerHTML=\"<button id='shadow-btn'>Shadow Go</button>\";"
+        "  }"
+        "}"
+        "customElements.define('my-widget', MyWidget);"
+        "</script>"
+        "</body></html>"
+    )
+    url = page_html.as_uri()
+
+    async def go():
+        mgr = SessionManager()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            nav = await bt.navigate(url)
+            assert nav["ok"] is True, nav
+            snap = (await bt.snapshot())["snapshot"]
+            # 1. cursor:pointer custom control surfaces despite no role/onclick
+            assert "Custom Control" in snap, snap
+            # 2. the inner real button surfaces; the pointer-styled wrapper
+            #    around it is suppressed (no separate <div>Inner Button</div>)
+            assert re.search(r"\[(\d+)\]<button[^>]*>Inner Button", snap), snap
+            assert not re.search(r"\[(\d+)\]<div[^>]*>Inner Button", snap), snap
+            # 3. a control inside an OPEN shadow root surfaces...
+            m = re.search(r"\[(\d+)\]<button[^>]*>Shadow Go", snap)
+            assert m, snap
+            # ...and is clickable by index (CSS locator pierces shadow DOM)
+            assert (await bt.click(int(m.group(1))))["ok"] is True
         finally:
             await mgr.stop()
 

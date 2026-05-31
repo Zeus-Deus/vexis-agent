@@ -33,6 +33,7 @@ from vexis_agent.tools.browser.profile import (
     action_timeout_seconds,
     headless,
     inactivity_timeout_seconds,
+    navigation_timeout_seconds,
     session_kwargs,
 )
 
@@ -105,13 +106,18 @@ class SessionManager:
             if self._page is None or self._page.is_closed():
                 page = await self._session.context.new_page()
                 # scrapling's own _get_page sets these; we bypass it by
-                # taking the context directly, so apply them here. Gives
-                # goto/click the full configured budget instead of
-                # Playwright's 30s default, which would otherwise fire
-                # before the action-timeout wrapper on a slow page.
-                timeout_ms = action_timeout_seconds() * 1000
-                page.set_default_navigation_timeout(timeout_ms)
-                page.set_default_timeout(timeout_ms)
+                # taking the context directly, so apply them here. Two
+                # distinct budgets on purpose:
+                #   * navigation timeout (default 30s) bounds goto/back and
+                #     the load/networkidle waits — a navigation must fail
+                #     fast, not creep toward the action ceiling.
+                #   * default timeout (action timeout, default 120s) bounds
+                #     interactions (click/type/fill); a deliberate, slow
+                #     action gets the generous budget the navigation can't.
+                page.set_default_navigation_timeout(
+                    navigation_timeout_seconds() * 1000
+                )
+                page.set_default_timeout(action_timeout_seconds() * 1000)
                 self._page = page
             self._last_activity = time.monotonic()
             self._last_activity_at_wall = datetime.now(timezone.utc)
@@ -122,12 +128,28 @@ class SessionManager:
     async def wait_stable(self, page: Any) -> None:
         """Wait for load / DOMContentLoaded / network-idle on ``page``.
 
-        Delegates to scrapling's own page-stability helper so we wait
-        exactly the way its ``fetch()`` does.
+        Delegates to scrapling's own page-stability helper so we settle the
+        page the way its ``fetch()`` does — but BOUNDED and BEST-EFFORT.
+        The caller's ``goto`` already awaited DOMContentLoaded, so the page
+        is usable; the trailing ``load`` + ``networkidle`` waits are a
+        nicety. A chat/feed page with long-lived sockets never reaches
+        networkidle, and scrapling's helper lets that wait run to the page
+        default timeout, so without a cap a single navigation would block
+        for the full action timeout. We cap it at the navigation budget and
+        swallow the timeout: settle if we can, proceed regardless.
         """
         if self._session is None:
             return
-        await self._session._wait_for_page_stability(page, True, True)
+        budget = navigation_timeout_seconds()
+        try:
+            await asyncio.wait_for(
+                self._session._wait_for_page_stability(page, True, True),
+                timeout=budget,
+            )
+        except Exception as exc:  # asyncio.TimeoutError + Playwright timeouts
+            # CancelledError is BaseException, so a real cancellation still
+            # propagates; only the stability wait's own failure is absorbed.
+            log.debug("[browser] page-stability wait capped at %ss: %s", budget, exc)
 
     async def solve_cloudflare(self, page: Any) -> None:
         """Run scrapling's Cloudflare solver against ``page`` (best-effort).

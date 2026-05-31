@@ -52,6 +52,10 @@ config_schema:
     type: int
     default: 120
     description: "Per-action wall-clock timeout. Legacy: [browser].action_timeout_seconds."
+  navigation_timeout_seconds:
+    type: int
+    default: 30
+    description: "Per-navigation budget (goto + load + networkidle settle). Bounded short and separate from action_timeout_seconds so a socket-heavy page can't stall a navigation. Legacy: [browser].navigation_timeout_seconds."
   solve_cloudflare:
     type: bool
     default: true

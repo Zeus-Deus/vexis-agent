@@ -36,6 +36,7 @@ DEFAULT_PROFILE_NAME = "default"
 DEFAULT_HEADLESS = True
 DEFAULT_INACTIVITY_TIMEOUT_S = 120
 DEFAULT_ACTION_TIMEOUT_S = 120
+DEFAULT_NAVIGATION_TIMEOUT_S = 30
 
 
 def profiles_dir() -> Path:
@@ -63,6 +64,16 @@ def inactivity_timeout_seconds() -> int:
 
 def action_timeout_seconds() -> int:
     return yaml_config.browser_action_timeout_seconds()
+
+
+def navigation_timeout_seconds() -> int:
+    """Per-navigation budget (goto + page-stability wait). Default 30s.
+
+    Bounds the network-idle wait so a navigation can't stall toward the
+    much larger action timeout; see ``session.wait_stable`` and
+    ``yaml_config.browser_navigation_timeout_seconds``.
+    """
+    return yaml_config.browser_navigation_timeout_seconds()
 
 
 def solve_cloudflare() -> bool:

@@ -89,9 +89,13 @@ addons:
   enabled:
     - browser
   # browser:
-  #   headless: true            # set false for a visible window at the machine
-  #   captcha_solver: none      # none | capsolver | twocaptcha
+  #   headless: true                 # set false for a visible window at the machine
+  #   captcha_solver: none           # none | capsolver | twocaptcha
   #   solve_cloudflare: true
+  #   navigation_timeout_seconds: 30 # goto + page-settle budget; bounds the
+  #                                  # networkidle wait so a socket-heavy page
+  #                                  # can't stall a navigation
+  #   action_timeout_seconds: 120    # overall per-action ceiling (click/type/etc.)
 
 # ── codemux orchestration watcher (see vexis_agent/addons/codemux/docs/codemux-watcher.md) ─────
 # Active ONLY when the `codemux` MCP is wired into mcp-servers.yaml;

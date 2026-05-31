@@ -3854,6 +3854,9 @@ class WebDashboard:
                 "action_timeout_seconds": (
                     yaml_config.browser_action_timeout_seconds()
                 ),
+                "navigation_timeout_seconds": (
+                    yaml_config.browser_navigation_timeout_seconds()
+                ),
                 "solve_cloudflare": yaml_config.browser_solve_cloudflare(),
                 "screenshot_include_base64": (
                     yaml_config.browser_screenshot_include_base64()

@@ -122,6 +122,11 @@ DEFAULT_CURATOR_STALE_AFTER_DAYS = 30
 DEFAULT_CURATOR_ARCHIVE_AFTER_DAYS = 90
 DEFAULT_BROWSER_INACTIVITY_TIMEOUT_SECONDS = 120
 DEFAULT_BROWSER_ACTION_TIMEOUT_SECONDS = 120
+# Navigation/page-stability budget — deliberately well under the action
+# timeout. goto() already returns at DOMContentLoaded; this bounds the
+# trailing load + networkidle wait so a page with long-lived sockets or
+# polling never stalls a navigation toward the much larger action ceiling.
+DEFAULT_BROWSER_NAVIGATION_TIMEOUT_SECONDS = 30
 DEFAULT_BROWSER_CAPTCHA_SOLVER = "none"
 # Providers the pluggable captcha-solver layer accepts. "none" disables it.
 VALID_BROWSER_CAPTCHA_SOLVERS = ("none", "capsolver", "twocaptcha")
@@ -327,6 +332,24 @@ def browser_action_timeout_seconds() -> int:
     return _int_or_default(
         _browser_section().get("action_timeout_seconds"),
         DEFAULT_BROWSER_ACTION_TIMEOUT_SECONDS,
+        minimum=5,
+    )
+
+
+def browser_navigation_timeout_seconds() -> int:
+    """Per-navigation budget (goto + load + networkidle). Default 30s.
+
+    Separate from ``action_timeout_seconds`` (the overall per-action
+    ceiling, default 120s) on purpose: navigation waits for the network
+    to settle, which a chat/feed page with long-lived sockets never does,
+    so the idle wait must be bounded short and best-effort rather than
+    inheriting the generous action ceiling. Set via
+    ``addons.browser.navigation_timeout_seconds`` (legacy
+    ``[browser].navigation_timeout_seconds`` still honoured).
+    """
+    return _int_or_default(
+        _browser_section().get("navigation_timeout_seconds"),
+        DEFAULT_BROWSER_NAVIGATION_TIMEOUT_SECONDS,
         minimum=5,
     )
 
