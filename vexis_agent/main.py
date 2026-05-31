@@ -911,6 +911,12 @@ def _build_dispatch(
                 if isinstance(verify_checks_raw, str) and verify_checks_raw
                 else None
             )
+            model_raw = args.get("model")
+            model = (
+                str(model_raw)
+                if isinstance(model_raw, str) and model_raw
+                else None
+            )
             try:
                 task = await bg.spawn(
                     chat_id,
@@ -918,6 +924,7 @@ def _build_dispatch(
                     prompt,
                     sandbox=sandbox,
                     verify_checks=verify_checks,
+                    model=model,
                 )
             except (
                 BackgroundTaskLimitReached,
@@ -938,6 +945,7 @@ def _build_dispatch(
                     "log_path": str(task.log_path),
                     "sandbox_enabled": task.sandbox_enabled,
                     "verify_checks_path": task.verify_checks_path,
+                    "model": task.model,
                 },
             }
         if op == "bg_cancel":

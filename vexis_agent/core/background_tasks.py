@@ -104,6 +104,13 @@ class BackgroundTask:
     sandbox_enabled: bool = field(default=False)
     verify_checks_path: str | None = field(default=None)
     verify_summary: str | None = field(default=None)
+    # Optional per-task model override. ``None`` (the default) means the
+    # spawned ``claude -p`` carries no ``--model`` flag, so the task runs
+    # on the account default — the historical behaviour. A set value is
+    # an abstract tier (``small``/``large``) OR a raw model id/alias
+    # (``sonnet``/``opus``/``haiku``/a full name); ``model_for_tier``
+    # translates the former and passes the latter through at launch.
+    model: str | None = field(default=None)
 
     def to_summary(self) -> dict:
         return {
@@ -118,6 +125,7 @@ class BackgroundTask:
             "sandbox_enabled": self.sandbox_enabled,
             "verify_checks_path": self.verify_checks_path,
             "verify_summary": self.verify_summary,
+            "model": self.model,
         }
 
 
@@ -244,6 +252,7 @@ class BackgroundTasks:
         *,
         sandbox: bool | None = None,
         verify_checks: str | None = None,
+        model: str | None = None,
     ) -> BackgroundTask:
         """Spawn a new background task. Raises on validation/limit/conflict.
 
@@ -259,8 +268,22 @@ class BackgroundTasks:
         check spec. When set AND sandbox is enabled, the watcher invokes
         ``vexis-verify run <name>`` after the agent process exits and
         flips the task to FAILED if any check fails.
+
+        ``model`` is an optional per-task model override (abstract tier
+        or raw model id/alias). ``None`` keeps the account-default
+        behaviour (no ``--model`` flag); a set value is resolved through
+        ``model_for_tier`` at launch — see :meth:`_launch`.
         """
         self.validate_name(name)
+        # Normalise the override: blank / "default" → no override so the
+        # account default is used. We keep the raw string otherwise and
+        # let ``model_for_tier`` do tier→native translation at launch.
+        if isinstance(model, str):
+            model = model.strip() or None
+            if model and model.lower() == "default":
+                model = None
+        else:
+            model = None
         # Final sandbox decision: explicit > heuristic > availability check.
         if sandbox is None:
             sandbox = should_sandbox(prompt)
@@ -302,6 +325,7 @@ class BackgroundTasks:
                 status=TaskStatus.PENDING,
                 sandbox_enabled=sandbox,
                 verify_checks_path=verify_checks,
+                model=model,
             )
             # Replace any stale finished record under the same name so the
             # new spawn owns the slot. The log file is appended to, not
@@ -383,6 +407,18 @@ class BackgroundTasks:
             "--permission-mode",
             "bypassPermissions",
         ]
+        # Per-task model override. This spawn path is claude-code-native
+        # (hardcoded ``claude -p``), so we resolve against that brain kind:
+        # an abstract tier (small/large) maps via the config tier-map, a
+        # raw alias/full name passes straight through, and None/"default"
+        # yields no id → no ``--model`` flag → account default (the
+        # historical behaviour). An opencode equivalent of this launcher
+        # would resolve with brain_kind="opencode" the same way.
+        from vexis_agent.core.yaml_config import model_for_tier
+
+        model_id = model_for_tier("claude-code", task.model)
+        if model_id:
+            argv += ["--model", model_id]
         env = {**os.environ, "VEXIS_CHAT_ID": str(task.chat_id)}
         if task.sandbox_enabled:
             # Let the agent's tools (`vexis-sandbox exec`, future
@@ -395,7 +431,8 @@ class BackgroundTasks:
                 f"# vexis-bg task '{task.name}' spawned "
                 f"{task.spawned_at.isoformat()} chat={task.chat_id} "
                 f"sandbox={task.sandbox_enabled} "
-                f"verify={task.verify_checks_path!r}\n"
+                f"verify={task.verify_checks_path!r} "
+                f"model={model_id or 'default'}\n"
                 f"# prompt: {task.prompt!r}\n".encode()
             )
             proc = await asyncio.create_subprocess_exec(

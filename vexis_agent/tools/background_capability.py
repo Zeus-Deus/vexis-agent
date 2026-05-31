@@ -65,6 +65,26 @@ Returns JSON with the task name and spawn time. Tell the user clearly:
 > "Spawned background task `fix-login-bug`. I'll ping you when it's
 > done — you can keep chatting in the meantime."
 
+### Choosing the model
+
+By default a background task runs on the account-default model — the
+same as a foreground turn. **Omit the model unless the user asks for
+one.**
+
+When the user names a model for the task ("run it on opus", "use
+haiku in the background", "background that with sonnet"), pass it
+with `--model`:
+
+    vexis-bg spawn refactor-auth '<prompt>' --model opus
+
+`--model` accepts an alias (`haiku`, `sonnet`, `opus`), a full model
+name, or an abstract tier (`small`, `medium`, `large`). The value
+flows straight to the spawned `claude -p --model <…>`. Don't guess a
+model the user didn't mention, and don't add the flag "to be safe" —
+a bad model id fails the whole task (it exits non-zero and the user
+gets the failure notification). When the user doesn't specify one,
+leave it off.
+
 ### Checking on a running task
 
 If the user asks "how's that going" or you want to peek mid-task, read
