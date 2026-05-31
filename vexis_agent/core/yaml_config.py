@@ -155,6 +155,15 @@ DEFAULT_GOALS_MAX_TURNS = 20
 # matrix and the per-policy send/suppress decisions.
 DEFAULT_GOALS_NOTIFY_POLICY = "done_only"
 _GOALS_NOTIFY_POLICY_VALUES = frozenset({"all", "done_only"})
+# Default execution surface for ``/goal <text>`` when the user gives no
+# explicit ``--fg`` / ``--bg`` flag. ``background`` (the default) files
+# the goal as a kanban task so the foreground chat stays free — progress
+# is surfaced via the ``[BACKGROUND GOALS]`` context block + /goal status
+# rather than streamed turn-by-turn into the chat. ``foreground`` runs
+# the in-chat continuation loop (pre-v0.11 behaviour). A per-invocation
+# flag always wins over this default.
+DEFAULT_GOALS_DEFAULT_MODE = "background"
+_GOALS_DEFAULT_MODE_VALUES = frozenset({"background", "foreground"})
 # /schedule feature defaults. Off through Day 1-3 dev; Day 4 flips
 # DEFAULT_SCHEDULES_ENABLED to True after the eval gate (no LLM eval —
 # integration test only; see tests/test_schedule_eval.py).
@@ -527,6 +536,33 @@ def goals_notify_policy() -> str:
     candidate = raw.strip().lower()
     if candidate not in _GOALS_NOTIFY_POLICY_VALUES:
         return DEFAULT_GOALS_NOTIFY_POLICY
+    return candidate
+
+
+def goals_default_mode() -> str:
+    """Execution surface for ``/goal <text>`` absent an explicit flag.
+
+    Returns ``"background"`` (the default) or ``"foreground"``.
+
+      * ``"background"`` files the goal as a kanban task. The foreground
+        Telegram chat stays free; progress is surfaced via the
+        ``[BACKGROUND GOALS]`` context block injected into chat turns and
+        via ``/goal status`` / the dashboard kanban board.
+      * ``"foreground"`` runs the in-chat continuation ("Ralph") loop
+        that streams each turn into the chat (pre-v0.11 default).
+
+    ``/goal --fg`` / ``/goal --foreground`` and ``/goal --bg`` /
+    ``/goal --background`` override this per invocation. Reads disk per
+    call (same posture as :func:`goals_notify_policy`) so an edit
+    hot-reloads at the next ``/goal`` without a daemon restart. Garbage /
+    unknown values fall through to ``DEFAULT_GOALS_DEFAULT_MODE``.
+    """
+    raw = _section("goals").get("default_mode", DEFAULT_GOALS_DEFAULT_MODE)
+    if not isinstance(raw, str):
+        return DEFAULT_GOALS_DEFAULT_MODE
+    candidate = raw.strip().lower()
+    if candidate not in _GOALS_DEFAULT_MODE_VALUES:
+        return DEFAULT_GOALS_DEFAULT_MODE
     return candidate
 
 

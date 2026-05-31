@@ -150,6 +150,22 @@ class _FakeHandler:
 # ──────────────────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _foreground_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin ``goals.default_mode`` to ``foreground`` for this module.
+
+    Most tests here predate the v0.11 background-by-default flip and
+    exercise the in-chat continuation loop; pinning foreground keeps
+    ``/goal <text>`` (no flag) on the foreground path they assert
+    against. Tests for the new background default re-monkeypatch this to
+    ``background`` in their own body (a later setattr wins).
+    """
+    monkeypatch.setattr(
+        "vexis_agent.core.yaml_config.goals_default_mode",
+        lambda: "foreground",
+    )
+
+
 @pytest.fixture
 def goals_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect ``core.paths.goals_path`` (which the transport's
@@ -2062,7 +2078,7 @@ def test_goal_bg_files_kanban_task_and_skips_foreground(
     assert "port the goal command to vexis" in task.title
     assert task.body == "port the goal command to vexis"
     assert task.lane == "implementation"
-    assert task.created_by == "user:/goal --bg"
+    assert task.created_by == "user:/goal"
 
 
 def test_goal_bg_empty_after_flag_rejects(

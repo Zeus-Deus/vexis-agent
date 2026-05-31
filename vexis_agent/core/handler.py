@@ -199,11 +199,19 @@ class MessageHandler:
         *,
         notifier: Notifier | None = None,
         workspace: Path | None = None,
+        background_goal_provider=None,
     ) -> None:
         self._brain = brain
         self._sessions = sessions
         self._allowed_user_id = allowed_user_id
         self._workspace = workspace
+        # Optional zero-arg provider returning a rendered
+        # ``[BACKGROUND GOALS]`` block (or None) to prepend to each
+        # foreground turn so the brain can report background-goal
+        # progress conversationally (see core.goal_background). Wired in
+        # main.py once the kanban store exists; None in tests / when
+        # kanban is disabled.
+        self._background_goal_provider = background_goal_provider
         # The notifier owns the per-chat context buffer. We consume from
         # it at the start of every brain turn so events that fired since
         # the last reply (background task completions, daemon-restart
@@ -237,6 +245,16 @@ class MessageHandler:
         ``iter_messages``. Read-only intentionally — the brain is
         bound at handler construction and never reassigned."""
         return self._brain
+
+    def set_background_goal_provider(self, provider) -> None:
+        """Wire (or clear) the ``[BACKGROUND GOALS]`` context provider.
+
+        Called from main.py after the kanban store is built — the store
+        doesn't exist yet at handler construction, so the provider can't
+        be passed to ``__init__`` in the normal wiring. ``provider`` is a
+        zero-arg callable returning the rendered block or ``None``.
+        """
+        self._background_goal_provider = provider
 
     async def handle(
         self,
@@ -624,8 +642,9 @@ class MessageHandler:
             if self._notifier is not None else []
         )
         verifier_footer = self._build_verifier_footer(chat_id)
+        background_goals = self._build_background_goal_block()
 
-        if not notes and not verifier_footer:
+        if not notes and not verifier_footer and not background_goals:
             return text
         if notes:
             log.info(
@@ -633,7 +652,9 @@ class MessageHandler:
                 len(notes),
                 chat_id,
             )
-        return _format_with_context(notes, text, verifier_footer)
+        return _format_with_context(
+            notes, text, verifier_footer, background_goals
+        )
 
     def _build_verifier_footer(self, chat_id: int) -> str | None:
         """Drain the brain's file-mutation buffer for ``chat_id`` and
@@ -674,6 +695,27 @@ class MessageHandler:
         turn = last + 1
         self._verifier_turn_index[chat_id] = turn
         return format_verifier_footer(turn, files)
+
+    def _build_background_goal_block(self) -> str | None:
+        """Render the ``[BACKGROUND GOALS]`` block for the next turn, or
+        ``None``.
+
+        Delegates to the provider wired in main.py (which reads the
+        kanban store via :func:`core.goal_background.render_background_goal_block`).
+        ``None`` when no provider is set (tests, kanban disabled) or no
+        background goals are active. Never raises — a broken provider
+        degrades to "no block", never a failed turn.
+        """
+        provider = self._background_goal_provider
+        if provider is None:
+            return None
+        try:
+            return provider()
+        except Exception:  # pragma: no cover - defensive
+            log.debug(
+                "background-goal context provider failed", exc_info=True
+            )
+            return None
 
     async def handle_clear(self, user_id: int) -> str | None:
         if not is_allowed(user_id, self._allowed_user_id):
@@ -915,6 +957,7 @@ def _format_with_context(
     notes: list[ContextNote],
     user_text: str,
     verifier_footer: str | None = None,
+    background_goal_block: str | None = None,
 ) -> str:
     """Render the [SYSTEM CONTEXT] / [USER MESSAGE] envelope for the brain.
 
@@ -942,6 +985,12 @@ def _format_with_context(
             for cont in rest:
                 lines.append(f"  {cont}")
         sections.append("\n".join((_SYSTEM_CONTEXT_HEADER, *lines)))
+    # Background-goal status sits closest to the user's message — it's
+    # ambient "current state" the user is most likely asking about, so
+    # keep it adjacent to [USER MESSAGE] rather than up with the
+    # previous-turn verifier footer.
+    if background_goal_block:
+        sections.append(background_goal_block)
     sections.append(f"{_USER_MESSAGE_HEADER}\n{user_text}")
     return "\n\n".join(sections)
 

@@ -189,18 +189,17 @@ sonnet-flip context) · `.plans/relationships-v3c-research.md`.
 
 ## Goals (v3d)
 
-`/goal <text>` kicks off a multi-step foreground task. After each
-turn an aux judge (`subsystem_tier("goal_judge")`) decides done;
-if not and budget remains, a continuation enqueues through the
-same per-chat FIFO real user messages use. `/goal resume` ALSO
-spawns a background dispatch — pure state-flips leave the loop
-idle (the v3d UX bug). `/cancel` mid-loop → paused. Budget
-default 20 (`goals.max_turns`); disable: `goals.enabled: false`.
-Two UX knobs: `goals.notify_policy` (`done_only` default —
-suppresses per-continuation pings, terminal-only delivery with
-the brain reply flushed inline; `all` restores pre-revisit noise).
-`/goal --bg <text>` routes long-horizon work to kanban (detached
-aux worker, foreground chat stays free).
+`/goal <text>` hands Vexis a multi-step objective. As of v0.11 it
+runs **in the background by default** (`goals.default_mode`): filed
+as a kanban task, chat stays free, progress via a `[BACKGROUND
+GOALS]` block injected into chat turns (just ask "how's my goal
+going?") + `/goal status` + the dashboard. `/goal --fg <text>` runs
+the old in-chat loop instead: an aux judge
+(`subsystem_tier("goal_judge")`) decides done each turn, else a
+continuation enqueues via the per-chat FIFO (`/goal
+resume`/`pause`/`clear`; `/cancel` → paused). Budget 20
+(`goals.max_turns`); disable `goals.enabled: false`; foreground
+noise `goals.notify_policy`. Projection: `core/goal_background.py`.
 
 **Pointers:** `docs/goals.md` · `.plans/goal-command-research.md`.
 
