@@ -53,6 +53,7 @@ def _build_dashboard(workspace: Path) -> WebDashboard:
     dashboard._background_tasks = None
     dashboard._curator = None
     dashboard._browser = None
+    dashboard._addon_runtime = None  # browser reached via addon runtime service
     dashboard._chat = None
     dashboard._running_brain_kind = None
     dashboard._profile_size_cache = None

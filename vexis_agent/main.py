@@ -37,7 +37,6 @@ from vexis_agent.core.paths import daemon_pid_path, state_dir, workspace_dir
 from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.core.sessions import SessionStore
 from vexis_agent.core.web_server import DEFAULT_DASHBOARD_PORT, DashboardConfig, WebDashboard
-from vexis_agent.tools.browser import BrowserTools, get_manager as get_browser_manager
 from vexis_agent.transports.telegram import TelegramTransport
 from vexis_agent.transports.web import WebChatTransport
 
@@ -340,8 +339,14 @@ async def _run() -> bool:
         system_prompt_provider=lambda: build_system_prompt(workspace),
         sandbox_runner=sandbox_runner,
     )
-    browser_manager = get_browser_manager()
-    browser_tools = BrowserTools(browser_manager, workspace)
+
+    # The browser is no longer hardcoded here — it ships as the bundled
+    # ``browser`` add-on (vexis_agent/addons/browser/). The add-on
+    # instantiates the SessionManager + BrowserTools in its register(),
+    # registers the nine browser_* dispatch handlers, owns session
+    # lifecycle via a background task, and exposes the live BrowserTools
+    # as the ``"browser"`` runtime service the dashboard reads. Core
+    # stays browser-agnostic.
 
     # Watcher subsystem (generic registry + polling loop). Always
     # instantiated; source plugins are supplied by add-ons via
@@ -383,6 +388,16 @@ async def _run() -> bool:
     )
     addon_runtime = AddonRuntime()
     addon_runtime.attach_service("watcher", watcher)
+    # The workspace path is a shared service so add-ons that bind to it
+    # (the browser add-on's BrowserTools) resolve it the same way the
+    # daemon did, without re-reading config. Attached BEFORE add-ons
+    # load so register() can read it.
+    addon_runtime.attach_service("workspace", workspace)
+    # ``discover_addons`` defaults bundled add-ons in
+    # ``DEFAULT_ENABLED_BUNDLED`` (browser) to on — they load even when
+    # the user's config has no ``addons.enabled`` line, so capabilities
+    # extracted from core (web browsing) survive an upgrade without a
+    # config edit. ``addons.disabled`` still turns them off.
     for _discovered in discover_addons(
         enabled=_addons_enabled(),
         disabled=_addons_disabled(),
@@ -432,7 +447,6 @@ async def _run() -> bool:
         default_socket_path(),
         _build_dispatch(
             background_tasks,
-            browser_tools,
             watcher,
             addon_runtime=addon_runtime,
         ),
@@ -529,6 +543,20 @@ async def _run() -> bool:
             extra_prompt_blocks=extra_prompt_blocks,
         )
         log.info("Brain: ClaudeCodeBrain (brain.kind=claude-code)")
+
+    # Add-on MCP defaults (see docs/addons.md). An add-on can declare
+    # an MCP server via ``ctx.register_mcp_server_default``; this is the
+    # one live consumer. Now that the brain AND the add-on runtime both
+    # exist, fold those defaults into the active brain's native MCP
+    # config. Goes through ``brain.write_mcp_config`` so claude-code
+    # (.mcp.json) and opencode (opencode.json) are both served; the next
+    # ``claude -p`` / ``opencode run`` spawn re-reads the file, so no
+    # daemon restart is needed. Precedence: user mcp-servers.yaml wins on
+    # a name collision, add-on defaults only fill gaps; user-owned
+    # native-file entries are preserved by the brain writer itself.
+    from vexis_agent.core.addon_mcp import merge_addon_mcp_defaults
+    merge_addon_mcp_defaults(brain, addon_runtime)
+
     handler = MessageHandler(
         brain=brain,
         sessions=sessions,
@@ -599,7 +627,13 @@ async def _run() -> bool:
         running_tasks=running_tasks,
         background_tasks=background_tasks,
         curator=curator,
-        browser=browser_tools,
+        # The dashboard reaches the live browser via the add-on runtime
+        # service registry (``get_service("browser")``) instead of a
+        # direct BrowserTools handle — so core/web_server never imports
+        # the browser add-on. When the browser add-on is disabled the
+        # service is absent and the Browser tab routes degrade
+        # gracefully (503 / hidden payload).
+        addon_runtime=addon_runtime,
         learning=learning_curator,
         config=DashboardConfig(
             port=dashboard_port,
@@ -690,7 +724,10 @@ async def _run() -> bool:
         await dashboard.stop()
         await control_socket.stop()
         await background_tasks.shutdown()
-        await browser_manager.stop()
+        # The browser session is torn down by the browser add-on's
+        # ``browser-session-lifecycle`` background task, cancelled above
+        # via ``addon_runtime.stop_all_background_tasks()`` — no direct
+        # ``browser_manager.stop()`` here (core stays browser-agnostic).
     # By here every socket the daemon owns (control socket, dashboard,
     # Telegram long-poll) is closed, so a re-exec'd image can re-bind
     # cleanly. ``main()`` performs the execv when this is True; a normal
@@ -769,15 +806,21 @@ def _dashboard_port_from_env() -> int:
 
 def _build_dispatch(
     bg: BackgroundTasks,
-    browser: BrowserTools,
     watcher: "object | None" = None,  # WatcherController; weak-typed to avoid import cycle
     addon_runtime: "AddonRuntime | None" = None,
 ):
     """Wire control-socket ops to in-daemon singletons.
 
     The dispatcher is intentionally exhaustive — adding a new op here is
-    the same effort as adding a new bg/browser method, and unknown ops
-    return a structured error rather than silently 200ing.
+    the same effort as adding a new bg method, and unknown ops return a
+    structured error rather than silently 200ing.
+
+    The nine ``browser_*`` ops are NOT hardcoded here anymore — they are
+    registered by the bundled browser add-on via
+    ``ctx.register_dispatch_handler`` and routed through the
+    add-on-dispatch-first check below. With the browser add-on disabled,
+    ``vexis-browse`` ops fall through to the unknown-op error, which is
+    the honest answer (the browser isn't loaded).
 
     ``watcher`` is ``None`` when the Codemux MCP isn't configured;
     ``watch_*`` ops in that mode return ``CodemuxNotConfigured`` so
@@ -940,75 +983,9 @@ def _build_dispatch(
             except TaskNotFound as exc:
                 return {"ok": False, "error": str(exc), "kind": "TaskNotFound"}
             return {"ok": True, "result": {"text": text}}
-        if op == "browser_navigate":
-            url = args.get("url", "")
-            return await browser.navigate(url if isinstance(url, str) else "")
-        if op == "browser_snapshot":
-            return await browser.snapshot(bool(args.get("full", False)))
-        if op == "browser_click":
-            try:
-                index = int(args.get("index"))
-            except (TypeError, ValueError):
-                return {
-                    "ok": False,
-                    "error": "'index' must be an integer",
-                    "kind": "BadRequest",
-                }
-            return await browser.click(index, bool(args.get("js", False)))
-        if op == "browser_read":
-            sel = args.get("selector")
-            if sel is not None and not isinstance(sel, str):
-                return {
-                    "ok": False,
-                    "error": "'selector' must be a string",
-                    "kind": "BadRequest",
-                }
-            return await browser.read(sel)
-        if op == "browser_type":
-            try:
-                index = int(args.get("index"))
-            except (TypeError, ValueError):
-                return {
-                    "ok": False,
-                    "error": "'index' must be an integer",
-                    "kind": "BadRequest",
-                }
-            text = args.get("text", "")
-            if not isinstance(text, str):
-                return {
-                    "ok": False,
-                    "error": "'text' must be a string",
-                    "kind": "BadRequest",
-                }
-            clear = bool(args.get("clear", True))
-            return await browser.type(index, text, clear)
-        if op == "browser_press":
-            key = args.get("key", "")
-            return await browser.press(key if isinstance(key, str) else "")
-        if op == "browser_back":
-            return await browser.back()
-        if op == "browser_scroll":
-            direction = args.get("direction", "")
-            if not isinstance(direction, str):
-                direction = ""
-            try:
-                pages = float(args.get("pages", 1.0))
-            except (TypeError, ValueError):
-                return {
-                    "ok": False,
-                    "error": "'pages' must be a number",
-                    "kind": "BadRequest",
-                }
-            return await browser.scroll(direction, pages)
-        if op == "browser_screenshot":
-            include_b64_raw = args.get("include_base64")
-            include_b64 = (
-                bool(include_b64_raw) if include_b64_raw is not None else None
-            )
-            return await browser.screenshot(
-                bool(args.get("full_page", False)),
-                include_base64=include_b64,
-            )
+        # browser_* ops are owned by the bundled browser add-on and
+        # routed via the add-on-dispatch-first check at the top of this
+        # function — there are no hardcoded browser branches here.
         if op == "watch_register":
             # The codemux add-on owns the resolver path (workspace_id
             # → session_id) and registers its own watch_register

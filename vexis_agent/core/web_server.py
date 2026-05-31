@@ -97,8 +97,15 @@ from vexis_agent.core.voice import (
     tts_provider,
     voice_enabled,
 )
-from vexis_agent.tools.browser import BrowserTools
 from vexis_agent.transports.web import WebChatTransport
+# Browser dashboard support imports the small shared CONTRACT under
+# ``tools/browser`` (captcha value-types + config, profile-dir helpers)
+# — never the browser ADD-ON. ``tools/`` is importable by core; the
+# add-on (``vexis_agent/addons/browser/``) owns the live session and
+# exposes it via the runtime service ``get_service("browser")``, which
+# the dashboard fetches lazily (see ``_browser_or_none``). When the
+# browser add-on is disabled the service is absent and the Browser-tab
+# routes degrade gracefully.
 from vexis_agent.tools.browser.captcha import (
     VALID_PROVIDERS as CAPTCHA_PROVIDERS,
     get_solver as captcha_get_solver,
@@ -269,6 +276,15 @@ CURATOR_RUN_HISTORY_LIMIT = 50
 # How many recent screenshots to surface on the browser page.
 BROWSER_SCREENSHOT_LIMIT = 5
 
+# Returned by the Browser-tab routes / payload when the browser add-on
+# isn't loaded (``addons.browser`` not enabled). The dashboard reaches
+# the live session via the add-on runtime service; absent that service,
+# the browser simply isn't available this run.
+_BROWSER_UNAVAILABLE_MSG = (
+    "Browser add-on not loaded. Enable it with "
+    "`vexis-addons enable browser` and restart the daemon."
+)
+
 # Profile-size cache TTL. Walking 60+ MB of Chromium profile every poll
 # tick is wasteful; once every 30 s is plenty given the size doesn't
 # change at second resolution. The UI surfaces "as of <ts>" so the user
@@ -322,9 +338,9 @@ class WebDashboard:
         running_tasks: RunningTasks,
         background_tasks: BackgroundTasks,
         curator: CuratorController | None,
-        browser: BrowserTools,
         learning: LearningController | None,
         config: DashboardConfig,
+        addon_runtime: "object | None" = None,
         running_brain_kind: str | None = None,
         chat: WebChatTransport | None = None,
     ) -> None:
@@ -333,7 +349,13 @@ class WebDashboard:
         self._running_tasks = running_tasks
         self._background_tasks = background_tasks
         self._curator = curator
-        self._browser = browser
+        # The browser is reached lazily through the add-on runtime's
+        # service registry (``get_service("browser")``) rather than a
+        # direct BrowserTools handle — so core/web_server never imports
+        # the browser add-on. ``None`` runtime (or no browser service)
+        # ⇒ the Browser tab degrades: routes 503, payload reports the
+        # add-on is unavailable. See ``_browser_or_none``.
+        self._addon_runtime = addon_runtime
         self._learning = learning
         self._config = config
         # Optional — when None the /api/v1/chat/* routes return 503.
@@ -956,15 +978,21 @@ class WebDashboard:
             # Reuses the exact codepath the control socket dispatches
             # for ``browser_navigate about:blank`` — same lazy-launch
             # behavior, same session reuse if one is already running.
-            return await self._browser.navigate("about:blank")
+            browser = self._browser_or_none()
+            if browser is None:
+                raise HTTPException(503, _BROWSER_UNAVAILABLE_MSG)
+            return await browser.navigate("about:blank")
 
         @app.post(
             "/api/v1/browser/recycle",
             dependencies=[Depends(_require_auth)],
         )
         async def post_browser_recycle() -> dict:
-            was_running = self._browser.manager.is_running()
-            await self._browser.manager.stop()
+            browser = self._browser_or_none()
+            if browser is None:
+                raise HTTPException(503, _BROWSER_UNAVAILABLE_MSG)
+            was_running = browser.manager.is_running()
+            await browser.manager.stop()
             return {"ok": True, "was_running": was_running}
 
         @app.post(
@@ -3743,17 +3771,54 @@ class WebDashboard:
             raise HTTPException(500, "goal record vanished after clear")
         return self._goal_record_dict(sid, state)
 
-    def _browser_payload(self) -> dict:
-        manager = self._browser.manager
-        session_state = manager.state_for_dashboard()
-        page_state = self._browser.state_for_dashboard()
+    def _browser_or_none(self):
+        """Live ``BrowserTools`` from the add-on runtime, or ``None``.
 
+        The browser ships as a bundled add-on that attaches its live
+        ``BrowserTools`` under the ``"browser"`` service name. The
+        dashboard fetches it here instead of holding a direct handle —
+        so ``core/web_server`` never imports ``vexis_agent.addons.browser``
+        (the add-on-isolation invariant). ``None`` ⇒ the add-on is
+        disabled this run; every Browser-tab surface degrades gracefully.
+        """
+        # getattr-default so __new__-built test dashboards that don't set
+        # the attr (and any pre-existing alternate wiring) degrade to
+        # "no browser" instead of AttributeError.
+        runtime = getattr(self, "_addon_runtime", None)
+        if runtime is None:
+            return None
+        getter = getattr(runtime, "get_service", None)
+        if getter is None:
+            return None
+        return getter("browser")
+
+    def _browser_payload(self) -> dict:
+        browser = self._browser_or_none()
         profile_path = browser_profile_dir()
         size_bytes, size_at = self._browser_profile_size(profile_path)
         cookie_count = _count_cookies(profile_path)
 
-        return {
-            "session": {
+        if browser is None:
+            # Browser add-on not loaded: report unavailable but still
+            # surface the resolved config + captcha status (those read
+            # from yaml, add-on-config-aware) and any on-disk profile /
+            # screenshots, so the tab renders something useful and the
+            # user knows to enable the add-on.
+            session = {
+                "state": "unavailable",
+                "current_url": None,
+                "current_title": None,
+                "started_at": None,
+                "last_activity_at": None,
+                "headless": yaml_config.browser_headless(),
+                "engine": "camoufox",
+            }
+            recent_navigations: list = []
+        else:
+            manager = browser.manager
+            session_state = manager.state_for_dashboard()
+            page_state = browser.state_for_dashboard()
+            session = {
                 "state": session_state["state"],
                 "current_url": page_state["current_url"],
                 "current_title": page_state["current_title"],
@@ -3761,7 +3826,12 @@ class WebDashboard:
                 "last_activity_at": session_state["last_activity_at"],
                 "headless": session_state["headless"],
                 "engine": "camoufox",
-            },
+            }
+            recent_navigations = page_state["recent_navigations"]
+
+        return {
+            "available": browser is not None,
+            "session": session,
             "profile": {
                 "path": str(profile_path),
                 "exists": profile_path.is_dir(),
@@ -3769,7 +3839,7 @@ class WebDashboard:
                 "size_as_of": size_at,
                 "cookie_count": cookie_count,
             },
-            "recent_navigations": page_state["recent_navigations"],
+            "recent_navigations": recent_navigations,
             "recent_screenshots": _list_recent_screenshots(
                 browser_screenshots_dir(self._workspace),
                 BROWSER_SCREENSHOT_LIMIT,
@@ -3816,12 +3886,18 @@ class WebDashboard:
         """POST /api/v1/browser/captcha/config — set provider + (optional) key.
 
         Body: ``{"provider": str, "api_key"?: str}``. Writes
-        ``[browser].captcha_solver`` and, when a non-empty ``api_key`` is
-        supplied, ``[browser].captcha_solver_api_key``. An omitted/blank key
-        keeps the existing one (so the masked-field UX doesn't wipe it). Same
-        write path as the model-UX endpoints: read-modify-write with a
-        comment-preserving backup and an atomic rewrite. Never returns the raw
-        key — only the masked form."""
+        ``addons.browser.captcha_solver`` and, when a non-empty ``api_key``
+        is supplied, ``addons.browser.captcha_solver_api_key`` — the
+        canonical add-on config location (``_browser_section`` reads it
+        first, so a dashboard edit always takes effect regardless of any
+        legacy ``[browser]`` block). An omitted/blank key keeps the
+        existing one (so the masked-field UX doesn't wipe it). For
+        back-compat, an existing key under the legacy ``[browser]`` block
+        is migrated into ``addons.browser`` on first write so the masked
+        round-trip is preserved. Same write path as the model-UX
+        endpoints: read-modify-write with a comment-preserving backup and
+        an atomic rewrite. Never returns the raw key — only the masked
+        form."""
         from fastapi import HTTPException
 
         from vexis_agent.core.paths import vexis_dir
@@ -3845,11 +3921,20 @@ class WebDashboard:
 
         cfg_path = vexis_dir() / "config.yaml"
         current = _read_raw()
-        browser = dict(current.get("browser") or {})
+        addons = dict(current.get("addons") or {})
+        browser = dict(addons.get("browser") or {})
+        # Migrate a legacy ``[browser]`` key forward so an omitted api_key
+        # preserves it under the canonical location.
+        legacy = current.get("browser") or {}
+        if "captcha_solver_api_key" not in browser and legacy.get(
+            "captcha_solver_api_key"
+        ):
+            browser["captcha_solver_api_key"] = legacy["captcha_solver_api_key"]
         browser["captcha_solver"] = provider
         if isinstance(api_key, str) and api_key.strip():
             browser["captcha_solver_api_key"] = api_key.strip()
-        proposed = {**current, "browser": browser}
+        addons["browser"] = browser
+        proposed = {**current, "addons": addons}
 
         backup_path = (
             backup_if_commented(cfg_path) if cfg_path.exists() else None

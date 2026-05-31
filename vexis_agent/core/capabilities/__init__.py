@@ -75,7 +75,13 @@ class CapabilityBlock:
 
 #: name -> CapabilityBlock. Populated by ``register_capability_block``
 #: at module-import time (per-tool modules) plus the ``core`` block
-#: registered lazily in :func:`_ensure_loaded`.
+#: registered lazily in :func:`_ensure_loaded`. Add-on capability
+#: blocks land here too: ``ctx.register_capability_block`` delegates to
+#: ``register_capability_block`` via ``AddonRuntime.add_capability_block``
+#: at add-on load time, so add-on blocks share this one registry — and
+#: thus the same global ``order`` space and the same conflict checks —
+#: with the core blocks. ``assemble_capability_docs()`` reads this dict,
+#: so the merge is automatic; no separate add-on assembly path exists.
 _REGISTRY: dict[str, CapabilityBlock] = {}
 
 #: Modules that own a core capability block. Imported exactly once by
@@ -86,6 +92,9 @@ _REGISTRY: dict[str, CapabilityBlock] = {}
 #: cross-cutting blocks that have no single owning tool live in
 #: ``builtin`` here in the capabilities package.
 _BUILTIN_CAPABILITY_MODULES: tuple[str, ...] = (
+    # Self-extension framing (no single tool owner): which seam to use
+    # when adding a capability (skill / MCP / add-on) + hot-vs-restart.
+    "vexis_agent.core.capabilities.self_extension",
     # Cross-cutting (no single tool owner): inbound images, omarchy-kb,
     # web dashboard.
     "vexis_agent.core.capabilities.builtin",
@@ -102,12 +111,19 @@ _BUILTIN_CAPABILITY_MODULES: tuple[str, ...] = (
     "vexis_agent.tools.memory_capability",
     # Procedural-knowledge skills library (vexis-skill).
     "vexis_agent.tools.skills_capability",
-    # Web browsing (vexis-browse) — the issue-#30 flagship.
-    "vexis_agent.tools.browser.capability",
     # Scheduling (vexis-agent schedule).
     "vexis_agent.tools.schedule_tool.capability",
-    # Codemux orchestration (vexis-watch).
-    "vexis_agent.tools.watch_capability",
+    # NOTE: web-browsing (order 13) is NOT a builtin. It moved to the
+    # browser add-on (``vexis_agent/addons/browser/``), which registers
+    # it via ``ctx.register_capability_block`` at load time — so the
+    # "Web browsing" section appears in the assembled prompt only when
+    # the browser add-on is enabled, and is absent from the
+    # builtins-only golden. Same model as codemux-orchestration below.
+    # NOTE: codemux-orchestration (order 15) is NOT a builtin. It moved
+    # to the codemux add-on, which registers it via
+    # ``ctx.register_capability_block`` at load time — so it appears in
+    # the assembled prompt only when codemux is enabled, and is absent
+    # from the builtins-only golden.
 )
 
 _loaded = False
@@ -192,9 +208,17 @@ def assemble_capability_docs() -> str:
     Replaces the monolithic ``read_capabilities()`` call in both brain
     prompt builders. Returns the per-capability blocks joined exactly
     as the monolith was laid out (``"\\n\\n"`` between sections, single
-    trailing newline) — byte-identical to the pre-decomposition file.
-    A provider that raises is logged and skipped so one broken block
-    can't take down the whole prompt.
+    trailing newline) — byte-identical to the pre-decomposition file
+    when only core blocks are registered.
+
+    Add-on capability blocks merge in transparently: they live in the
+    same ``_REGISTRY`` (registered via
+    ``ctx.register_capability_block`` at add-on load time) and are
+    sorted into the same global ``order`` space, so they appear in
+    deterministic position with no separate assembly path. Order
+    collisions across core+add-on are rejected at registration time,
+    not here. A provider that raises is logged and skipped so one
+    broken block can't take down the whole prompt.
     """
     parts: list[str] = []
     for block in iter_capability_blocks():

@@ -1,0 +1,63 @@
+name: browser
+version: 1.0.0
+description: "Stealth web browsing — drives a Camoufox (hardened Firefox) session via `vexis-browse`. The flagship in-process add-on: navigate/snapshot/click/read/type/press/back/scroll/screenshot, persistent login profiles, Cloudflare auto-solve, and a pluggable CapSolver/2Captcha layer."
+author: "Zeus-Deus"
+kind: standalone
+
+requires:
+  vexis_agent: ">=0.9.0"
+  python: ">=3.11"
+
+provides:
+  dispatch_handlers:
+    - browser_navigate
+    - browser_snapshot
+    - browser_click
+    - browser_read
+    - browser_type
+    - browser_press
+    - browser_back
+    - browser_scroll
+    - browser_screenshot
+  background_tasks: ["browser-session-lifecycle"]
+  skills: ["browser.md"]
+
+# Config back-compat: every knob also reads the legacy top-level
+# ``[browser]`` block when ``addons.browser.*`` is unset, so existing
+# user configs keep working with no edit. See __init__.py
+# ``_browser_config_overrides`` and tools/browser/profile.py.
+config_schema:
+  profiles_dir:
+    type: str
+    description: "Directory holding Camoufox profiles. Default ~/.vexis/browser-profiles. Legacy: [browser].profiles_dir."
+  default_profile:
+    type: str
+    default: default
+    description: "Profile name used for the live session. Legacy: [browser].default_profile."
+  headless:
+    type: bool
+    default: true
+    description: "Run headless (no window). Default true — a laptop-as-home-server has no usable display. Legacy: [browser].headless."
+  inactivity_timeout_seconds:
+    type: int
+    default: 120
+    description: "Idle window before the session is recycled. Legacy: [browser].inactivity_timeout_seconds."
+  action_timeout_seconds:
+    type: int
+    default: 120
+    description: "Per-action wall-clock timeout. Legacy: [browser].action_timeout_seconds."
+  solve_cloudflare:
+    type: bool
+    default: true
+    description: "Auto-solve Cloudflare challenges on navigate. Legacy: [browser].solve_cloudflare."
+  captcha_solver:
+    type: str
+    default: none
+    description: "Paid captcha provider: none | capsolver | twocaptcha. Legacy: [browser].captcha_solver."
+  captcha_solver_api_key:
+    type: str
+    description: "API key for the selected captcha provider. Legacy: [browser].captcha_solver_api_key."
+  screenshot_include_base64:
+    type: bool
+    default: false
+    description: "Include image_base64 in screenshot results by default. Legacy: [browser].screenshot_include_base64."

@@ -1,17 +1,22 @@
-"""Web-browsing capability prompt block (issue #30) — the flagship.
+"""Web-browsing capability prompt block — owned by the browser add-on.
 
 `vexis-browse` drives a real stealth Camoufox session. This block
-documents the browser NEXT TO its implementation, so the next
-engine swap (Camoufox -> whatever) updates this guidance in the
-same PR that changes the engine — exactly the drift issue #30
-exists to kill. Acceptance criterion #1 names this block: the
-browser documents itself via a registered prompt block instead of
-a CAPABILITIES.md section, with no change to the assembled prompt.
+documents the browser NEXT TO its integration, so the next engine swap
+(Camoufox -> whatever) updates this guidance in the same PR that
+changes the engine — exactly the drift modularisation exists to kill.
+
+It used to be a core builtin (``vexis_agent/tools/browser/capability.py``,
+order 13). With the browser extracted into this add-on, the block moved
+here and is registered via ``ctx.register_capability_block`` from
+``register(ctx)`` — so the "Web browsing" section appears in the
+assembled system prompt ONLY when the browser add-on is loaded, instead
+of leaking into core for every install. Order 13 is preserved so it
+sorts into its historical position.
 """
 
 from __future__ import annotations
 
-from vexis_agent.core.capabilities import register_capability_block
+from vexis_agent.core.addons.context import PluginContext
 
 
 _WEB_BROWSING_BLOCK = r"""## Web browsing — `vexis-browse`
@@ -141,4 +146,17 @@ def web_browsing_block() -> str:
     return _WEB_BROWSING_BLOCK
 
 
-register_capability_block('web-browsing', order=13, provider=web_browsing_block)
+def register_capability(ctx: PluginContext) -> None:
+    """Register the web-browsing capability block on ``ctx``.
+
+    Slots into the shared "Capabilities" order space at 13 — same
+    position the block held when it was a core builtin
+    (``vexis_agent/tools/browser/capability.py``). Duplicate
+    name/order against core or another add-on raises
+    ``AddonConflictError``.
+    """
+    ctx.register_capability_block(
+        "web-browsing",
+        web_browsing_block,
+        order=13,
+    )

@@ -1,22 +1,24 @@
-"""Codemux-orchestration capability prompt block (issue #30).
+"""Codemux-orchestration capability prompt block.
 
-`vexis-watch` registers terminal-attached agents and pings the
-user when the inner agent goes idle.
+Owned by the codemux add-on. Registered onto the core capability
+registry via ``ctx.register_capability_block`` from the add-on's
+``register(ctx)`` (see :func:`register_capability` below) rather than
+shipped as a core builtin — this is the modular-addons home for what
+used to leak from ``vexis_agent/tools/watch_capability.py``.
 
-Ownership note: the codemux *integration* ships as a bundled
-add-on, but `vexis-watch` is a core console script and the watcher
-controller is instantiated unconditionally in `main.py`, so this
-how-to is documented in core to keep the assembled prompt
-byte-identical to the pre-decomposition monolith. Moving it behind
-the add-on's own prompt block (so it only appears when codemux is
-enabled) is a deliberate follow-up — it would change the prompt
-for codemux-disabled installs, which this PR intentionally avoids.
-This module imports nothing from `vexis_agent.addons.*`.
+Because the block now lives behind the add-on hook, it only appears in
+the assembled system prompt when the codemux add-on is loaded. On a
+codemux-disabled install the "Codemux orchestration" section is simply
+absent. Order 15 — its historical position in the assembled doc, kept
+so codemux still sorts after every core block.
+
+The text is the longer-form companion to ``skills/codemux.md``; keep
+the two in sync with the actual codemux tool surface.
 """
 
 from __future__ import annotations
 
-from vexis_agent.core.capabilities import register_capability_block
+from vexis_agent.core.addons.context import PluginContext
 
 
 _CODEMUX_ORCHESTRATION_BLOCK = r"""## Codemux orchestration — `vexis-watch`
@@ -63,4 +65,15 @@ def codemux_orchestration_block() -> str:
     return _CODEMUX_ORCHESTRATION_BLOCK
 
 
-register_capability_block('codemux-orchestration', order=15, provider=codemux_orchestration_block)
+def register_capability(ctx: PluginContext) -> None:
+    """Register the codemux-orchestration capability block on ``ctx``.
+
+    Slots into the shared "Capabilities" order space at 15 — same
+    position the block held when it was a core builtin. Duplicate
+    name/order against core or another add-on raises ``AddonConflictError``.
+    """
+    ctx.register_capability_block(
+        "codemux-orchestration",
+        codemux_orchestration_block,
+        order=15,
+    )

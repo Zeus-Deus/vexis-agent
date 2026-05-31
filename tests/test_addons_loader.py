@@ -434,3 +434,111 @@ def test_user_addons_root_accepts_explicit_home(tmp_path: Path) -> None:
 def test_project_addons_root_uses_cwd(tmp_path: Path) -> None:
     root = project_addons_root(cwd=tmp_path)
     assert root == tmp_path / ".vexis" / "addons"
+
+
+# ---------- default-on bundled add-ons (upgrade safety) ---------------------
+#
+# Regression guard for the browser-extraction upgrade trap: the browser
+# was previously hardcoded into core. After extraction into a bundled
+# add-on, an EXISTING user's ~/.vexis/config.yaml has no
+# ``addons.enabled`` line, so a pure explicit-allow-list would silently
+# strip web browsing on the next restart. ``DEFAULT_ENABLED_BUNDLED``
+# carves bundled add-ons out of that gate. These tests pin the carve-out
+# behaviour (and its source-scoping + disabled-wins guarantees) so a
+# future "tighten the gate" refactor can't reintroduce the regression.
+
+
+def test_bundled_browser_loads_with_empty_enabled(tmp_path: Path) -> None:
+    """``enabled=[]`` (legacy/empty config → addons_enabled() returns [])
+    still loads the bundled browser add-on. This is THE regression case:
+    an upgrading user whose config predates the add-on system."""
+    bundled = tmp_path / "bundled"
+    _write_addon(bundled, "browser")
+    found = discover_addons(
+        enabled=[],  # what addons_enabled() returns with no addons.enabled
+        bundled_root=bundled,
+        user_root=tmp_path / "no-user",
+        project_root_enabled=False,
+    )
+    assert [d.manifest.name for d in found] == ["browser"]
+    assert found[0].source == "bundled"
+
+
+def test_bundled_browser_loads_with_enabled_none(tmp_path: Path) -> None:
+    """``enabled=None`` (strictest default) still loads default-on
+    bundled add-ons."""
+    bundled = tmp_path / "bundled"
+    _write_addon(bundled, "browser")
+    found = discover_addons(
+        enabled=None,
+        bundled_root=bundled,
+        user_root=tmp_path / "no-user",
+        project_root_enabled=False,
+    )
+    assert [d.manifest.name for d in found] == ["browser"]
+
+
+def test_bundled_browser_disabled_wins(tmp_path: Path) -> None:
+    """``addons.disabled`` still turns the browser off — the default-on
+    carve-out never overrides an explicit opt-out."""
+    bundled = tmp_path / "bundled"
+    _write_addon(bundled, "browser")
+    found = discover_addons(
+        enabled=[],
+        disabled=["browser"],
+        bundled_root=bundled,
+        user_root=tmp_path / "no-user",
+        project_root_enabled=False,
+    )
+    assert found == []
+
+
+def test_default_on_carveout_is_bundled_source_only(tmp_path: Path) -> None:
+    """A USER add-on named ``browser`` still needs an explicit opt-in —
+    the default-on carve-out is scoped to the bundled source so a stray
+    ~/.vexis/addons/browser/ can't auto-load (or shadow the real one)."""
+    user = tmp_path / "user"
+    _write_addon(user, "browser")
+    found = discover_addons(
+        enabled=[],
+        bundled_root=tmp_path / "no-bundled",
+        user_root=user,
+        project_root_enabled=False,
+    )
+    assert found == []
+
+
+def test_default_enabled_bundled_override_restores_strict_gate(
+    tmp_path: Path,
+) -> None:
+    """Passing an empty ``default_enabled_bundled`` restores the pure
+    explicit-allow-list behaviour (used by tests that assert the gate in
+    isolation)."""
+    bundled = tmp_path / "bundled"
+    _write_addon(bundled, "browser")
+    found = discover_addons(
+        enabled=[],
+        bundled_root=bundled,
+        user_root=tmp_path / "no-user",
+        project_root_enabled=False,
+        default_enabled_bundled=frozenset(),
+    )
+    assert found == []
+
+
+def test_real_bundled_browser_loads_against_legacy_config(tmp_path: Path) -> None:
+    """End-to-end against the SHIPPED bundled add-on dir (no fixture):
+    discover with an empty enabled list — mirroring addons_enabled()
+    on a legacy config — and confirm the real browser add-on is found.
+    Guards the wiring between the shipped addon.yaml and the carve-out."""
+    found = discover_addons(
+        enabled=[],
+        bundled_root=bundled_addons_root(),
+        user_root=tmp_path / "no-user",
+        project_root_enabled=False,
+    )
+    names = {d.manifest.name for d in found}
+    assert "browser" in names
+    # codemux is bundled too but is NOT default-on (needs its MCP) —
+    # confirm the carve-out is narrow, not "all bundled".
+    assert "codemux" not in names

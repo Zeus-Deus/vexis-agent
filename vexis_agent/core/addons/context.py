@@ -27,6 +27,7 @@ from typing import Any, Optional
 from .registry import (
     AddonRuntime,
     BackgroundTaskRegistration,
+    CapabilityBlockRegistration,
     DashboardPageRegistration,
     DispatchHandlerRegistration,
     McpServerDefaultRegistration,
@@ -199,17 +200,64 @@ class PluginContext:
             )
         )
 
+    def register_capability_block(
+        self,
+        name: str,
+        provider: Callable[[], Optional[str]],
+        *,
+        order: float,
+    ) -> None:
+        """Contribute a block to the system-prompt "Capabilities" section.
+
+        This is the add-on seam onto the core capability-block registry
+        (``vexis_agent.core.capabilities``): the block lands in the SAME
+        global ``order`` space as the built-in core blocks, sorted and
+        joined identically by ``assemble_capability_docs()`` (which both
+        brain prompt builders call). Use it for durable *how-to* docs for
+        an ability the add-on adds — e.g. a watcher source or MCP tool the
+        model needs usage guidance for.
+
+        This is distinct from :meth:`register_system_prompt_block`, which
+        appends a *dynamic* "active state" header at the very END of the
+        prompt every session. Capability blocks slot INTO the Capabilities
+        section by ``order`` and are meant to be stable how-to, not live
+        state. Pick an ``order`` well clear of the core blocks (which sit
+        at small integers); collisions on ``name`` OR ``order`` against
+        core or another add-on raise :class:`AddonConflictError`.
+
+        ``provider`` is a zero-arg callable returning the block's markdown
+        (injected verbatim) or ``None`` to hide it. It is invoked at
+        prompt-assembly time, and a provider that raises is logged and
+        skipped rather than crashing the prompt build. Because add-ons
+        register at daemon load time — before any session spawns — the
+        per-session cached prompt stays stable (cache discipline).
+        """
+        self._runtime.add_capability_block(
+            CapabilityBlockRegistration(
+                addon_name=self.addon_name,
+                name=name,
+                order=order,
+                provider=provider,
+            )
+        )
+
     def register_mcp_server_default(self, spec: Any) -> None:
-        """Declare an MCP server this add-on expects to be configured.
+        """Declare an MCP server this add-on wants the brain to have.
 
         ``spec`` is a
-        :class:`vexis_agent.core.brain.base.McpServerSpec`. The setup
-        wizard reads these to offer "would you like to enable the
-        codemux MCP?" prompts when the user installs an add-on whose
-        MCP isn't yet in ``~/.vexis/mcp-servers.yaml``. The add-on
-        STILL needs to declare the MCP in its manifest under
-        ``requires.mcp_servers`` — this hook is for surfacing
-        recommended defaults, not gating.
+        :class:`vexis_agent.core.brain.base.McpServerSpec`. Live (was
+        advisory): at daemon startup
+        ``core.addon_mcp.merge_addon_mcp_defaults`` folds every
+        registered default into the active brain's native MCP config
+        (claude-code ``.mcp.json`` / opencode ``opencode.json``) via
+        ``brain.write_mcp_config``, so the next brain spawn actually
+        gets the tool — no restart needed. Precedence: a user entry in
+        ``$VEXIS_HOME/mcp-servers.yaml`` wins on a name collision, an
+        add-on default only fills a gap, and user-owned native-file
+        entries are preserved by the brain writer. An add-on may also
+        declare the MCP in its manifest under ``requires.mcp_servers``
+        for the wizard's install-time prompt; this hook is the runtime
+        wiring that actually delivers it to the brain.
         """
         self._runtime.add_mcp_default(
             McpServerDefaultRegistration(

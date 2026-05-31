@@ -126,13 +126,17 @@ def test_both_brains_embed_assembled_capabilities(brain):
 # ──────────────────────────────────────────────────────────────────
 
 
-def test_browser_block_is_registered_and_owned_by_its_module():
+def test_browser_block_is_owned_by_the_browser_addon():
+    """The web-browsing block moved OUT of core builtins into the browser
+    add-on (``vexis_agent/addons/browser/capability.py``). So it is NOT
+    in the builtins-only ``iter_capability_blocks()``, and the module
+    that owns its text lives under the add-on — next to the browser
+    integration. (Presence in the assembled prompt when the add-on loads
+    is covered by tests/test_addon_capability_block.py.)"""
     names = {b.name for b in iter_capability_blocks()}
-    assert "web-browsing" in names
+    assert "web-browsing" not in names
 
-    # Owned by tools/browser/capability.py — the module returns the
-    # browser's own usage docs, next to the browser implementation.
-    from vexis_agent.tools.browser.capability import web_browsing_block
+    from vexis_agent.addons.browser.capability import web_browsing_block
 
     block = web_browsing_block()
     assert block.startswith("## Web browsing — `vexis-browse`")
@@ -247,7 +251,7 @@ def test_provider_exception_is_skipped_not_fatal(restore_registry):
     register_capability_block("explosive-runtime", order=997.0, provider=_boom)
     # Should not raise, and should still contain the real blocks.
     assembled = assemble_capability_docs()
-    assert "## Web browsing — `vexis-browse`" in assembled
+    assert "## Scheduling — `vexis-agent schedule`" in assembled
     assert "# Capabilities" in assembled
 
 
@@ -262,38 +266,33 @@ def test_provider_returning_none_is_dropped(restore_registry):
 
 
 def test_duplicate_name_rejected(restore_registry):
+    # "scheduling" is a core builtin block name (order 14).
     with pytest.raises(ValueError, match="already registered"):
         register_capability_block(
-            "web-browsing", order=998.0, provider=lambda: "x"
+            "scheduling", order=998.0, provider=lambda: "x"
         )
 
 
 def test_duplicate_order_rejected(restore_registry):
-    # order 13 belongs to web-browsing.
+    # order 14 belongs to the scheduling builtin block.
     with pytest.raises(ValueError, match="order .* already taken"):
         register_capability_block(
-            "totally-new-name", order=13, provider=lambda: "x"
+            "totally-new-name", order=14, provider=lambda: "x"
         )
 
 
 # ──────────────────────────────────────────────────────────────────
-# 7. The codemux block stays add-on-import-free (core/ ↔ addons/ rule)
+# 7. Core capability modules stay add-on-import-free (core/ ↔ addons/)
 # ──────────────────────────────────────────────────────────────────
 
 
-def test_watch_capability_does_not_import_addons():
-    """watch_capability.py documents vexis-watch in core (so the block
-    assembles even when the codemux add-on is disabled); it must not
-    actually import from the add-on. Checked via AST so docstring prose
-    that *mentions* the add-on path doesn't trip the gate."""
+def _imports_from_addons(path: Path) -> list[str]:
+    """AST-scan ``path`` for any import of ``vexis_agent.addons.*``.
+
+    Checked via AST (not a substring grep) so docstring prose that
+    *mentions* an add-on path doesn't trip the gate."""
     import ast
 
-    path = (
-        Path(__file__).resolve().parent.parent
-        / "vexis_agent"
-        / "tools"
-        / "watch_capability.py"
-    )
     tree = ast.parse(path.read_text(encoding="utf-8"))
     bad: list[str] = []
     for node in ast.walk(tree):
@@ -304,4 +303,46 @@ def test_watch_capability_does_not_import_addons():
             for alias in node.names:
                 if alias.name.startswith("vexis_agent.addons"):
                     bad.append(alias.name)
-    assert not bad, f"watch_capability.py imports from add-ons: {bad}"
+    return bad
+
+
+def test_self_extension_block_does_not_import_addons():
+    """The self-extension block is a CORE capability module: it must not
+    import from any add-on. (The codemux-orchestration block, which used
+    to be the core block guarded here, now lives IN the codemux add-on —
+    where importing core's PluginContext is legitimate. Core staying
+    add-on-agnostic is pinned by test_codemux_extraction_invariant.py.)"""
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "vexis_agent"
+        / "core"
+        / "capabilities"
+        / "self_extension.py"
+    )
+    bad = _imports_from_addons(path)
+    assert not bad, f"self_extension.py imports from add-ons: {bad}"
+
+
+def test_every_builtin_capability_module_is_addon_import_free():
+    """Every module in _BUILTIN_CAPABILITY_MODULES is core — none may
+    import from vexis_agent.addons.*. The codemux block's move out of
+    this list (into the add-on) is exactly what this guards: a core
+    builtin can't depend on an add-on."""
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parent.parent
+    offenders: dict[str, list[str]] = {}
+    for module_path in cap._BUILTIN_CAPABILITY_MODULES:
+        spec = importlib.util.find_spec(module_path)
+        assert spec is not None and spec.origin, (
+            f"builtin capability module {module_path!r} is not importable"
+        )
+        src = Path(spec.origin)
+        # Sanity: every builtin lives under vexis_agent/, never addons/.
+        assert "addons" not in src.relative_to(repo_root).parts, (
+            f"builtin capability module {module_path!r} lives under addons/"
+        )
+        bad = _imports_from_addons(src)
+        if bad:
+            offenders[module_path] = bad
+    assert not offenders, f"builtin capability modules import add-ons: {offenders}"

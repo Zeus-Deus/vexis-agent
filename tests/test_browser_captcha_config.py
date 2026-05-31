@@ -83,7 +83,7 @@ def _build_dashboard(tmp_path: Path) -> WebDashboard:
     d._running_tasks = RunningTasks()
     d._background_tasks = None
     d._curator = None
-    d._browser = None
+    d._addon_runtime = None
     d._started_at = None
     d._tailscale_url = None
     d._tailscale_dns = None
@@ -133,16 +133,20 @@ def test_config_writes_and_masks_key(client, tmp_path):
     # response carries only the masked form, never the raw key
     assert body["captcha_solver_key_masked"] == "•••• 1234"
     assert "supersecret1234" not in str(body)
-    # but the raw key IS persisted to disk
+    # but the raw key IS persisted to disk — under the canonical add-on
+    # location ``addons.browser.*`` (the browser is a bundled add-on).
     cfg = yaml.safe_load((tmp_path / "vexis" / "config.yaml").read_text())
-    assert cfg["browser"]["captcha_solver_api_key"] == "supersecret1234"
-    assert cfg["browser"]["captcha_solver"] == "capsolver"
+    assert cfg["addons"]["browser"]["captcha_solver_api_key"] == "supersecret1234"
+    assert cfg["addons"]["browser"]["captcha_solver"] == "capsolver"
 
 
 def test_config_blank_key_keeps_existing(client, tmp_path):
     cfg_path = tmp_path / "vexis" / "config.yaml"
+    # Seed under the canonical add-on location; omitting api_key on a
+    # provider switch must preserve the existing key.
     cfg_path.write_text(
-        "browser:\n  captcha_solver: capsolver\n  captcha_solver_api_key: keepme1234\n",
+        "addons:\n  browser:\n    captcha_solver: capsolver\n"
+        "    captcha_solver_api_key: keepme1234\n",
         encoding="utf-8",
     )
     # switch provider, omit api_key -> key preserved
@@ -152,8 +156,28 @@ def test_config_blank_key_keeps_existing(client, tmp_path):
     )
     assert r.status_code == 200
     cfg = yaml.safe_load(cfg_path.read_text())
-    assert cfg["browser"]["captcha_solver"] == "twocaptcha"
-    assert cfg["browser"]["captcha_solver_api_key"] == "keepme1234"
+    assert cfg["addons"]["browser"]["captcha_solver"] == "twocaptcha"
+    assert cfg["addons"]["browser"]["captcha_solver_api_key"] == "keepme1234"
+
+
+def test_config_migrates_legacy_browser_key_forward(client, tmp_path):
+    """A legacy ``[browser].captcha_solver_api_key`` is migrated into the
+    canonical ``addons.browser`` block on a key-omitting write, so the
+    masked round-trip survives the extraction."""
+    cfg_path = tmp_path / "vexis" / "config.yaml"
+    cfg_path.write_text(
+        "browser:\n  captcha_solver: capsolver\n"
+        "  captcha_solver_api_key: legacy9999\n",
+        encoding="utf-8",
+    )
+    r = client.post(
+        "/api/v1/browser/captcha/config",
+        json={"provider": "twocaptcha"}, headers=_hdr(),
+    )
+    assert r.status_code == 200
+    cfg = yaml.safe_load(cfg_path.read_text())
+    assert cfg["addons"]["browser"]["captcha_solver"] == "twocaptcha"
+    assert cfg["addons"]["browser"]["captcha_solver_api_key"] == "legacy9999"
 
 
 # --- test endpoint ---------------------------------------------------------

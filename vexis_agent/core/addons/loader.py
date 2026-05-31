@@ -56,6 +56,20 @@ PROJECT_ADDONS_ENV = "VEXIS_ENABLE_PROJECT_ADDONS"
 #: doesn't accidentally hit some other package on ``sys.path``.
 MODULE_NAMESPACE = "vexis_addons"
 
+#: Bundled add-ons that load by default — without an explicit
+#: ``addons.enabled`` entry — UNLESS the user opts out via
+#: ``addons.disabled``. This is the carve-out for capabilities that
+#: used to be hardcoded into core and were extracted into add-ons:
+#: an existing user upgrading from such a build has a config with no
+#: ``addons.enabled`` line, and a pure explicit-allow-list would
+#: silently strip the capability on first restart. ``browser`` was
+#: previously always-on core (the nine ``if op == browser_*`` dispatch
+#: branches in main.py), so it MUST survive the extraction with no
+#: config edit. The gate is source-scoped to ``"bundled"`` so a
+#: user/project add-on of the same name still needs an explicit opt-in,
+#: and ``addons.disabled`` always wins so the off switch keeps working.
+DEFAULT_ENABLED_BUNDLED = frozenset({"browser"})
+
 
 @dataclass(frozen=True)
 class DiscoveredAddon:
@@ -112,20 +126,35 @@ def discover_addons(
     bundled_root: Optional[Path] = None,
     user_root: Optional[Path] = None,
     project_root_enabled: Optional[bool] = None,
+    default_enabled_bundled: Optional[frozenset[str]] = None,
     log: Optional[logging.Logger] = None,
 ) -> list[DiscoveredAddon]:
     """Walk all discovery roots and return successfully-parsed add-ons.
 
     Filtering by ``enabled`` / ``disabled``:
 
-      * If ``enabled`` is ``None``: nothing passes (strictest default).
-        The daemon's config-loading layer is responsible for reading
-        the user's ``addons.enabled`` and passing it in.
-      * If ``enabled`` is an empty list ``[]``: nothing passes
-        (explicit "no add-ons" mode, useful for tests + debugging).
-      * If ``enabled`` is a list of names: only those names pass.
-      * ``disabled`` wins: even an enabled add-on is skipped if also
-        listed in ``disabled``.
+      * If ``enabled`` is ``None``: nothing passes EXCEPT default-on
+        bundled add-ons (see below) — the strictest default for
+        non-bundled sources.
+      * If ``enabled`` is an empty list ``[]``: same as ``None`` for
+        non-bundled add-ons (explicit "no add-ons" mode for user /
+        project sources). Default-on bundled add-ons still load.
+      * If ``enabled`` is a list of names: those names pass, plus any
+        default-on bundled add-on not in ``disabled``.
+      * ``disabled`` wins: even an enabled (or default-on bundled)
+        add-on is skipped if also listed in ``disabled``.
+
+    Default-on bundled add-ons (``default_enabled_bundled``, defaulting
+    to :data:`DEFAULT_ENABLED_BUNDLED`): a bundled-source add-on in this
+    set loads even when its name is absent from ``enabled`` — but only
+    when it's also absent from ``disabled``. This is the upgrade-safety
+    carve-out: capabilities extracted from core into bundled add-ons
+    (browser) must NOT silently vanish for users whose pre-extraction
+    config has no ``addons.enabled`` line. The gate is source-scoped:
+    a user / project add-on of the same name still needs an explicit
+    opt-in (no shadowing-by-default). Pass an empty frozenset to get
+    the old pure-allow-list behaviour (tests do this when they want to
+    assert the explicit gate in isolation).
 
     Manifest parse errors are logged and the offending add-on is
     skipped; everything else continues. This way one broken add-on
@@ -139,6 +168,11 @@ def discover_addons(
 
     enabled_set = set(enabled or [])
     disabled_set = set(disabled or [])
+    default_bundled = (
+        DEFAULT_ENABLED_BUNDLED
+        if default_enabled_bundled is None
+        else default_enabled_bundled
+    )
 
     if project_root_enabled is None:
         project_root_enabled = os.environ.get(PROJECT_ADDONS_ENV) == "1"
@@ -184,7 +218,12 @@ def discover_addons(
             if name in disabled_set:
                 logger.info("addon %r is disabled in config; skipping", name)
                 continue
-            if name not in enabled_set:
+            # Default-on bundled add-ons load without an explicit
+            # ``addons.enabled`` entry (upgrade safety for capabilities
+            # extracted from core — see DEFAULT_ENABLED_BUNDLED).
+            # ``disabled`` was already checked above and still wins.
+            default_on = source == "bundled" and name in default_bundled
+            if name not in enabled_set and not default_on:
                 logger.debug(
                     "addon %r found at %s but not enabled in config; skipping",
                     name,

@@ -38,22 +38,29 @@ used to sit (after SOUL, before the skill-authoring block).
   of the old `read_capabilities()`.
 
 `order` is a capability's position in the assembled doc. The blocks
-extracted from the monolith kept their original chunk indices (2–15)
-so the assembled output is **byte-identical** to the pre-decomposition
-file. `order` 0 is the shrunk `CAPABILITIES.md` itself (identity + the
-add-on/skill/MCP model), re-read from package data each build.
+extracted from the monolith kept their original chunk indices, with two
+deliberate post-decomposition changes: `self-extension` was added at
+order 1, and `codemux-orchestration` (order 15) moved out to the
+codemux add-on. `order` 0 is the shrunk `CAPABILITIES.md` itself
+(identity + the add-on/skill/MCP model), re-read from package data each
+build.
 
-## The byte-identity contract
+## The golden contract
 
 `tests/test_capability_blocks.py` asserts `assemble_capability_docs()`
-equals `tests/data/capabilities_golden.md` — a frozen snapshot of the
-monolith taken at decomposition time. The model sees the same prompt;
-only the *source layout* changed.
+equals `tests/data/capabilities_golden.md` — the frozen expected
+assembly of the **builtins-only** blocks. Add-on blocks register at
+load time and are NOT in the golden, so it stays stable whether or not
+codemux is enabled. The model sees a stable prompt; only the *source
+layout* changed.
 
-If you intentionally edit capability prose, the golden test will fail.
-That failure is the signal the change is deliberate: regenerate the
-golden in the same PR and explain why in the commit. (The golden is
-not auto-updated — drifting it silently would defeat the point.)
+If you intentionally edit capability prose, or add/move a block, the
+golden test will fail. That failure is the signal the change is
+deliberate: regenerate the golden in the same PR (set `PYTHONPATH` to
+the repo root, call `assemble_capability_docs()` with a clean
+builtins-only registry, write the result to the golden) and explain why
+in the commit. (The golden is not auto-updated — drifting it silently
+would defeat the point.)
 
 ## Adding a new core capability
 
@@ -91,11 +98,27 @@ A block must be importable without pulling in its tool's heavy runtime
 — keep `capability.py` to the markdown string + the `register` call.
 The docs live beside the code; they don't depend on it at import time.
 
+## Adding a capability block from an add-on
+
+Add-ons don't touch `_BUILTIN_CAPABILITY_MODULES`; they call
+`ctx.register_capability_block(name, provider, *, order)` (see
+[docs/addons.md](addons.md)). The hook delegates into this same core
+registry at add-on load time, so add-on blocks share the global
+`order` space and conflict checks with the core blocks and are merged
+transparently by `assemble_capability_docs()` — there is no separate
+add-on assembly path. Pick an `order` clear of the core builtins (0–14
+today); the codemux add-on already owns 15. Add-on blocks are absent
+from the builtins-only golden — they assemble only when the add-on is
+enabled.
+
 ## Ownership map
+
+### Core (builtin) blocks — in the golden
 
 | Block(s) | Module | order |
 |---|---|---|
 | identity + add-on model | `data/CAPABILITIES.md` | 0 |
+| self-extension | `core/capabilities/self_extension.py` | 1 |
 | inbound images, omarchy-kb, web dashboard | `core/capabilities/builtin.py` | 4, 5, 12 |
 | desktop capture / control / vision loop | `tools/desktop_capability.py` | 2, 6, 7 |
 | sandboxes & headless displays | `tools/sandbox/capability.py` | 3 |
@@ -105,21 +128,41 @@ The docs live beside the code; they don't depend on it at import time.
 | skills | `tools/skills_capability.py` | 11 |
 | web browsing | `tools/browser/capability.py` | 13 |
 | scheduling | `tools/schedule_tool/capability.py` | 14 |
-| codemux orchestration | `tools/watch_capability.py` | 15 |
 
-### Note on codemux
+### Add-on blocks — NOT in the golden
 
-`vexis-watch` orchestration is documented in core (`watch_capability.py`)
-rather than the codemux add-on, even though codemux ships as a bundled
-add-on. `vexis-watch` is a core console script and the watcher
-controller is instantiated unconditionally, so the how-to is
-always-present — and keeping it in core is what makes the assembled
-prompt byte-identical to the old monolith for *every* install,
-including ones with codemux disabled. Moving it behind the add-on's
-own prompt block (so it only shows when codemux is enabled) is a clean
-follow-up; it would change the prompt for codemux-disabled installs,
-which the decomposition PR intentionally avoided. `watch_capability.py`
-imports nothing from `vexis_agent.addons.*`.
+Registered at add-on load time via `ctx.register_capability_block`, so
+they assemble only when the add-on is enabled and are absent from the
+builtins-only golden. They share the same global `order` space.
+
+| Block | Module | order | Add-on |
+|---|---|---|---|
+| codemux orchestration | `addons/codemux/capability.py` | 15 | codemux |
+
+### self-extension (order 1)
+
+Teaches the agent which seam to use to add a capability to itself —
+skill vs MCP server vs in-process add-on — and the hot-vs-restart cost
+of each. It has no owning tool (it's framing, like the `builtin`
+cross-cutting blocks), so it lives in the capabilities package. Its
+longer-form procedural companion ships as the `self-extension`
+**bundled skill**
+(`vexis_agent/_bundled_skills/meta/self-extension/SKILL.md`),
+auto-discovered into every workspace's `skills/` view on the next
+session.
+
+### Note on codemux — add-on-owned now
+
+The codemux orchestration block used to live in core
+(`tools/watch_capability.py`) as a documented leak: codemux is an
+add-on, but its how-to assembled into every install's prompt. It now
+lives in the codemux add-on (`addons/codemux/capability.py`) and
+registers through `ctx.register_capability_block` at load time, so the
+"Codemux orchestration" section appears ONLY when codemux is enabled —
+and is absent from the builtins-only golden. The add-on legitimately
+imports `vexis_agent.core.addons.context.PluginContext`; the
+core/addons boundary holds because nothing under `core/` imports the
+add-on (pinned by `tests/test_codemux_extraction_invariant.py`).
 
 ## Not in scope (yet)
 

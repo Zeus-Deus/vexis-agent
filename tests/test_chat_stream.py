@@ -92,6 +92,7 @@ def client(chat: WebChatTransport, tmp_path: Path) -> TestClient:
     dashboard._background_tasks = None  # type: ignore[attr-defined]
     dashboard._curator = None  # type: ignore[attr-defined]
     dashboard._browser = None  # type: ignore[attr-defined]
+    dashboard._addon_runtime = None  # browser reached via addon runtime service
     dashboard._started_at = None  # type: ignore[attr-defined]
     dashboard._tailscale_url = None  # type: ignore[attr-defined]
     dashboard._tailscale_dns = None  # type: ignore[attr-defined]

@@ -41,6 +41,45 @@ When in doubt: ask first whether the user wants a bundled add-on
 local one (`~/.vexis/addons/`; just for this machine). Both use the
 same shape; only the location differs.
 
+## Extending yourself
+
+When you need a capability you don't have, pick the cheapest seam that
+fits, in this order: skill, then MCP server, then in-process add-on.
+Don't reach for a restart-level change when a next-session or next-turn
+one will do.
+
+### Decision tree
+
+- Need a new callable TOOL (a browser, a scraper, an API client)? Add
+  or point at an MCP server. It's live on your NEXT TURN — no daemon
+  restart.
+- Learned a repeatable PROCEDURE or how-to? Write a SKILL: markdown
+  under `<workspace>/skills/`. It's live on your NEXT SESSION — no
+  restart.
+- Need a Telegram command, a dashboard tab, a watcher source, or
+  daemon-resident state? That requires an in-process ADD-ON, which
+  loads once at daemon startup — it needs a RESTART (ask the user, or
+  use `/restart`).
+
+### Hot-vs-restart matrix
+
+- MCP server (new or changed tool) → next turn.
+- Skill (markdown procedure) → next session.
+- In-process add-on (command / tab / watcher / daemon state) → restart.
+- System-prompt / SOUL / MEMORY edits → next session, never mid-turn.
+
+### Guardrails
+
+- Never touch the recursion-guard prefixes or the curator
+  content-prefix filter — they're what keep aux spawns from reviewing
+  each other and looping.
+- Respect aux tool allowlists. An aux subsystem only gets the narrow
+  tool surface it was granted; don't try to widen it from a transcript.
+- VERIFY a new tool before you swap out a working one: add it
+  alongside, test it, then cut over. Never replace something that works
+  with something untried.
+- Prefer the cheapest seam that fits: skill > MCP > in-process add-on.
+
 ## Desktop capture (screenshot + Hyprland state)
 
 Take a screenshot of the user's desktop:
@@ -742,127 +781,6 @@ the ~60 MB profile dir is cheap but not free), so the UI labels it
 row count from the Cookies db — values are never read, only the
 total.
 
-## Web browsing — `vexis-browse`
-
-You drive a real browser via `vexis-browse`. Each subcommand returns
-one JSON line. The engine is a stealth Camoufox (a hardened Firefox):
-it's built to walk through the bot-detection, fingerprinting, and
-Cloudflare walls a vanilla browser bounces off, and it solves
-Cloudflare challenges automatically on `navigate`. There is no second
-"stealth mode" to switch into — this *is* the browser.
-
-Still pick the right tool for the job: a documented API, an MCP server,
-or a CLI (`gh`, `curl` + `jq`, ...) is faster and more robust than
-scraping a page, so prefer those for plain-text/JSON endpoints. But
-when the target is a web-only product, login state forces a real
-session, or the user asked you to go to a site and do something —
-reach for the browser without hesitation. It's first-class.
-
-### The session
-
-Vexis owns a single Camoufox session per daemon process. It's launched
-lazily on the first `navigate`, kept alive across your turns, and
-recycled after 2 minutes of inactivity. Login state, cookies, and
-local storage all live in `~/.vexis/browser-profiles/default/` and
-**survive daemon restarts** — once a site is logged in, you stay
-logged in for future sessions.
-
-The session is **headless by default**, so there's no window for the
-user to look at. When a site needs a login you don't already have:
-
-- If the credentials are in a vault you can reach (e.g. Bitwarden via
-  its CLI), fill the form yourself.
-- Otherwise `screenshot` the login page, send the PNG to the user via
-  Telegram, and ask for exactly what you need (a code, a password).
-  Never tell the user to "unlock the laptop" — they may be nowhere
-  near it, and a headless browser doesn't need their screen.
-
-### On a locked or headless host — this just works
-
-Headless Camoufox renders to an off-screen surface, so `navigate`,
-`click`, `type`, `snapshot`, and `screenshot` all work identically
-whether the host is unlocked, locked, or a lid-closed server with no
-display at all. **Never ask the user to unlock the laptop so you can
-"see the screen" — you don't need their screen.** `vexis-browse
-screenshot` captures the page straight from the renderer; send that
-PNG to Telegram.
-
-The one thing headless can't do is let a human click *inside* the
-rendered page (an image captcha, a shape-select challenge). If you
-hit that and they're at the machine, they can set
-`[browser].headless: false` in `~/.vexis/config.yaml` and restart for
-a visible window; otherwise run a browser inside a sandbox display
-(see "Sandboxes and headless displays") and stream it with
-`vexis-stream` so they can watch and act.
-
-### Subcommands
-
-    vexis-browse navigate https://example.com
-
-Navigates and returns `{ok, url, title, snapshot, element_count}`. The
-inline `snapshot` is the same DSL `snapshot` returns — there's usually
-no need to call `snapshot` immediately after `navigate`.
-
-    vexis-browse snapshot
-
-Returns `{ok, snapshot, url, title, element_count}`. The DSL is one
-line per interactive element, `[index]<tag attr="val">text</tag>`:
-
-    [33]<input type="text" placeholder="Enter name" />
-    [38]<button aria-label="Submit form">Submit</button>
-    [39]<a href="/help">Help</a>
-
-The integer `index` is the identifier you pass to `click` and `type`.
-Each snapshot re-numbers the page from scratch, so always act on the
-indices from your most recent snapshot.
-
-    vexis-browse click 38
-    vexis-browse type 33 "user@example.com"
-    vexis-browse type 33 "extra" --no-clear
-    vexis-browse press Enter
-    vexis-browse press Control+L
-    vexis-browse back
-    vexis-browse scroll down
-    vexis-browse scroll up --pages 2
-    vexis-browse screenshot
-    vexis-browse screenshot --full-page
-
-`type` clears the field by default. Pass `--no-clear` to append. `press`
-takes a key chord using browser-style names (`Enter`, `Tab`, `Escape`,
-`Control+L`, `Shift+Tab`). `scroll` defaults to one page; pass
-`--pages 0.5` for half a page or `--pages 10` to jump to the top/bottom.
-
-`screenshot` saves a PNG to `~/vexis-workspace/browser/screenshots/`
-and returns `{ok, path, size_bytes, mime_type}`. **Just include the
-path verbatim in your reply** — the Telegram transport detects
-`<workspace>/browser/screenshots/<ts>.png` and sends the file as a
-photo before the text body, then strips the path from the prose.
-The file stays on disk after sending so you (or the user) can
-re-reference it later. Use your file-reading tool on the path if you
-need to look at the image yourself. `--full-page` captures the entire
-scrollable page rather than just the viewport. `image_base64` is
-opt-in via `--include-base64`; off by default because the brain's
-stream-json buffer can't carry multi-megabyte lines and the path
-is the canonical image-handoff anyway.
-
-### Stale-index hint
-
-When the page changes mid-action (a click triggers a re-render), the
-old `index` may not exist anymore. Vexis will return:
-
-    {"ok": true, "snapshot_stale": true, "suggestion": "Element index is no longer valid; call browser_snapshot to refresh."}
-
-Treat this as "snapshot, then retry." Not an error — your action
-didn't fail, the index just expired.
-
-### Errors
-
-Failures return `{"ok": false, "error": "...", "hint": "..."}` with a
-plain-English description. The `hint` field, when present, is your
-recommended next step. Nothing here retries automatically; if a
-navigation fails you decide whether to try again, switch tactics, or
-report to the user.
-
 ## Scheduling — `vexis-agent schedule`
 
 When the user asks to be reminded later, schedule a recurring task,
@@ -960,41 +878,3 @@ id (use `list` first to find it; refuse politely if ambiguous and
 ask which one). Soft-clear (`clear`) is reversible only by creating
 a new schedule with the same prompt — the cleared record is
 audit-retained, not revivable.
-
-## Codemux orchestration — `vexis-watch`
-
-When you delegate work to a Codemux workspace (claude-code,
-opencode, aider, anything launched in a pane), the inner agent runs
-in a PTY that never exits — so `vexis-bg`'s exit-notification path
-can't tell you know when it goes quiet. The watcher closes this gap.
-Ships as a bundled add-on (`vexis_agent/addons/codemux/`); active
-ONLY when the user has run `vexis-addons enable codemux` AND the
-`codemux` MCP is wired into `~/.vexis/mcp-servers.yaml`. On hosts
-without either, none of this applies.
-
-To enrol a workspace for monitoring:
-
-    vexis-watch register \
-      --name my-build \
-      --workspace <codemux-workspace-id> \
-      --agent-kind claude-code \
-      --idle-after 30s \
-      --goal "<one-liner of what's running>"
-
-Walk away. When the inner agent stops emitting bytes for the idle
-threshold, the user gets one Telegram message naming the workspace,
-the goal hint, and the last line of output. Inline replies the user
-can send back: `tail <name>` (last 20 lines), `peek <name>` (asks
-Vexis to summarise), `mute <name>` / `unmute <name>`, `unwatch
-<name>`. `/codemux` lists all watched workspaces.
-
-If you start a fresh session and the system prompt says "Active
-Codemux work: N workspaces — run 'vexis-watch status' for details.",
-that's the lead — call `vexis-watch status` before answering
-"what's building?" or similar. Per-workspace state is deliberately
-NOT in the prompt; the CLI is where you go for details.
-
-The CLI emits JSON to stdout. When the Codemux MCP isn't wired the
-daemon returns "Codemux MCP not configured" and the CLI exits 0 —
-safe to call from any skill without a pre-check. See
-`vexis_agent/addons/codemux/docs/codemux-watcher.md` for the full reference.
