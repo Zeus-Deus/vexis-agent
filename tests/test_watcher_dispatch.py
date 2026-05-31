@@ -58,20 +58,19 @@ class _NoBg:
     """Background tasks stand-in. The watcher ops don't touch it."""
 
 
-class _NoBrowser:
-    pass
-
-
 def _controller(tmp_path: Path) -> WatcherController:
     return WatcherController(
         registry=WatcherRegistry(state_path=tmp_path / "wr.json"),
-        
+
     )
 
 
 def _dispatcher(tmp_path: Path, *, with_watcher: bool):
+    # _build_dispatch no longer takes a browser arg — the browser moved
+    # to its own add-on and registers its dispatch handlers through the
+    # add-on runtime. Signature is now (bg, watcher, addon_runtime=None).
     watcher = _controller(tmp_path) if with_watcher else None
-    return _build_dispatch(_NoBg(), _NoBrowser(), watcher), watcher
+    return _build_dispatch(_NoBg(), watcher), watcher
 
 
 # ---------- conditional activation ------------------------------------------

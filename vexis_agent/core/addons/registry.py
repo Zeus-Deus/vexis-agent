@@ -16,9 +16,11 @@ each add-on's ``register(ctx)`` runs, and then queried by:
 
 Conflict policy: every register-by-name hook (telegram_command,
 dispatch_handler, watcher_source, header_block, dashboard_page,
-mcp_server_default) raises :class:`AddonConflictError` on duplicate
-keys. Skills and background tasks are list-additive — same skill
-file shipped by two add-ons is fine, they just both copy.
+mcp_server_default, capability_block) raises
+:class:`AddonConflictError` on duplicate keys. Capability blocks also
+collide on duplicate ``order`` (they share the core "Capabilities"
+order space). Skills and background tasks are list-additive — same
+skill file shipped by two add-ons is fine, they just both copy.
 """
 
 from __future__ import annotations
@@ -97,6 +99,14 @@ class DashboardPageRegistration:
     manifest: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class CapabilityBlockRegistration:
+    addon_name: str
+    name: str
+    order: float
+    provider: Callable[[], Optional[str]]
+
+
 # ---------- the runtime ------------------------------------------------------
 
 
@@ -153,6 +163,13 @@ class AddonRuntime:
         self._watcher_sources: dict[str, WatcherSourceRegistration] = {}
         self._header_blocks: dict[str, SystemPromptBlockRegistration] = {}
         self._mcp_defaults: dict[str, McpServerDefaultRegistration] = {}
+
+        # Name-keyed bookkeeping for add-on capability blocks. The
+        # authoritative copy lives in the core capabilities ``_REGISTRY``
+        # (add_capability_block delegates there so assemble_capability_docs
+        # picks it up); this dict mirrors what THIS add-on contributed so
+        # ``vexis addons inspect`` / the dashboard can show ownership.
+        self._capability_blocks: dict[str, CapabilityBlockRegistration] = {}
 
         # List-additive registrations (multiple per name OK).
         self._background_tasks: list[BackgroundTaskRegistration] = []
@@ -268,6 +285,41 @@ class AddonRuntime:
         # List-additive; dashboard merges all pages into its tab list.
         self._dashboard_pages.append(reg)
 
+    def add_capability_block(self, reg: CapabilityBlockRegistration) -> None:
+        """Register an add-on block into the core "Capabilities" section.
+
+        Add-on capability blocks live in the SAME global order space as
+        the core blocks: we delegate to the core registry so the block
+        lands in the ``_REGISTRY`` that ``assemble_capability_docs()``
+        already reads (both brain prompt builders call it). This is the
+        wiring — registration at add-on load time, before any session
+        spawns, so the per-session cached prompt stays stable.
+
+        Conflict detection (duplicate name OR duplicate order, across
+        core + every other add-on) is owned by the core registry. We
+        ``_ensure_loaded()`` first so an order that collides with a core
+        block is caught here rather than silently merged, then translate
+        the core ``ValueError`` into the add-on layer's
+        :class:`AddonConflictError` for parity with every other
+        register-by-name hook. Imported lazily to avoid an import cycle
+        (the core capabilities package must not depend on addons).
+        """
+        from vexis_agent.core import capabilities as core_caps
+
+        core_caps._ensure_loaded()
+        try:
+            core_caps.register_capability_block(
+                reg.name, order=reg.order, provider=reg.provider
+            )
+        except ValueError as e:
+            raise AddonConflictError(
+                f"capability block {reg.name!r} (order {reg.order}) from "
+                f"add-on {reg.addon_name!r} conflicts with an existing "
+                f"capability block: {e}",
+                addon_name=reg.addon_name,
+            ) from e
+        self._capability_blocks[reg.name] = reg
+
     # ---------- shared services -----------------------------------------
 
     def attach_service(self, name: str, obj: Any) -> None:
@@ -306,6 +358,10 @@ class AddonRuntime:
         return list(self._header_blocks.values())
 
     def mcp_defaults(self) -> Iterable[McpServerDefaultRegistration]:
+        # Consumed at daemon startup by
+        # core.addon_mcp.merge_addon_mcp_defaults, which reads each
+        # record's .spec and merges it into the active brain's native
+        # MCP config. Order is registration order (dict insertion).
         return list(self._mcp_defaults.values())
 
     def background_tasks(self) -> Iterable[BackgroundTaskRegistration]:
@@ -316,6 +372,9 @@ class AddonRuntime:
 
     def dashboard_pages(self) -> Iterable[DashboardPageRegistration]:
         return list(self._dashboard_pages)
+
+    def capability_blocks(self) -> Iterable[CapabilityBlockRegistration]:
+        return list(self._capability_blocks.values())
 
     # ---------- background-task lifecycle -------------------------------
 

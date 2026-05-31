@@ -203,6 +203,29 @@ def _section(name: str) -> dict[str, Any]:
     return section if isinstance(section, dict) else {}
 
 
+def _browser_section() -> dict[str, Any]:
+    """Resolved ``[browser]`` knobs, add-on config taking precedence.
+
+    The browser is a bundled add-on (``vexis_agent/addons/browser/``);
+    its config canonically lives under ``addons.browser.*``. The legacy
+    top-level ``[browser]`` block is still honoured so configs written
+    before the extraction keep working — addon config wins per-key,
+    legacy fills the gaps. Both the browser engine readers below and the
+    dashboard payload go through here, so they always agree. This is the
+    config-reader half of the back-compat contract; the add-on touches
+    nothing else.
+    """
+    legacy = _section("browser")
+    addon = _section("addons").get("browser")
+    if not isinstance(addon, dict):
+        return legacy
+    if not legacy:
+        return addon
+    merged = dict(legacy)
+    merged.update(addon)
+    return merged
+
+
 def _int_or_default(value: Any, default: int, *, minimum: int = 1) -> int:
     if isinstance(value, bool):
         return default
@@ -269,26 +292,32 @@ def _str_or_none(value: Any) -> str | None:
     return None
 
 
+# Browser knobs read ``addons.browser.*`` first, then legacy
+# ``[browser]`` (see ``_browser_section``). The browser ships as a
+# bundled add-on; these readers stay in core because BOTH the add-on's
+# engine and the dashboard payload consume them, and config-reading is
+# add-on-agnostic (no addons import). Pure back-compat: existing
+# ``[browser]`` configs keep working unchanged.
 def browser_profiles_dir() -> str | None:
-    return _str_or_none(_section("browser").get("profiles_dir"))
+    return _str_or_none(_browser_section().get("profiles_dir"))
 
 
 def browser_default_profile() -> str | None:
-    return _str_or_none(_section("browser").get("default_profile"))
+    return _str_or_none(_browser_section().get("default_profile"))
 
 
 def browser_headless() -> bool:
     # Default True: the daemon commonly runs on a lid-closed,
     # screen-locked laptop-as-home-server with no usable display.
-    # Headless Chromium needs none. Set [browser].headless: false to
+    # Headless Chromium needs none. Set headless: false to
     # opt into a visible window when physically at the machine.
-    raw = _section("browser").get("headless", True)
+    raw = _browser_section().get("headless", True)
     return bool(raw)
 
 
 def browser_inactivity_timeout_seconds() -> int:
     return _int_or_default(
-        _section("browser").get("inactivity_timeout_seconds"),
+        _browser_section().get("inactivity_timeout_seconds"),
         DEFAULT_BROWSER_INACTIVITY_TIMEOUT_SECONDS,
         minimum=10,
     )
@@ -296,7 +325,7 @@ def browser_inactivity_timeout_seconds() -> int:
 
 def browser_action_timeout_seconds() -> int:
     return _int_or_default(
-        _section("browser").get("action_timeout_seconds"),
+        _browser_section().get("action_timeout_seconds"),
         DEFAULT_BROWSER_ACTION_TIMEOUT_SECONDS,
         minimum=5,
     )
@@ -307,9 +336,10 @@ def browser_solve_cloudflare() -> bool:
 
     The Camoufox engine exists to walk through bot walls; solving is on
     out of the box. Costs time only when a challenge is actually present.
-    Disable via ``[browser].solve_cloudflare: false``.
+    Disable via ``addons.browser.solve_cloudflare: false`` (or the
+    legacy ``[browser].solve_cloudflare: false``).
     """
-    raw = _section("browser").get("solve_cloudflare", True)
+    raw = _browser_section().get("solve_cloudflare", True)
     return bool(raw)
 
 
@@ -321,7 +351,7 @@ def browser_captcha_solver() -> str:
     the paid solver that handles hCaptcha / reCAPTCHA / standalone Turnstile.
     An unrecognized value falls back to ``none``.
     """
-    raw = _section("browser").get("captcha_solver", DEFAULT_BROWSER_CAPTCHA_SOLVER)
+    raw = _browser_section().get("captcha_solver", DEFAULT_BROWSER_CAPTCHA_SOLVER)
     value = str(raw).strip().lower() if raw is not None else DEFAULT_BROWSER_CAPTCHA_SOLVER
     return value if value in VALID_BROWSER_CAPTCHA_SOLVERS else DEFAULT_BROWSER_CAPTCHA_SOLVER
 
@@ -329,11 +359,12 @@ def browser_captcha_solver() -> str:
 def browser_captcha_solver_api_key() -> str | None:
     """API key for the selected captcha solver, or ``None``.
 
-    Stored plaintext under ``[browser].captcha_solver_api_key`` in the user's
-    gitignored ``~/.vexis/config.yaml`` (not a committed secret). Never echoed
-    back to the dashboard — the web layer masks it.
+    Stored plaintext under ``addons.browser.captcha_solver_api_key`` (or
+    the legacy ``[browser].captcha_solver_api_key``) in the user's
+    gitignored ``~/.vexis/config.yaml`` (not a committed secret). Never
+    echoed back to the dashboard — the web layer masks it.
     """
-    return _str_or_none(_section("browser").get("captcha_solver_api_key"))
+    return _str_or_none(_browser_section().get("captcha_solver_api_key"))
 
 
 def learning_enabled() -> bool:
@@ -554,7 +585,7 @@ def browser_screenshot_include_base64() -> bool:
     rides through the brain's stream-json output. CLI callers can opt
     in per-call with ``--include-base64``.
     """
-    raw = _section("browser").get("screenshot_include_base64", False)
+    raw = _browser_section().get("screenshot_include_base64", False)
     return bool(raw)
 
 

@@ -291,9 +291,9 @@ turns remain visible to the learning curator.
 
 Vexis features that aren't part of core ship as add-ons under
 `vexis_agent/addons/<name>/`. Each add-on is a folder with
-`addon.yaml` + `__init__.py` defining `register(ctx)`. Codemux is
-the first bundled add-on; future watcher sources / dashboards /
-slash commands plug in the same way.
+`addon.yaml` + `__init__.py` defining `register(ctx)`. Bundled:
+`browser` (default-on; ships the `vexis-browser` MCP server) and
+`codemux`. Future tools / watcher sources / dashboards plug in alike.
 
 **Pointers:** `docs/addons.md` (full author guide) ·
 `vexis_agent/addons/codemux/docs/codemux-watcher.md` (codemux

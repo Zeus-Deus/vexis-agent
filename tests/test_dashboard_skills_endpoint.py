@@ -49,6 +49,7 @@ def _build_dashboard(workspace: Path) -> WebDashboard:
     dashboard._background_tasks = None  # type: ignore[attr-defined]
     dashboard._curator = None  # type: ignore[attr-defined]
     dashboard._browser = None  # type: ignore[attr-defined]
+    dashboard._addon_runtime = None  # browser reached via addon runtime service
     dashboard._chat = None  # type: ignore[attr-defined]
     dashboard._running_brain_kind = None  # type: ignore[attr-defined]
     dashboard._profile_size_cache = None  # type: ignore[attr-defined]

@@ -6,6 +6,7 @@ This add-on owns:
   * The watch_* control-socket dispatch handlers (consumed by
     vexis-watch)
   * The codemux-active-work system-prompt header injection
+  * The codemux-orchestration capability prompt block (order 15)
   * The codemux watcher source plugin
   * The codemux-watcher-poller background task
   * The codemux.md skill auto-installed into every workspace
@@ -59,7 +60,14 @@ def register(ctx: PluginContext) -> None:
     in-core source registry; this add-on supplies the only
     shipping source. Future watcher sources (raw PTY, tmux pane)
     plug in the same way through their own add-ons.
+
+    The codemux-orchestration capability block (the system-prompt
+    "Codemux orchestration" how-to) is registered here too via
+    ``ctx.register_capability_block`` — so it appears in the assembled
+    Capabilities section ONLY when this add-on is loaded, instead of
+    leaking into core for every install.
     """
+    from vexis_agent.addons.codemux.capability import register_capability
     from vexis_agent.addons.codemux.dispatch import (
         build_watch_register_handler,
     )
@@ -75,6 +83,9 @@ def register(ctx: PluginContext) -> None:
     skill_file = ctx.addon_dir / "skills" / "codemux.md"
     if skill_file.is_file():
         ctx.register_skill(skill_file)
+
+    # 1b. Codemux-orchestration capability prompt block (order 15).
+    register_capability(ctx)
 
     # 2. Watcher source registration. Two registries:
     #    - AddonRuntime tracker (vexis-addons inspect, dashboard)

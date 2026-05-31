@@ -1,84 +1,44 @@
 """CLI client for ``vexis-browse``.
 
-Same shape as ``tools.background_cli``: connect to the daemon's
-control socket, send a single JSON line, print the JSON response.
-The daemon's ``main.py`` dispatch routes ``browser_*`` ops to a
-shared ``BrowserTools`` instance.
+A thin shell over the daemon control socket: connect, send one JSON
+line, print the JSON response. The daemon's dispatch routes
+``browser_*`` ops to the browser add-on's ``BrowserTools`` instance
+(the one persistent Camoufox session per daemon).
+
+The socket round-trip lives in ``tools.browser._client`` — shared with
+the ``vexis-browser-mcp`` MCP server so the CLI and the MCP front-end
+can't drift. This module owns only the argparse surface and exit-code
+mapping.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import socket
 import sys
-from pathlib import Path
 
-# Slightly above the daemon-side action timeout (default 120s) so a
-# slow page can finish before the client gives up first.
-DEFAULT_TIMEOUT_SECONDS = 150.0
-RECV_BUFSIZE = 65536
-
-
-def _socket_path() -> Path:
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    return Path(runtime) / "vexis-agent" / "vexis-agent.sock"
+from vexis_agent.tools.browser._client import (
+    BrowserSocketError,
+    send as _socket_send,
+    unwrap_response,
+)
 
 
-def _send(op: str, args: dict, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict:
-    path = _socket_path()
-    if not path.exists():
-        print(
-            f"vexis-browse: daemon socket not found at {path} — is vexis-agent running?",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
+def _send(op: str, args: dict) -> dict:
+    """Send a request; on any socket failure print to stderr and exit 1.
+
+    The CLI's contract is "speak JSON on success, die loudly on
+    transport failure" — so a missing daemon is a hard exit, unlike the
+    MCP server which keeps running and returns the error as a result."""
     try:
-        try:
-            sock.connect(str(path))
-        except OSError as exc:
-            print(f"vexis-browse: cannot connect: {exc}", file=sys.stderr)
-            sys.exit(1)
-        try:
-            sock.sendall((json.dumps({"op": op, "args": args}) + "\n").encode())
-            sock.shutdown(socket.SHUT_WR)
-        except OSError as exc:
-            print(f"vexis-browse: send failed: {exc}", file=sys.stderr)
-            sys.exit(1)
-        chunks: list[bytes] = []
-        try:
-            while True:
-                chunk = sock.recv(RECV_BUFSIZE)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-        except socket.timeout:
-            print("vexis-browse: timed out waiting for daemon", file=sys.stderr)
-            sys.exit(1)
-    finally:
-        sock.close()
-    raw = b"".join(chunks).decode().strip()
-    if not raw:
-        print("vexis-browse: empty response from daemon", file=sys.stderr)
-        sys.exit(1)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        print(f"vexis-browse: invalid JSON from daemon: {raw!r}", file=sys.stderr)
+        return _socket_send(op, args)
+    except BrowserSocketError as exc:
+        print(f"vexis-browse: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
 def _print_and_exit(resp: dict) -> int:
-    # Control socket wraps as {"ok": true, "result": ...} when the
-    # dispatcher returns a non-dict; for browser ops the dispatcher
-    # forwards the dict directly so {"ok": ...} is at the top level.
-    if "result" in resp and isinstance(resp.get("result"), dict):
-        payload = resp["result"]
-    else:
-        payload = resp
+    payload = unwrap_response(resp)
     print(json.dumps(payload, ensure_ascii=False))
     return 0 if payload.get("ok") else 1
 
@@ -125,8 +85,8 @@ def _cmd_scroll(direction: str, pages: float) -> int:
 def _cmd_screenshot(full_page: bool, include_base64: bool) -> int:
     args: dict = {"full_page": full_page}
     # Only forward when explicitly set; daemon falls back to its
-    # config default (``[browser].screenshot_include_base64``) when
-    # the key is absent.
+    # config default (``addons.browser.screenshot_include_base64``)
+    # when the key is absent.
     if include_base64:
         args["include_base64"] = True
     return _print_and_exit(_send("browser_screenshot", args))

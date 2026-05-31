@@ -32,6 +32,7 @@ from .errors import (
     ManifestError,
 )
 from .loader import (
+    DEFAULT_ENABLED_BUNDLED,
     DiscoveredAddon,
     PROJECT_ADDONS_ENV,
     bundled_addons_root,
@@ -77,6 +78,7 @@ __all__ = [
     "AddonRequirementError",
     "ManifestError",
     # loader
+    "DEFAULT_ENABLED_BUNDLED",
     "DiscoveredAddon",
     "PROJECT_ADDONS_ENV",
     "bundled_addons_root",
