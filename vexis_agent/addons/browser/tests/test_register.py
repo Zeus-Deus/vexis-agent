@@ -95,7 +95,9 @@ def test_register_registers_capability_block(restore_registry, runtime, tmp_path
     assert cap._REGISTRY["web-browsing"].order == 13
     assert "web-browsing" in {r.name for r in runtime.capability_blocks()}
     assembled = cap.assemble_capability_docs()
-    assert "## Web browsing — `vexis-browse`" in assembled
+    # The browser is now the vexis-browser MCP server; the block heads
+    # with the MCP tools (vexis-browse CLI kept as an equivalent fallback).
+    assert "## Web browsing — `vexis-browser`" in assembled
 
 
 def test_register_attaches_browser_service(restore_registry, runtime, tmp_path):

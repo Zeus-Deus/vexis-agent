@@ -3,9 +3,19 @@
 This add-on owns the entire browser integration that used to be
 hardcoded into core:
 
+  * The ``vexis-browser`` MCP server default — the brain's PRIMARY
+    browser interface. ``register_mcp_server_default`` declares a
+    stdio MCP server (``vexis-browser-mcp``) that the daemon writes
+    into both brains' native MCP config at startup, so the brain calls
+    ``browser_*`` as native MCP tools. Because that boundary is plain
+    MCP, swapping to a different browser server (Playwright MCP, a
+    cloud browser, a new engine) is a config change — no daemon edit,
+    no release.
   * The nine ``browser_*`` control-socket dispatch handlers
     (navigate / snapshot / click / read / type / press / back /
-    scroll / screenshot) consumed by the ``vexis-browse`` CLI.
+    scroll / screenshot) — the engine behind BOTH the MCP server and
+    the back-compat ``vexis-browse`` CLI (both are thin front-ends
+    that forward here over the control socket).
   * The ``web-browsing`` capability prompt block (order 13), moved
     out of ``vexis_agent/tools/browser/capability.py`` so the "Web
     browsing" system-prompt section appears ONLY when this add-on is
@@ -51,16 +61,20 @@ def register(ctx: PluginContext) -> None:
        add-on-dispatch-first check in ``main._build_dispatch`` routes
        control-socket ops here before any hardcoded branch (there are
        none left for the browser).
-    3. Register the ``web-browsing`` capability block (order 13).
-    4. Register the ``browser.md`` skill.
-    5. Attach the live ``BrowserTools`` as the ``"browser"`` runtime
+    3. Register the ``vexis-browser`` MCP server default so the brain
+       gets native ``browser_*`` MCP tools (both brains).
+    4. Register the ``web-browsing`` capability block (order 13).
+    5. Register the ``browser.md`` skill.
+    6. Attach the live ``BrowserTools`` as the ``"browser"`` runtime
        service so the dashboard can read session state.
-    6. Register a lifecycle background task that owns ``manager.stop()``
+    7. Register a lifecycle background task that owns ``manager.stop()``
        on cancellation (daemon shutdown).
     """
     from vexis_agent.addons.browser.capability import register_capability
     from vexis_agent.addons.browser.dispatch import build_browser_handlers
+    from vexis_agent.core.brain.base import McpServerSpec
     from vexis_agent.tools.browser import BrowserTools, get_manager
+    from vexis_agent.tools.browser.mcp_server import SERVER_NAME
 
     # 1. Browser engine instances. ``get_manager`` returns the
     #    process-global singleton (also what ``vexis-browse`` and the
@@ -76,22 +90,37 @@ def register(ctx: PluginContext) -> None:
     for op_name, handler in build_browser_handlers(browser_tools).items():
         ctx.register_dispatch_handler(op_name, handler)
 
-    # 3. web-browsing capability block (order 13) — the brain-facing
+    # 3. The vexis-browser MCP server default — the brain's PRIMARY
+    #    browser interface. The daemon's ``merge_addon_mcp_defaults``
+    #    (core/addon_mcp.py) folds this into BOTH brains' native MCP
+    #    config at startup, so the brain gets native ``browser_*`` MCP
+    #    tools (mcp__vexis-browser__browser_navigate, ...). The server
+    #    is a stdio adapter (vexis-browser-mcp) that forwards to the
+    #    same dispatch handlers registered above, over the control
+    #    socket — so MCP and the vexis-browse CLI drive the one
+    #    persistent session identically. A user entry of the same name
+    #    in mcp-servers.yaml wins (lets them point at a different
+    #    browser MCP server with no code change).
+    ctx.register_mcp_server_default(
+        McpServerSpec(name=SERVER_NAME, command="vexis-browser-mcp", args=[])
+    )
+
+    # 4. web-browsing capability block (order 13) — the brain-facing
     #    how-to, present only when this add-on is loaded.
     register_capability(ctx)
 
-    # 4. browser.md skill auto-installed into every workspace.
+    # 5. browser.md skill auto-installed into every workspace.
     skill_file = ctx.addon_dir / "skills" / "browser.md"
     if skill_file.is_file():
         ctx.register_skill(skill_file)
 
-    # 5. Expose the live BrowserTools to the dashboard via the runtime
+    # 6. Expose the live BrowserTools to the dashboard via the runtime
     #    service registry. ``web_server`` fetches it with
     #    ``get_service("browser")`` and hides/disables the Browser tab
     #    routes when it's absent — so core never imports this add-on.
     ctx._runtime.attach_service("browser", browser_tools)
 
-    # 6. Session lifecycle. The background task parks until cancelled,
+    # 7. Session lifecycle. The background task parks until cancelled,
     #    then stops the manager — symmetric with the daemon's old
     #    ``await browser_manager.stop()`` in main's finally block, but
     #    owned by the add-on now. ``stop_all_background_tasks`` cancels

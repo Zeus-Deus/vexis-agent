@@ -139,9 +139,13 @@ def test_browser_block_is_owned_by_the_browser_addon():
     from vexis_agent.addons.browser.capability import web_browsing_block
 
     block = web_browsing_block()
-    assert block.startswith("## Web browsing — `vexis-browse`")
+    # The browser is now delivered as the vexis-browser MCP server; the
+    # block leads with the MCP tools and keeps the vexis-browse CLI as
+    # an equivalent fallback.
+    assert block.startswith("## Web browsing — `vexis-browser`")
     assert "stealth Camoufox" in block
-    assert "vexis-browse navigate" in block
+    assert "browser_navigate" in block  # primary: MCP tool name
+    assert "vexis-browse" in block  # back-compat CLI still documented
 
 
 def test_browser_docs_no_longer_in_capabilities_md():

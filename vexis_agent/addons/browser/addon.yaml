@@ -1,6 +1,6 @@
 name: browser
 version: 1.0.0
-description: "Stealth web browsing — drives a Camoufox (hardened Firefox) session via `vexis-browse`. The flagship in-process add-on: navigate/snapshot/click/read/type/press/back/scroll/screenshot, persistent login profiles, Cloudflare auto-solve, and a pluggable CapSolver/2Captcha layer."
+description: "Stealth web browsing — drives a Camoufox (hardened Firefox) session, exposed to the brain as the `vexis-browser` MCP server (with the `vexis-browse` CLI as a back-compat front-end). The flagship add-on: navigate/snapshot/click/read/type/press/back/scroll/screenshot, persistent login profiles, Cloudflare auto-solve, and a pluggable CapSolver/2Captcha layer. Because the brain reaches it over MCP, any other browser MCP server is a config-level drop-in replacement — no daemon edit, no release."
 author: "Zeus-Deus"
 kind: standalone
 
@@ -9,6 +9,12 @@ requires:
   python: ">=3.11"
 
 provides:
+  # The brain's primary interface: the vexis-browser stdio MCP server
+  # (vexis-browser-mcp console script). Folded into both brains' native
+  # MCP config at startup via register_mcp_server_default.
+  mcp_server_defaults: ["vexis-browser"]
+  # The engine behind the MCP server AND the back-compat vexis-browse
+  # CLI — both forward to these handlers over the control socket.
   dispatch_handlers:
     - browser_navigate
     - browser_snapshot
