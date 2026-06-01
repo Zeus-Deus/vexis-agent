@@ -381,15 +381,23 @@ _GOAL_ALREADY_TERMINAL_TMPL = (
 # worker runs it in a detached aux session — foreground chat
 # stays free, notifications fire on done/blocked only.
 _GOAL_BG_FLAGS = frozenset({"--bg", "--background"})
+# Foreground override. As of v0.11 ``/goal <text>`` defaults to the
+# background (kanban) surface — see ``goals.default_mode`` and
+# ``core.yaml_config.goals_default_mode``. ``--fg`` / ``--foreground``
+# forces the in-chat continuation loop for a single invocation.
+_GOAL_FG_FLAGS = frozenset({"--fg", "--foreground"})
 _GOAL_BG_KANBAN_DISABLED = (
-    "/goal --bg needs the kanban store, but it's not available. "
-    "Make sure kanban is enabled (it is by default; check "
-    "~/.vexis/config.yaml hasn't disabled it)."
+    "Goals run in the background via kanban, but the kanban store isn't "
+    "available. Enable kanban (it's on by default — check "
+    "~/.vexis/config.yaml hasn't set kanban.enabled: false), or run this "
+    "goal in the foreground instead with /goal --fg <text>."
 )
 _GOAL_BG_REPLY_TMPL = (
-    "📋 Filed as kanban task `{task_id}`: {title}\n"
-    "Working in the background — /kanban show {task_id} for live status, "
-    "/kanban list for the board."
+    "📋 Goal filed as background task `{task_id}`: {title}\n"
+    "Working on it in the background — your chat stays free. Ask me "
+    '"how\'s the goal going?" any time, or check /goal status · '
+    "/kanban show {task_id} · the dashboard.\n"
+    "(Prefer it to run in this chat instead? /goal --fg <text>.)"
 )
 # Kanban lane the background goal lands in. ``implementation`` is
 # the default work lane (see ``docs/kanban.md``); user can rename
@@ -2261,6 +2269,9 @@ class TelegramTransport:
         goal_line = self._goal_status_line()
         if goal_line:
             reply = f"{reply}\n{goal_line}"
+        bg_goals = self._background_goals_status()
+        if bg_goals:
+            reply = f"{reply}\n{bg_goals}"
         await msg.reply_text(reply)
 
     def _goal_status_line(self) -> str | None:
@@ -2391,6 +2402,22 @@ class TelegramTransport:
     # the upstream /goal). Source of truth: `.plans/goal-command-research.md`.
     # ────────────────────────────────────────────────────────────────
 
+    def _background_goals_status(self) -> str | None:
+        """Render active background goals (kanban tasks filed via /goal)
+        for /goal status and /status, or None when there are none or the
+        kanban store is unavailable. Read-only; safe mid-drain."""
+        store = getattr(self, "_kanban_store", None)
+        if store is None:
+            return None
+        try:
+            from vexis_agent.core.goal_background import (
+                render_background_goals_status,
+            )
+            return render_background_goals_status(store)
+        except Exception:
+            log.debug("background-goal status read failed", exc_info=True)
+            return None
+
     def _build_goal_manager(self, session_uuid: str):
         """Construct a GoalManager bound to the given session UUID.
 
@@ -2456,7 +2483,11 @@ class TelegramTransport:
 
         # Control-plane: always safe, no drain interaction.
         if sub == "status":
-            await msg.reply_text(mgr.status_line())
+            lines = [mgr.status_line()]
+            bg = self._background_goals_status()
+            if bg:
+                lines.append(bg)
+            await msg.reply_text("\n".join(lines))
             return
 
         if sub == "pause":
@@ -2558,24 +2589,29 @@ class TelegramTransport:
             await msg.reply_text(_GOAL_INVALID_TMPL.format(reason="goal text is empty"))
             return
 
-        # ``--bg`` / ``--background`` as a leading flag routes the goal
-        # to kanban instead of the foreground drain loop. Matches the
-        # hermes architectural split (their /goal stays short-horizon,
-        # long-running work files as a cron/kanban task). Strip the
-        # flag from goal_text before falling through to the rest of
-        # the handler so the kickoff/judge see clean goal text.
-        background_mode = False
+        # Mode flags. As of v0.11 ``/goal <text>`` defaults to the
+        # BACKGROUND surface (filed as a kanban task; the foreground chat
+        # stays free) — see ``goals.default_mode`` /
+        # ``core.yaml_config.goals_default_mode``. A leading
+        # ``--bg``/``--background`` forces background; ``--fg``/
+        # ``--foreground`` forces the in-chat continuation ("Ralph")
+        # loop. Strip the flag from goal_text before anything else so the
+        # kanban title / foreground judge see clean text.
+        forced_mode: str | None = None
         tokens = goal_text.split()
         if tokens and tokens[0].lower() in _GOAL_BG_FLAGS:
-            background_mode = True
+            forced_mode = "background"
             goal_text = " ".join(tokens[1:]).strip()
-            if not goal_text:
-                await msg.reply_text(
-                    _GOAL_INVALID_TMPL.format(
-                        reason="goal text is empty after stripping --bg"
-                    )
+        elif tokens and tokens[0].lower() in _GOAL_FG_FLAGS:
+            forced_mode = "foreground"
+            goal_text = " ".join(tokens[1:]).strip()
+        if forced_mode is not None and not goal_text:
+            await msg.reply_text(
+                _GOAL_INVALID_TMPL.format(
+                    reason="goal text is empty after stripping the mode flag"
                 )
-                return
+            )
+            return
 
         # Bareword-typo guard. /goal cancel / /goal stop / etc. is
         # almost always a typo for /cancel — never a real goal.
@@ -2585,13 +2621,18 @@ class TelegramTransport:
             await msg.reply_text(_GOAL_BAREWORD_HINT)
             return
 
-        # Background-mode route: file as a kanban task and return
-        # early. We deliberately do NOT touch the GoalManager / the
-        # FIFO drain — the kanban dispatcher owns the lifecycle
-        # (claim → spawn_aux worker → emit task_events → archive)
-        # and reuses the workspace+brain the daemon already has. The
-        # foreground Telegram chat is left completely free.
-        if background_mode:
+        from vexis_agent.core.yaml_config import goals_default_mode
+        mode = forced_mode or goals_default_mode()
+
+        # Background route (the default): file as a kanban task and return
+        # early. We deliberately do NOT touch the GoalManager / the FIFO
+        # drain — the kanban dispatcher owns the lifecycle (claim →
+        # spawn_aux worker → emit task_events → archive) and reuses the
+        # workspace+brain the daemon already has. The foreground Telegram
+        # chat is left completely free; progress is surfaced via /goal
+        # status and the [BACKGROUND GOALS] block the handler injects into
+        # chat turns (see core.goal_background).
+        if mode == "background":
             store = self._kanban_store
             if store is None:
                 await msg.reply_text(_GOAL_BG_KANBAN_DISABLED)
@@ -2599,6 +2640,7 @@ class TelegramTransport:
             title = goal_text.replace("\n", " ").strip()
             if len(title) > _GOAL_BG_TITLE_MAX_CHARS:
                 title = title[: _GOAL_BG_TITLE_MAX_CHARS - 1].rstrip() + "…"
+            from vexis_agent.core.goal_background import GOAL_TASK_CREATED_BY
             from vexis_agent.tools.kanban import api as kanban_api
             result = kanban_api.create_task(
                 store,
@@ -2606,7 +2648,7 @@ class TelegramTransport:
                 body=goal_text,
                 lane=_GOAL_BG_DEFAULT_LANE,
                 status="ready",
-                created_by="user:/goal --bg",
+                created_by=GOAL_TASK_CREATED_BY,
             )
             if not result.get("ok"):
                 await msg.reply_text(

@@ -609,6 +609,20 @@ async def _run() -> bool:
     else:
         log.info("kanban: disabled via config (kanban.enabled=false)")
 
+    # Wire the background-goal context provider so foreground chat turns
+    # carry a [BACKGROUND GOALS] block describing /goal tasks running in
+    # kanban — lets the brain answer "how's my goal going?" from live
+    # state. Done here (not at handler construction) because the kanban
+    # store is created after the handler. No-op when kanban is disabled.
+    if kanban_store is not None:
+        from vexis_agent.core.goal_background import (
+            render_background_goal_block,
+        )
+        _goal_kanban_store = kanban_store
+        handler.set_background_goal_provider(
+            lambda: render_background_goal_block(_goal_kanban_store)
+        )
+
     # Web chat bridges the dashboard chat UI to the same MessageHandler
     # the Telegram transport uses. Sharing the handler means both
     # transports see the same SessionStore and Notifier — slash commands

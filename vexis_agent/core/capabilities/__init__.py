@@ -107,6 +107,10 @@ _BUILTIN_CAPABILITY_MODULES: tuple[str, ...] = (
     "vexis_agent.tools.livestream_capability",
     # Background tasks (vexis-bg) + system-context envelope.
     "vexis_agent.tools.background_capability",
+    # Goals (/goal) — background-by-default multi-step objectives +
+    # the [BACKGROUND GOALS] progress block. Order 9.5 places it right
+    # after background-tasks and before memory.
+    "vexis_agent.core.goal_capability",
     # Persistent memory notes (vexis-mem).
     "vexis_agent.tools.memory_capability",
     # Procedural-knowledge skills library (vexis-skill).

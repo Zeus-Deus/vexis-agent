@@ -1,33 +1,43 @@
 # Goals
 
-`/goal <text>` lets you kick off a multi-step task from your phone,
-walk away, and come back to the result. Vexis keeps working on the
-goal across turns — after each brain reply, an auxiliary judge
-decides whether the goal is done; if not, Vexis enqueues a
-continuation prompt and keeps going until it is, you pause it, or
-the turn budget runs out.
+`/goal <text>` lets you hand Vexis a multi-step task from your phone,
+walk away, and come back to the result.
 
-This is the "Ralph loop" port from the upstream / Codex CLI 0.128.0,
-adapted to Vexis's Telegram + `claude -p` shape.
+**As of v0.11, goals run in the background by default.** `/goal
+<text>` files the goal as a kanban task: a background worker drives it
+while your foreground chat stays completely free. You can keep
+chatting, ask "how's my goal going?" at any time (Vexis sees the live
+status and answers from it), check `/goal status`, or watch it on the
+dashboard. See [Background goals](#background-goals-the-default) below.
+
+`/goal --fg <text>` opts into the older **foreground** loop instead:
+Vexis works the goal turn-by-turn inside the chat — after each brain
+reply an auxiliary judge decides whether the goal is done; if not,
+Vexis enqueues a continuation prompt and keeps going until it is, you
+pause it, or the turn budget runs out. This is the "Ralph loop" port
+from the upstream / Codex CLI 0.128.0, adapted to Vexis's Telegram +
+`claude -p` shape. Flip the default permanently with
+`goals.default_mode: foreground` in `~/.vexis/config.yaml`.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/goal <text>` | Set a standing goal and kick off the first turn. |
-| `/goal --bg <text>` | File the goal as a kanban task — runs in the background, foreground chat stays free. See [Background goals](#background-goals-via-kanban) below. |
-| `/goal` (or `/goal status`) | Show current state. |
-| `/goal pause` | Soft pause — the in-flight turn finishes, loop won't auto-continue after. |
-| `/goal resume` | Resume the loop AND immediately advance one turn (resets the turn budget to a fresh 20). |
-| `/goal clear` | Drop the goal. Subsequent messages are normal turns. |
+| `/goal <text>` | Start a goal. **Runs in the background by default** (filed as a kanban task; chat stays free). See [Background goals](#background-goals-the-default). |
+| `/goal --fg <text>` | Force the in-chat **foreground** loop for this goal. |
+| `/goal --bg <text>` | Force background even when `goals.default_mode: foreground`. |
+| `/goal` (or `/goal status`) | Show current state — the foreground goal (if any) plus all active background goals. |
+| `/goal pause` | *(Foreground)* Soft pause — the in-flight turn finishes, loop won't auto-continue after. |
+| `/goal resume` | *(Foreground)* Resume the loop AND immediately advance one turn (resets the turn budget to a fresh 20). |
+| `/goal clear` | *(Foreground)* Drop the goal. Subsequent messages are normal turns. Background goals are controlled via `/kanban` instead. |
 
 Quick examples:
 
 ```
-/goal port the goal command to Vexis
-/goal --bg ship the rocket and write the release notes
+/goal ship the rocket and write the release notes   # background (default)
+/goal --fg port the goal command to Vexis           # in-chat foreground loop
 /goal status
-/goal pause
+/goal pause      # foreground loop only
 /goal resume
 /goal clear
 ```
@@ -151,8 +161,10 @@ until you `/goal <text>` again.
 
 ## Notification policy
 
-How chatty the loop is on Telegram is controlled by
-`goals.notify_policy` in `~/.vexis/config.yaml`:
+How chatty the **foreground** loop is on Telegram is controlled by
+`goals.notify_policy` in `~/.vexis/config.yaml` (background goals use
+kanban's own notification rules instead — see
+[Background goals](#background-goals-the-default)):
 
 | Value | Behaviour |
 |---|---|
@@ -168,23 +180,29 @@ goals:
 The policy reads disk per turn, so an edit takes effect at the
 next continuation without a daemon restart.
 
-## Background goals (via kanban)
+## Background goals (the default)
 
-`/goal <text>` is the **short-horizon** surface: it runs in your
-foreground chat, capped at the 20-turn budget, with the judge
-firing after every turn. Anything that could legitimately take
-hours or days should run in the background instead:
+`/goal <text>` files the goal as a single `ready`-state kanban task
+in the `implementation` lane. The kanban dispatcher picks it up,
+spawns a worker in a detached aux session, and runs it there. Your
+foreground Telegram chat is left completely free — keep chatting,
+ask for screenshots, kick off other goals.
 
-```
-/goal --bg refactor the goal manager and ship a release PR
-```
+### Asking how it's going
 
-This files the goal as a single `ready`-state kanban task in the
-`implementation` lane. The kanban dispatcher picks it up, spawns a
-worker in a detached aux session, and runs it there. Your
-foreground Telegram chat is left completely free — you can keep
-chatting, asking for screenshots, kicking off other tasks. Check
-on the background goal with:
+Every foreground turn, while a background goal is active, carries a
+`[BACKGROUND GOALS]` block (goal id, state, elapsed time, latest
+activity) that Vexis reads as ground truth. So you can just ask, in
+plain language:
+
+> **you:** how's my goal going?
+> **vexis:** The "refactor the goal manager" goal is still working
+> (about 4m in) — last activity: wrote the new continuation handler.
+
+`/goal status` shows the same list explicitly, and the dashboard
+kanban board renders every goal task live. For the full transcript
+of one goal run, ask Vexis (it runs `vexis-kanban show <id>` for
+you) or use the Telegram kanban commands directly:
 
 ```
 /kanban show <task_id>     # full status + recent activity
@@ -192,15 +210,20 @@ on the background goal with:
 /kanban complete <task_id> # mark done early if needed
 ```
 
-You can mix surfaces: a foreground `/goal` for a quick objective
-while a `/goal --bg` task chugs along, with the kanban event bus
-pinging you on done/blocked. The two paths don't share state — a
-foreground goal's pause/clear/resume controls don't affect a
-background kanban task and vice versa.
+### Notifications
 
-Background goals don't use `goals.notify_policy` — they use
-kanban's own notification rules (only ping on done / blocked /
-needs-input; see `docs/kanban.md`).
+Background goals don't use `goals.notify_policy` — they use kanban's
+own rules (only ping on done / blocked / needs-input; see
+`docs/kanban.md`). That's the point: the chat stays quiet while the
+worker grinds, and you pull status when you want it.
+
+### Foreground vs. background
+
+`/goal --fg <text>` runs the in-chat continuation loop instead (see
+the top of this doc); `goals.default_mode: foreground` flips the
+default permanently. The two surfaces don't share state — a
+foreground goal's pause/clear/resume don't affect a background
+kanban task and vice versa, and you can run both at once.
 
 ## Configuration cheat sheet
 
@@ -212,8 +235,16 @@ goals:
   # to silence the slash command and the post-turn hook entirely.
   enabled: true
 
-  # Max continuation turns before auto-pause. /goal resume zeros
-  # the counter so you get another full budget without editing this.
+  # Where `/goal <text>` runs when you don't pass --fg / --bg:
+  #   background (default) — file as a kanban task; chat stays free,
+  #                          progress via the [BACKGROUND GOALS] block
+  #                          + /goal status + the dashboard.
+  #   foreground           — in-chat continuation ("Ralph") loop.
+  default_mode: background
+
+  # Max continuation turns before auto-pause (foreground loop only).
+  # /goal resume zeros the counter so you get another full budget
+  # without editing this.
   max_turns: 20
 
 models:

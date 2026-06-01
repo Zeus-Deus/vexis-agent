@@ -69,6 +69,12 @@ models:
 # ── goals (v3d, see docs/goals.md) ──────────────────────────────────
 goals:
   enabled: true
+  # Where `/goal <text>` runs when you don't pass --fg / --bg:
+  #   background (default) — file as a kanban task; foreground chat
+  #                          stays free (progress via /goal status, the
+  #                          [BACKGROUND GOALS] chat block, dashboard).
+  #   foreground           — in-chat continuation ("Ralph") loop.
+  default_mode: background
   max_turns: 20
 
 # ── relationships (v3c, see docs/relationships.md) ──────────────────
