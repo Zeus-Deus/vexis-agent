@@ -93,13 +93,15 @@ Canonical schema reference (every block is optional; missing file
                                     # while the brain generates;
                                     # false falls back to one
                                     # buffered send at done time
-      streaming_min_interval_seconds: 1.0
+      streaming_min_interval_seconds: 0.5
                                     # min seconds between successive
                                     # edit_message_text calls in a
                                     # single chat. Clamped to
                                     # [0.5, 5.0]. Telegram's edits
-                                    # bucket is ~6/sec bot-wide; 1s
-                                    # per chat keeps us well under.
+                                    # bucket is ~6/sec bot-wide; two
+                                    # edits/sec per chat stays well
+                                    # under it. Raise toward 1-2s if
+                                    # a chat hits 429s.
 """
 
 from __future__ import annotations
@@ -1578,7 +1580,7 @@ def chat_attachments_allowed_mimes() -> frozenset[str]:
 
 
 DEFAULT_TELEGRAM_STREAMING_ENABLED: bool = True
-DEFAULT_TELEGRAM_STREAMING_MIN_INTERVAL_SECONDS: float = 1.0
+DEFAULT_TELEGRAM_STREAMING_MIN_INTERVAL_SECONDS: float = 0.5
 # Hard floor: Telegram's per-chat write budget is ~1 msg/sec; going
 # below 0.5s edits in the same chat starts attracting 429s with
 # retry_after windows that defeat the point of streaming.
@@ -1611,14 +1613,16 @@ def telegram_streaming_min_interval_seconds() -> float:
     """Minimum wall-clock seconds between successive
     ``edit_message_text`` calls for a single chat during streaming.
 
-    Default 1.0s. Clamped to ``[0.5, 5.0]`` — values outside this
-    band fall back to the default with a warning. Telegram's edit
-    bucket is ~6 edits/sec bot-wide and ~1 message/sec per chat;
-    one edit per chat per second is the safe rule that keeps us
-    well under both even with the chat in flight on a tight chunk
-    cadence (every 1-2 tokens). Too-fast values trigger 429s with
-    multi-second retry windows that defeat the point of streaming
-    in the first place.
+    Default 0.5s (two edits/sec per chat) — the smoothest cadence
+    that still sits comfortably under Telegram's ~6 edit/sec bot-
+    wide bucket. 1.0s was the original default but read as "chunky"
+    against native token-stream UX; 0.5s repaints the bubble twice
+    as often for the same streamed deltas. Clamped to ``[0.5, 5.0]``
+    — values outside this band fall back to the default with a
+    warning. Going below the 0.5s floor in a single chat starts
+    attracting 429s with multi-second retry windows that defeat the
+    point of streaming; the per-chat ~1 msg/sec send limit does not
+    bind edits to an existing message, so two edits/sec is safe.
     """
     raw = _section("telegram").get(
         "streaming_min_interval_seconds",
@@ -1626,7 +1630,7 @@ def telegram_streaming_min_interval_seconds() -> float:
     )
     if isinstance(raw, bool):
         # bool is an int subclass — refuse it to avoid silently
-        # accepting `streaming_min_interval_seconds: true` as 1.0.
+        # accepting `streaming_min_interval_seconds: true` as 0.5.
         return DEFAULT_TELEGRAM_STREAMING_MIN_INTERVAL_SECONDS
     try:
         value = float(raw)

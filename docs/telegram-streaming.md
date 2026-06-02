@@ -44,7 +44,7 @@ In `~/.vexis/config.yaml`:
 ```yaml
 telegram:
   streaming_enabled: true              # default true
-  streaming_min_interval_seconds: 1.0  # default 1.0; clamped [0.5, 5.0]
+  streaming_min_interval_seconds: 0.5  # default 0.5; clamped [0.5, 5.0]
 ```
 
 `streaming_enabled: false` falls back to the pre-streaming buffered
@@ -54,11 +54,13 @@ safety valve if streaming misbehaves on a given account; flip it
 back to `true` once the issue is resolved.
 
 `streaming_min_interval_seconds` controls the per-chat edit cadence.
-The default 1.0s is the safe rule that keeps a single chat well
-under both Telegram limits even on a tight chunk cadence:
+The default 0.5s repaints the bubble twice a second, which reads as
+smooth against the brain's token-level deltas; 1.0s was the original
+default but felt chunky. 0.5s still keeps a single chat well under
+both Telegram limits even on a tight chunk cadence:
 
 - Telegram caps edits at ~6/sec bot-wide. With one chat in flight
-  at 1 edit/sec we use ~17% of that bucket — leaving headroom for
+  at 2 edits/sec we use ~33% of that bucket — leaving headroom for
   callback-driven edits (`/model`, `/goal status`, etc).
 - Telegram caps writes at ~1 message/sec per chat. We're not sending
   new messages mid-stream (only edits), so we're nowhere near that.
@@ -96,8 +98,8 @@ flag does the same.
 ## When to disable streaming
 
 - The bot is hitting 429s consistently. First check
-  `streaming_min_interval_seconds` — bumping it from 1.0 to 1.5 or
-  2.0 should resolve transient throttling without losing the
+  `streaming_min_interval_seconds` — bumping it from 0.5 to 1.0 or
+  1.5 should resolve transient throttling without losing the
   streaming feel. Fall back to `streaming_enabled: false` only if
   the throttle increase doesn't help.
 - A specific chat keeps showing partial / corrupted bubbles.
