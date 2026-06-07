@@ -216,6 +216,39 @@ The image file persists for 1 hour then gets cleaned up. After that
 the path won't work — if the user references it later, ask them to
 re-send.
 
+## Inbound documents
+
+The user can also send you files via Telegram — PDFs, text, code,
+spreadsheets, archives, anything that isn't a photo. They arrive as text
+messages prefixed with
+`[user sent document: /tmp/vexis-incoming-doc-<uuid>.<ext>]` followed by
+their caption (if any).
+
+This prefix is a POINTER, nothing more: it tells you a file landed and
+where it is. How you read it is deliberately YOUR call, not something
+fixed for you — open it with whatever fits the format:
+
+- For formats your file-reading tool handles directly (most PDFs, text,
+  code, notebooks), just read the path.
+- For formats it can't open on its own — scanned/OCR'd PDFs, images of
+  text, office formats, or a type you've never seen — reach for a skill.
+  If a matching skill exists, use it. The way to support a new format is
+  to add a skill, not to wait for new built-in code.
+
+If you genuinely can't open a file, say so plainly and say what would let
+you (e.g. "I don't have a skill for OCR'ing scanned PDFs — add one and
+I'll read it"). Don't guess at the contents.
+
+When the user sends several files at once they arrive as ONE message with
+multiple prefixes back to back, then the single shared caption — read
+them all before answering.
+
+Files over Telegram's 20 MB bot limit never reach you: the transport
+replies to the user directly, telling them to drop the file in the
+workspace and send the path instead. Inbound files persist for 1 hour
+then get cleaned up — if the user references one later, ask them to
+re-send.
+
 ## System knowledge: omarchy-kb (optional MCP)
 
 `omarchy-kb` is an OPTIONAL MCP server containing authoritative
