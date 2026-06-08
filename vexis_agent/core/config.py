@@ -23,7 +23,20 @@ def _require(name: str) -> str:
     return value
 
 
-def load_config() -> Config:
+def load_config(require_telegram: bool = True) -> Config:
+    # ``require_telegram`` defaults True so every existing caller —
+    # and any deployment that hasn't touched the new ``transports``
+    # config — keeps the original hard-require behaviour byte-for-
+    # byte: a missing TELEGRAM_BOT_TOKEN still raises so the setup
+    # wizard's "run setup first" message is reachable (issue #39).
+    #
+    # When the Telegram transport is disabled (``transports.telegram:
+    # false``), ``main._run`` calls this with ``require_telegram=False``
+    # so a headless web-/CLI-only deployment doesn't need a bot token
+    # or an allowed-user id it will never use. The token then falls
+    # back to "" and the allowed-user id to 0 — the web dashboard
+    # carries its own bearer-token auth, independent of this id.
+    #
     # Pass an explicit path. python-dotenv's bare ``load_dotenv()``
     # delegates to ``find_dotenv(usecwd=False)`` which walks up from
     # the caller's ``__file__`` — i.e. from inside the pipx venv at
@@ -48,8 +61,16 @@ def load_config() -> Config:
 
     load_dotenv(vexis_dir() / ".env")
 
-    token = _require("TELEGRAM_BOT_TOKEN")
-    raw_user_id = _require("TELEGRAM_ALLOWED_USER_ID")
+    if require_telegram:
+        token = _require("TELEGRAM_BOT_TOKEN")
+        raw_user_id = _require("TELEGRAM_ALLOWED_USER_ID")
+    else:
+        # Telegram disabled: secrets are optional. Honour them if the
+        # operator set them anyway (handy for flipping Telegram back on
+        # without re-running setup), otherwise fall back to inert
+        # defaults.
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        raw_user_id = os.environ.get("TELEGRAM_ALLOWED_USER_ID", "").strip() or "0"
     try:
         user_id = int(raw_user_id)
     except ValueError as exc:

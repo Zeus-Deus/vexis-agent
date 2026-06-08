@@ -1277,10 +1277,18 @@ class TelegramTransport:
         brain dispatch proceeds normally (option (a) per scoping
         doc §3.1).
         """
+        # Issue #39 master switch: relationship/user-fact learning is
+        # droppable as a whole. When it's off, this per-turn hook is a
+        # no-op regardless of the explicit-consent sub-flag below.
+        from vexis_agent.core.yaml_config import (
+            relationships_enabled,
+            relationships_explicit_consent_enabled,
+        )
+        if not relationships_enabled():
+            return
         # v3c Day 4a flag: zero-cost short-circuit when the legacy
         # explicit path is disabled (the default). No detector
         # call, no cursor claim, nothing.
-        from vexis_agent.core.yaml_config import relationships_explicit_consent_enabled
         if not relationships_explicit_consent_enabled():
             return
         if self._learning_curator is None:

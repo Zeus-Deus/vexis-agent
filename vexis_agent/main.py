@@ -169,8 +169,27 @@ def acquire_daemon_lock(pid_path: Path | None = None) -> int:
 
 
 async def _run() -> bool:
-    config = load_config()
+    # Issue #39: transports are config-selectable (telegram / web /
+    # both). Read the gates BEFORE load_config so a Telegram-disabled
+    # (headless / web-only) deployment doesn't have to carry a bot
+    # token + allowed-user id it will never use. Both default True, so
+    # a config that never mentions ``transports`` boots exactly as
+    # before. See docs/modular-subsystems.md.
+    from vexis_agent.core.yaml_config import (
+        transport_telegram_enabled as _telegram_enabled_fn,
+        transport_web_enabled as _web_enabled_fn,
+    )
+    telegram_enabled = _telegram_enabled_fn()
+    web_enabled = _web_enabled_fn()
+
+    config = load_config(require_telegram=telegram_enabled)
     setup_logging(config.log_level)
+    if not telegram_enabled or not web_enabled:
+        log.info(
+            "Transports: telegram=%s, web=%s (issue #39 modular boot)",
+            "on" if telegram_enabled else "off",
+            "on" if web_enabled else "off",
+        )
 
     acquire_daemon_lock()
 
@@ -358,18 +377,34 @@ async def _run() -> bool:
     # enabled a watcher source.
     from vexis_agent.core.watcher import WatcherController
     from vexis_agent.core.yaml_config import (
+        watcher_enabled as _watcher_enabled,
         watcher_oscillation_window_seconds as _watcher_osc,
         watcher_poll_interval_seconds as _watcher_poll,
     )
-    watcher = WatcherController(
-        poll_interval_seconds=_watcher_poll(),
-        oscillation_window_seconds=_watcher_osc(),
-    )
-    log.info(
-        "watcher: controller active (poll=%.1fs, oscillation_window=%.1fs); "
-        "sources supplied by enabled add-ons",
-        _watcher_poll(), _watcher_osc(),
-    )
+    # Issue #39: the watcher is independently disableable. When off,
+    # ``watcher`` is None and the daemon takes the SAME path it already
+    # uses when the codemux MCP isn't configured — ``_build_dispatch``
+    # returns ``CodemuxNotConfigured`` for every ``watch_*`` op and the
+    # Telegram watcher verbs hide themselves (all gated on ``watcher is
+    # not None``). Reusing the tested None-path keeps the off-switch
+    # cheap and low-risk.
+    watcher: "WatcherController | None"
+    if _watcher_enabled():
+        watcher = WatcherController(
+            poll_interval_seconds=_watcher_poll(),
+            oscillation_window_seconds=_watcher_osc(),
+        )
+        log.info(
+            "watcher: controller active (poll=%.1fs, oscillation_window=%.1fs); "
+            "sources supplied by enabled add-ons",
+            _watcher_poll(), _watcher_osc(),
+        )
+    else:
+        watcher = None
+        log.info(
+            "watcher: disabled via config (watcher.enabled=false); "
+            "watch_* ops report unavailable"
+        )
 
     # Add-on system (see docs/addons.md). Discover everything the
     # user opted into via ``addons.enabled`` in ~/.vexis/config.yaml,
@@ -387,7 +422,11 @@ async def _run() -> bool:
         addons_enabled as _addons_enabled,
     )
     addon_runtime = AddonRuntime()
-    addon_runtime.attach_service("watcher", watcher)
+    # Only advertise the watcher service when the subsystem is live; an
+    # add-on that needs it (codemux) resolves ``get_service("watcher")``
+    # to None and degrades, rather than binding a disabled controller.
+    if watcher is not None:
+        addon_runtime.attach_service("watcher", watcher)
     # The workspace path is a shared service so add-ons that bind to it
     # (the browser add-on's BrowserTools) resolve it the same way the
     # daemon did, without re-reading config. Attached BEFORE add-ons
@@ -629,105 +668,141 @@ async def _run() -> bool:
     # in Telegram and clicks in the chat sidebar mutate the same state.
     # The chat_id namespace is partitioned (transports/web.py:WEB_CHAT_ID)
     # so the per-chat notifier buffers don't cross-contaminate.
-    web_chat = WebChatTransport(
-        handler=handler,
-        allowed_user_id=config.telegram_allowed_user_id,
-    )
+    #
+    # Issue #39: the whole web surface (dashboard + chat bridge) is
+    # gated by ``transports.web``. When off, ``dashboard`` stays None
+    # and the daemon serves Telegram (or just the control socket) only.
+    # Every consumer of ``dashboard`` below already accepts None.
+    web_chat: "WebChatTransport | None" = None
+    dashboard: "WebDashboard | None" = None
+    if web_enabled:
+        web_chat = WebChatTransport(
+            handler=handler,
+            allowed_user_id=config.telegram_allowed_user_id,
+        )
+        dashboard_port = _dashboard_port_from_env()
+        dashboard = WebDashboard(
+            workspace=workspace,
+            sessions=sessions,
+            running_tasks=running_tasks,
+            background_tasks=background_tasks,
+            curator=curator,
+            # The dashboard reaches the live browser via the add-on
+            # runtime service registry (``get_service("browser")``)
+            # instead of a direct BrowserTools handle — so
+            # core/web_server never imports the browser add-on. When the
+            # browser add-on is disabled the service is absent and the
+            # Browser tab routes degrade gracefully (503 / hidden).
+            addon_runtime=addon_runtime,
+            learning=learning_curator,
+            config=DashboardConfig(
+                port=dashboard_port,
+                web_dist=_resolve_web_dist(),
+            ),
+            chat=web_chat,
+            # Day 5 of model UX: the canary-check helper needs to know
+            # what brain class the daemon actually instantiated so the
+            # dashboard payload's global_findings can surface the
+            # "edited brain.kind without restarting" warning.
+            running_brain_kind=_kind,
+        )
+        # Late-attach the schedule store so the dashboard
+        # /api/v1/schedules* endpoints can read/mutate it. Kept off the
+        # WebDashboard constructor for backwards compatibility with
+        # test/alternate wirings.
+        dashboard.attach_schedule_store(schedule_store)
+        # Same pattern for kanban — the dashboard's /api/v1/kanban/* and
+        # WS /api/v1/kanban/events return 503 until the store lands.
+        if kanban_store is not None:
+            dashboard.attach_kanban_store(kanban_store)
+    else:
+        log.info("web: dashboard disabled via config (transports.web=false)")
 
-    dashboard_port = _dashboard_port_from_env()
-    dashboard = WebDashboard(
-        workspace=workspace,
-        sessions=sessions,
-        running_tasks=running_tasks,
-        background_tasks=background_tasks,
-        curator=curator,
-        # The dashboard reaches the live browser via the add-on runtime
-        # service registry (``get_service("browser")``) instead of a
-        # direct BrowserTools handle — so core/web_server never imports
-        # the browser add-on. When the browser add-on is disabled the
-        # service is absent and the Browser tab routes degrade
-        # gracefully (503 / hidden payload).
-        addon_runtime=addon_runtime,
-        learning=learning_curator,
-        config=DashboardConfig(
-            port=dashboard_port,
-            web_dist=_resolve_web_dist(),
-        ),
-        chat=web_chat,
-        # Day 5 of model UX: the canary-check helper needs to know
-        # what brain class the daemon actually instantiated so the
-        # dashboard payload's global_findings can surface the
-        # "edited brain.kind without restarting" warning. ``_kind``
-        # is the value ``brain_kind()`` returned at startup; the
-        # check runs on every dashboard poll against the
-        # current on-disk value.
-        running_brain_kind=_kind,
-    )
+    # Issue #39: the Telegram transport is the historical daemon main
+    # loop; it's now optional. When ``transports.telegram`` is off,
+    # ``transport`` is None and the daemon runs headless (web + control
+    # socket only), blocking in ``_run_headless_until_signal`` instead
+    # of the long-poll. All transport-coupled wiring below (schedule
+    # dispatch callback, watcher notify) is conditioned on it.
+    transport: "TelegramTransport | None" = None
+    if telegram_enabled:
+        transport = TelegramTransport(
+            token=config.telegram_bot_token,
+            handler=handler,
+            running_tasks=running_tasks,
+            allowed_user_id=config.telegram_allowed_user_id,
+            background_tasks=background_tasks,
+            notifier=notifier,
+            curator=curator,
+            learning_curator=learning_curator,
+            dashboard=dashboard,
+            schedule_store=schedule_store,
+            kanban_store=kanban_store,
+            watcher=watcher,
+            addon_runtime=addon_runtime,
+        )
+        # Wire the dispatch callback so ScheduleManager fires route
+        # through the transport's ``claim() ? drain : enqueue`` protocol
+        # instead of raw FIFO enqueue. Without this, a fire at idle
+        # wall-clock time (2:30 AM) strands the prompt in the deque
+        # until the next real user message wakes a fresh claim — the
+        # v0.4.0 bug. The transport exists by here; ScheduleManager.
+        # start() hasn't been called yet, so the first tick sees it.
+        schedule_manager.set_dispatch_fn(transport.dispatch_scheduled_fire)
+        # Reverse wire: the drain calls back into the manager with the
+        # real brain outcome so ``last_status`` reflects truth instead
+        # of the pre-emptive "ok" the dispatch-time _record_fire writes.
+        transport._schedule_outcome_cb = schedule_manager.report_fire_outcome
 
-    # Late-attach the schedule store so the dashboard /api/v1/schedules*
-    # endpoints can read/mutate it. Kept off the WebDashboard constructor
-    # for backwards compatibility with test/alternate wirings.
-    dashboard.attach_schedule_store(schedule_store)
-    # Same pattern for kanban — the dashboard's /api/v1/kanban/* and
-    # WS /api/v1/kanban/events return 503 until the store lands.
-    if kanban_store is not None:
-        dashboard.attach_kanban_store(kanban_store)
-
-    transport = TelegramTransport(
-        token=config.telegram_bot_token,
-        handler=handler,
-        running_tasks=running_tasks,
-        allowed_user_id=config.telegram_allowed_user_id,
-        background_tasks=background_tasks,
-        notifier=notifier,
-        curator=curator,
-        learning_curator=learning_curator,
-        dashboard=dashboard,
-        schedule_store=schedule_store,
-        kanban_store=kanban_store,
-        watcher=watcher,
-        addon_runtime=addon_runtime,
-    )
     # The watcher pushes its idle pings through the same notifier the
     # rest of the daemon uses — same per-chat context buffer, same
     # Markdown fall-back, same retry shape as vexis-bg's exit pings.
-    watcher.set_notify(notifier.send)
+    if watcher is not None:
+        watcher.set_notify(notifier.send)
 
-    # Wire the dispatch callback so ScheduleManager fires route through
-    # the transport's ``claim() ? drain : enqueue`` protocol instead of
-    # raw FIFO enqueue. Without this, a fire at idle wall-clock time
-    # (2:30 AM) strands the prompt in the deque until the next real
-    # user message wakes a fresh claim — the v0.4.0 bug. The transport
-    # exists by here; ScheduleManager.start() hasn't been called yet,
-    # so the very first tick sees the dispatch_fn wired.
-    schedule_manager.set_dispatch_fn(transport.dispatch_scheduled_fire)
-    # Reverse wire: the drain calls back into the manager with the
-    # real brain outcome so ``last_status`` reflects truth instead of
-    # the pre-emptive "ok" the dispatch-time _record_fire writes.
-    # Without this, a brain failure (the 15 May 2026 Anthropic 500)
-    # leaves the schedule showing ok forever despite the user seeing
-    # an error in Telegram.
-    transport._schedule_outcome_cb = schedule_manager.report_fire_outcome
+    from vexis_agent.core.yaml_config import schedules_enabled as _schedules_enabled
 
     log.info("Vexis-Agent starting")
     await control_socket.start()
-    await dashboard.start()
+    if dashboard is not None:
+        await dashboard.start()
     curator.start(asyncio.get_running_loop())
     learning_curator.start(asyncio.get_running_loop())
-    schedule_manager.start(asyncio.get_running_loop())
+    # Issue #39: scheduling is its own switch (schedules.enabled). It
+    # also needs a draining transport, so warn loudly if it's on in a
+    # Telegram-less deployment rather than letting fires pile up silently.
+    if _schedules_enabled():
+        if transport is None:
+            log.warning(
+                "schedules enabled but the Telegram transport is disabled; "
+                "scheduled fires will enqueue with no loop to drain them. "
+                "Set schedules.enabled: false for a headless deployment."
+            )
+        schedule_manager.start(asyncio.get_running_loop())
+    else:
+        log.info("schedules: disabled via config (schedules.enabled=false)")
     if kanban_controller is not None:
         kanban_controller.start(asyncio.get_running_loop())
-    await watcher.start()
+    if watcher is not None:
+        await watcher.start()
     # Add-on background tasks come last so they boot against a daemon
     # that's already serving (control socket up, dashboard up, brain
     # ready). They get cancelled FIRST in the finally block for the
     # symmetric reason — let them drain before core subsystems vanish.
     await addon_runtime.start_all_background_tasks()
     try:
-        await transport.run()
+        if transport is not None:
+            await transport.run()
+        else:
+            log.info(
+                "No Telegram transport (transports.telegram=false); running "
+                "headless. Dashboard + control socket serve until a signal."
+            )
+            await _run_headless_until_signal()
     finally:
         await addon_runtime.stop_all_background_tasks()
-        await watcher.stop()
+        if watcher is not None:
+            await watcher.stop()
         if kanban_controller is not None:
             await kanban_controller.stop()
         if kanban_store is not None:
@@ -735,7 +810,8 @@ async def _run() -> bool:
         schedule_manager.stop()
         learning_curator.stop()
         curator.stop()
-        await dashboard.stop()
+        if dashboard is not None:
+            await dashboard.stop()
         await control_socket.stop()
         await background_tasks.shutdown()
         # The browser session is torn down by the browser add-on's
@@ -747,6 +823,27 @@ async def _run() -> bool:
     # cleanly. ``main()`` performs the execv when this is True; a normal
     # SIGTERM/SIGINT shutdown leaves it False and the process exits.
     return bool(getattr(transport, "_restart_requested", False))
+
+
+async def _run_headless_until_signal() -> None:
+    """Block forever for a Telegram-less (web-/headless-only) daemon.
+
+    The Telegram path blocks in ``TelegramTransport.run`` on its
+    shutdown event; with ``transports.telegram: false`` there is no
+    such loop, so ``_run`` would fall straight through and the process
+    would exit moments after it finished booting. This keeps it alive
+    serving the dashboard + control socket.
+
+    Shutdown is identical to the Telegram path: the SIGTERM/SIGINT
+    handlers installed in :func:`acquire_daemon_lock` release the PID
+    lock, reset to ``SIG_DFL``, and re-raise — terminating the process
+    rather than unwinding the ``_run`` ``finally``, exactly as a signal
+    ends the long-poll today. So no graceful-teardown contract differs
+    between the two modes. (Dashboard-triggered ``/restart`` is a
+    Telegram-transport affordance and is a no-op in headless mode for
+    now — issue #39 scope is booting headless, not in-place restart.)
+    """
+    await asyncio.Event().wait()
 
 
 def _resolve_web_dist() -> Path:
@@ -901,6 +998,24 @@ def _build_dispatch(
                     }
 
         if op == "bg_spawn":
+            # Issue #39: background tasks are independently disableable.
+            # Gating the single spawn chokepoint (every caller — /bg,
+            # the dashboard, the vexis-bg CLI — funnels through this op)
+            # turns the subsystem off without touching the BackgroundTasks
+            # object, so status/tail/cancel of any already-running task
+            # keep working while no new work can be created.
+            from vexis_agent.core.yaml_config import (
+                background_tasks_enabled as _bg_enabled,
+            )
+            if not _bg_enabled():
+                return {
+                    "ok": False,
+                    "error": (
+                        "Background tasks are disabled "
+                        "(background_tasks.enabled=false in ~/.vexis/config.yaml)."
+                    ),
+                    "kind": "Disabled",
+                }
             try:
                 chat_id = int(args["chat_id"])
                 name = str(args["name"])

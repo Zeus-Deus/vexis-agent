@@ -282,10 +282,26 @@ def test_recursion_guard_prevents_start(env, monkeypatch):
 
 
 def test_disabled_via_config_prevents_start(env, monkeypatch):
+    # Issue #39: the controller daemon now runs if EITHER skill/memory
+    # lessons OR relationship learning is enabled. With lessons off the
+    # thread only stays down when relationships is ALSO off.
     monkeypatch.setattr(lc, "learning_enabled", lambda: False)
+    monkeypatch.setattr(lc, "relationships_enabled", lambda: False)
     controller = LearningController(workspace=env)
     controller.start()
     assert controller._thread is None
+    controller.stop()
+
+
+def test_relationships_only_still_starts(env, monkeypatch):
+    # Issue #39: lessons off but relationships on → the daemon still
+    # starts (the relationship extractor rides the same tick loop).
+    monkeypatch.setattr(lc, "learning_enabled", lambda: False)
+    monkeypatch.setattr(lc, "relationships_enabled", lambda: True)
+    controller = LearningController(workspace=env)
+    controller.start()
+    assert controller._thread is not None
+    controller.stop()
 
 
 # --------------------------------------------------------------------
