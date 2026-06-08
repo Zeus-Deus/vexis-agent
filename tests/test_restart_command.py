@@ -246,7 +246,7 @@ def test_run_returns_and_tears_down_on_restart_trip(monkeypatch):
     async def _never() -> None:
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(telegram_mod, "_incoming_image_cleanup_loop", _never)
+    monkeypatch.setattr(telegram_mod, "_incoming_file_cleanup_loop", _never)
 
     async def scenario() -> None:
         run_task = asyncio.create_task(transport.run())

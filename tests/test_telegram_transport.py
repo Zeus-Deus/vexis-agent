@@ -1,13 +1,19 @@
-"""Tests for transports/telegram.py — inbound photo support and cleanup.
+"""Tests for transports/telegram.py — inbound photo/document support and
+cleanup.
 
 Photo updates from Telegram should land on disk as
 /tmp/vexis-incoming-<uuid>.png and be routed to the brain as a synthetic
-text message. A periodic cleanup sweeps files older than 1 hour.
+text message. Documents (any non-photo file) land as
+/tmp/vexis-incoming-doc-<uuid><ext> and route to the brain as a
+``[user sent document: <path>]`` pointer — the transport never inspects
+or reads them; comprehension is the brain's job (its file tool or a
+skill). A periodic cleanup sweeps both namespaces for files older than
+1 hour.
 
-An album (multiple photos sent together, sharing a media_group_id) is
-buffered behind a debounce window and dispatched as a SINGLE brain turn
-carrying every image prefix plus the one caption — see the
-media_group tests below.
+An album (multiple photos/files sent together, sharing a media_group_id)
+is buffered behind a debounce window and dispatched as a SINGLE brain
+turn carrying every prefix plus the one caption — see the media_group
+tests below.
 
 Tests follow the codebase convention of sync test functions calling
 asyncio.run() rather than pytest-asyncio.
@@ -28,12 +34,17 @@ from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.core.status import StatusSnapshot
 import vexis_agent.transports.telegram as telegram_mod
 from vexis_agent.transports.telegram import (
+    _DOC_TOO_LARGE,
     _INCOMING_PHOTO_DIR,
     _PICKING_UP_PREFIX,
     _STATUS_IDLE,
+    _TELEGRAM_DOC_MAX_BYTES,
     TelegramTransport,
+    _build_incoming_document_path,
     _build_incoming_photo_path,
-    _cleanup_incoming_images,
+    _cleanup_incoming_files,
+    _format_incoming_document_message,
+    _format_incoming_documents_message,
     _format_incoming_image_message,
     _format_incoming_images_message,
     _format_status_duration,
@@ -114,7 +125,7 @@ def test_cleanup_removes_old_keeps_new(tmp_path):
     two_hours_ago = (now - timedelta(hours=2)).timestamp()
     os.utime(old_file, (two_hours_ago, two_hours_ago))
 
-    removed = _cleanup_incoming_images(now, directory=tmp_path)
+    removed = _cleanup_incoming_files(now, directory=tmp_path)
 
     assert removed == 1
     assert not old_file.exists()
@@ -129,14 +140,32 @@ def test_cleanup_at_threshold_keeps_file(tmp_path):
     exactly_max_age = (now - timedelta(hours=1)).timestamp()
     os.utime(f, (exactly_max_age, exactly_max_age))
 
-    removed = _cleanup_incoming_images(now, directory=tmp_path)
+    removed = _cleanup_incoming_files(now, directory=tmp_path)
 
     assert removed == 0
     assert f.exists()
 
 
 def test_cleanup_handles_empty_directory(tmp_path):
-    assert _cleanup_incoming_images(datetime.now(timezone.utc), directory=tmp_path) == 0
+    assert _cleanup_incoming_files(datetime.now(timezone.utc), directory=tmp_path) == 0
+
+
+def test_cleanup_sweeps_documents_too(tmp_path):
+    """The sweep covers the vexis-incoming-doc-* namespace, not just
+    photos — stale documents shouldn't accumulate in /tmp."""
+    old_doc = tmp_path / "vexis-incoming-doc-old.pdf"
+    new_doc = tmp_path / "vexis-incoming-doc-new.csv"
+    for f in (old_doc, new_doc):
+        f.write_bytes(b"x")
+    now = datetime.now(timezone.utc)
+    two_hours_ago = (now - timedelta(hours=2)).timestamp()
+    os.utime(old_doc, (two_hours_ago, two_hours_ago))
+
+    removed = _cleanup_incoming_files(now, directory=tmp_path)
+
+    assert removed == 1
+    assert not old_doc.exists()
+    assert new_doc.exists()
 
 
 # --- _on_photo end-to-end --------------------------------------------------
@@ -432,6 +461,254 @@ def test_on_photo_media_group_without_caption_uses_bare_prefixes(monkeypatch):
                 p.file.saved_to.unlink(missing_ok=True)
 
 
+# --- inbound document helpers ----------------------------------------------
+
+
+def test_format_document_message_with_caption():
+    path = Path("/tmp/vexis-incoming-doc-abc.pdf")
+    out = _format_incoming_document_message(path, "what time do I land?")
+    assert out == (
+        "[user sent document: /tmp/vexis-incoming-doc-abc.pdf] "
+        "what time do I land?"
+    )
+
+
+def test_format_document_message_without_caption():
+    path = Path("/tmp/vexis-incoming-doc-abc.pdf")
+    assert _format_incoming_document_message(path, None) == (
+        "[user sent document: /tmp/vexis-incoming-doc-abc.pdf]"
+    )
+
+
+def test_format_documents_message_multiple():
+    paths = [
+        Path("/tmp/vexis-incoming-doc-a.pdf"),
+        Path("/tmp/vexis-incoming-doc-b.csv"),
+    ]
+    assert _format_incoming_documents_message(paths, "compare these") == (
+        "[user sent document: /tmp/vexis-incoming-doc-a.pdf] "
+        "[user sent document: /tmp/vexis-incoming-doc-b.csv] compare these"
+    )
+
+
+def test_build_incoming_document_path_preserves_extension():
+    p = _build_incoming_document_path("TicketDetails.pdf")
+    assert p.parent == _INCOMING_PHOTO_DIR
+    assert p.name.startswith("vexis-incoming-doc-")
+    assert p.suffix == ".pdf"
+
+
+def test_build_incoming_document_path_handles_missing_name():
+    p = _build_incoming_document_path(None)
+    assert p.name.startswith("vexis-incoming-doc-")
+    assert p.suffix == ""
+
+
+def test_build_incoming_document_path_takes_only_the_suffix():
+    """A directory-laden or hostile name can't traverse — only the
+    extension survives; the stem is a uuid."""
+    p = _build_incoming_document_path("../../../etc/evil.conf")
+    assert p.parent == _INCOMING_PHOTO_DIR
+    assert p.name.startswith("vexis-incoming-doc-")
+    assert p.suffix == ".conf"
+
+
+def test_build_incoming_document_path_is_unique_per_call():
+    assert _build_incoming_document_path("a.pdf") != _build_incoming_document_path(
+        "a.pdf"
+    )
+
+
+# --- _on_document end-to-end -----------------------------------------------
+
+
+class _FakeDoc:
+    def __init__(
+        self,
+        file_name: str | None = None,
+        file_size: int | None = None,
+        *,
+        raise_on_get: bool = False,
+    ) -> None:
+        self.file_name = file_name
+        self.file_size = file_size
+        self.file = _FakeFile()
+        self._raise_on_get = raise_on_get
+
+    async def get_file(self) -> _FakeFile:
+        if self._raise_on_get:
+            raise RuntimeError("file is too big")
+        return self.file
+
+
+class _FakeDocMessage:
+    def __init__(
+        self,
+        document: _FakeDoc,
+        caption: str | None,
+        chat_id: int,
+        bot: _FakeBot,
+        *,
+        media_group_id: str | None = None,
+        message_id: int = 0,
+    ) -> None:
+        self.document = document
+        self.caption = caption
+        self.chat_id = chat_id
+        self._bot = bot
+        self.media_group_id = media_group_id
+        self.message_id = message_id
+        self.replies: list[str] = []
+
+    def get_bot(self) -> _FakeBot:
+        return self._bot
+
+    async def reply_text(self, text: str) -> None:
+        self.replies.append(text)
+
+
+def test_on_document_routes_synthetic_text_to_brain():
+    handler = _FakeHandler(reply=None)
+    transport = _make_transport(handler, allowed_user_id=_USER)
+    bot = _FakeBot()
+    doc = _FakeDoc(file_name="TicketDetails.pdf", file_size=4096)
+    msg = _FakeDocMessage(
+        document=doc, caption="what time do I land in Brussels?",
+        chat_id=_CHAT, bot=bot,
+    )
+    update = _FakeUpdate(msg, _FakeUser(_USER))
+
+    try:
+        asyncio.run(transport._on_document(update, None))
+
+        saved = doc.file.saved_to
+        assert saved is not None
+        assert saved.parent == Path("/tmp")
+        assert saved.name.startswith("vexis-incoming-doc-")
+        assert saved.suffix == ".pdf"
+        assert saved.exists()
+        assert handler.last_user_id == _USER
+        assert handler.last_chat_id == _CHAT
+        assert handler.last_text == (
+            f"[user sent document: {saved}] what time do I land in Brussels?"
+        )
+        assert msg.replies == []
+    finally:
+        if doc.file.saved_to is not None:
+            doc.file.saved_to.unlink(missing_ok=True)
+
+
+def test_on_document_without_caption_uses_bare_prefix():
+    handler = _FakeHandler(reply=None)
+    transport = _make_transport(handler, allowed_user_id=_USER)
+    bot = _FakeBot()
+    doc = _FakeDoc(file_name="notes.txt", file_size=10)
+    msg = _FakeDocMessage(document=doc, caption=None, chat_id=_CHAT, bot=bot)
+    update = _FakeUpdate(msg, _FakeUser(_USER))
+
+    try:
+        asyncio.run(transport._on_document(update, None))
+
+        saved = doc.file.saved_to
+        assert saved is not None
+        assert handler.last_text == f"[user sent document: {saved}]"
+    finally:
+        if doc.file.saved_to is not None:
+            doc.file.saved_to.unlink(missing_ok=True)
+
+
+def test_on_document_rejects_disallowed_user():
+    handler = _FakeHandler(reply=None)
+    transport = _make_transport(handler, allowed_user_id=_USER)
+    bot = _FakeBot()
+    doc = _FakeDoc(file_name="x.pdf", file_size=10)
+    msg = _FakeDocMessage(document=doc, caption="hi", chat_id=_CHAT, bot=bot)
+    update = _FakeUpdate(msg, _FakeUser(user_id=12345))
+
+    asyncio.run(transport._on_document(update, None))
+
+    assert doc.file.saved_to is None
+    assert handler.last_text is None
+    assert msg.replies == []
+
+
+def test_on_document_too_large_rejected_before_download():
+    """An over-limit file is refused with the guidance message and never
+    downloaded or dispatched — Telegram can't serve it to a bot anyway."""
+    handler = _FakeHandler(reply=None)
+    transport = _make_transport(handler, allowed_user_id=_USER)
+    bot = _FakeBot()
+    doc = _FakeDoc(file_name="huge.pdf", file_size=_TELEGRAM_DOC_MAX_BYTES + 1)
+    msg = _FakeDocMessage(document=doc, caption=None, chat_id=_CHAT, bot=bot)
+    update = _FakeUpdate(msg, _FakeUser(_USER))
+
+    asyncio.run(transport._on_document(update, None))
+
+    assert doc.file.saved_to is None
+    assert handler.last_text is None
+    assert msg.replies == [_DOC_TOO_LARGE]
+
+
+def test_on_document_download_failure_notifies_user():
+    """If getFile/download blows up (e.g. size Telegram didn't pre-report),
+    the user gets told rather than left guessing — and nothing dispatches."""
+    handler = _FakeHandler(reply=None)
+    transport = _make_transport(handler, allowed_user_id=_USER)
+    bot = _FakeBot()
+    doc = _FakeDoc(file_name="x.pdf", file_size=10, raise_on_get=True)
+    msg = _FakeDocMessage(document=doc, caption=None, chat_id=_CHAT, bot=bot)
+    update = _FakeUpdate(msg, _FakeUser(_USER))
+
+    asyncio.run(transport._on_document(update, None))
+
+    assert handler.last_text is None
+    assert len(msg.replies) == 1
+    assert msg.replies[0].startswith("⚠️")
+
+
+def test_on_document_media_group_batches_into_single_turn(monkeypatch):
+    """Several files sent at once (a document album) become ONE brain turn
+    carrying every document prefix plus the single caption, ordered by
+    message_id — same batching the photo path gets."""
+    monkeypatch.setattr(telegram_mod, "_MEDIA_GROUP_DEBOUNCE_SECONDS", 0.05)
+    handler = _FakeHandler(reply=None)
+    transport = _make_transport(handler, allowed_user_id=_USER)
+    bot = _FakeBot()
+    docs = [
+        _FakeDoc(file_name="a.pdf", file_size=10),
+        _FakeDoc(file_name="b.csv", file_size=10),
+    ]
+    specs = [
+        (docs[0], None, 301),
+        (docs[1], "summarise both", 300),
+    ]
+
+    async def run() -> None:
+        for doc, caption, message_id in specs:
+            msg = _FakeDocMessage(
+                document=doc, caption=caption, chat_id=_CHAT, bot=bot,
+                media_group_id="files-1", message_id=message_id,
+            )
+            await transport._on_document(_FakeUpdate(msg, _FakeUser(_USER)), None)
+        await asyncio.sleep(0.3)
+
+    try:
+        asyncio.run(run())
+
+        assert handler.handle_calls == 1
+        saved = [d.file.saved_to for d in docs]
+        assert all(s is not None for s in saved)
+        # message_id order: docs[1] (300) then docs[0] (301).
+        assert handler.last_text == (
+            f"[user sent document: {saved[1]}] "
+            f"[user sent document: {saved[0]}] summarise both"
+        )
+    finally:
+        for d in docs:
+            if d.file.saved_to is not None:
+                d.file.saved_to.unlink(missing_ok=True)
+
+
 # --- pickup preview formatting ---------------------------------------------
 
 
@@ -450,6 +727,18 @@ def test_pickup_preview_strips_image_prefix_with_caption():
 def test_pickup_preview_strips_image_prefix_without_caption():
     out = _make_pickup_preview("[user sent image: /tmp/vexis-incoming-abc.png]")
     assert out == "📷"
+
+
+def test_pickup_preview_strips_document_prefix_with_caption():
+    out = _make_pickup_preview(
+        "[user sent document: /tmp/vexis-incoming-doc-abc.pdf] what's the date?"
+    )
+    assert out == "📄 what's the date?"
+
+
+def test_pickup_preview_strips_document_prefix_without_caption():
+    out = _make_pickup_preview("[user sent document: /tmp/vexis-incoming-doc-abc.pdf]")
+    assert out == "📄"
 
 
 def test_pickup_preview_truncates_long_text():

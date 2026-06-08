@@ -140,6 +140,7 @@ _PICKING_UP_PREFIX = "Picking up: "
 _PICKING_UP_PREVIEW_LEN = 40
 _PICKING_UP_FALLBACK = "(empty)"
 _INCOMING_IMAGE_PREFIX_RE = re.compile(r"^\[user sent image: [^\]]+\]\s*")
+_INCOMING_DOCUMENT_PREFIX_RE = re.compile(r"^\[user sent document: [^\]]+\]\s*")
 _DRAIN_TURN_BROKE = "⚠️ Something broke handling that. Logs have details."
 _TRANSCRIPTION_EMPTY = "⚠️ Couldn't hear anything in that. Try again?"
 _TRANSCRIPTION_FAILED = "⚠️ Couldn't transcribe that. Logs have details."
@@ -159,9 +160,27 @@ _BROWSER_SCREENSHOT_PATH_RE = re.compile(
 )
 _INCOMING_PHOTO_DIR = Path("/tmp")
 _INCOMING_PHOTO_GLOB = "vexis-incoming-*.png"
+# Inbound non-photo files (PDFs, text, code, anything) land beside the
+# photos in /tmp under their own namespace so the cleanup sweep finds
+# both. The original extension is preserved (see
+# ``_build_incoming_document_path``) so the brain — or whatever skill it
+# reaches for — can recognise the format from the path alone.
+_INCOMING_DOC_GLOB = "vexis-incoming-doc-*"
 _INCOMING_PHOTO_MAX_AGE = timedelta(hours=1)
 _INCOMING_PHOTO_CLEANUP_INTERVAL_SECONDS = 600
 _INCOMING_BRAIN_PREFIX = "[user sent image: {path}]"
+_INCOMING_DOC_BRAIN_PREFIX = "[user sent document: {path}]"
+# Telegram's cloud Bot API caps getFile downloads at 20 MB. A bot simply
+# can't pull anything larger (only a self-hosted Bot API server lifts
+# this), so we reject up front and tell the user how to hand the file
+# over another way rather than failing opaquely mid-download.
+_TELEGRAM_DOC_MAX_BYTES = 20 * 1024 * 1024
+_DOC_TOO_LARGE = (
+    "That file's over Telegram's 20 MB limit for bots, sir — it never "
+    "reaches me. Drop it somewhere in the workspace and tell me the path, "
+    "and I'll read it from there."
+)
+_DOC_DOWNLOAD_FAILED = "⚠️ Couldn't pull that file down. Logs have details."
 # Telegram delivers an "album" (multiple photos sent together) as
 # separate photo messages sharing one media_group_id, with the caption
 # attached to only one of them. There is no "last photo of the group"
@@ -169,7 +188,7 @@ _INCOMING_BRAIN_PREFIX = "[user sent image: {path}]"
 # as ONE brain turn once this quiet window elapses with no further
 # photo arriving. Sized comfortably above the sub-second gap Telegram
 # leaves between album messages so a slow download can't split a group.
-# See `_on_photo` / `_buffer_media_group_photo` / `_flush_media_group`.
+# See `_on_photo` / `_buffer_media_group_item` / `_flush_media_group`.
 _MEDIA_GROUP_DEBOUNCE_SECONDS = 1.5
 _CANCEL_OK = "Cancelled, sir. What next?"
 _NOTHING_TO_CANCEL = "Nothing to cancel — I'm not working on anything right now."
@@ -604,22 +623,42 @@ def _build_incoming_photo_path() -> Path:
     return _INCOMING_PHOTO_DIR / f"vexis-incoming-{uuid.uuid4().hex}.png"
 
 
+def _build_incoming_document_path(filename: str | None) -> Path:
+    """Allocate a fresh /tmp path for an inbound Telegram document.
+
+    The original extension (``.pdf``, ``.csv``, …) is preserved so the
+    brain — or whatever skill it reaches for — can recognise the format
+    from the path alone. We keep ONLY the suffix of the user-supplied
+    name (the stem becomes a uuid), so a weird or hostile filename can't
+    traverse paths or collide; an unknown/extensionless name just yields
+    a suffix-less temp path, which is still readable as bytes. We do not
+    inspect or trust the extension beyond naming — comprehension is the
+    brain's call, not the transport's.
+    """
+    suffix = Path(filename or "").suffix[:16]
+    return _INCOMING_PHOTO_DIR / f"vexis-incoming-doc-{uuid.uuid4().hex}{suffix}"
+
+
 def _make_pickup_preview(text: str, max_len: int = _PICKING_UP_PREVIEW_LEN) -> str:
     """Render a short preview of a queued message for the 'Picking up:' ack.
 
-    Strips the internal routing prefixes used for voice/photo so the user
-    sees something they recognise from what they sent (echoed voice text,
-    a 📷 marker for an image) rather than the synthetic ``[user sent
-    image: /tmp/...]`` form.
+    Strips the internal routing prefixes used for voice/photo/document so
+    the user sees something they recognise from what they sent (echoed
+    voice text, a 📷 marker for an image, 📄 for a file) rather than the
+    synthetic ``[user sent image: /tmp/...]`` form.
     """
     cleaned = text
     if cleaned.startswith(_VOICE_BRAIN_TAG):
         cleaned = _VOICE_ECHO_PREFIX + cleaned[len(_VOICE_BRAIN_TAG) :]
     else:
-        match = _INCOMING_IMAGE_PREFIX_RE.match(cleaned)
-        if match:
-            rest = cleaned[match.end() :].strip()
+        img = _INCOMING_IMAGE_PREFIX_RE.match(cleaned)
+        doc = _INCOMING_DOCUMENT_PREFIX_RE.match(cleaned)
+        if img:
+            rest = cleaned[img.end() :].strip()
             cleaned = f"📷 {rest}" if rest else "📷"
+        elif doc:
+            rest = cleaned[doc.end() :].strip()
+            cleaned = f"📄 {rest}" if rest else "📄"
     cleaned = cleaned.strip().replace("\n", " ")
     if not cleaned:
         return _PICKING_UP_FALLBACK
@@ -653,6 +692,30 @@ def _format_incoming_image_message(image_path: Path, caption: str | None) -> str
     return _format_incoming_images_message([image_path], caption)
 
 
+def _format_incoming_documents_message(
+    doc_paths: list[Path], caption: str | None
+) -> str:
+    """Build the synthetic brain message for one or more inbound files.
+
+    Same shape as the image variant — one ``[user sent document: <path>]``
+    prefix per file, then the single shared caption — but deliberately
+    says NOTHING about how to open them. The prefix is a pointer; the
+    brain decides how to read each path (its file tool for common
+    formats, a skill for the rest). See the ``inbound-documents``
+    capability block (``core/capabilities/builtin.py``).
+    """
+    prefix = " ".join(_INCOMING_DOC_BRAIN_PREFIX.format(path=p) for p in doc_paths)
+    body = (caption or "").strip()
+    if body:
+        return f"{prefix} {body}"
+    return prefix
+
+
+def _format_incoming_document_message(doc_path: Path, caption: str | None) -> str:
+    """Build the synthetic brain message for a single inbound file."""
+    return _format_incoming_documents_message([doc_path], caption)
+
+
 @dataclass
 class _MediaGroupBuffer:
     """Accumulates one Telegram album (photos sharing a media_group_id).
@@ -668,34 +731,49 @@ class _MediaGroupBuffer:
     chat_id: int
     user_id: int
     bot: object
+    # "image" or "document". A Telegram album is homogeneous — you can't
+    # mix photos and files in one media_group — so one kind per buffer is
+    # safe and picks the right formatter at flush time.
+    kind: str = "image"
     entries: dict[int, Path] = field(default_factory=dict)
     caption: str | None = None
     timer: "asyncio.Task | None" = None
 
 
-def _cleanup_incoming_images(
+def _cleanup_incoming_files(
     now: datetime,
     *,
     directory: Path = _INCOMING_PHOTO_DIR,
     max_age: timedelta = _INCOMING_PHOTO_MAX_AGE,
 ) -> int:
-    """Delete vexis-incoming-*.png files older than max_age. Returns count removed."""
+    """Delete stale inbound files (photos + documents) older than max_age.
+
+    Sweeps both the ``vexis-incoming-*.png`` photo namespace and the
+    ``vexis-incoming-doc-*`` document namespace. A path that matches both
+    globs (e.g. a ``.png`` sent as a file) is processed once. Returns the
+    count removed.
+    """
     removed = 0
-    for path in directory.glob(_INCOMING_PHOTO_GLOB):
-        try:
-            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-        except FileNotFoundError:
-            continue
-        if now - mtime <= max_age:
-            continue
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            continue
-        except OSError:
-            log.exception("Failed to clean up incoming image %s", path)
-            continue
-        removed += 1
+    seen: set[Path] = set()
+    for glob in (_INCOMING_PHOTO_GLOB, _INCOMING_DOC_GLOB):
+        for path in directory.glob(glob):
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            except FileNotFoundError:
+                continue
+            if now - mtime <= max_age:
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                log.exception("Failed to clean up incoming file %s", path)
+                continue
+            removed += 1
     return removed
 
 
@@ -979,6 +1057,12 @@ class TelegramTransport:
         )
         self._app.add_handler(PtbMessageHandler(filters.VOICE, self._on_voice))
         self._app.add_handler(PtbMessageHandler(filters.PHOTO, self._on_photo))
+        # Any non-photo file the user attaches (PDF, text, code, …).
+        # filters.PHOTO above already claims compressed images, so this
+        # only catches true "send as file" document attachments.
+        self._app.add_handler(
+            PtbMessageHandler(filters.Document.ALL, self._on_document)
+        )
         self._app.add_handler(CommandHandler("clear", self._on_clear))
         self._app.add_handler(CommandHandler("new", self._on_new))
         self._app.add_handler(CommandHandler("switch", self._on_switch))
@@ -2056,10 +2140,11 @@ class TelegramTransport:
         # instead of answering each photo as a separate turn.
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id is not None:
-            await self._buffer_media_group_photo(
+            await self._buffer_media_group_item(
+                kind="image",
                 media_group_id=media_group_id,
                 message_id=getattr(msg, "message_id", 0),
-                image_path=image_path,
+                file_path=image_path,
                 caption=msg.caption,
                 chat_id=chat_id,
                 user_id=user.id,
@@ -2073,21 +2158,88 @@ class TelegramTransport:
         await self._preempt_goal_continuations(chat_id)
         await self._dispatch_to_brain(bot, chat_id, user.id, synthetic)
 
-    async def _buffer_media_group_photo(
+    async def _on_document(
+        self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle an inbound Telegram document (any non-photo file).
+
+        Deliberately a dumb pipe: download the file, hand the brain a
+        pointer to where it landed, and stop. We do NOT inspect, convert,
+        or decide how to read it — that's the brain's call (its file tool
+        for common formats, a skill for the rest). Supporting a new file
+        type is therefore a skill drop-in, never a change here. See the
+        ``inbound-documents`` capability block.
+        """
+        msg = update.message
+        user = update.effective_user
+        if msg is None or user is None or getattr(msg, "document", None) is None:
+            return
+        if not is_allowed(user.id, self._allowed_user_id):
+            log.warning("Rejected document from user_id=%s", user.id)
+            return
+
+        chat_id = msg.chat_id
+        bot = msg.get_bot()
+        doc = msg.document
+
+        # Reject over-limit files up front: Telegram's cloud Bot API won't
+        # serve getFile past 20 MB, so a download would just fail. Tell the
+        # user how to hand it over another way instead of failing silently.
+        file_size = getattr(doc, "file_size", None)
+        if file_size and file_size > _TELEGRAM_DOC_MAX_BYTES:
+            await msg.reply_text(_DOC_TOO_LARGE)
+            return
+
+        doc_path = _build_incoming_document_path(getattr(doc, "file_name", None))
+        try:
+            tg_file = await doc.get_file()
+            await tg_file.download_to_drive(custom_path=doc_path)
+        except Exception:
+            # Backstop: Telegram may not report file_size, so getFile can
+            # still reject the size here (or a transient error hits). Clean
+            # up the empty target and don't leave the user guessing.
+            log.exception("Failed to download inbound document")
+            doc_path.unlink(missing_ok=True)
+            await msg.reply_text(_DOC_DOWNLOAD_FAILED)
+            return
+
+        # Album of files: same buffering as photos so several files sent
+        # together become one brain turn rather than one turn each.
+        media_group_id = getattr(msg, "media_group_id", None)
+        if media_group_id is not None:
+            await self._buffer_media_group_item(
+                kind="document",
+                media_group_id=media_group_id,
+                message_id=getattr(msg, "message_id", 0),
+                file_path=doc_path,
+                caption=msg.caption,
+                chat_id=chat_id,
+                user_id=user.id,
+                bot=bot,
+            )
+            return
+
+        synthetic = _format_incoming_document_message(doc_path, msg.caption)
+        # Same preemption rationale as the photo path.
+        await self._preempt_goal_continuations(chat_id)
+        await self._dispatch_to_brain(bot, chat_id, user.id, synthetic)
+
+    async def _buffer_media_group_item(
         self,
         *,
+        kind: str,
         media_group_id: str,
         message_id: int,
-        image_path: Path,
+        file_path: Path,
         caption: str | None,
         chat_id: int,
         user_id: int,
         bot: object,
     ) -> None:
-        """Add one album photo to its media-group buffer and (re)arm the
-        debounce timer.
+        """Add one album item (photo or document) to its media-group
+        buffer and (re)arm the debounce timer.
 
-        Each arriving photo cancels the timer the previous one armed and
+        Each arriving item cancels the timer the previous one armed and
         starts a fresh one, so the batch only dispatches once the album
         stops arriving (``_MEDIA_GROUP_DEBOUNCE_SECONDS`` of quiet). See
         ``_flush_media_group`` for the dispatch side.
@@ -2095,9 +2247,11 @@ class TelegramTransport:
         async with self._media_group_lock:
             buf = self._media_group_buffers.get(media_group_id)
             if buf is None:
-                buf = _MediaGroupBuffer(chat_id=chat_id, user_id=user_id, bot=bot)
+                buf = _MediaGroupBuffer(
+                    chat_id=chat_id, user_id=user_id, bot=bot, kind=kind
+                )
                 self._media_group_buffers[media_group_id] = buf
-            buf.entries[message_id] = image_path
+            buf.entries[message_id] = file_path
             # Telegram puts the caption on exactly one message of the
             # album; keep the first non-empty one we see.
             if caption and caption.strip() and not buf.caption:
@@ -2115,7 +2269,7 @@ class TelegramTransport:
         dispatch every buffered photo as a single brain turn.
 
         A photo arriving before the window elapses cancels this task and
-        arms a fresh one (see ``_buffer_media_group_photo``), so only the
+        arms a fresh one (see ``_buffer_media_group_item``), so only the
         last timer standing reaches the dispatch.
         """
         try:
@@ -2128,8 +2282,11 @@ class TelegramTransport:
             if buf is None or buf.timer is not asyncio.current_task():
                 return
             del self._media_group_buffers[media_group_id]
-        image_paths = [buf.entries[mid] for mid in sorted(buf.entries)]
-        synthetic = _format_incoming_images_message(image_paths, buf.caption)
+        paths = [buf.entries[mid] for mid in sorted(buf.entries)]
+        if buf.kind == "document":
+            synthetic = _format_incoming_documents_message(paths, buf.caption)
+        else:
+            synthetic = _format_incoming_images_message(paths, buf.caption)
         # Preempt any pending goal continuations — same rationale as the
         # single-photo path: the album turn runs after the in-flight
         # turn, not behind queued continuations.
@@ -5100,7 +5257,7 @@ class TelegramTransport:
         await self._app.start()
         await self._app.updater.start_polling()
         log.info("Telegram polling started")
-        cleanup_task = asyncio.create_task(_incoming_image_cleanup_loop())
+        cleanup_task = asyncio.create_task(_incoming_file_cleanup_loop())
         try:
             # Blocks until SIGTERM/SIGINT cancels this coroutine OR
             # ``request_restart`` (the /restart command) trips the event.
@@ -5135,15 +5292,16 @@ class TelegramTransport:
                 )
 
 
-async def _incoming_image_cleanup_loop() -> None:
-    """Sweep stale /tmp/vexis-incoming-*.png files every 10 minutes."""
+async def _incoming_file_cleanup_loop() -> None:
+    """Sweep stale /tmp/vexis-incoming-* files (photos + documents) every
+    10 minutes."""
     while True:
         try:
-            removed = _cleanup_incoming_images(datetime.now(timezone.utc))
+            removed = _cleanup_incoming_files(datetime.now(timezone.utc))
             if removed:
-                log.info("Cleaned up %d expired incoming image(s)", removed)
+                log.info("Cleaned up %d expired incoming file(s)", removed)
         except Exception:
-            log.exception("Incoming-image cleanup failed")
+            log.exception("Incoming-file cleanup failed")
         await asyncio.sleep(_INCOMING_PHOTO_CLEANUP_INTERVAL_SECONDS)
 
 
