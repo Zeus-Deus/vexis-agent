@@ -252,6 +252,100 @@ def _int_or_default(value: Any, default: int, *, minimum: int = 1) -> int:
     return ivalue if ivalue >= minimum else default
 
 
+def _bool_or_default(value: Any, default: bool) -> bool:
+    """Coerce a YAML scalar to a bool, accepting native booleans and
+    the common quoted-string spellings (``"true"`` / ``"off"`` / …).
+
+    Anything unrecognised falls back to ``default`` — a config typo
+    must never wedge a subsystem on or off in a surprising direction.
+    Mirrors the per-call bool readers scattered through this module
+    (curator/goals/etc.); extracted so the issue-#39 subsystem gates
+    all share one parser and can't drift in their truthiness rules.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in ("true", "yes", "1", "on"):
+            return True
+        if cleaned in ("false", "no", "0", "off"):
+            return False
+    return default
+
+
+# --------------------------------------------------------------------
+# Modular subsystem gates (issue #39)
+# --------------------------------------------------------------------
+#
+# vexis-agent can be composed per deployment: a headless web backend
+# turns off the personal-assistant subsystems it doesn't use and
+# keeps the ones it does — purely via config, mirroring the add-on
+# loader's enabled/disabled model. Every gate below DEFAULTS ON, so a
+# config with none of these keys behaves byte-for-byte like today.
+# See docs/modular-subsystems.md for the full toggle map. The other
+# half of the gate set already existed before this issue:
+# ``curator.enabled``, ``learning.enabled``, ``goals.enabled``,
+# ``schedules.enabled``, ``kanban.enabled`` — read by their own
+# helpers in this module / kanban.lanes.
+#
+# Reads disk per call (no caching) so a toggle edit takes effect at
+# the next read boundary without a daemon restart, EXCEPT where the
+# gate decides a startup-time wiring choice (transport selection,
+# whether the watcher poll loop is constructed) — those are bound
+# once in ``main._run`` and need a restart, same as ``brain.kind``.
+
+DEFAULT_BACKGROUND_TASKS_ENABLED = True
+DEFAULT_WATCHER_ENABLED = True
+DEFAULT_RELATIONSHIPS_ENABLED = True
+DEFAULT_TRANSPORT_TELEGRAM_ENABLED = True
+DEFAULT_TRANSPORT_WEB_ENABLED = True
+
+
+def background_tasks_enabled() -> bool:
+    """``vexis-bg`` spawn surface gate. Default ``True``.
+
+    When ``False`` the ``bg_spawn`` control-socket op refuses with a
+    structured ``Disabled`` error (so ``/bg``, the dashboard, and the
+    CLI all report the same thing) while status/tail/cancel of any
+    already-running task keep working. The ``BackgroundTasks`` object
+    is still constructed — it owns no poll loop, so there's no cost to
+    keeping it for teardown + the dashboard panel; the off-switch is
+    on the one chokepoint that creates new work.
+    """
+    return _bool_or_default(
+        _section("background_tasks").get("enabled", True),
+        DEFAULT_BACKGROUND_TASKS_ENABLED,
+    )
+
+
+def _transport_enabled(name: str, default: bool) -> bool:
+    """Resolve ``transports.<name>`` accepting either a bare bool
+    (``transports.telegram: false``) or a nested ``enabled`` key
+    (``transports.telegram: {enabled: false}``) — both spellings are
+    honoured so the config reads naturally either way. Missing →
+    ``default``."""
+    raw = _section("transports").get(name)
+    if isinstance(raw, dict):
+        raw = raw.get("enabled", default)
+    return _bool_or_default(raw, default)
+
+
+def transport_telegram_enabled() -> bool:
+    """Whether the Telegram transport (the historical daemon main
+    loop) runs. Default ``True``. ``False`` boots the daemon
+    web-/headless-only: no long-poll, and the bot token is no longer
+    required at startup (see ``core.config.load_config``)."""
+    return _transport_enabled("telegram", DEFAULT_TRANSPORT_TELEGRAM_ENABLED)
+
+
+def transport_web_enabled() -> bool:
+    """Whether the web surface (dashboard + chat bridge) runs.
+    Default ``True``. ``False`` skips starting the FastAPI dashboard —
+    useful for a Telegram-only deployment that wants no HTTP surface.
+    """
+    return _transport_enabled("web", DEFAULT_TRANSPORT_WEB_ENABLED)
+
+
 def memory_char_limit() -> int:
     return _int_or_default(
         _section("memory").get("memory_char_limit"),
@@ -754,6 +848,27 @@ def model_relationships_extractor() -> str:
 
 # v3c relationships section helpers — gates for the silent queue
 # pipeline and the explicit-consent fast lane.
+
+
+def relationships_enabled() -> bool:
+    """Master switch for relationship / user-fact learning. Default
+    ``True``.
+
+    Issue #39 separates the two learning systems that used to ride
+    the single ``learning.enabled`` flag: the skill/memory curator
+    (``learning.enabled`` — keepable; makes the agent faster over
+    time) and the personal relationship/third-party-fact extraction
+    (this flag — droppable for a headless backend that has no use for
+    a social graph). When ``False`` the silent extractor, the
+    restart-recovery pass, and the tick-promote pass inside the
+    learning controller all short-circuit; the lesson reviewer is
+    untouched. The controller daemon still runs as long as EITHER
+    flag is on (see ``LearningController.start``).
+    """
+    return _bool_or_default(
+        _section("relationships").get("enabled", True),
+        DEFAULT_RELATIONSHIPS_ENABLED,
+    )
 
 
 def relationships_explicit_consent_enabled() -> bool:
@@ -1737,6 +1852,24 @@ def watcher_oscillation_window_seconds() -> float:
         floor=_WATCHER_OSCILLATION_WINDOW_FLOOR,
         ceiling=_WATCHER_OSCILLATION_WINDOW_CEILING,
         label="watcher.oscillation_window_seconds",
+    )
+
+
+def watcher_enabled() -> bool:
+    """Whether the watcher subsystem (generic poll loop + source
+    registry) is constructed at all. Default ``True``.
+
+    Issue #39 gate. When ``False`` ``main._run`` sets ``watcher =
+    None`` and the daemon takes the same well-trodden path it already
+    uses when the codemux MCP isn't configured: ``watch_*`` control-
+    socket ops return ``CodemuxNotConfigured`` and every Telegram
+    watcher verb is hidden. Read once at startup (it decides a wiring
+    choice), so toggling needs a daemon restart — same posture as the
+    add-on enable/disable list documented above.
+    """
+    return _bool_or_default(
+        _section("watcher").get("enabled", True),
+        DEFAULT_WATCHER_ENABLED,
     )
 
 

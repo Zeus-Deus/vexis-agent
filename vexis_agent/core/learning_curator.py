@@ -99,6 +99,7 @@ from vexis_agent.core.yaml_config import (
     model_coherence_judge,
     model_learning_review,
     model_migration_classifier,
+    relationships_enabled,
 )
 
 # Type alias for dependency-injected review functions (used by tests
@@ -1748,18 +1749,34 @@ class LearningController:
                 RECURSION_ENV_VAR,
             )
             return
-        if not learning_enabled():
-            log.info("Learning curator disabled via config; not starting daemon")
+        # Issue #39: the two learning systems are now distinct
+        # switches. The controller daemon runs as long as EITHER is
+        # on — skill/memory lessons (``learning.enabled``) OR
+        # relationship/user-fact extraction (``relationships.enabled``).
+        # Each per-tick pass is gated again on its own flag below, so
+        # ``learning.enabled: true`` + ``relationships.enabled: false``
+        # keeps lessons while dropping the personal social graph, and
+        # vice-versa. Only when BOTH are off does the thread stay down.
+        learning_on = learning_enabled()
+        relationships_on = relationships_enabled()
+        if not (learning_on or relationships_on):
+            log.info(
+                "Learning curator + relationships both disabled via config; "
+                "not starting daemon"
+            )
             return
         self._thread = threading.Thread(
             target=self._run_loop, name="vexis-learning", daemon=True
         )
         self._thread.start()
         log.info(
-            "Learning curator daemon started (tick=%dm, idle=%dm, shadow=%s)",
+            "Learning curator daemon started (tick=%dm, idle=%dm, shadow=%s, "
+            "lessons=%s, relationships=%s)",
             learning_tick_interval_minutes(),
             learning_idle_threshold_minutes(),
             learning_shadow_mode(),
+            "on" if learning_on else "off",
+            "on" if relationships_on else "off",
         )
 
     def stop(self) -> None:
@@ -1802,6 +1819,13 @@ class LearningController:
         cooldown = timedelta(hours=learning_failure_cooldown_hours())
         records = self._reviewed.load()
 
+        # Issue #39: relationship/user-fact learning is its own switch.
+        # When it's off, every relationships pass in this tick (restart
+        # recovery here, tick-promote and the silent extractor below)
+        # short-circuits while the lesson reviewer keeps running. Read
+        # once per tick so a mid-run config edit hot-reloads cleanly.
+        do_relationships = relationships_enabled()
+
         # v3b Day 2: relationships restart-recovery is one-shot,
         # gated by an internal `_has_recovered` flag in the curator
         # itself. Runs BEFORE the lesson-curator work so any tokens
@@ -1809,12 +1833,13 @@ class LearningController:
         # spawns claude -p per pending entry — bounded at ~5 calls
         # per restart per the research doc; safe under the per-tick
         # budget. Failures are logged and don't block the tick.
-        try:
-            asyncio.run(
-                self._relationships_curator.recover_after_restart()
-            )
-        except Exception:
-            log.exception("relationships.recover_after_restart raised")
+        if do_relationships:
+            try:
+                asyncio.run(
+                    self._relationships_curator.recover_after_restart()
+                )
+            except Exception:
+                log.exception("relationships.recover_after_restart raised")
 
         # Day 3.5 housekeeping: every N ticks, expire stale USER
         # candidate queue entries. Runs BEFORE the per-session reviews
@@ -1953,18 +1978,21 @@ class LearningController:
         # v3b Day 2: relationships tick-promote pass. Runs AFTER
         # the lesson-curator work so any restart-recovered tokens
         # from this tick's startup pass are still in the registry.
-        # Failures are logged and don't fail the tick.
-        try:
-            promote_results = self._relationships_curator.tick_promote_pending()
-            if promote_results:
-                promoted = sum(1 for r in promote_results if r.promoted)
-                blocked = len(promote_results) - promoted
-                log.info(
-                    "relationships tick: %d attempted, %d promoted, %d blocked",
-                    len(promote_results), promoted, blocked,
-                )
-        except Exception:
-            log.exception("relationships.tick_promote_pending raised")
+        # Failures are logged and don't fail the tick. Gated by the
+        # issue-#39 relationships switch (read once at the top of
+        # this tick into ``do_relationships``).
+        if do_relationships:
+            try:
+                promote_results = self._relationships_curator.tick_promote_pending()
+                if promote_results:
+                    promoted = sum(1 for r in promote_results if r.promoted)
+                    blocked = len(promote_results) - promoted
+                    log.info(
+                        "relationships tick: %d attempted, %d promoted, %d blocked",
+                        len(promote_results), promoted, blocked,
+                    )
+            except Exception:
+                log.exception("relationships.tick_promote_pending raised")
 
         # Per-tick REPORT.md + run.json — only when the tick did
         # something (eligible or skipped). No-op ticks would otherwise
@@ -2200,13 +2228,22 @@ class LearningController:
         """
         before = self._scan_brain_session_uuids()
         try:
-            ret = self._review_fn(self._workspace, meta)
-            if isinstance(ret, tuple):
-                outcome, summary = ret
+            if learning_enabled():
+                ret = self._review_fn(self._workspace, meta)
+                if isinstance(ret, tuple):
+                    outcome, summary = ret
+                else:
+                    # Legacy stub returning just a string — synthesize
+                    # an empty summary so the rest of the pipeline works.
+                    outcome, summary = ret, WriteSummary()
             else:
-                # Legacy stub returning just a string — synthesize
-                # an empty summary so the rest of the pipeline works.
-                outcome, summary = ret, WriteSummary()
+                # Issue #39: the skill/memory lesson reviewer is off
+                # but the controller is still running for the
+                # relationship extractor below. Skip the (expensive)
+                # review spawn and report a no-op outcome. The caller's
+                # bookkeeping in _run_once still advances reviewed.json
+                # so this session isn't re-walked every tick.
+                outcome, summary = "lessons-disabled", WriteSummary()
         finally:
             after = self._scan_brain_session_uuids()
             new_uuids = after - before
@@ -2243,14 +2280,20 @@ class LearningController:
         # restructuring the entire daemon to async for a marginal
         # latency win wasn't worth the blast radius (documented as
         # a deviation in the day-4a deliverables).
-        try:
-            self._run_silent_extractor(meta)
-        except Exception:
-            log.exception(
-                "relationships extractor raised for %s",
-                meta.session_uuid,
-            )
-            self._relationships_curator.increment_counter("extractor_errors")
+        #
+        # Issue #39: the silent extractor is the relationship/user-fact
+        # learning system — its own switch, independent of the lesson
+        # reviewer above. When relationships are disabled this is a
+        # pure no-op (no transcript read, no aux spawn).
+        if relationships_enabled():
+            try:
+                self._run_silent_extractor(meta)
+            except Exception:
+                log.exception(
+                    "relationships extractor raised for %s",
+                    meta.session_uuid,
+                )
+                self._relationships_curator.increment_counter("extractor_errors")
         return outcome, summary
 
     def _run_silent_extractor(self, meta: SessionMeta) -> None:

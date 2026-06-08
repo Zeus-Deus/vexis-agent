@@ -115,6 +115,14 @@ section — violating them is breaking the codebase.
   sanctioned exception is the watcher's back-compat re-export of
   `UNAVAILABLE_MESSAGE` from the codemux add-on, allowlisted in
   the test.
+- **Core subsystems are individually gated, default-on (issue
+  #39).** Background tasks, watcher, scheduling, goals, the two
+  learning systems, and the two transports each carry an `enabled`
+  switch read in `main._run` (or per-call); absent keys = today's
+  behaviour byte-for-byte. Skill/memory (`learning.enabled`) and
+  relationship/user-fact learning (`relationships.enabled`) are
+  DISTINCT switches. No shipped preset — composition is per-
+  deployment config. See `docs/modular-subsystems.md`.
 
 ## Model selection
 

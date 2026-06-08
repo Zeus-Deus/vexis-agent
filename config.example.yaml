@@ -27,6 +27,28 @@ brain:
                                # Reads disk per turn — toggling takes
                                # effect on the next turn, no restart.
 
+# ── modular subsystem toggles (issue #39, see docs/modular-subsystems.md) ─────
+# Every core subsystem is independently switchable, default-on. A
+# config that omits all of these behaves exactly like before. Compose a
+# headless / web-only deployment by turning off what you don't use —
+# there is NO shipped preset. (curator.enabled, learning.enabled,
+# goals.enabled, schedules.enabled, kanban.enabled are the other half of
+# the gate set, in their own sections below.)
+#
+# transports:                  # which transport(s) run. Bare bool or a
+#   telegram: true             # nested `enabled:` are both accepted.
+#   web: true                  # telegram:false drops the long-poll AND
+#                              #   the bot-token requirement (headless);
+#                              # web:false skips the dashboard.
+# background_tasks:
+#   enabled: true              # false → `vexis-bg` spawn refuses
+# watcher:
+#   enabled: true              # false → codemux orchestration watcher off
+# relationships:
+#   enabled: true              # false → drop relationship/user-fact
+#                              #   learning while KEEPING skill/memory
+#                              #   lessons (learning.enabled, distinct).
+
 # ── memory limits ───────────────────────────────────────────────────
 memory:
   memory_char_limit: 2200
@@ -79,6 +101,10 @@ goals:
 
 # ── relationships (v3c, see docs/relationships.md) ──────────────────
 relationships:
+  enabled: true                 # master switch for relationship/user-
+                                # fact learning (issue #39). false drops
+                                # it entirely while keeping the skill/
+                                # memory curator (learning.enabled).
   explicit_consent_enabled: false
   approval_hint_enabled: true
 
@@ -121,5 +147,8 @@ addons:
 #
 # Changes take effect on daemon restart.
 watcher:
+  enabled: true                  # issue #39 off-switch; false → the
+                                 # watcher subsystem isn't constructed
+                                 # and watch_* ops report unavailable
   poll_interval_seconds: 5.0
   oscillation_window_seconds: 60.0

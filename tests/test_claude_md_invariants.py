@@ -81,12 +81,24 @@ from pathlib import Path
 #     the feature section's TL;DR per the established escape hatch
 #     (Invariants is already ≥40 lines). Pinned by
 #     ``tests/test_capability_blocks.py``.
+#   - +7 (321 → 328): a new Invariants bullet "Core subsystems are
+#     individually gated, default-on (issue #39)" — the cross-feature
+#     contract that every core subsystem (background tasks, watcher,
+#     scheduling, goals, the two learning systems, the two transports)
+#     carries its own default-on `enabled` switch, that skill/memory
+#     vs relationship learning are DISTINCT switches, and that no
+#     preset ships. This is exactly the sanctioned bump path: a NEW
+#     cross-feature contract in Invariants, not per-feature bloat. The
+#     full toggle map / transport-selection mechanics are extracted to
+#     ``docs/modular-subsystems.md``; the bullet is a 7-line pointer.
+#     Pinned by ``tests/test_subsystem_toggles.py`` and the
+#     ``test_*_still_starts`` cases in ``tests/test_learning_curator.py``.
 # Bump only when the growth comes from new cross-feature
 # contracts in the Invariants section AND that section is
 # itself still under ~40 lines, OR a genuinely new feature
 # section that respects the ~30-line per-section ceiling.
 # Never bump for per-feature bloat in existing sections.
-CLAUDE_MD_MAX_LINES = 321
+CLAUDE_MD_MAX_LINES = 328
 
 
 def test_claude_md_stays_under_size_limit() -> None:
