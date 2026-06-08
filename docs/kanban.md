@@ -28,7 +28,11 @@ triage → todo → ready → in_progress → blocked → done
 The dispatcher promotes `todo → ready` when **every parent is
 done**. `ready → in_progress` happens when the dispatcher claims a
 task and starts a worker run. Workers flip `in_progress → done` by
-calling `kanban_complete`, or `→ blocked` by calling `kanban_block`.
+running `vexis-kanban complete "$VEXIS_KANBAN_TASK_ID"` in their
+shell, or `→ blocked` by running `vexis-kanban block`. There is no
+`kanban_complete` MCP tool — the completion handshake is the CLI, and
+the dispatcher keeps the claim alive (`_claim_keepalive`) so a worker
+busy inside a long tool call doesn't get reclaimed mid-run.
 
 **Lane.** vexis's lightweight replacement for upstream profiles. A
 lane is `(system_prompt_slice, skills, tier_override)` — same brain,

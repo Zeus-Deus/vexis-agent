@@ -143,8 +143,9 @@ DEFAULT_LANES: dict[str, LaneSpec] = {
         system_prompt=(
             "You research. Read sources, summarise findings, cite where "
             "things came from. Do not edit the codebase unless the task "
-            "explicitly says so. Use kanban_complete with a structured "
-            "summary when you're done."
+            "explicitly says so. When done, run `vexis-kanban complete` "
+            "(the exact command is in your task brief) with a structured "
+            "summary."
         ),
     ),
     "implementation": LaneSpec(
@@ -156,7 +157,8 @@ DEFAULT_LANES: dict[str, LaneSpec] = {
             "You implement. Write small, well-scoped code changes. Add "
             "or update tests when you change behaviour. Run the tests. "
             "Report what you changed and what's still outstanding via "
-            "kanban_complete."
+            "`vexis-kanban complete` (the exact command is in your task "
+            "brief)."
         ),
     ),
     "review": LaneSpec(
@@ -167,8 +169,9 @@ DEFAULT_LANES: dict[str, LaneSpec] = {
         system_prompt=(
             "You review. Read the changes referenced by the task, "
             "critique them, identify risk, suggest improvements. Do not "
-            "edit files. Summarise via kanban_complete; if blocked or "
-            "missing context, kanban_block with a clear reason."
+            "edit files. Summarise via `vexis-kanban complete`; if "
+            "blocked or missing context, `vexis-kanban block` with a "
+            "clear reason."
         ),
     ),
     "ops": LaneSpec(
@@ -179,9 +182,9 @@ DEFAULT_LANES: dict[str, LaneSpec] = {
         system_prompt=(
             "You operate. Run commands, check service health, report "
             "status. Confirm before destructive actions; if a destructive "
-            "step is required and unconfirmed, kanban_block with the "
-            "command you'd run and ask the user. Use kanban_complete "
-            "with the captured output."
+            "step is required and unconfirmed, `vexis-kanban block` with "
+            "the command you'd run and ask the user. Use `vexis-kanban "
+            "complete` with the captured output."
         ),
     ),
     "triage": LaneSpec(
@@ -191,10 +194,10 @@ DEFAULT_LANES: dict[str, LaneSpec] = {
         description="Classifies and routes; doesn't do the work itself.",
         system_prompt=(
             "You triage. Classify the task, decide which specialised "
-            "lane should do it, and use kanban_create to fan out child "
-            "tasks to the right lane. Do not do the work yourself. "
-            "kanban_complete this triage task with a one-line summary "
-            "of how you decomposed it."
+            "lane should do it, and use `vexis-kanban create` to fan out "
+            "child tasks to the right lane. Do not do the work yourself. "
+            "Run `vexis-kanban complete` on this triage task with a "
+            "one-line summary of how you decomposed it."
         ),
     ),
     # Fallback when a task has no lane assigned. Generic prompt; the
@@ -206,8 +209,9 @@ DEFAULT_LANES: dict[str, LaneSpec] = {
         description="Generic worker; used when no lane is assigned.",
         system_prompt=(
             "You are a kanban worker. Read the task title and body, do "
-            "the work, and use kanban_complete with a short summary "
-            "when done. If blocked, use kanban_block with a clear reason."
+            "the work, and run `vexis-kanban complete` with a short "
+            "summary when done. If blocked, run `vexis-kanban block` "
+            "with a clear reason."
         ),
     ),
 }

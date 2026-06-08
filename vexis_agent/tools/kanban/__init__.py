@@ -6,21 +6,24 @@ and return structured results. They handle validation, audit-event
 emission, and the small bits of business logic that don't belong in
 the bare DB layer (e.g. "completing a task also flips its run to done").
 
-The MCP-tool naming convention from ``.plans/kanban-research.md`` §6
-maps to module-level functions here:
+These functions are surfaced to workers as the ``vexis-kanban``
+**CLI subcommands** (``vexis_agent/tools/kanban/cli.py``), NOT as MCP
+tools — there is no ``kanban_complete`` tool. The abstract action name
+from ``.plans/kanban-research.md`` §6, its ``vexis-kanban`` subcommand,
+and the function here line up:
 
-  * ``kanban_create``      → :func:`create_task`
-  * ``kanban_show``        → :func:`show_task`
-  * ``kanban_list``        → :func:`list_board`
-  * ``kanban_complete``    → :func:`complete_task`
-  * ``kanban_block``       → :func:`block_task`
-  * ``kanban_unblock``     → :func:`unblock_task`
-  * ``kanban_comment``     → :func:`comment_on_task`
-  * ``kanban_heartbeat``   → :func:`heartbeat_task`
-  * ``kanban_archive``     → :func:`archive_task`
-  * ``kanban_link``        → :func:`add_link`
-  * ``kanban_unlink``      → :func:`remove_link`
-  * ``kanban_assign``      → :func:`assign_lane`
+  * action ``kanban_create``     → ``vexis-kanban create``    → :func:`create_task`
+  * action ``kanban_show``       → ``vexis-kanban show``      → :func:`show_task`
+  * action ``kanban_list``       → ``vexis-kanban list``      → :func:`list_board`
+  * action ``kanban_complete``   → ``vexis-kanban complete``  → :func:`complete_task`
+  * action ``kanban_block``      → ``vexis-kanban block``     → :func:`block_task`
+  * action ``kanban_unblock``    → ``vexis-kanban unblock``   → :func:`unblock_task`
+  * action ``kanban_comment``    → ``vexis-kanban comment``   → :func:`comment_on_task`
+  * action ``kanban_heartbeat``  → ``vexis-kanban heartbeat`` → :func:`heartbeat_task`
+  * action ``kanban_archive``    → ``vexis-kanban archive``   → :func:`archive_task`
+  * action ``kanban_link``       → ``vexis-kanban link``      → :func:`add_link`
+  * action ``kanban_unlink``     → ``vexis-kanban unlink``    → :func:`remove_link`
+  * action ``kanban_assign``     → ``vexis-kanban assign``    → :func:`assign_lane`
 
 Each function returns a JSON-serialisable dict suitable for direct
 return from a REST endpoint, an MCP tool result, or a Telegram reply

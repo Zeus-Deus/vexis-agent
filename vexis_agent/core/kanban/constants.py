@@ -81,7 +81,7 @@ EVENT_UNLINKED = "unlinked"
 EVENT_PROMOTED = "promoted"          # todo → ready
 EVENT_CLAIMED = "claimed"
 EVENT_STARTED = "started"            # ready → in_progress (worker began)
-EVENT_HEARTBEAT = "heartbeat"        # worker called kanban_heartbeat
+EVENT_HEARTBEAT = "heartbeat"        # `vexis-kanban heartbeat` (or dispatcher keepalive)
 EVENT_PROGRESS = "progress"          # worker reported progress
 EVENT_BLOCKED = "blocked"
 EVENT_UNBLOCKED = "unblocked"
@@ -120,10 +120,21 @@ KANBAN_WORKER_PREFIX = "[KANBAN-WORKER]"
 
 # Env var the spawned worker reads to know which task it owns.
 # Forensic / introspection only — the recursion guard does NOT
-# read this; it filters by content prefix above.
+# read this; it filters by content prefix above. The worker also
+# reads ``VEXIS_KANBAN_TASK_ID`` operationally: it's the id it passes
+# to ``vexis-kanban complete`` / ``vexis-kanban block`` to declare its
+# outcome (see ``build_worker_prompt``).
 ENV_VAR_KANBAN_TASK_ID = "VEXIS_KANBAN_TASK_ID"
 ENV_VAR_KANBAN_LANE = "VEXIS_KANBAN_LANE"
 ENV_VAR_KANBAN = "VEXIS_KANBAN"  # set to "1" on every worker spawn
+
+# Claim lock the dispatcher minted for this run. The worker only needs
+# it if it wants to heartbeat manually via ``vexis-kanban heartbeat
+# --claim-lock`` — but the dispatcher auto-heartbeats in-flight runs
+# (``KanbanController._claim_keepalive``), so a well-behaved worker can
+# ignore it. Exposed for forensics + the rare long single-tool-call
+# worker that wants to extend its own claim explicitly.
+ENV_VAR_KANBAN_CLAIM_LOCK = "VEXIS_KANBAN_CLAIM_LOCK"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -165,6 +176,7 @@ __all__ = [
     "DEFAULT_MAX_CONCURRENT_WORKERS",
     "DEFAULT_MAX_RUNTIME_SECONDS",
     "ENV_VAR_KANBAN",
+    "ENV_VAR_KANBAN_CLAIM_LOCK",
     "ENV_VAR_KANBAN_LANE",
     "ENV_VAR_KANBAN_TASK_ID",
     "EVENT_ARCHIVED",

@@ -508,14 +508,34 @@ export interface GoalRecord {
   paused_reason: string | null;
 }
 
+// A background goal: a kanban task filed via `/goal <text>` (the v0.11
+// default). Lives in the kanban store, driven by a background worker —
+// distinct from the foreground `GoalRecord` (per-session, in-chat loop).
+export interface BackgroundGoal {
+  id: string;
+  title: string;
+  status: string; // raw kanban status: ready | in_progress | blocked
+  state: string; // friendly: queued | working | blocked
+  lane: string | null;
+  created_at: number | null; // unix seconds
+  started_at: number | null; // unix seconds
+  elapsed: string; // compact "12m", "3h07m"
+  elapsed_seconds: number | null;
+  last_activity: string | null; // latest worker heartbeat/progress/summary
+}
+
 export interface GoalsState {
-  // The current session's goal record when status ∈ {active, paused}.
-  // Done and cleared records appear in `history` instead so the
-  // active panel only renders things the user can act on.
+  // The current session's FOREGROUND goal record when status ∈
+  // {active, paused}. Done and cleared records appear in `history`
+  // instead so the active panel only renders things the user can act on.
   active: GoalRecord | null;
-  // Most recent 20 non-active records (paused / done / cleared)
-  // sorted by last_turn_at desc.
+  // Most recent 20 non-active foreground records (paused / done /
+  // cleared) sorted by last_turn_at desc.
   history: GoalRecord[];
+  // Live background goals (kanban tasks filed via `/goal`). Empty when
+  // kanban is off or nothing's in flight. May be absent on older
+  // backends, so treat as optional.
+  background?: BackgroundGoal[];
 }
 
 // ---- /schedule dashboard tab ----------------------------------

@@ -196,6 +196,47 @@ def render_background_goal_block(
     return "\n".join(lines)
 
 
+def background_goals_payload(
+    store: "KanbanStore",
+    *,
+    now: int | None = None,
+) -> list[dict]:
+    """Structured background-goal rows for the dashboard ``/api/v1/goals``.
+
+    The dashboard's foreground goal payload (``active`` / ``history``)
+    reads the per-session ``goals.json`` store and is blind to the
+    kanban-backed background goals filed by ``/goal <text>`` (the v0.11
+    default). This is the read the dashboard uses to also surface those,
+    so a background goal is visible on the Goals page + goal-pad — not
+    only on the raw kanban board.
+
+    Returns ``[]`` when no background goals are active or the store is
+    unavailable. Each row is JSON-safe (ints + strings + None).
+    """
+    goals = list_background_goals(store)
+    if not goals:
+        return []
+    now = int(time.time()) if now is None else now
+    rows: list[dict] = []
+    for task in goals:
+        started = task.started_at or task.created_at
+        rows.append({
+            "id": task.id,
+            "title": task.title,
+            "status": task.status,                       # ready/in_progress/blocked
+            "state": _STATUS_WORD.get(task.status, task.status),  # queued/working/blocked
+            "lane": task.lane,
+            "created_at": task.created_at,
+            "started_at": task.started_at,
+            "elapsed": _fmt_elapsed(started, now),
+            "elapsed_seconds": (
+                max(0, now - int(started)) if started else None
+            ),
+            "last_activity": _latest_activity(store, task) or None,
+        })
+    return rows
+
+
 def render_background_goals_status(
     store: "KanbanStore",
     *,
@@ -223,6 +264,7 @@ def render_background_goals_status(
 
 __all__ = [
     "GOAL_TASK_CREATED_BY",
+    "background_goals_payload",
     "list_background_goals",
     "render_background_goal_block",
     "render_background_goals_status",

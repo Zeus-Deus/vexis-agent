@@ -21,10 +21,15 @@ Architecture summary:
     finalise their own run row + task status before exiting; if they
     crash mid-flight, the next tick's stale-claim cleanup releases
     the task and bumps consecutive_failures.
-  * Workers communicate back via kanban_* MCP tools (Phase 4).
-    Specifically: ``kanban_complete`` flips the task to ``done`` +
-    finalises the run; ``kanban_block`` flips to ``blocked`` and
-    notifies the user; ``kanban_heartbeat`` extends the claim TTL.
+  * Workers communicate back by running the ``vexis-kanban`` CLI in
+    their shell (NOT an MCP tool — there is no ``kanban_complete``
+    tool). ``vexis-kanban complete "$VEXIS_KANBAN_TASK_ID"`` flips the
+    task to ``done`` + finalises the run; ``vexis-kanban block`` flips
+    to ``blocked`` and notifies the user. The build_worker_prompt
+    handshake spells out the exact commands. Claim liveness
+    (``vexis-kanban heartbeat``) is handled FOR the worker by the
+    dispatcher's ``_claim_keepalive`` so the worker can't strand its
+    own run by forgetting to beat.
 
 Concurrency invariants:
 
@@ -39,6 +44,7 @@ Concurrency invariants:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -50,6 +56,7 @@ from typing import TYPE_CHECKING
 
 from vexis_agent.core.kanban.constants import (
     ENV_VAR_KANBAN,
+    ENV_VAR_KANBAN_CLAIM_LOCK,
     ENV_VAR_KANBAN_LANE,
     ENV_VAR_KANBAN_TASK_ID,
     EVENT_BLOCKED,
@@ -134,13 +141,24 @@ def build_worker_prompt(task: Task, lane: LaneSpec) -> str:
          curator's recursion guard skips. CLAUDE.md Invariant.
       2. The lane's ``system_prompt`` — tells the worker its persona.
       3. The task body — title + body verbatim.
-      4. A short MCP-tool reminder so the worker knows how to declare
-         completion.
+      4. The completion handshake — the EXACT ``vexis-kanban`` shell
+         commands the worker must run to declare its outcome.
 
     Returned string passes through ``brain.spawn_aux`` as ``prompt``.
     The brain prepends its own system prompt (SOUL.md + memories +
     skills) above this; we don't replace that — we add a per-spawn
     user-turn slice.
+
+    The handshake is the load-bearing part. There is **no
+    ``kanban_complete`` tool** — completion is signalled by running the
+    ``vexis-kanban`` CLI in the shell, with the task id taken from the
+    ``$VEXIS_KANBAN_TASK_ID`` env var the dispatcher sets on the spawn.
+    A worker that finishes the work but never runs ``vexis-kanban
+    complete`` is finalised as ``gave_up`` and retried, so the command
+    is spelled out verbatim rather than named like a tool. Liveness
+    (claim heartbeating) is handled automatically by the dispatcher
+    (``KanbanController._claim_keepalive``) so the worker doesn't need
+    to heartbeat itself.
     """
     parts: list[str] = [KANBAN_WORKER_PREFIX]
     if lane.system_prompt.strip():
@@ -148,11 +166,27 @@ def build_worker_prompt(task: Task, lane: LaneSpec) -> str:
     body = task.body or ""
     parts.append(f"Task #{task.id}: {task.title}\n\n{body}".rstrip())
     parts.append(
-        "When you're done, call kanban_complete with a short structured "
-        "summary. If you're blocked or need user input, call kanban_block "
-        "with a clear reason instead. Long tasks should call "
-        "kanban_heartbeat periodically so the dispatcher knows you're "
-        "still alive."
+        "## Declaring your outcome (required)\n"
+        "\n"
+        "This task is being driven by the kanban dispatcher. It is NOT "
+        "finished until you run one of these shell commands — there is no "
+        "`kanban_complete` tool, you run the `vexis-kanban` CLI yourself. "
+        "Your task id is already in the `$VEXIS_KANBAN_TASK_ID` "
+        "environment variable.\n"
+        "\n"
+        "When the work is done, mark it complete:\n"
+        "\n"
+        "    vexis-kanban complete \"$VEXIS_KANBAN_TASK_ID\" "
+        "--summary \"<one-line summary of what you did>\"\n"
+        "\n"
+        "If you are blocked and genuinely need the user to decide or "
+        "provide something, stop and mark it blocked instead:\n"
+        "\n"
+        "    vexis-kanban block \"$VEXIS_KANBAN_TASK_ID\" "
+        "\"<clear reason you're blocked>\"\n"
+        "\n"
+        "Do not report success in prose alone — the dispatcher only sees "
+        "the task as done once `vexis-kanban complete` exits 0."
     )
     return "\n\n".join(parts)
 
@@ -429,8 +463,8 @@ class KanbanController:
         Outcome decision tree (matches ``.plans/kanban-research.md`` §6):
 
           * AuxResult with returncode == 0 AND task already moved out
-            of ``in_progress`` (worker called kanban_complete or
-            kanban_block via MCP) → trust the worker. Finalise run
+            of ``in_progress`` (worker ran ``vexis-kanban complete`` or
+            ``vexis-kanban block``) → trust the worker. Finalise run
             as ``done``.
           * AuxResult with returncode == 0 BUT task still in_progress
             → worker exited without declaring outcome. Finalise as
@@ -462,11 +496,16 @@ class KanbanController:
             ENV_VAR_KANBAN: "1",
             ENV_VAR_KANBAN_TASK_ID: task.id,
             ENV_VAR_KANBAN_LANE: lane.name,
+            # The claim lock the worker would need to heartbeat itself.
+            # The dispatcher auto-heartbeats (see ``_claim_keepalive``)
+            # so this is mostly forensic, but exposing it lets a long
+            # single-tool-call worker extend its own claim if it wants.
+            ENV_VAR_KANBAN_CLAIM_LOCK: claim_lock,
         }
         # cwd: task's workspace_path if set, else the daemon's
-        # workspace. The kanban-worker MCP tools (Phase 4) need
-        # the kanban DB to be reachable; the daemon-wide workspace
-        # always has a stable path to it via ~/.vexis/kanban.db.
+        # workspace. The ``vexis-kanban`` CLI the worker uses to declare
+        # completion finds the DB at ~/.vexis/kanban.db regardless of
+        # cwd, so any workspace works.
         cwd: Path | None = None
         if task.workspace_path:
             try:
@@ -474,40 +513,60 @@ class KanbanController:
             except (TypeError, ValueError):
                 cwd = None
 
+        # Auto-heartbeat the claim while the worker runs. Without this a
+        # worker whose run exceeds the claim TTL (default 150s, far
+        # under the 900s runtime budget) has its claim reclaimed by the
+        # next ``cleanup_stale_claims`` tick — which flips the task back
+        # to ``ready``, bumps consecutive_failures, AND lets the
+        # dispatcher spawn a SECOND worker on the same task. The worker
+        # can't reliably heartbeat itself (it's busy inside long tool
+        # calls), so the dispatcher does it: the run is provably alive
+        # as long as this coroutine is awaiting ``spawn_aux``.
+        keepalive = asyncio.ensure_future(
+            self._claim_keepalive(task.id, claim_lock)
+        )
         try:
-            aux = await self._brain.spawn_aux(
-                prompt,
-                model_tier=lane.tier,
-                timeout_seconds=float(max_runtime),
-                env_overrides=env_overrides,
-                # Issue #10 — kanban workers run real tasks and need
-                # broad tool access. The narrower per-lane allowlist
-                # (``LaneSpec.tool_allowlist``) is the natural next
-                # step but explicitly out of scope here; for now this
-                # caller stays on the back-compat allow_tools=True
-                # path. ``allowed_tools`` is left None so the boolean
-                # still wins.
-                allow_tools=True,
-                allowed_tools=None,
-                cwd=cwd,
-                subsystem="kanban_worker",
-            )
-        except BrainTimeoutError as exc:
-            await self._on_spawn_timeout(task, run_id, str(exc))
-            return
-        except BrainModelNotFoundError as exc:
-            await self._on_spawn_model_error(task, run_id, exc)
-            return
-        except BrainError as exc:
-            await self._on_spawn_error(task, run_id, str(exc))
-            return
-        except asyncio.CancelledError:
-            # Shutdown / /cancel — release the claim so the next
-            # dispatcher tick can re-pick or so the user can re-assign.
-            await asyncio.to_thread(
-                self._finalize_cancelled, task.id, run_id, claim_lock,
-            )
-            raise
+            try:
+                aux = await self._brain.spawn_aux(
+                    prompt,
+                    model_tier=lane.tier,
+                    timeout_seconds=float(max_runtime),
+                    env_overrides=env_overrides,
+                    # Issue #10 — kanban workers run real tasks and need
+                    # broad tool access. The narrower per-lane allowlist
+                    # (``LaneSpec.tool_allowlist``) is the natural next
+                    # step but explicitly out of scope here; for now this
+                    # caller stays on the back-compat allow_tools=True
+                    # path. ``allowed_tools`` is left None so the boolean
+                    # still wins.
+                    allow_tools=True,
+                    allowed_tools=None,
+                    cwd=cwd,
+                    subsystem="kanban_worker",
+                )
+            except BrainTimeoutError as exc:
+                await self._on_spawn_timeout(task, run_id, str(exc))
+                return
+            except BrainModelNotFoundError as exc:
+                await self._on_spawn_model_error(task, run_id, exc)
+                return
+            except BrainError as exc:
+                await self._on_spawn_error(task, run_id, str(exc))
+                return
+            except asyncio.CancelledError:
+                # Shutdown / /cancel — release the claim so the next
+                # dispatcher tick can re-pick or so the user can re-assign.
+                await asyncio.to_thread(
+                    self._finalize_cancelled, task.id, run_id, claim_lock,
+                )
+                raise
+        finally:
+            # Stop heartbeating the moment the worker is no longer
+            # running, regardless of how it exited — so a finished run's
+            # claim is free for finalisation to mutate.
+            keepalive.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await keepalive
 
         # Spawn returned. Decide outcome based on returncode + task state.
         await asyncio.to_thread(
@@ -519,6 +578,44 @@ class KanbanController:
             except Exception:
                 log.exception("kanban: event_hook raised post-spawn")
 
+    async def _claim_keepalive(self, task_id: str, claim_lock: str) -> None:
+        """Extend the task's claim on a timer while its worker runs.
+
+        Beats every ``ttl // 2`` seconds (floored at 15s) so a single
+        missed beat never lets the claim lapse. Re-reads the TTL each
+        beat so a config edit hot-reloads. Stops itself if the claim is
+        lost (another worker took over — shouldn't happen with one
+        dispatcher, but we bail rather than fight). Cancelled by
+        ``_spawn_worker``'s ``finally`` the instant the worker exits.
+        """
+        try:
+            while True:
+                ttl = kanban_claim_ttl_seconds()
+                interval = max(15, ttl // 2)
+                await asyncio.sleep(interval)
+                try:
+                    still_ours = await asyncio.to_thread(
+                        self._store.heartbeat,
+                        task_id, claim_lock=claim_lock, ttl_seconds=ttl,
+                    )
+                except Exception:
+                    # A transient store hiccup shouldn't kill the
+                    # keepalive — the worker is still alive, keep beating.
+                    log.debug(
+                        "kanban: keepalive beat failed for %s",
+                        task_id, exc_info=True,
+                    )
+                    continue
+                if not still_ours:
+                    log.warning(
+                        "kanban: keepalive lost claim on %s "
+                        "(reclaimed by another worker?)",
+                        task_id,
+                    )
+                    return
+        except asyncio.CancelledError:
+            raise
+
     # ─── finalisers (sync, run via to_thread from spawn handlers) ─
 
     def _finalize_normal_return(
@@ -528,7 +625,7 @@ class KanbanController:
         aux: "AuxResultLike",
     ) -> None:
         # Re-read the task because the worker may have flipped status
-        # via kanban_complete / kanban_block MCP calls.
+        # by running `vexis-kanban complete` / `vexis-kanban block`.
         task = self._store.get_task(task_id)
         if task is None:
             log.warning(
@@ -559,7 +656,7 @@ class KanbanController:
             self._store.finalize_run(
                 run_id, outcome="gave_up",
                 summary=_truncate(aux.stdout, 4000),
-                error="worker exited without kanban_complete/kanban_block",
+                error="worker exited without running vexis-kanban complete/block",
                 new_status=RUN_STATUS_FAILED,
             )
             self._record_failure(

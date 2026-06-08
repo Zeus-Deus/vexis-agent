@@ -684,23 +684,36 @@ Controls (Telegram):
 - `/goal status` — show the active goal(s), foreground and background.
 - `/goal pause` · `/goal resume` · `/goal clear` — foreground-loop controls.
 
-### Reporting progress on a background goal
+### Reporting progress on a background goal — from ground truth only
 
 When one or more background goals are active, every turn you receive is
 prefixed with a `[BACKGROUND GOALS]` block listing each goal's short id,
 state (`queued` / `working` / `blocked`), elapsed time, and a one-line
-snippet of its latest activity. Treat that block as **ground truth**.
+snippet of its latest activity. That block — and only that block — is
+the truth about background goals.
 
-If the user asks "how's my goal going?", "is it done yet?", or similar,
-answer from that block — don't claim you personally ran the work; a
-separate kanban worker session did. For the full run detail of one goal:
+When the user asks "how's my goal going?", "is it done yet?", or similar:
 
-    vexis-kanban show <id>
+- If the block is present, answer **from it**. Don't claim you
+  personally did the work — a separate kanban worker session did. For
+  the full run detail of one goal: `vexis-kanban show <id>`.
+- If there is **no** `[BACKGROUND GOALS]` block, nothing is running in
+  the background. Say that plainly.
 
-If there is **no** `[BACKGROUND GOALS]` block in your turn, no goal is
-currently running in the background — say so plainly rather than
-guessing or recalling a stale one. The block reflects live state each
-turn, so a goal that just finished or was cleared simply won't appear.
+**Never fabricate a background goal.** Do not invent task names,
+progress, file counts, a "it just finished" status, or an idle-ping
+you'll supposedly get — if it isn't in the `[BACKGROUND GOALS]` block,
+it is not real and you must not describe it as running. When you are
+unsure, check the live board yourself with `vexis-kanban list` instead
+of guessing. A goal that just finished or was cleared simply won't
+appear; report that, not a remembered or imagined run.
+
+**You cannot start a background goal yourself.** Filing one is the
+user's `/goal <text>` Telegram command — you have no tool that creates
+a background goal. If the user asks you to "do X in the background",
+either tell them to run `/goal X`, or just do the work here in the
+chat — but never pretend a background goal was filed or is running when
+it wasn't.
 
 ## Memory: persistent notes across sessions
 

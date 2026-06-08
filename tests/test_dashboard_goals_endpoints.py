@@ -108,11 +108,49 @@ def test_get_goals_rejects_missing_token(client: TestClient) -> None:
 
 
 def test_get_goals_no_active_returns_null(client: TestClient) -> None:
-    """No goal record on disk → ``active=null`` and ``history=[]``."""
+    """No goal record on disk → ``active=null``, ``history=[]``, and
+    ``background=[]`` (no kanban store attached in this fixture)."""
     resp = client.get("/api/v1/goals", headers=_hdr())
     assert resp.status_code == 200
     body = resp.json()
-    assert body == {"active": None, "history": []}
+    assert body == {"active": None, "history": [], "background": []}
+
+
+def test_get_goals_surfaces_background_kanban_goal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A kanban task filed via /goal (created_by=user:/goal) shows up in
+    the ``background`` list — the v0.11 dashboard-blindness fix."""
+    from vexis_agent.core.goal_background import GOAL_TASK_CREATED_BY
+    from vexis_agent.core.kanban.db import KanbanStore
+
+    dashboard = _build_dashboard(tmp_path, monkeypatch)
+    kanban = KanbanStore(tmp_path / "kanban.db")
+    # A real /goal-filed background task, plus a plain /kanban add task
+    # that must NOT leak into the goal surface.
+    kanban.create_task(
+        title="research OEM sources",
+        body="full text",
+        lane="implementation",
+        status="ready",
+        created_by=GOAL_TASK_CREATED_BY,
+    )
+    kanban.create_task(
+        title="not a goal",
+        status="ready",
+        created_by="user:/kanban",
+    )
+    dashboard.attach_kanban_store(kanban)
+    client = TestClient(dashboard._app)
+
+    body = client.get("/api/v1/goals", headers=_hdr()).json()
+    bg = body["background"]
+    assert len(bg) == 1
+    assert bg[0]["title"] == "research OEM sources"
+    assert bg[0]["status"] == "ready"
+    assert bg[0]["state"] == "queued"
+    assert bg[0]["lane"] == "implementation"
+    assert "id" in bg[0]
 
 
 def test_get_goals_with_active(
