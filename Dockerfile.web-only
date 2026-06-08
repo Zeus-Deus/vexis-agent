@@ -1,0 +1,51 @@
+# Headless / web-only vexis-agent — provisions + launches fully
+# unattended (no Telegram, no TTY). The concrete enabler for running
+# vexis as a service backend (e.g. PartPilot's lookup engine).
+# See docs/modular-subsystems.md ("Provisioning headlessly").
+#
+# Builds from the local source checkout so it exercises THIS code. Once
+# this lands on PyPI you can swap `pip install /src` for `pip install
+# vexis-agent`.
+#
+# Build:  docker build -f Dockerfile.web-only -t vexis-web-only .
+# Run (real brain — mount authenticated claude creds + CLI):
+#         docker run --rm -p 8766:8766 \
+#           -v "$HOME/.claude:/home/vexis/.claude:ro" \
+#           vexis-web-only
+#
+# The chat API is bearer-token gated; read the token the daemon mints at
+# /home/vexis/.vexis/dashboard_token (mode 0600) from inside the
+# container, then POST /api/v1/chat/send.
+FROM python:3.11-slim
+
+# Non-root runtime user; vexis state lives under its home.
+RUN useradd --create-home --shell /bin/bash vexis
+
+# Copy the source checkout (see .dockerignore for what's excluded).
+WORKDIR /src
+COPY . /src
+RUN chown -R vexis:vexis /src
+
+USER vexis
+WORKDIR /home/vexis
+ENV PATH=/home/vexis/.local/bin:$PATH
+
+# Install vexis-agent from source. (Browser add-on's Camoufox binary is
+# fetched separately via `camoufox fetch`; not needed for a headless
+# lookup backend — the browser tools just degrade if it's absent.)
+RUN pip install --user --no-cache-dir /src
+
+# Web-only / headless mode. VEXIS_WEB_ONLY=1 makes `setup` non-interactive
+# AND disable the Telegram transport (transports.telegram: false).
+ENV VEXIS_WEB_ONLY=1
+# Brain selection: claude-code (default) needs the `claude` CLI installed
+# + authenticated (mount ~/.claude or set ANTHROPIC_API_KEY at run time).
+# ENV VEXIS_BRAIN_KIND=claude-code
+
+# Provision config.yaml (transports.telegram: false) + a Telegram-free
+# .env, AT BUILD TIME. No TTY, must exit 0 — this line is the proof that
+# headless provisioning works unattended in a clean OS.
+RUN vexis-agent setup --non-interactive
+
+EXPOSE 8766
+CMD ["vexis-agent", "run"]

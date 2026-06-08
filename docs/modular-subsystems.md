@@ -122,6 +122,63 @@ background_tasks:
 
 Everything not listed stays on its default.
 
+## Provisioning headlessly (non-interactive setup, issue #40)
+
+Issue #39 made the daemon *boot* headless; issue #40 makes it *set up*
+headless — no interactive TTY, no Telegram. `vexis-agent setup` grew an
+unattended path that writes the headless config for you:
+
+```sh
+# Disable the Telegram transport + provision a Telegram-free .env,
+# with no prompts. Equivalent: VEXIS_WEB_ONLY=1 vexis-agent setup --non-interactive
+vexis-agent setup --web-only --non-interactive
+```
+
+What it does, all without reading stdin:
+
+- writes an active `transports:` block with `telegram: false`, `web: true`
+  (the same toggle the daemon reads — there's still no shipped preset,
+  setup just composes it for you),
+- comments out the Telegram placeholders the `.env` template ships so
+  there are no active Telegram values, and
+- skips the Telegram prompts entirely.
+
+`--web-only` implies `--non-interactive`; `VEXIS_WEB_ONLY=1` implies
+both. `--non-interactive` on its own provisions a normal Telegram
+install from `$TELEGRAM_BOT_TOKEN` / `$TELEGRAM_ALLOWED_USER_ID` in the
+environment instead of prompting. Pick the brain with `$VEXIS_BRAIN_KIND`
+(default `claude-code`). Under the hood it feeds `run_setup()` the
+existing prompt/confirm/choice seam via `env_backed_prompt` +
+`noninteractive_*` providers — no second wizard.
+
+`vexis-agent doctor` agrees: with the Telegram transport disabled it
+treats absent Telegram secrets as a clean pass, so a headless container
+passes the readiness check.
+
+### Dockerfile
+
+`Dockerfile.web-only` (repo root) provisions at build time and launches
+unattended:
+
+```dockerfile
+FROM python:3.11-slim
+RUN useradd --create-home vexis
+USER vexis
+WORKDIR /home/vexis
+ENV PATH=/home/vexis/.local/bin:$PATH
+RUN pip install --user --no-cache-dir vexis-agent   # or -e /src from a checkout
+ENV VEXIS_WEB_ONLY=1
+RUN vexis-agent setup --non-interactive              # web-only, no TTY, exit 0
+EXPOSE 8766
+CMD ["vexis-agent", "run"]
+```
+
+The brain CLI (e.g. `claude`) must be installed + authenticated in the
+image for real replies — mount `~/.claude` or set `ANTHROPIC_API_KEY` at
+run time. The chat API is bearer-token gated; read the token from
+`~/.vexis/dashboard_token` inside the container and POST
+`/api/v1/chat/send`.
+
 ## Where each gate is read
 
 All gates live in `core/yaml_config.py` (kanban's in `core/kanban/lanes.py`),

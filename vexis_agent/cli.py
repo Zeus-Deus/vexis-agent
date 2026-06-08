@@ -7,6 +7,7 @@ Phase 2 wired ``run``; Phase 3 wires ``service`` (systemd lifecycle),
 
 from __future__ import annotations
 
+import os
 import sys
 
 import typer
@@ -81,6 +82,13 @@ def run() -> None:
     _daemon_main()
 
 
+def _env_truthy(name: str) -> bool:
+    """True iff env var ``name`` is set to a recognisably-true value
+    (1/true/yes/on). Honours ``VEXIS_WEB_ONLY=1`` on the setup command
+    without importing the full daemon config layer."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 @app.command()
 def setup(
     reset: bool = typer.Option(
@@ -88,23 +96,77 @@ def setup(
         "--reset",
         help="Archive existing config.yaml + .env to *.bak.<utc> and re-run.",
     ),
+    non_interactive: bool = typer.Option(
+        False,
+        "--non-interactive",
+        help=(
+            "Provision without any TTY prompts — for containers and "
+            "service-backend deploys. Reads values from the environment "
+            "(TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOWED_USER_ID optional, "
+            "VEXIS_BRAIN_KIND to pick the brain) and writes config.yaml "
+            "+ .env directly. Implied by --web-only and by VEXIS_WEB_ONLY=1."
+        ),
+    ),
+    web_only: bool = typer.Option(
+        False,
+        "--web-only",
+        help=(
+            "Headless mode: disable the Telegram transport "
+            "(transports.telegram: false) and write a Telegram-free .env. "
+            "The daemon serves only the web dashboard + the /api/v1/chat/* "
+            "API. Implies --non-interactive. Also enabled by "
+            "VEXIS_WEB_ONLY=1."
+        ),
+    ),
 ) -> None:
-    """Interactive first-run setup.
+    """First-run setup — interactive by default, unattended on demand.
 
     Creates ``$VEXIS_HOME/config.yaml`` and ``$VEXIS_HOME/.env`` (mode
     0600) from shipped templates if absent, prompts for the Telegram
     bot token + allowed user ID, and offers to install the systemd
     user unit. Existing curator/learning/goal state is left untouched
     — the wizard never deletes data.
+
+    ``--non-interactive`` / ``--web-only`` (or ``VEXIS_WEB_ONLY=1``)
+    provision without a TTY: values come from the environment and the
+    wizard never blocks on input. ``--web-only`` additionally disables
+    the Telegram transport (``transports.telegram: false``, issue #39's
+    toggle) and leaves no Telegram values in .env, so the daemon boots
+    as a pure HTTP/chat-API service backend.
     """
     from vexis_agent.setup_wizard import (
         SetupAborted,
+        env_backed_prompt,
         format_summary,
+        noninteractive_choice,
+        noninteractive_confirm,
         run_setup,
     )
 
+    # Intent comes from the flags/env at invocation time, NOT from an
+    # existing config.yaml — re-running plain ``setup`` on a web-only
+    # box must still be able to reconfigure interactively.
+    web_only_effective = web_only or _env_truthy("VEXIS_WEB_ONLY")
+    non_interactive_effective = non_interactive or web_only_effective
+
     try:
-        result = run_setup(reset=reset)
+        if non_interactive_effective:
+            brain_kind = (
+                os.environ.get("VEXIS_BRAIN_KIND", "").strip() or "claude-code"
+            )
+            result = run_setup(
+                reset=reset,
+                install_service=False,
+                require_interactive=False,
+                print_banner=False,
+                prompt=env_backed_prompt,
+                confirm=noninteractive_confirm,
+                choice=noninteractive_choice,
+                brain_kind_override=brain_kind,
+                web_only=web_only_effective,
+            )
+        else:
+            result = run_setup(reset=reset)
     except SetupAborted as exc:
         typer.echo(f"vexis-agent setup: {exc}", err=True)
         raise typer.Exit(1)

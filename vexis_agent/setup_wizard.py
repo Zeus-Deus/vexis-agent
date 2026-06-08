@@ -192,6 +192,34 @@ def update_env_value(env_path: Path, key: str, value: str) -> None:
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def comment_out_env_key(env_path: Path, key: str) -> bool:
+    """Comment out any ACTIVE ``KEY=...`` line in a dotenv — turn
+    ``KEY=val`` into ``# KEY=val``. Already-commented lines are left
+    untouched. Returns True iff anything changed.
+
+    Used by headless / web-only setup (issue #40) to neutralise the
+    Telegram placeholders the shipped ``.env`` template carries (it
+    ships ``TELEGRAM_BOT_TOKEN=your-...-here`` uncommented). Without
+    this a headless install would keep an active — but bogus — Telegram
+    value. Commenting (rather than deleting) is non-destructive: a real
+    value a user had set survives as a comment they can re-enable.
+    """
+    if not env_path.exists():
+        return False
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    changed = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        if stripped.split("=", 1)[0].strip() == key:
+            lines[i] = f"# {line}"
+            changed = True
+    if changed:
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return changed
+
+
 # ── Brain detection ───────────────────────────────────────────────
 
 
@@ -701,6 +729,7 @@ class SetupResult:
     mcp_config_path: Optional[Path] = None
     mcp_config_paths: list = field(default_factory=list)
     mcp_servers_wired: list = field(default_factory=list)
+    web_only: bool = False
 
 
 PromptFn = Callable[[str, bool], str]
@@ -746,6 +775,46 @@ def _default_prompt(message: str, secret: bool) -> str:
     if ans is None:
         raise SetupAborted("setup cancelled by user")
     return ans
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Non-interactive provisioning providers (issue #40)
+#
+# Unattended setup (containers, service-backend deploys) feeds these
+# through the SAME prompt/confirm/choice seam ``run_setup`` already
+# exposes — no second wizard. They read from the environment and NEVER
+# touch a TTY, so a headless ``vexis-agent setup --non-interactive``
+# can't hang on a blocking ``input()``. Unmapped prompts return "" (the
+# wizard's skip path); a genuinely-required value that's absent surfaces
+# through the wizard's own warnings + the daemon's clear startup error
+# rather than a silent hang.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def env_backed_prompt(message: str, secret: bool) -> str:
+    """A :data:`PromptFn` for unattended setup. Resolves the known
+    wizard prompts from environment variables; returns "" for anything
+    unmapped so the wizard's skip path handles it. Never reads stdin."""
+    if "Telegram bot token" in message:
+        return os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if "Allowed Telegram user ID" in message:
+        return os.environ.get("TELEGRAM_ALLOWED_USER_ID", "").strip()
+    return ""
+
+
+def noninteractive_confirm(message: str) -> bool:
+    """A confirm fn for unattended setup: always declines. Optional /
+    destructive steps (the systemd service install) are opt-in via
+    explicit flags in unattended mode, never auto-accepted."""
+    return False
+
+
+def noninteractive_choice(message: str, options: list[str], default_idx: int) -> int:
+    """A choice fn for unattended setup: takes the supplied default
+    without prompting. The unattended caller pins the brain via
+    ``brain_kind_override`` so the brain picker isn't reached, but this
+    keeps every choice path non-blocking for robustness."""
+    return default_idx
 
 
 def _default_confirm(message: str) -> bool:
@@ -799,6 +868,59 @@ def _set_brain_kind(config_path: Path, kind: str) -> None:
         config_path.write_text(new_text, encoding="utf-8")
 
 
+def _set_transports(
+    config_path: Path, *, telegram: bool, web: bool = True
+) -> None:
+    """Write an active top-level ``transports:`` block into config.yaml
+    (issue #40, in #39's transport-toggle vocabulary).
+
+    The shipped template documents ``transports:`` only as a COMMENTED
+    example, so there's no active block to edit — we append a fresh one.
+    Any pre-existing ACTIVE (column-0, uncommented) ``transports:`` block
+    is stripped first so a re-run can't leave a stale/duplicate block
+    (YAML would otherwise take the last key, but duplicates are ugly).
+    Comments — including the template's commented example — are
+    preserved; only an active block is touched.
+    """
+    text = config_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # An active (uncommented, column-0) ``transports:`` block start.
+        if line.rstrip() == "transports:" or (
+            line.startswith("transports:") and not line.lstrip().startswith("#")
+        ):
+            # Skip this line and its indented body (and blank lines
+            # interleaved within the block) until the next column-0
+            # non-blank line.
+            i += 1
+            while i < len(lines):
+                nxt = lines[i]
+                if nxt.strip() == "" or nxt[:1] in (" ", "\t"):
+                    i += 1
+                    continue
+                break
+            continue
+        out.append(line)
+        i += 1
+
+    block = [
+        "transports:",
+        f"  telegram: {'true' if telegram else 'false'}",
+        f"  web: {'true' if web else 'false'}",
+    ]
+    # Separate from prior content with exactly one blank line.
+    while out and out[-1].strip() == "":
+        out.pop()
+    if out:
+        out.append("")
+    out.extend(block)
+    config_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
 def _read_brain_kind(home: Path) -> str:
     """Best-effort read of brain.kind from the just-written
     config.yaml. Mirrors yaml_config.brain_kind() but doesn't import
@@ -829,11 +951,20 @@ def run_setup(
     brain_kind_override: Optional[str] = None,
     require_interactive: bool = True,
     print_banner: bool = True,
+    web_only: bool = False,
 ) -> SetupResult:
     """Drive the wizard. Returns a SetupResult.
 
     ``brain_kind_override`` skips the interactive brain picker — used
     by tests + by automation that wants to pin the kind via env.
+
+    ``web_only`` (issue #40) provisions a headless install: it writes an
+    active ``transports.telegram: false`` (+ ``web: true``) block — the
+    #39 transport-toggle vocabulary the daemon reads — skips the Telegram
+    section entirely (no prompts, no Telegram values in .env), and
+    comments out the .env Telegram placeholders. Pair with
+    ``require_interactive=False`` + the ``env_backed_prompt`` /
+    ``noninteractive_*`` providers for fully unattended provisioning.
     """
     confirm_fn = confirm if confirm is not None else _default_confirm
     choice_fn = choice if choice is not None else _default_choice
@@ -864,26 +995,50 @@ def run_setup(
     ok(f"config: {config_path}")
     ok(f"secrets: {dotenv_path} (mode 0600)")
 
-    # ── 2. Telegram secrets ───────────────────────────────────────
-    section("Telegram")
-    info("From @BotFather: /newbot, then copy the token.")
-    token = prompt("Telegram bot token", True).strip()
-    if token:
-        update_env_value(dotenv_path, "TELEGRAM_BOT_TOKEN", token)
-        ok("TELEGRAM_BOT_TOKEN written")
-    else:
-        warn("skipped — set TELEGRAM_BOT_TOKEN later in ~/.vexis/.env")
-
-    info("Your numeric Telegram user ID (use @userinfobot to look up).")
-    user_id = prompt("Allowed Telegram user ID", False).strip()
-    if user_id:
-        update_env_value(dotenv_path, "TELEGRAM_ALLOWED_USER_ID", user_id)
-        ok("TELEGRAM_ALLOWED_USER_ID written")
-    else:
-        warn(
-            "skipped — set TELEGRAM_ALLOWED_USER_ID later in ~/.vexis/.env "
-            "(daemon refuses to start without it)"
+    # ── 2. Transport ──────────────────────────────────────────────
+    # Headless / web-only skips Telegram entirely: no prompts, no
+    # secrets in .env, and config.yaml gets an active
+    # ``transports.telegram: false`` block (issue #39 vocabulary) so the
+    # daemon boots web-only and ``load_config`` drops the bot-token
+    # requirement.
+    if web_only:
+        section("Transport (web-only / headless)")
+        _set_transports(config_path, telegram=False, web=True)
+        ok("transports.telegram: false — no Telegram bot (web-only)")
+        # Neutralise the Telegram placeholders the .env template ships
+        # so a headless install has no active Telegram values. Evaluate
+        # BOTH keys (a short-circuiting any() would stop after the first).
+        commented = [
+            key
+            for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USER_ID")
+            if comment_out_env_key(dotenv_path, key)
+        ]
+        if commented:
+            info("commented out Telegram placeholders in .env")
+        info(
+            "The daemon will serve only the web dashboard + the "
+            "/api/v1/chat/* API. Telegram secrets are not required."
         )
+    else:
+        section("Telegram")
+        info("From @BotFather: /newbot, then copy the token.")
+        token = prompt("Telegram bot token", True).strip()
+        if token:
+            update_env_value(dotenv_path, "TELEGRAM_BOT_TOKEN", token)
+            ok("TELEGRAM_BOT_TOKEN written")
+        else:
+            warn("skipped — set TELEGRAM_BOT_TOKEN later in ~/.vexis/.env")
+
+        info("Your numeric Telegram user ID (use @userinfobot to look up).")
+        user_id = prompt("Allowed Telegram user ID", False).strip()
+        if user_id:
+            update_env_value(dotenv_path, "TELEGRAM_ALLOWED_USER_ID", user_id)
+            ok("TELEGRAM_ALLOWED_USER_ID written")
+        else:
+            warn(
+                "skipped — set TELEGRAM_ALLOWED_USER_ID later in ~/.vexis/.env "
+                "(daemon refuses to start without it)"
+            )
 
     # ── 3. Brain CLI: pick + check ────────────────────────────────
     section("Brain CLI")
@@ -1093,6 +1248,7 @@ def run_setup(
         ),
         mcp_config_paths=mcp_paths,
         mcp_servers_wired=[s["name"] for s in detected],
+        web_only=web_only,
     )
 
 
@@ -1123,6 +1279,8 @@ def format_summary(result: SetupResult) -> str:
     lines.append(f"  secrets:   {result.dotenv_path}  (mode 0600)")
     if result.workspace:
         lines.append(f"  workspace: {result.workspace}")
+    if result.web_only:
+        lines.append("  mode:      web-only (headless — Telegram transport off)")
     if result.archived_config:
         lines.append(f"  archived:  {result.archived_config}")
     if result.archived_dotenv:
