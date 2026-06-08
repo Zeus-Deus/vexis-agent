@@ -42,6 +42,7 @@ from vexis_agent.core.brain.base import (
 from vexis_agent.core.brain.null import BrainNull
 from vexis_agent.core.kanban.constants import (
     ENV_VAR_KANBAN,
+    ENV_VAR_KANBAN_CLAIM_LOCK,
     ENV_VAR_KANBAN_LANE,
     ENV_VAR_KANBAN_TASK_ID,
     KANBAN_WORKER_PREFIX,
@@ -151,6 +152,21 @@ def test_worker_prompt_handles_empty_body(store):
     task = store.create_task(title="just-title")
     prompt = build_worker_prompt(task, DEFAULT_LANES["default"])
     assert "just-title" in prompt
+
+
+def test_worker_prompt_uses_vexis_kanban_cli_handshake(store):
+    """The completion handshake is the real `vexis-kanban` CLI keyed on
+    $VEXIS_KANBAN_TASK_ID — NOT a phantom `kanban_complete` tool. A
+    worker that took the old wording literally never declared done and
+    got retried into an auto-block (the v0.11 background-goal break)."""
+    task = store.create_task(title="x", body="b")
+    prompt = build_worker_prompt(task, DEFAULT_LANES["implementation"])
+    # Exact completion command, with the env var the dispatcher sets.
+    assert 'vexis-kanban complete "$VEXIS_KANBAN_TASK_ID"' in prompt
+    assert 'vexis-kanban block "$VEXIS_KANBAN_TASK_ID"' in prompt
+    # It explicitly disclaims the nonexistent tool so a literal-minded
+    # worker doesn't hunt for it.
+    assert "no `kanban_complete` tool" in prompt
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -499,6 +515,59 @@ def test_spawn_aux_carries_kanban_env_vars(store, workspace):
     assert env.get(ENV_VAR_KANBAN) == "1"
     assert env.get(ENV_VAR_KANBAN_TASK_ID) == t.id
     assert env.get(ENV_VAR_KANBAN_LANE) == "research"
+    # The claim lock the worker would use to heartbeat itself — non-empty
+    # so a long single-tool-call worker can extend its own claim.
+    assert env.get(ENV_VAR_KANBAN_CLAIM_LOCK)
+
+
+def test_claim_keepalive_heartbeats_in_flight_task(store, workspace, monkeypatch):
+    """While a worker runs, the dispatcher heartbeats its claim so a run
+    longer than the claim TTL isn't reclaimed mid-flight (which would
+    bump failures AND spawn a duplicate worker). We drive
+    ``_claim_keepalive`` directly with an instant clock and assert it
+    actually beats the store."""
+    import vexis_agent.core.kanban.dispatcher as disp
+
+    t = store.create_task(title="x", status=STATUS_READY, lane="research")
+    store.claim_task(t.id, claim_lock="L1", ttl_seconds=100)
+
+    # Spy on the store heartbeat so the assertion is clock-independent.
+    hb_calls: list[tuple] = []
+    real_hb = store.heartbeat
+
+    def spy_heartbeat(task_id, *, claim_lock, ttl_seconds):
+        hb_calls.append((task_id, claim_lock, ttl_seconds))
+        return real_hb(task_id, claim_lock=claim_lock, ttl_seconds=ttl_seconds)
+
+    monkeypatch.setattr(store, "heartbeat", spy_heartbeat)
+
+    # Beat immediately instead of sleeping ttl//2, and stop after two beats.
+    real_sleep = asyncio.sleep
+    beats = {"n": 0}
+
+    async def fast_sleep(_seconds):
+        beats["n"] += 1
+        if beats["n"] > 2:
+            raise asyncio.CancelledError
+        await real_sleep(0)
+
+    monkeypatch.setattr(disp.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(disp, "kanban_claim_ttl_seconds", lambda: 100)
+
+    async def scenario():
+        ctrl = KanbanController(store=store, brain=BrainNull(), workspace=workspace)
+        try:
+            await ctrl._claim_keepalive(t.id, "L1")
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    # Two beats landed on the store with the right task id, claim lock,
+    # and TTL — the claim is being kept alive under the worker.
+    assert len(hb_calls) >= 2
+    assert hb_calls[0] == (t.id, "L1", 100)
+    assert store.get_task(t.id).claim_expires is not None
 
 
 def test_spawn_aux_allow_tools_true_and_subsystem(store, workspace):

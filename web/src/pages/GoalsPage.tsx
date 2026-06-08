@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "../lib/api";
-import type { GoalRecord, GoalsState, GoalStatus } from "../lib/types";
+import type {
+  BackgroundGoal,
+  GoalRecord,
+  GoalsState,
+  GoalStatus,
+} from "../lib/types";
 import { classNames, relativeTime } from "../lib/format";
 import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
@@ -113,6 +118,7 @@ export function GoalsPage({ token, onAuthFail }: GoalsPageProps) {
     <div className="space-y-8">
       <Header />
       {error && <ErrorBanner message={error} />}
+      <BackgroundSection goals={state.background ?? []} />
       <ActiveSection
         record={state.active}
         pending={pendingAction}
@@ -133,11 +139,17 @@ function Header() {
       <h1 className="font-data text-[15px] tracking-tight text-[var(--color-fg)]">
         ⊙ <span className="ml-1">Standing goals</span>
       </h1>
-      <p className="text-xs text-[var(--color-fg-dim)] font-data leading-relaxed max-w-[60ch]">
-        Multi-turn objectives Vexis works on across continuations until done,
-        paused, or the budget runs out. Set one with{" "}
+      <p className="text-xs text-[var(--color-fg-dim)] font-data leading-relaxed max-w-[64ch]">
+        Multi-step objectives Vexis works on until done, paused, or the budget
+        runs out. Set one with{" "}
         <code className="text-[var(--color-fg-2)]">/goal &lt;text&gt;</code>{" "}
-        in Telegram; control it from here or from your phone.
+        in Telegram. By default a goal runs in the{" "}
+        <span className="text-[var(--color-fg-2)]">background</span> as a kanban
+        worker (your chat stays free) — those show under{" "}
+        <span className="text-[var(--color-fg-2)]">Background</span> below.{" "}
+        <code className="text-[var(--color-fg-2)]">/goal --fg</code> runs the
+        in-chat loop instead, which shows under{" "}
+        <span className="text-[var(--color-fg-2)]">Active</span>.
       </p>
     </div>
   );
@@ -156,6 +168,110 @@ function ErrorBanner({ message }: { message: string }) {
         The page will retry automatically every {Math.round(POLL_INTERVAL_MS / 1000)}s.
       </p>
     </div>
+  );
+}
+
+// ---- Background panel --------------------------------------------
+
+function BgStateBadge({ state }: { state: string }) {
+  if (state === "working") {
+    return (
+      <Badge tone="active" glyph="▸">
+        working
+      </Badge>
+    );
+  }
+  if (state === "blocked") {
+    return (
+      <Badge tone="warn" glyph="⛔">
+        blocked
+      </Badge>
+    );
+  }
+  // queued (kanban "ready") or any unmapped status.
+  return (
+    <Badge tone="subtle" glyph="•">
+      {state}
+    </Badge>
+  );
+}
+
+function BackgroundSection({ goals }: { goals: BackgroundGoal[] }) {
+  return (
+    <Section
+      title="Background"
+      trailing={
+        goals.length
+          ? `${goals.length} running`
+          : undefined
+      }
+    >
+      {goals.length === 0 ? (
+        <EmptyState
+          glyph="·"
+          title="No background goals running."
+          hint={
+            <>
+              A goal filed with{" "}
+              <code className="font-data text-[var(--color-fg)]">
+                /goal &lt;text&gt;
+              </code>{" "}
+              runs here as a kanban worker. Live progress streams in while it
+              works; finished goals drop off (find them on the Kanban board).
+            </>
+          }
+        />
+      ) : (
+        <div className="space-y-3">
+          {goals.map((g) => (
+            <Card key={g.id}>
+              <div className="px-5 py-4 space-y-3">
+                <div className="flex items-baseline gap-3 flex-wrap">
+                  <BgStateBadge state={g.state} />
+                  <span className="font-data text-[10.5px] text-[var(--color-fg-dim)]">
+                    {g.elapsed ? `${g.elapsed} elapsed` : ""}
+                  </span>
+                  {g.lane && (
+                    <span className="font-data text-[10.5px] text-[var(--color-fg-dim)]">
+                      lane — {g.lane}
+                    </span>
+                  )}
+                  <span className="ml-auto font-data text-[10px] text-[var(--color-fg-dim)] tabular-nums">
+                    {g.id}
+                  </span>
+                </div>
+
+                <div className="text-[14px] text-[var(--color-fg)] leading-snug">
+                  {g.title}
+                </div>
+
+                {g.last_activity && (
+                  <div className="flex items-baseline gap-2 min-w-0">
+                    <span className="uppercase-tight text-[10px] text-[var(--color-fg-dim)] shrink-0">
+                      latest
+                    </span>
+                    <span
+                      className="text-[12px] text-[var(--color-fg-2)] truncate"
+                      title={g.last_activity}
+                    >
+                      {g.last_activity}
+                    </span>
+                  </div>
+                )}
+
+                <p className="font-data text-[10px] text-[var(--color-fg-dim)] pt-1 border-t border-[var(--color-border)]">
+                  runs as a kanban worker — chat stays free.{" "}
+                  <code className="text-[var(--color-fg-2)]">
+                    vexis-kanban show {g.id}
+                  </code>{" "}
+                  for full run detail.
+                </p>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+    </Section>
   );
 }
 

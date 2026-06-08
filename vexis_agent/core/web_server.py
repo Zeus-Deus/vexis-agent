@@ -2938,13 +2938,19 @@ class WebDashboard:
             return None
 
     def _goals_payload(self) -> dict:
-        """``{active, history}`` for the dashboard.
+        """``{active, history, background}`` for the dashboard.
 
-        ``active`` is the goal record for the current session UUID
-        (only when its status is ``"active"`` or ``"paused"`` — done
+        ``active`` is the FOREGROUND goal record for the current session
+        UUID (only when its status is ``"active"`` or ``"paused"`` — done
         and cleared records appear in history instead). ``history``
-        is the most recent 20 non-active records sorted by
+        is the most recent 20 non-active foreground records sorted by
         ``last_turn_at`` desc.
+
+        ``background`` is the live list of BACKGROUND goals — kanban
+        tasks filed via ``/goal <text>`` (the v0.11 default). These live
+        in the kanban store, not ``goals.json``, so without this the
+        dashboard was blind to every background goal. Empty list when
+        kanban is unavailable or no background goal is in flight.
         """
         store = self._goals_store()
         active_record: dict | None = None
@@ -2968,7 +2974,27 @@ class WebDashboard:
                 self._goal_record_dict(sid, state)
                 for sid, state in history_pairs
             ],
+            "background": self._background_goals_payload(),
         }
+
+    def _background_goals_payload(self) -> list[dict]:
+        """Structured background (kanban) goals for the goals payload.
+
+        Reads the attached kanban store via the canonical projection in
+        ``core.goal_background``. Fails soft (``[]``) when kanban is
+        disabled/unattached or any store read raises, so a kanban hiccup
+        never 500s the goals endpoint."""
+        kanban = getattr(self, "_kanban_store", None)
+        if kanban is None:
+            return []
+        try:
+            from vexis_agent.core.goal_background import (
+                background_goals_payload,
+            )
+            return background_goals_payload(kanban)
+        except Exception:
+            log.debug("goals: background payload read failed", exc_info=True)
+            return []
 
     def _models_payload(self) -> dict:
         """Day 3 of model UX — read-only resolution table for the
