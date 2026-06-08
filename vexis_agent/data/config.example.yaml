@@ -31,7 +31,9 @@ brain:
 # Every core subsystem is independently switchable, default-on. A
 # config that omits all of these behaves exactly like before. Compose a
 # headless / web-only deployment by turning off what you don't use —
-# there is NO shipped preset. (curator.enabled, learning.enabled,
+# there is NO shipped preset (but `vexis-agent setup --web-only` writes
+# the transports.telegram:false config for you, unattended; see issue
+# #40 in docs/modular-subsystems.md). (curator.enabled, learning.enabled,
 # goals.enabled, schedules.enabled, kanban.enabled are the other half of
 # the gate set, in their own sections below.)
 #

@@ -87,7 +87,17 @@ def check_secrets() -> CheckResult:
     """``TELEGRAM_BOT_TOKEN`` and ``TELEGRAM_ALLOWED_USER_ID`` reachable
     via env or ``$VEXIS_HOME/.env``. We don't actually load .env here
     (avoid a side-effect on the parent shell); we just confirm that
-    one of the two surfaces has a value."""
+    one of the two surfaces has a value.
+
+    Headless / web-only deploys (issue #40) disable the Telegram
+    transport (``transports.telegram: false``). With no bot to run,
+    the secrets aren't required, so absent secrets are a clean pass
+    rather than a hard fail — this is what lets a headless container
+    pass ``vexis-agent doctor``. We consult the same
+    ``transport_telegram_enabled`` gate ``main._run`` uses so doctor
+    agrees with what ``run`` will actually do."""
+    from vexis_agent.core.yaml_config import transport_telegram_enabled
+
     env_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     env_user = os.environ.get("TELEGRAM_ALLOWED_USER_ID")
 
@@ -115,16 +125,29 @@ def check_secrets() -> CheckResult:
 
     if has_token and has_user:
         return CheckResult("Telegram secrets set", Status.OK)
+
     missing = []
     if not has_token:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not has_user:
         missing.append("TELEGRAM_ALLOWED_USER_ID")
+
+    # Telegram transport disabled (headless / web-only): the secrets are
+    # not required, so missing is expected — pass cleanly.
+    if not transport_telegram_enabled():
+        return CheckResult(
+            "Telegram secrets set",
+            Status.OK,
+            "not required (transports.telegram disabled — headless)",
+        )
+
     return CheckResult(
         "Telegram secrets set",
         Status.FAIL,
         f"missing: {', '.join(missing)}",
-        f"Add the missing key(s) to {dotenv} or export them in your shell.",
+        f"Add the missing key(s) to {dotenv} or export them in your shell. "
+        f"Running headless? Disable the Telegram transport "
+        f"(transports.telegram: false, or 'vexis-agent setup --web-only').",
     )
 
 
