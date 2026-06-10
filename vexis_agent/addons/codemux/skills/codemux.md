@@ -20,6 +20,11 @@ in Telegram for status.
 - **Register agents you care about.** The watcher is opt-in per
   workspace — un-watched workspaces don't ping. Aim for "register
   when I start a long task, unregister when done."
+- **Register BEFORE you tell the user it's running.** Registration is
+  also visibility: watched workspaces show up in `/tasks`, `/status`,
+  and on the dashboard. An unregistered delegation is invisible —
+  `/tasks` will tell the user "nothing running" while your delegate
+  works. Pass `--goal` so the listing says what it's doing.
 - **Use the workspace_id, not the session_id.** `vexis-watch
   register --workspace <id>` resolves the active terminal pane
   automatically. You don't need to chase the session id yourself.

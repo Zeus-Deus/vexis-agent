@@ -715,6 +715,11 @@ async def _run() -> bool:
         # WS /api/v1/kanban/events return 503 until the store lands.
         if kanban_store is not None:
             dashboard.attach_kanban_store(kanban_store)
+        # And for the watcher — the status payload's ``watched_agents``
+        # stays [] until attached, so a watcher-disabled deployment
+        # renders identically to "nothing watched".
+        if watcher is not None:
+            dashboard.attach_watcher(watcher)
     else:
         log.info("web: dashboard disabled via config (transports.web=false)")
 

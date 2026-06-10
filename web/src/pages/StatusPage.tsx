@@ -5,6 +5,7 @@ import type {
   ForegroundChat,
   LogLine,
   StatusState,
+  WatchedAgentSummary,
 } from "../lib/types";
 import { classNames, relativeTime, uptime } from "../lib/format";
 import { Badge } from "../components/Badge";
@@ -100,6 +101,19 @@ export function StatusPage({ token, onAuthFail }: StatusPageProps) {
           )}
         </Section>
       </div>
+
+      {(state.watched_agents ?? []).length > 0 && (
+        <Section
+          title="Watched workspaces"
+          trailing={`${(state.watched_agents ?? []).length} watched`}
+        >
+          <ul className="space-y-2">
+            {(state.watched_agents ?? []).map((agent, i) => (
+              <WatchedCard key={agent.name} agent={agent} delay={i * 30} />
+            ))}
+          </ul>
+        </Section>
+      )}
 
       <LogStream lines={state.log_lines} />
     </div>
@@ -271,6 +285,68 @@ function BackgroundStatus({
       return (
         <Badge tone="error" glyph="✕">
           failed{exitCode !== null && ` ${exitCode}`}
+        </Badge>
+      );
+  }
+}
+
+function WatchedCard({
+  agent,
+  delay,
+}: {
+  agent: WatchedAgentSummary;
+  delay: number;
+}) {
+  return (
+    <Card delay={delay}>
+      <div className="px-4 py-3">
+        <div className="flex items-baseline gap-3 flex-wrap">
+          <span className="font-data text-[12.5px] text-[var(--color-fg)]">
+            {agent.name}
+          </span>
+          <WatchedStatus status={agent.status} />
+          {agent.muted && <Badge tone="stale">muted</Badge>}
+          <span className="font-data text-[11px] text-[var(--color-fg-dim)]">
+            {agent.agent_kind}
+            {agent.workspace_id && ` · ${agent.workspace_id}`}
+          </span>
+          <span className="ml-auto font-data text-[11px] text-[var(--color-fg-dim)]">
+            {agent.state} {agent.elapsed}
+          </span>
+        </div>
+        {agent.goal_hint && (
+          <p className="mt-1 font-data text-[10.5px] text-[var(--color-fg-2)] truncate">
+            {agent.goal_hint}
+          </p>
+        )}
+        {agent.last_line && (
+          <p className="mt-1 font-data text-[10.5px] text-[var(--color-fg-dim)] truncate">
+            {agent.last_line}
+          </p>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+function WatchedStatus({ status }: { status: WatchedAgentSummary["status"] }) {
+  switch (status) {
+    case "running":
+      return (
+        <Badge tone="active" glyph="●">
+          running
+        </Badge>
+      );
+    case "idle":
+      return (
+        <Badge tone="subtle" glyph="○">
+          quiet
+        </Badge>
+      );
+    case "dead":
+      return (
+        <Badge tone="error" glyph="✕">
+          gone
         </Badge>
       );
   }

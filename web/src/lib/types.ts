@@ -159,6 +159,26 @@ export interface LogLine {
   message: string;
 }
 
+// Watcher-tracked workspace delegation (codemux et al.) — the work the
+// brain hands to a terminal-attached agent and enrols via
+// `vexis-watch register`. Shape mirrors core/watcher/views.py
+// watched_work_payload().
+export interface WatchedAgentSummary {
+  name: string;
+  source_type: string;
+  workspace_id: string | null;
+  agent_kind: string;
+  status: "running" | "idle" | "dead";
+  state: string;
+  muted: boolean;
+  goal_hint: string | null;
+  registered_at: string;
+  last_output_at: string | null;
+  last_line: string | null;
+  elapsed: string;
+  elapsed_seconds: number | null;
+}
+
 export interface StatusState {
   started_at: string;
   uptime_seconds: number;
@@ -167,6 +187,9 @@ export interface StatusState {
   sessions: SessionInfo[];
   foreground_chats: ForegroundChat[];
   background_tasks: BackgroundTaskSummary[];
+  // Optional on the wire so the dashboard keeps rendering status
+  // snapshots from daemons that predate watcher visibility.
+  watched_agents?: WatchedAgentSummary[];
   log_lines: LogLine[];
 }
 
