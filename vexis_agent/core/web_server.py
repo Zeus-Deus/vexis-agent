@@ -63,6 +63,7 @@ from vexis_agent.core.paths import (
 )
 from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.core.sessions import SessionStore
+from vexis_agent.core.watcher.views import watched_work_payload
 from vexis_agent.core.skill_history import list_versions, read_version
 from vexis_agent.core.skills import (
     _find_skill_dir,
@@ -374,6 +375,11 @@ class WebDashboard:
         # ws://api/v1/kanban/events endpoints become live. Returns
         # 503 until attached.
         self._kanban_store: object | None = None
+        # Watcher — same late-attach pattern. ``attach_watcher`` wires
+        # the WatcherController so the status payload's
+        # ``watched_agents`` list is live; until attached (or when the
+        # watcher subsystem is disabled) the list is simply empty.
+        self._watcher: object | None = None
         # Day 5 of model UX: the dashboard payload's
         # check_brain_kind_consistency canary needs to know what
         # brain class the daemon actually instantiated. main.py
@@ -2618,6 +2624,12 @@ class WebDashboard:
             ],
             "foreground_chats": fg,
             "background_tasks": bg,
+            # Watcher-tracked workspace delegations (codemux et al.).
+            # Without this the dashboard mirrored the old /tasks bug:
+            # "nothing running" while a watched delegation was
+            # mid-flight. Empty list when the watcher is disabled,
+            # unattached, or has nothing registered.
+            "watched_agents": watched_work_payload(self._watcher),  # type: ignore[arg-type]
             "log_lines": log_lines,
         }
 
@@ -2793,6 +2805,16 @@ class WebDashboard:
         endpoints (and the WS events stream) return 503 until this
         is called."""
         self._kanban_store = store
+
+    def attach_watcher(self, watcher) -> None:
+        """Late-attach the WatcherController from main.py.
+
+        Kept off the constructor signature so existing call sites
+        (tests, alternative wirings) don't break. Until attached the
+        status payload's ``watched_agents`` is ``[]`` — same shape as
+        a live watcher with nothing registered, so the frontend needs
+        no attached/absent distinction."""
+        self._watcher = watcher
 
     def _schedule_record_dict(self, state) -> dict:
         """Serialize a ScheduleState to the dashboard JSON shape."""

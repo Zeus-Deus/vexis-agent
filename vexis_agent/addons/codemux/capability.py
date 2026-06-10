@@ -48,6 +48,13 @@ can send back: `tail <name>` (last 20 lines), `peek <name>` (asks
 Vexis to summarise), `mute <name>` / `unmute <name>`, `unwatch
 <name>`. `/codemux` lists all watched workspaces.
 
+Registering does double duty: the idle ping AND visibility. A watched
+workspace appears in the user's `/tasks` and `/status` replies and on
+the dashboard status page. An unregistered delegation is invisible
+everywhere — the user runs `/tasks` and reads "nothing running" while
+your delegate is mid-flight. Register first, then tell the user the
+work is running; pass `--goal` so the listing says what it's doing.
+
 If you start a fresh session and the system prompt says "Active
 Codemux work: N workspaces — run 'vexis-watch status' for details.",
 that's the lead — call `vexis-watch status` before answering

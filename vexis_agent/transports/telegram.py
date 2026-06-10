@@ -2393,6 +2393,16 @@ class TelegramTransport:
         loop.call_soon(self._shutdown_event.set)
 
     async def _on_tasks(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """One-stop "what's working in the background?" reply.
+
+        Composes ALL the work registries — vexis-bg tasks, kanban-backed
+        background goals, and watcher-tracked workspace delegations — so
+        the reply can never claim "No background tasks running." while
+        another registry has live work. Pre-fix this read only the
+        vexis-bg registry, which made autonomous brain delegations
+        (codemux + `vexis-watch register`) invisible here even though
+        the watcher was actively tracking them.
+        """
         msg = update.message
         user = update.effective_user
         if msg is None or user is None:
@@ -2401,7 +2411,16 @@ class TelegramTransport:
             log.warning("Rejected /tasks from user_id=%s", user.id)
             return
         summary = await self._background_tasks.status_summary()
-        await msg.reply_text(_format_tasks(summary))
+        sections: list[str] = []
+        if summary:
+            sections.append(_format_tasks(summary))
+        bg_goals = self._background_goals_status()
+        if bg_goals:
+            sections.append(bg_goals)
+        watched = self._watched_work_status()
+        if watched:
+            sections.append(watched)
+        await msg.reply_text("\n\n".join(sections) if sections else _NO_BG_TASKS)
 
     async def _on_status(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Read-only window into the running brain.
@@ -2415,7 +2434,10 @@ class TelegramTransport:
         When a goal exists for the current session UUID and goals are
         enabled, appends a one-line goal summary so the user can see
         whether the loop is active without typing /goal status
-        separately.
+        separately. Background goals (kanban) and watcher-tracked
+        workspace delegations append their own blocks the same way —
+        "Nothing running, sir." refers strictly to the foreground
+        chat; any live background work is listed right below it.
         """
         msg = update.message
         user = update.effective_user
@@ -2437,6 +2459,9 @@ class TelegramTransport:
         bg_goals = self._background_goals_status()
         if bg_goals:
             reply = f"{reply}\n{bg_goals}"
+        watched = self._watched_work_status()
+        if watched:
+            reply = f"{reply}\n{watched}"
         await msg.reply_text(reply)
 
     def _goal_status_line(self) -> str | None:
@@ -2581,6 +2606,21 @@ class TelegramTransport:
             return render_background_goals_status(store)
         except Exception:
             log.debug("background-goal status read failed", exc_info=True)
+            return None
+
+    def _watched_work_status(self) -> str | None:
+        """Render watcher-tracked workspace delegations for /tasks and
+        /status, or None when the watcher is disabled or empty.
+        Read-only; safe mid-drain. Mirrors ``_background_goals_status``
+        so the two background registries compose identically."""
+        watcher = getattr(self, "_watcher", None)
+        if watcher is None:
+            return None
+        try:
+            from vexis_agent.core.watcher.views import render_watched_status
+            return render_watched_status(watcher)
+        except Exception:
+            log.debug("watched-work status read failed", exc_info=True)
             return None
 
     def _build_goal_manager(self, session_uuid: str):

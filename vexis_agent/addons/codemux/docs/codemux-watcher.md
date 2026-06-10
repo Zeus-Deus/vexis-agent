@@ -122,6 +122,20 @@ slash command all work unchanged.
   state changes but the notify path is short-circuited until
   `vexis-watch unmute <name>` re-arms it.
 
+## Visibility on the generic status surfaces
+
+Registration is not just the idle ping — it is what makes a
+delegation *visible*. Watched agents are rendered by
+`core/watcher/views.py` and composed into:
+
+- Telegram `/tasks` and `/status` (the `👁 Watched workspaces:` block),
+- the dashboard status page (`watched_agents` in `/api/v1/status`).
+
+See `docs/active-work-visibility.md` for the full contract. The
+historical bug this closes: the brain delegated to a workspace,
+truthfully said "still working", and `/tasks` replied "No background
+tasks running." because only the vexis-bg registry was consulted.
+
 ## Inline reply commands
 
 Telegram-side commands recognised when their second token matches a
