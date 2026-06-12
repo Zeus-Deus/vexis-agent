@@ -241,7 +241,7 @@ assignment are first-class UX surfaces; YAML-edit-and-restart
 still supported but no longer required.
 
 **Pointers:** `docs/brains.md` · `docs/migration.md` ·
-`docs/model-ux.md` · `docs/dogfood-checklist.md`.
+`docs/model-ux.md` · `docs/dogfood-checklist.md` · `docs/memory-isolation.md` (per-subagent memory scopes; `brain.subprocess_memory_max`).
 
 ## Conversation compression
 

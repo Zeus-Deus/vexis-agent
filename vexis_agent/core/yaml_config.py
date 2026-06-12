@@ -25,6 +25,18 @@ Canonical schema reference (every block is optional; missing file
                                   # snapshot walk is too slow (~50 ms
                                   # for 10k files). Hot-reloaded — no
                                   # daemon restart.
+      subprocess_memory_max: 2G   # Per-subagent memory cap. Every
+                                  # "claude -p" spawn (foreground turn +
+                                  # aux subsystems) runs inside its own
+                                  # "systemd-run --scope" with this
+                                  # MemoryMax, so a runaway tool OOM-kills
+                                  # inside its own scope instead of
+                                  # throttle-freezing the whole bot (the
+                                  # 2026-06-12 freeze). Accepts any
+                                  # systemd byte suffix (M/G). Set to
+                                  # "none"/0 to disable scoping; no-ops
+                                  # automatically when systemd-run is
+                                  # absent. Hot-reloaded per turn.
 
     # ── memory limits ───────────────────────────────────────────
     memory:
@@ -1189,6 +1201,45 @@ def brain_file_mutation_footer_enabled() -> bool:
         if cleaned in ("false", "no", "0", "off"):
             return False
     return _FILE_MUTATION_FOOTER_DEFAULT
+
+
+# Default per-subagent memory cap (2026-06-12 freeze fix). Every
+# ``claude -p`` spawn runs inside a ``systemd-run --scope`` carrying
+# this ``MemoryMax`` so a runaway tool dies in its own scope rather
+# than throttle-freezing the shared bot cgroup. 2G leaves headroom
+# for Playwright/Chromium and normal builds on the 7.5 GB home box
+# while still killing the pathological multi-GB grep that triggered
+# the incident. See docs/memory-isolation.md.
+_SUBPROCESS_MEMORY_MAX_DEFAULT = "2G"
+
+
+def brain_subprocess_memory_max() -> str | None:
+    """Read ``brain.subprocess_memory_max`` from ``~/.vexis/config.yaml``.
+
+    Returns a systemd memory-size string (e.g. ``"2G"``) or ``None``
+    when scoping is disabled. ``None``/``"none"``/``"0"``/empty all
+    disable. Reads disk per call so a change takes effect on the next
+    brain spawn without a daemon restart — same hot-reload posture as
+    :func:`brain_file_mutation_footer_enabled`. Anything unparseable
+    falls back to the default rather than erroring: a config typo must
+    never wedge the brain (and ``wrap_with_memory_scope`` no-ops anyway
+    when ``systemd-run`` is absent).
+    """
+    raw = _section("brain").get(
+        "subprocess_memory_max", _SUBPROCESS_MEMORY_MAX_DEFAULT,
+    )
+    # Explicit disable: None, or a string/number that reads as off/zero.
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return None if raw == 0 else f"{int(raw)}"
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        if cleaned.lower() in ("none", "off", "no", "disabled", "0", ""):
+            return None
+        return cleaned
+    # Unexpected type → fall back to the safe default.
+    return _SUBPROCESS_MEMORY_MAX_DEFAULT
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -71,6 +71,7 @@ from vexis_agent.core.workspace_snapshot import (
     diff as _snapshot_diff,
     snapshot as _take_snapshot,
 )
+from vexis_agent.core.brain._memory_scope import wrap_with_memory_scope
 from vexis_agent.core.yaml_config import brain_file_mutation_footer_enabled
 
 # Re-export the exception types so existing import sites
@@ -708,9 +709,17 @@ class ClaudeCodeBrain(Brain):
         final_text = ""
         assistant_text = ""
         stderr_bytes = b""
+        # Per-subagent memory isolation (2026-06-12 freeze fix): run the
+        # brain (and its whole tool subtree) in its own memory-capped
+        # systemd scope so a runaway tool OOMs in isolation instead of
+        # throttle-freezing the shared bot cgroup. No-ops when disabled
+        # or systemd-run is absent. start_new_session below keeps the
+        # process group intact so _kill_group's killpg still reaches the
+        # real claude through the scope wrapper.
+        spawn_argv = wrap_with_memory_scope(argv)
         try:
             proc = await asyncio.create_subprocess_exec(
-                *argv,
+                *spawn_argv,
                 cwd=str(self._workspace),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -958,9 +967,12 @@ class ClaudeCodeBrain(Brain):
         assistant_text_parts: list[str] = []
         stderr_bytes = b""
         proc: asyncio.subprocess.Process | None = None
+        # Same per-subagent memory scoping as _attempt_respond — see the
+        # rationale there. Wrap before spawn; no-op when disabled/absent.
+        spawn_argv = wrap_with_memory_scope(argv)
         try:
             proc = await asyncio.create_subprocess_exec(
-                *argv,
+                *spawn_argv,
                 cwd=str(self._workspace),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -1269,10 +1281,17 @@ class ClaudeCodeBrain(Brain):
 
         workdir = str(cwd if cwd is not None else self._workspace)
 
+        # Per-subagent memory isolation (2026-06-12 freeze fix), same as
+        # the foreground spawns: aux subsystems (curators, judges, kanban
+        # workers) get their own memory-capped scope too. Verified that
+        # subprocess.run's timeout (which SIGKILLs the systemd-run client)
+        # still tears the scoped claude down — no orphan on BrainTimeout.
+        scoped_argv = wrap_with_memory_scope(argv)
+
         def _run() -> AuxResult:
             try:
                 cp = subprocess.run(
-                    argv,
+                    scoped_argv,
                     env=env,
                     cwd=workdir,
                     stdout=subprocess.PIPE,
