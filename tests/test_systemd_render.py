@@ -165,3 +165,104 @@ def test_install_user_unit_writes_file_and_returns_path(
     body = written.read_text(encoding="utf-8")
     assert "ExecStart=/foo/python -m vexis_agent.cli run" in body
     assert f"Environment=VEXIS_HOME={tmp_path / 'fakehome'}" in body
+
+
+# ──────────────────────────────────────────────────────────────────
+# Memory isolation: aggregate-cap slice + Slice= membership
+# (2026-06-12 freeze fix — see docs/memory-isolation.md)
+# ──────────────────────────────────────────────────────────────────
+
+
+def _has_directive(body: str, key: str) -> bool:
+    """True if any non-comment line sets ``key=``. Avoids matching a
+    comment that merely mentions the directive (e.g. '# No MemoryHigh')."""
+    return any(
+        line.strip().startswith(f"{key}=")
+        for line in body.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+
+def test_render_user_slice_caps_memory_without_high() -> None:
+    """The slice carries a HARD cap only. MemoryHigh is a *throttle*
+    threshold — it's what parked the whole shared cgroup (bot included)
+    in uninterruptible sleep on 2026-06-12. A hard MemoryMax instead
+    OOM-kills the single biggest offender and leaves the bot running."""
+    body = systemd.render_user_slice()
+    assert "[Slice]" in body
+    assert _has_directive(body, "MemoryMax"), "slice must set a hard MemoryMax"
+    assert not _has_directive(body, "MemoryHigh"), (
+        "slice must NOT set MemoryHigh — that throttle is the freeze bug"
+    )
+
+
+def test_render_user_unit_runs_under_slice() -> None:
+    """The bot service joins the slice so the slice's aggregate cap
+    bounds the bot + all per-subagent scopes together. The service
+    itself carries no memory limit (the slice owns host protection)."""
+    unit = systemd.render_user_unit(python_path="/x/py", vexis_home="/y")
+    assert f"Slice={systemd.SLICE_NAME}" in unit
+    assert not _has_directive(unit, "MemoryHigh")
+    assert not _has_directive(unit, "MemoryMax"), (
+        "the service should not self-limit; the slice owns the cap"
+    )
+
+
+def _stub_systemctl(tmp_path, monkeypatch) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    (fake_bin / "systemctl").write_text("#!/bin/sh\nexit 0\n")
+    (fake_bin / "systemctl").chmod(0o755)
+    import os
+
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+
+
+def test_install_writes_slice_unit(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    _stub_systemctl(tmp_path, monkeypatch)
+
+    systemd.install_user_unit(
+        python_path=Path("/foo/python"), vexis_home=tmp_path / "fakehome"
+    )
+    slice_path = tmp_path / "cfg" / "systemd" / "user" / systemd.SLICE_NAME
+    assert slice_path.exists(), "install must write the vexis-agent.slice unit"
+    assert "[Slice]" in slice_path.read_text(encoding="utf-8")
+
+
+def test_install_removes_legacy_memory_dropin(tmp_path, monkeypatch) -> None:
+    """The hand-rolled 50-memory-limit.conf drop-in (its MemoryHigh
+    caused the freeze) must be removed on install so the shipped slice
+    policy is authoritative — but unrelated drop-ins are left alone."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    _stub_systemctl(tmp_path, monkeypatch)
+
+    dropin_dir = (
+        tmp_path / "cfg" / "systemd" / "user" / f"{systemd.UNIT_FILENAME}.d"
+    )
+    dropin_dir.mkdir(parents=True)
+    legacy = dropin_dir / "50-memory-limit.conf"
+    legacy.write_text("[Service]\nMemoryHigh=2560M\n", encoding="utf-8")
+    other = dropin_dir / "99-user-tweak.conf"
+    other.write_text("[Service]\nNice=5\n", encoding="utf-8")
+
+    systemd.install_user_unit(
+        python_path=Path("/foo/python"), vexis_home=tmp_path / "fakehome"
+    )
+
+    assert not legacy.exists(), "legacy MemoryHigh drop-in must be removed"
+    assert other.exists(), "unrelated user drop-ins must be preserved"
+
+
+def test_uninstall_removes_slice_unit(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    _stub_systemctl(tmp_path, monkeypatch)
+
+    systemd.install_user_unit(
+        python_path=Path("/foo/python"), vexis_home=tmp_path / "fakehome"
+    )
+    slice_path = tmp_path / "cfg" / "systemd" / "user" / systemd.SLICE_NAME
+    assert slice_path.exists()
+
+    systemd.uninstall_user_unit()
+    assert not slice_path.exists(), "uninstall must remove the slice unit"

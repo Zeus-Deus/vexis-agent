@@ -11,7 +11,8 @@ Decision D6 in ``.plans/packaging-implementation-plan.md`` §2.
 Public API:
 
   render_user_unit(...)   → str  — pure renderer, used by tests too
-  install_user_unit(...)  → Path — writes + daemon-reloads
+  render_user_slice(...)  → str  — pure renderer for vexis-agent.slice
+  install_user_unit(...)  → Path — writes unit + slice, daemon-reloads
   uninstall_user_unit()   → bool — stops, disables, removes, reloads
 
 Functions that shell out (install / uninstall / start / stop / status /
@@ -34,6 +35,32 @@ SERVICE_NAME = "vexis-agent"
 UNIT_FILENAME = f"{SERVICE_NAME}.service"
 DESCRIPTION = "vexis-agent — Telegram bot + agent CLI bridge"
 
+# Aggregate memory blast-radius cap for the bot + every subagent scope
+# (2026-06-12 freeze fix). The bot service and each per-subagent
+# ``systemd-run --scope`` both live under this slice, so its MemoryMax
+# bounds their *combined* footprint for host protection while each scope
+# still self-limits. Deliberately NO MemoryHigh anywhere — a hard cap
+# OOM-kills the single biggest offender (a runaway tool) instead of
+# throttle-freezing the whole cgroup, which is exactly the bug that froze
+# the bot. See docs/memory-isolation.md.
+#
+# SLICE_NAME must equal ``core.brain._memory_scope.VEXIS_SLICE`` (the
+# value the scope wrapper passes to ``--slice``); the equality is
+# drift-guarded by tests/test_memory_scope.py. Defined independently here
+# rather than imported to keep this module free of the heavy brain
+# package import.
+SLICE_NAME = "vexis-agent.slice"
+SLICE_DESCRIPTION = "vexis-agent — bot + subagent scopes (aggregate memory cap)"
+# 5G on the 7.5 GB home box leaves ~2.5 GB for the docker AI stack + OS.
+# Tune here (or override per-machine by editing the installed slice file).
+SLICE_MEMORY_MAX = "5G"
+SLICE_MEMORY_SWAP_MAX = "1G"
+
+# Legacy hand-rolled drop-in (added 2026-06-09, superseded 2026-06-12).
+# Its ``MemoryHigh`` is what throttle-froze the bot; the installer removes
+# it so the shipped slice policy is authoritative.
+_LEGACY_MEMORY_DROPIN = "50-memory-limit.conf"
+
 
 def user_unit_dir() -> Path:
     """``~/.config/systemd/user`` (or ``$XDG_CONFIG_HOME/systemd/user``)."""
@@ -45,6 +72,11 @@ def user_unit_dir() -> Path:
 def user_unit_path() -> Path:
     """Full path to the installed user unit file."""
     return user_unit_dir() / UNIT_FILENAME
+
+
+def slice_unit_path() -> Path:
+    """Full path to the installed ``vexis-agent.slice`` unit file."""
+    return user_unit_dir() / SLICE_NAME
 
 
 def render_user_unit(
@@ -76,6 +108,12 @@ def render_user_unit(
         "\n"
         "[Service]\n"
         "Type=simple\n"
+        # Run the bot under the shared slice so its aggregate MemoryMax
+        # bounds the bot + all per-subagent scopes together. No memory
+        # limit on the service itself: the slice owns host protection and
+        # the bot's own RSS is tiny. Changing Slice= needs a service
+        # *restart* (not just daemon-reload) to take effect.
+        f"Slice={SLICE_NAME}\n"
         f"ExecStart={python} -m vexis_agent.cli run\n"
         f"WorkingDirectory={home}\n"
         f"Environment=VEXIS_HOME={home}\n"
@@ -111,6 +149,58 @@ def render_user_unit(
     )
 
 
+def render_user_slice(
+    *,
+    description: str = SLICE_DESCRIPTION,
+    memory_max: str = SLICE_MEMORY_MAX,
+    memory_swap_max: str = SLICE_MEMORY_SWAP_MAX,
+) -> str:
+    """Render the ``vexis-agent.slice`` body (aggregate memory cap).
+
+    Pure function — no side effects, used by tests too. Carries only a
+    hard ``MemoryMax`` (+ swap cap), never ``MemoryHigh``: the 2026-06-12
+    freeze was a ``memory.high`` throttle that parked every task in the
+    shared cgroup in uninterruptible sleep. A hard cap instead OOM-kills
+    the single biggest offender — a runaway subagent tool — and leaves
+    the bot running. See docs/memory-isolation.md.
+    """
+    return (
+        "[Unit]\n"
+        f"Description={description}\n"
+        "\n"
+        "[Slice]\n"
+        "# No MemoryHigh on purpose — see module docstring / the\n"
+        "# 2026-06-12 freeze. Hard cap OOM-kills the offender instead\n"
+        "# of throttle-freezing the whole cgroup.\n"
+        f"MemoryMax={memory_max}\n"
+        f"MemorySwapMax={memory_swap_max}\n"
+    )
+
+
+def _remove_legacy_memory_dropin() -> None:
+    """Delete the superseded hand-rolled ``50-memory-limit.conf`` drop-in.
+
+    Best-effort: its ``MemoryHigh`` would re-introduce the throttle-freeze
+    on top of the shipped slice policy. Only removes the one file we know
+    about (leaving any other user drop-ins untouched) and prunes the
+    ``.service.d`` dir if it ends up empty.
+    """
+    dropin = user_unit_dir() / f"{UNIT_FILENAME}.d" / _LEGACY_MEMORY_DROPIN
+    if not dropin.exists():
+        return
+    try:
+        dropin.unlink()
+        log.info(
+            "Removed legacy memory drop-in %s (superseded by %s)",
+            dropin, SLICE_NAME,
+        )
+        parent = dropin.parent
+        if parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError as exc:
+        log.warning("Could not remove legacy drop-in %s: %s", dropin, exc)
+
+
 def install_user_unit(
     *,
     python_path: Path | str | None = None,
@@ -136,6 +226,15 @@ def install_user_unit(
     unit_dir.mkdir(parents=True, exist_ok=True)
     target = user_unit_path()
     target.write_text(body, encoding="utf-8")
+
+    # Ship the aggregate-cap slice the unit's Slice= references and the
+    # per-subagent scopes nest under. Written every install so policy
+    # tweaks (cap sizes) ship with upgrades.
+    slice_unit_path().write_text(render_user_slice(), encoding="utf-8")
+
+    # Drop the superseded hand-rolled drop-in so its MemoryHigh can't
+    # re-introduce the throttle-freeze on top of the new slice policy.
+    _remove_legacy_memory_dropin()
 
     # daemon-reload tells systemd to re-scan unit files. Without it,
     # "systemctl --user start" can race against a stale view of the
@@ -166,6 +265,15 @@ def uninstall_user_unit() -> bool:
 
     if existed:
         target.unlink()
+
+    # Remove the slice unit too (best-effort) so uninstall leaves no
+    # orphaned vexis-agent.slice behind.
+    slice_target = slice_unit_path()
+    if slice_target.exists():
+        try:
+            slice_target.unlink()
+        except OSError as exc:
+            log.warning("Could not remove slice unit %s: %s", slice_target, exc)
 
     _systemctl(["daemon-reload"], check=False)
     return existed

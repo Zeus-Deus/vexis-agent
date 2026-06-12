@@ -365,6 +365,15 @@ def test_claude_code_spawn_aux_argv_shape_with_tier(
         return _FakeCP()
 
     monkeypatch.setattr("vexis_agent.core.brain.claude_code.subprocess.run", _fake_run)
+    # Per-subagent memory scoping (docs/memory-isolation.md) prepends a
+    # `systemd-run --scope … --` wrapper to argv on hosts that have
+    # systemd-run (e.g. CI runners). This test pins the *claude* argv
+    # composition, which is orthogonal to scoping, so neutralise the
+    # wrapper here to keep the assertion deterministic across environments.
+    monkeypatch.setattr(
+        "vexis_agent.core.brain.claude_code.wrap_with_memory_scope",
+        lambda argv: argv,
+    )
     result = asyncio.run(
         claude_brain.spawn_aux(
             "test prompt",
