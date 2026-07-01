@@ -45,6 +45,50 @@ log = logging.getLogger(__name__)
 _SWEEP_INTERVAL_SECONDS = 30.0
 
 
+class _CloudflareNoiseFilter(logging.Filter):
+    """Suppresses scrapling's spurious ``No Cloudflare challenge found.`` ERROR.
+
+    scrapling logs that line at ERROR from ``_cloudflare_solver`` whenever the
+    solver runs on a page with no challenge (issue #45) — a normal outcome it
+    misclassifies as an error. ``SessionManager.solve_cloudflare`` now gates
+    the solver behind a challenge pre-check, so in the normal flow the solver
+    never runs on an unchallenged page; this filter closes the residual gaps —
+    a challenge that clears between the pre-check and the solver's own
+    re-detection, plus any future non-gated solver call — so the line can never
+    spam the journal and bury real errors. Every other scrapling record passes
+    untouched.
+    """
+
+    _NEEDLE = "No Cloudflare challenge found."
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            # A malformed record elsewhere must not take down logging.
+            return True
+        # Drop (return False), don't merely downgrade the level: scrapling's
+        # own handler emits at NOTSET, so a level-downgraded record would still
+        # print. Dropping is what actually silences it.
+        return self._NEEDLE not in message
+
+
+def _silence_cloudflare_noise() -> None:
+    """Attach :class:`_CloudflareNoiseFilter` to the ``scrapling`` logger.
+
+    Logger-level, not handler-level: scrapling emits the line directly on the
+    ``scrapling`` logger (not a descendant), so one filter there drops it
+    before any handler and before it propagates to root — unlike the "Typed"
+    redaction, which must go on handlers because those records come from
+    descendant loggers. Idempotent: skips if the filter is already attached, so
+    it is safe on every session start and self-heals if scrapling reconfigures
+    its logger.
+    """
+    logger = logging.getLogger("scrapling")
+    if not any(isinstance(f, _CloudflareNoiseFilter) for f in logger.filters):
+        logger.addFilter(_CloudflareNoiseFilter())
+
+
 class SessionManager:
     """Owns the live Camoufox session + persistent page (or None when idle)."""
 
@@ -100,6 +144,9 @@ class SessionManager:
                 # password typed during an agent-driven login never lands in
                 # the journal, surviving idle-recycle.
                 redact_sensitive_logs("scrapling")
+                # Drop scrapling's spurious "No Cloudflare challenge found."
+                # ERROR (issue #45) — a normal outcome it logs as an error.
+                _silence_cloudflare_noise()
                 self._session = session
                 self._page = None
                 self._started_at_wall = datetime.now(timezone.utc)
@@ -152,16 +199,56 @@ class SessionManager:
             log.debug("[browser] page-stability wait capped at %ss: %s", budget, exc)
 
     async def solve_cloudflare(self, page: Any) -> None:
-        """Run scrapling's Cloudflare solver against ``page`` (best-effort).
+        """Run scrapling's Cloudflare solver against ``page`` — but only when a
+        challenge is actually present (issue #45).
 
-        Same solver ``StealthySession.fetch`` invokes; no-ops when no
-        challenge is present. Wrapped here so the scrapling-private call
-        lives in one place.
+        scrapling's ``_cloudflare_solver`` unconditionally waits up to 5s for
+        network-idle and then treats "no challenge" as an ``ERROR`` — so on a
+        browsing-heavy daemon the common case (a page with no challenge) pays
+        ~5s and emits a spurious ``ERROR: No Cloudflare challenge found.`` on
+        nearly every navigation. We gate it: the caller already ran
+        ``wait_stable`` (load + domcontentloaded + network-idle) before us, so
+        the page is settled and any challenge is already in its content. We run
+        scrapling's *own* ``_detect_cloudflare`` classifier on that content —
+        the same one the solver uses, so our skip-decision agrees with what the
+        solver would find — and invoke the full solver only when it detects a
+        challenge. No challenge → return immediately, paying neither the wait
+        nor the ERROR. A genuinely challenged page still gets the full solve.
+
+        Wrapped here so the scrapling-private calls live in one place.
         """
         if self._session is None:
             return
+        if not await self._has_cloudflare_challenge(page):
+            return
         await self._session._cloudflare_solver(page)
         await self.wait_stable(page)
+
+    async def _has_cloudflare_challenge(self, page: Any) -> bool:
+        """Wait-free pre-check: does ``page`` currently show a CF challenge?
+
+        Reuses scrapling's own ``_detect_cloudflare`` string classifier so our
+        verdict matches what the solver would decide — but against the
+        already-settled page content, skipping the solver's 5s network-idle
+        wait. Fail-safe: if the scrapling-private classifier is absent (version
+        drift) or reading the content raises, return ``True`` so the full
+        solver still runs. When unsure, solving a real challenge beats saving
+        the wait.
+        """
+        session = self._session
+        if session is None:
+            return False
+        detect = getattr(session, "_detect_cloudflare", None)
+        if detect is None:
+            return True
+        try:
+            content = await page.content()
+        except Exception:
+            return True
+        try:
+            return detect(content or "") is not None
+        except Exception:
+            return True
 
     @property
     def solves_cloudflare(self) -> bool:
