@@ -1,18 +1,21 @@
 """Browser subsystem tests for the scrapling/Camoufox stack.
 
 Pin counts (update when adding cases): 1 DSL-format case group, the
-error/stale payload shapes, the dashboard-state contract, and the config
-surface (incl. the navigation-vs-action timeout split). The pure-logic
-tests run anywhere. The real-browser end-to-end tests (``test_e2e_*``)
-launch Camoufox and are gated behind ``VEXIS_BROWSER_E2E=1`` — they need
-the browser binary (``camoufox fetch``) and a host that lets a Firefox
+error/stale payload shapes, the dashboard-state contract, the config
+surface (incl. the navigation-vs-action timeout split), and the Cloudflare
+solver-gating group (issue #45: pre-check skips the solver on unchallenged
+pages, fail-safes, and the noise-filter). The pure-logic tests run
+anywhere. The real-browser end-to-end tests (``test_e2e_*``) launch
+Camoufox and are gated behind ``VEXIS_BROWSER_E2E=1`` — they need the
+browser binary (``camoufox fetch``) and a host that lets a Firefox
 subprocess spawn, so they're opt-in rather than a default CI step.
 
 The e2e cases drive ``file://`` pages: the core flow (navigate → snapshot
 → click → type → press → scroll → screenshot → back), the read/JS-click
-recovery path, the shadow-DOM + cursor:pointer snapshot reach, and cookie
-persistence across restart — all against the real engine, no network. Run
-them on a real machine with:
+recovery path, the shadow-DOM + cursor:pointer snapshot reach, cookie
+persistence across restart, and the #45 gate (solver skipped on an
+unchallenged page) — all against the real engine, no network. Run them on
+a real machine with:
 
     VEXIS_BROWSER_E2E=1 pytest tests/test_browser.py -k e2e -s
 """
@@ -145,6 +148,155 @@ def test_navigation_timeout_is_separate_and_shorter_than_action_timeout():
     assert nav == 30
     assert act == 120
     assert nav < act
+
+
+# --- Cloudflare solver gating (issue #45) ---------------------------
+# The solver must run ONLY when a challenge is actually present, so a
+# no-challenge navigation skips scrapling's ~5s network-idle wait and its
+# spurious "No Cloudflare challenge found." ERROR. These drive
+# SessionManager.solve_cloudflare with a fake scrapling session + page, so
+# they assert the gate deterministically without launching a browser.
+
+class _FakeCFPage:
+    def __init__(self, content: str, raise_content: bool = False) -> None:
+        self._content = content
+        self._raise_content = raise_content
+
+    async def content(self) -> str:
+        if self._raise_content:
+            raise RuntimeError("page.content() boom")
+        return self._content
+
+
+class _FakeCFSession:
+    """Stands in for scrapling's AsyncStealthySession — only the two
+    private hooks SessionManager.solve_cloudflare touches."""
+
+    def __init__(self, detect_result) -> None:
+        self._detect_result = detect_result
+        self.solver_calls = 0
+        self.stability_calls = 0
+
+    def _detect_cloudflare(self, content: str):
+        return self._detect_result
+
+    async def _cloudflare_solver(self, page) -> None:
+        self.solver_calls += 1
+
+    async def _wait_for_page_stability(self, page, load_dom, network_idle) -> None:
+        self.stability_calls += 1
+
+
+class _FakeCFSessionNoDetect(_FakeCFSession):
+    """A scrapling build where ``_detect_cloudflare`` is absent (version
+    drift) — the pre-check must fail safe and still run the solver. The
+    ``__getattribute__`` override makes the attribute genuinely missing, so
+    ``getattr(session, "_detect_cloudflare", None)`` returns ``None``."""
+
+    def __init__(self) -> None:
+        super().__init__(detect_result=None)
+
+    def __getattribute__(self, name):
+        if name == "_detect_cloudflare":
+            raise AttributeError(name)
+        return object.__getattribute__(self, name)
+
+
+def test_solve_cloudflare_skips_solver_when_no_challenge():
+    import asyncio
+    mgr = SessionManager()
+    fake = _FakeCFSession(detect_result=None)
+    mgr._session = fake
+    page = _FakeCFPage("<html><body>ordinary page</body></html>")
+    asyncio.run(mgr.solve_cloudflare(page))
+    # No challenge -> the ~5s solver (and its ERROR log) is never invoked.
+    assert fake.solver_calls == 0
+
+
+def test_solve_cloudflare_runs_solver_when_challenge_present():
+    import asyncio
+    mgr = SessionManager()
+    fake = _FakeCFSession(detect_result="managed")
+    mgr._session = fake
+    page = _FakeCFPage("<html>cType: 'managed'</html>")
+    asyncio.run(mgr.solve_cloudflare(page))
+    # Challenge detected -> full solve, then re-settle the page.
+    assert fake.solver_calls == 1
+    assert fake.stability_calls >= 1
+
+
+def test_solve_cloudflare_fails_safe_when_detect_missing():
+    import asyncio
+    mgr = SessionManager()
+    fake = _FakeCFSessionNoDetect()
+    mgr._session = fake
+    page = _FakeCFPage("<html></html>")
+    asyncio.run(mgr.solve_cloudflare(page))
+    # Can't pre-check -> run the solver rather than risk skipping a real one.
+    assert fake.solver_calls == 1
+
+
+def test_solve_cloudflare_fails_safe_when_content_unreadable():
+    import asyncio
+    mgr = SessionManager()
+    fake = _FakeCFSession(detect_result=None)
+    mgr._session = fake
+    page = _FakeCFPage("", raise_content=True)
+    asyncio.run(mgr.solve_cloudflare(page))
+    assert fake.solver_calls == 1
+
+
+def test_solve_cloudflare_noop_without_session():
+    import asyncio
+    mgr = SessionManager()
+    # No live session -> pure no-op, no exception.
+    asyncio.run(mgr.solve_cloudflare(_FakeCFPage("<html></html>")))
+
+
+def test_cloudflare_noise_filter_drops_no_challenge_error():
+    import logging
+    from vexis_agent.tools.browser.session import _CloudflareNoiseFilter
+    f = _CloudflareNoiseFilter()
+    rec = logging.LogRecord(
+        "scrapling", logging.ERROR, __file__, 1,
+        "No Cloudflare challenge found.", (), None,
+    )
+    assert f.filter(rec) is False
+
+
+def test_cloudflare_noise_filter_passes_other_records():
+    import logging
+    from vexis_agent.tools.browser.session import _CloudflareNoiseFilter
+    f = _CloudflareNoiseFilter()
+    rec = logging.LogRecord(
+        "scrapling", logging.INFO, __file__, 1,
+        'The turnstile version discovered is "%s"', ("managed",), None,
+    )
+    assert f.filter(rec) is True
+
+
+def test_silence_cloudflare_noise_is_idempotent():
+    import logging
+    from vexis_agent.tools.browser.session import (
+        _CloudflareNoiseFilter,
+        _silence_cloudflare_noise,
+    )
+    logger = logging.getLogger("scrapling")
+    logger.filters = [
+        f for f in logger.filters if not isinstance(f, _CloudflareNoiseFilter)
+    ]
+    _silence_cloudflare_noise()
+    _silence_cloudflare_noise()
+    try:
+        count = sum(
+            isinstance(f, _CloudflareNoiseFilter) for f in logger.filters
+        )
+        assert count == 1
+    finally:
+        logger.filters = [
+            f for f in logger.filters
+            if not isinstance(f, _CloudflareNoiseFilter)
+        ]
 
 
 # --- real-browser end-to-end (opt-in) -------------------------------
@@ -349,3 +501,43 @@ def test_e2e_cookie_persists_across_restart(tmp_path, monkeypatch):
     cookies = asyncio.run(reread())
     found = [c for c in cookies if c["name"] == "vexis_login"]
     assert found and found[0]["value"] == "sess_abc123"
+
+
+@pytest.mark.skipif(not E2E, reason="set VEXIS_BROWSER_E2E=1 to run real browser e2e")
+def test_e2e_solver_skipped_on_unchallenged_page(tmp_path):
+    # Issue #45: with solve_cloudflare on (the default), a navigation to a
+    # page with NO challenge must NOT invoke scrapling's ~5s solver. We wrap
+    # the real session's private solver with a counter after acquire and
+    # assert it stays at zero across a local navigation.
+    import asyncio
+    from vexis_agent.tools.browser import profile as profile_mod
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(profile_mod, "solve_cloudflare", lambda: True)
+    page_html = tmp_path / "plain.html"
+    page_html.write_text("<html><body><h1>No challenge here</h1></body></html>")
+    url = page_html.as_uri()
+
+    async def go():
+        mgr = SessionManager()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            session, _page = await mgr.acquire()
+            calls = {"n": 0}
+            real_solver = session._cloudflare_solver
+
+            async def counting_solver(page):
+                calls["n"] += 1
+                return await real_solver(page)
+
+            session._cloudflare_solver = counting_solver
+            assert mgr.solves_cloudflare is True
+            nav = await bt.navigate(url)
+            assert nav["ok"] is True, nav
+            # The gate detected no challenge and skipped the solver entirely.
+            assert calls["n"] == 0
+        finally:
+            await mgr.stop()
+            monkeypatch.undo()
+
+    asyncio.run(go())
