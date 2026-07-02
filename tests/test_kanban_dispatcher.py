@@ -119,6 +119,14 @@ async def _drain(ctrl: KanbanController) -> None:
         await asyncio.gather(*list(ctrl._in_flight), return_exceptions=True)
 
 
+def _write_config(tmp_path: Path, body: str) -> None:
+    """Write ``~/.vexis/config.yaml`` to the location the autouse
+    ``_isolate_yaml_config`` fixture points ``vexis_dir()`` at."""
+    cfg = tmp_path / "_vexis_isolated" / "config.yaml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(body, encoding="utf-8")
+
+
 # ──────────────────────────────────────────────────────────────────
 # build_worker_prompt
 # ──────────────────────────────────────────────────────────────────
@@ -607,6 +615,38 @@ def test_spawn_aux_carries_lane_tier(store, workspace):
     records = brain.aux_call_records()
     # implementation lane defaults to ``large`` tier.
     assert records[0]["model_tier"] == "large"
+    # Built-in lanes pin no effort — reasoning defers to the CLI default.
+    assert records[0]["reasoning_level"] is None
+
+
+def test_spawn_aux_carries_lane_reasoning(store, workspace, tmp_path):
+    """Issue #50: a lane's ``reasoning`` knob flows through to
+    ``brain.spawn_aux`` as ``reasoning_level`` the same way ``tier``
+    flows through as ``model_tier``."""
+    _write_config(tmp_path, """
+kanban:
+  lanes:
+    implementation:
+      tier: large
+      reasoning: low
+    """)
+    store.create_task(
+        title="x", status=STATUS_READY, lane="implementation",
+    )
+    brain = BrainNull(
+        aux_results=[AuxResult(stdout="ok", stderr="", returncode=0)],
+    )
+
+    async def scenario():
+        ctrl = KanbanController(store=store, brain=brain, workspace=workspace)
+        ctrl._loop = asyncio.get_running_loop()
+        await ctrl.tick()
+        await _drain(ctrl)
+    asyncio.run(scenario())
+
+    records = brain.aux_call_records()
+    assert records[0]["model_tier"] == "large"
+    assert records[0]["reasoning_level"] == "low"
 
 
 def test_event_hook_invoked_on_spawn(store, workspace):

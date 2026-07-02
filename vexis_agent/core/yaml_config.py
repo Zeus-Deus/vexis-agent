@@ -814,8 +814,87 @@ def _model_tier(key: str, default: str) -> str:
     return default
 
 
+def model_brain_from_config(models_section: Any) -> str:
+    """Pure-function variant of :func:`model_brain` that takes the
+    ``models`` section dict directly rather than reading from disk.
+
+    Issue #50 — per-model reasoning-effort knob. ``models.brain`` used
+    to be string-only (a tier-or-raw model id, or the ``"default"``
+    sentinel). It now accepts the SAME dict shape the subsystems
+    already accept::
+
+        models:
+          brain:
+            model: default   # or a tier / raw id; may be omitted
+            reasoning: low
+
+    so a headless deployment talking to the foreground brain can pin an
+    effort level without an out-of-band ``~/.claude/settings.json`` edit.
+    This function returns only the *model* half; :func:`model_brain_reasoning`
+    returns the effort half. Splitting the two keeps
+    :func:`model_for_tier` (which only understands model ids) unchanged.
+
+    Resolution, mirroring the old ``_model_tier("brain", ...)`` posture:
+      - plain string → returned verbatim (exactly today's behaviour),
+      - dict → the ``model`` key is extracted via
+        :func:`_extract_subsystem_value_and_reasoning`,
+      - missing / empty / non-string-non-dict / a dict whose ``model``
+        key is missing or empty → the ``"default"`` sentinel.
+
+    A dict carrying only ``reasoning`` (no ``model``) is deliberately
+    meaningful: it resolves to ``"default"`` here — account-default
+    model — while :func:`model_brain_reasoning` still surfaces the
+    effort level. That single case is the issue reporter's fix.
+    """
+    section = models_section if isinstance(models_section, dict) else {}
+    raw = section.get("brain", DEFAULT_MODEL_BRAIN)
+    value, _reasoning = _extract_subsystem_value_and_reasoning(raw)
+    return value if value else DEFAULT_MODEL_BRAIN
+
+
+def model_brain_reasoning_from_config(models_section: Any) -> str | None:
+    """Pure-function lookup for the reasoning effort configured on the
+    foreground (chat) brain under the dict-shaped ``models.brain``.
+
+    Issue #50 — companion to :func:`model_brain_from_config`. Returns
+    ``None`` when ``models.brain`` is a plain string (today's shape —
+    no effort override), when the ``brain`` key is unset, or when the
+    dict carries no ``reasoning`` key. ``None`` passes straight through
+    to ``Brain.respond``/``astream`` as "let the brain pick its default
+    effort," i.e. whatever ``~/.claude/settings.json`` says on
+    claude-code — byte-identical to pre-#50 behaviour.
+    """
+    section = models_section if isinstance(models_section, dict) else {}
+    _model, reasoning = _extract_subsystem_value_and_reasoning(
+        section.get("brain")
+    )
+    return reasoning
+
+
 def model_brain() -> str:
-    return _model_tier("brain", DEFAULT_MODEL_BRAIN)
+    """Foreground (chat) brain model — the model you talk to.
+
+    Disk-reading wrapper over :func:`model_brain_from_config`; re-reads
+    ``~/.vexis/config.yaml`` per call so a config edit hot-reloads at the
+    next chat turn. Returns the model half only (tier-or-raw id, or the
+    ``"default"`` sentinel); the effort half lives in
+    :func:`model_brain_reasoning`. Signature and default preserved from
+    the pre-#50 string-only implementation so existing callers (the
+    learning-curator status payload, the handler's foreground resolver)
+    are unaffected.
+    """
+    return model_brain_from_config(_read_raw().get("models"))
+
+
+def model_brain_reasoning() -> str | None:
+    """Reasoning effort for the foreground (chat) brain, or ``None``.
+
+    Disk-reading wrapper over :func:`model_brain_reasoning_from_config`
+    (Issue #50). Re-reads ``~/.vexis/config.yaml`` per call so effort
+    edits hot-reload at the next chat turn. ``None`` (a plain-string or
+    absent ``models.brain``) means "defer to the CLI default effort."
+    """
+    return model_brain_reasoning_from_config(_read_raw().get("models"))
 
 
 def model_learning_review() -> str:

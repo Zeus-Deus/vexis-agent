@@ -3161,6 +3161,7 @@ class WebDashboard:
         from vexis_agent.core.model_discovery import (
             discovery_for_validator,
             discovery_grouped_for_validator,
+            reasoning_vocabulary_for_validator,
         )
         from vexis_agent.core.model_validator import build_resolution_table
         from vexis_agent.core.yaml_config import (
@@ -3174,6 +3175,14 @@ class WebDashboard:
             cfg = _read_raw()
             kind = brain_kind()
             available = discovery_for_validator(VALID_BRAIN_KINDS)
+            # Issue #50 — effort-level vocabulary so the dashboard
+            # surfaces rule 9's warning on a hand-edited ``reasoning:``
+            # value outside the brain's discovered set. Same 5-min
+            # cache as ``available`` (claude ``--help`` probe / opencode
+            # capability fetch); empty offline → rule 9 silently skips.
+            reasoning_levels = reasoning_vocabulary_for_validator(
+                VALID_BRAIN_KINDS
+            )
             # Defensive getattr — Day 5 added _running_brain_kind
             # via the new constructor parameter. Existing test
             # fixtures that bypass __init__ via __new__ don't set
@@ -3183,6 +3192,7 @@ class WebDashboard:
             table = build_resolution_table(
                 cfg, kind,
                 available_models_per_brain=available,
+                available_reasoning_levels_per_brain=reasoning_levels,
                 running_brain_kind=running_kind,
             )
             # Day 4 additions on top of the Day 3 shape.
@@ -3211,6 +3221,7 @@ class WebDashboard:
                 "brain_kind": "claude-code",
                 "foreground": {
                     "configured": None,
+                    "reasoning": None,
                     "resolved_model_id": None,
                     "findings": [],
                 },
@@ -3248,7 +3259,13 @@ class WebDashboard:
 
     def _models_set(self, payload: dict) -> dict:
         """POST /api/v1/models/set — set a per-subsystem
-        assignment. Body: ``{"subsystem": str, "value": str}``.
+        assignment. Body: ``{"subsystem": str, "value": str,
+        "reasoning": str | None}``.
+
+        ``reasoning`` (Issue #50) is optional: when a non-empty string,
+        the config is written in the dict shape ({model, reasoning})
+        that pins the effort level — for both a subsystem and the
+        foreground chat model. Absent → plain string, today's behaviour.
 
         Same gates as the slash command:
           - flag-gated behind ``model_ux_enabled()``
@@ -3297,6 +3314,16 @@ class WebDashboard:
                 status_code=400,
                 detail="payload requires {subsystem: str, value: str}",
             )
+        # Optional reasoning effort (Issue #50). A blank / non-string
+        # value collapses to None (= today's plain-string write), same
+        # tolerant posture as the rest of the config helpers — a stray
+        # empty ``reasoning`` in the payload never wedges the write.
+        reasoning_raw = payload.get("reasoning")
+        reasoning = (
+            reasoning_raw.strip()
+            if isinstance(reasoning_raw, str) and reasoning_raw.strip()
+            else None
+        )
 
         # Foreground (chat) model target — writes the top-level
         # ``models.brain`` knob that drives the foreground turn (see
@@ -3320,10 +3347,15 @@ class WebDashboard:
         current = _read_raw()
         if is_foreground:
             models = dict(current.get("models") or {})
-            models["brain"] = value
+            if reasoning:
+                models["brain"] = {"model": value, "reasoning": reasoning}
+            else:
+                models["brain"] = value
             proposed = {**current, "models": models}
         else:
-            proposed = self._proposed_set_subsystem(current, subsystem, value)
+            proposed = self._proposed_set_subsystem(
+                current, subsystem, value, reasoning=reasoning,
+            )
 
         available = discovery_for_validator(VALID_BRAIN_KINDS)
         findings = validate_models_config(
@@ -3362,6 +3394,7 @@ class WebDashboard:
             "ok": True,
             "subsystem": subsystem,
             "value": value,
+            "reasoning": reasoning,
             "resolved_tier": resolved_tier,
             "resolved_model_id": resolved_id,
             "backup_path": str(backup_path) if backup_path else None,
@@ -3803,15 +3836,24 @@ class WebDashboard:
     @staticmethod
     def _proposed_set_subsystem(
         current: dict, subsystem: str, value: str,
+        reasoning: str | None = None,
     ) -> dict:
         """Build the proposed config for a per-subsystem set. Pure
         function; the writer never sees a partial edit. Mirrors
         ``transports.telegram.TelegramTransport._proposed_set_subsystem``
         — both surfaces produce the same shape so the validator
-        sees identical inputs."""
+        sees identical inputs.
+
+        ``reasoning`` (Issue #50): when set, writes the dict shape
+        ``models.subsystems.<sub>: {model: <value>, reasoning: <level>}``;
+        when None (the default) the plain-string shape, byte-identical
+        to pre-#50 writes."""
         models = dict(current.get("models") or {})
         subs = dict(models.get("subsystems") or {})
-        subs[subsystem] = value
+        if reasoning:
+            subs[subsystem] = {"model": value, "reasoning": reasoning}
+        else:
+            subs[subsystem] = value
         models["subsystems"] = subs
         return {**current, "models": models}
 

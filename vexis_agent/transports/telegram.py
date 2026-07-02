@@ -208,7 +208,7 @@ _MODEL_USAGE = (
     "/model — show current resolution\n"
     "/model list — enumerate subsystems + brains\n"
     "/model list <brain> — list models for that brain\n"
-    "/model set foreground <tier-or-name> — set the chat model\n"
+    "/model set foreground <tier-or-name> [reasoning] — set the chat model\n"
     "/model set brain <name> — change brain.kind (restart required)\n"
     "/model set <subsystem> <tier-or-name> — set subsystem assignment\n"
     "/model set <subsystem> — picker: tap a provider then a model\n"
@@ -224,8 +224,10 @@ _MODEL_SET_FOREGROUND_OK_TMPL = (
     "Takes effect on the next chat turn."
 )
 _MODEL_FOREGROUND_USAGE = (
-    "/model set foreground <tier-or-name> — set the chat model "
+    "/model set foreground <tier-or-name> [reasoning] — set the chat model "
     "(e.g. 'sonnet', 'large', or a provider/model id on opencode). "
+    "An optional second value pins the reasoning effort (e.g. "
+    "'/model set foreground sonnet low'), written as {model, reasoning}. "
     "Use 'default' or /model reset foreground for the account default. "
     "See /model list <brain> for valid ids, or use the dashboard "
     "Models tab for a picker."
@@ -3357,7 +3359,13 @@ class TelegramTransport:
                 if len(args) < 3:
                     await msg.reply_text(_MODEL_FOREGROUND_USAGE)
                     return
-                _ok, reply = self._apply_foreground_set(args[2])
+                # Issue #50 — optional second value is the reasoning
+                # effort. Present → write the dict shape {model,
+                # reasoning}; absent → plain string (today's behaviour).
+                reasoning = args[3] if len(args) >= 4 else None
+                _ok, reply = self._apply_foreground_set(
+                    args[2], reasoning=reasoning,
+                )
                 await msg.reply_text(reply)
                 return
 
@@ -3553,7 +3561,9 @@ class TelegramTransport:
             ) + backup_msg,
         )
 
-    def _apply_foreground_set(self, value: str) -> tuple[bool, str]:
+    def _apply_foreground_set(
+        self, value: str, reasoning: str | None = None,
+    ) -> tuple[bool, str]:
         """Validate + write + render the reply for the foreground
         (chat) model mutation ``models.brain = <value>``.
 
@@ -3566,6 +3576,15 @@ class TelegramTransport:
         id, or the ``default`` sentinel (account default). Hot-reloads
         at the next chat turn — no restart. Returns
         ``(success, reply_text)``.
+
+        ``reasoning`` (Issue #50): when set, writes the dict shape
+        ``models.brain: {model: <value>, reasoning: <level>}`` — the
+        same {model, reasoning} vocabulary the subsystems use — so a
+        headless deployment can pin the chat brain's effort without an
+        out-of-band ``~/.claude/settings.json`` edit. When None (the
+        default) the plain-string shape is written, which clobber-drops
+        any prior reasoning key — the same accepted semantics as the
+        subsystem typed-arg path.
         """
         from vexis_agent.core.model_discovery import (
             discovery_for_validator,
@@ -3613,7 +3632,10 @@ class TelegramTransport:
                 )
 
         models = dict(current.get("models") or {})
-        models["brain"] = value
+        if reasoning:
+            models["brain"] = {"model": value, "reasoning": reasoning}
+        else:
+            models["brain"] = value
         proposed = {**current, "models": models}
 
         available = discovery_for_validator(VALID_BRAIN_KINDS)
@@ -3643,10 +3665,14 @@ class TelegramTransport:
         resolved = model_for_tier_from_config(
             proposed.get("models"), brain_kind(), value,
         )
+        # Confirmation echoes the reasoning level when set so the user
+        # has visual proof their pick stuck — matches the subsystem
+        # path's "+ reasoning=<level>" copy.
+        reasoning_suffix = f" + reasoning={reasoning}" if reasoning else ""
         return (
             True,
             _MODEL_SET_FOREGROUND_OK_TMPL.format(
-                value=value,
+                value=value + reasoning_suffix,
                 resolved=resolved or "<brain default>",
                 brain=brain_kind(),
             ) + backup_msg,
@@ -4382,11 +4408,21 @@ class TelegramTransport:
         # brain.kind (which CLI) and the aux subsystems below. Resolved
         # from models.brain; "(default → …)" means the brain's account
         # default (no --model flag).
+        # Issue #50 — the configured reasoning effort rides alongside
+        # each row as a "+ reasoning=<level>" suffix (matching the
+        # /model set confirmation copy). None → no suffix (defer to the
+        # CLI default effort), so plain-string configs render unchanged.
+        def _reasoning_suffix(entry: dict) -> str:
+            level = entry.get("reasoning")
+            return f" + reasoning={level}" if level else ""
+
         fg = table.get("foreground") or {}
         fg_display = format_resolution_display(
             fg.get("configured"), fg.get("resolved_model_id"),
         )
-        lines.append(f"  foreground (chat)  {fg_display}")
+        lines.append(
+            f"  foreground (chat)  {fg_display}{_reasoning_suffix(fg)}"
+        )
         lines.append("")
         max_name = max(len(n) for n in DEFAULT_SUBSYSTEM_TIERS)
         for row in table["subsystems"]:
@@ -4400,7 +4436,8 @@ class TelegramTransport:
                 row["configured"], row["resolved_model_id"],
             )
             lines.append(
-                f"  {row['name'].ljust(max_name)}  {display}"
+                f"  {row['name'].ljust(max_name)}  "
+                f"{display}{_reasoning_suffix(row)}"
             )
         non_info = [
             f for f in (table["global_findings"] + fg.get("findings", []) + [

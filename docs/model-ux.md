@@ -18,10 +18,10 @@ for the recommended path).
 | Knob | Type | What it does | Hot-reload? |
 |---|---|---|---|
 | `brain.kind` | str | Selects which agent CLI vexis spawns under (`claude-code` / `opencode` / `null`). Read once at startup. | **Restart required** |
-| `models.subsystems.<name>` | str | NEW (Phase B+) per-subsystem tier override. Value is one of `tiny` / `small` / `medium` / `large`, OR a raw model id for power users. Wins over the legacy `models.<name>` key when both are set. | Hot |
+| `models.subsystems.<name>` | str \| `{model, reasoning}` | NEW (Phase B+) per-subsystem tier override. Value is one of `tiny` / `small` / `medium` / `large`, OR a raw model id for power users. Wins over the legacy `models.<name>` key when both are set. Also accepts the `{model, reasoning}` dict shape to pin a reasoning-effort level alongside the model — see [Reasoning effort](#reasoning-effort). | Hot |
 | `models.tiers.<brain-kind>.<tier>` | str | Per-brain tier→native-id override. Example: `models.tiers.opencode.large: openai/gpt-4o`. | Hot |
 | `models.<subsystem-name>` | str | LEGACY raw-string passthrough (pre-Phase-B). Works on claude-code via passthrough; breaks on opencode (which requires `provider/model` shape). The slash + dashboard surface a rule-4 warning when this combo would crash. See [`docs/migration.md`](migration.md). | Hot (when valid) |
-| `models.brain` | str | **Foreground (chat) model** — the model you talk to. Resolved tier-or-raw like a subsystem and passed as `--model` on the foreground turn (`MessageHandler._resolve_foreground_model`). `default` / unset → no `--model` flag → the brain's account default. Settable via `/model set foreground` and the dashboard's Foreground (chat) row. Acute on opencode, which has no meaningful account default. Per-turn overrides (voice, computer-use) still win. | Hot (per turn) |
+| `models.brain` | str \| `{model, reasoning}` | **Foreground (chat) model** — the model you talk to. Resolved tier-or-raw like a subsystem and passed as `--model` on the foreground turn (`MessageHandler._resolve_foreground_model`). `default` / unset → no `--model` flag → the brain's account default. Settable via `/model set foreground` and the dashboard's Foreground (chat) row. Acute on opencode, which has no meaningful account default. Per-turn overrides (voice, computer-use) still win. Also accepts the `{model, reasoning}` dict shape (Issue #50) to pin a chat reasoning-effort level; `{reasoning: low}` with no `model` key = account-default model at low effort. See [Reasoning effort](#reasoning-effort). | Hot (per turn) |
 | `model_ux.enabled` | bool | Gates the `/model` slash command and the dashboard's edit affordances. Default `true` (Day 5 release flip). Set `false` to silence both surfaces without code changes. | Restart required |
 
 ### Why `brain.kind` needs a restart
@@ -83,6 +83,132 @@ Day 1–4 of the picker UX inverted this:
   the validator and resolution layer disambiguate by inspecting
   the value's shape, not by the key location.
 
+## Reasoning effort
+
+Every model knob carries an optional reasoning-effort knob:
+anywhere you pin a model you can also pin how hard it thinks, via
+a `{model, reasoning}` dict in place of the plain model string.
+
+### Motivation (issue #50)
+
+Before this, the only effort control on claude-code was the global
+`effortLevel` in `~/.claude/settings.json` — undocumented,
+process-wide (every spawn inherited it), and reset-prone (a
+`claude` upgrade or a `/config` edit silently rewrites it). A
+deployment that wanted its chat brain pinned at `low` effort had
+no per-vexis, in-config way to say so. Per-model effort is a real
+latency win at equal accuracy on lookup-shaped work — a judge
+skimming a transcript for a yes/no verdict, a summariser
+condensing a bounded template — where max-effort reasoning buys
+nothing but latency.
+
+### The dict shape
+
+Any config value that takes a model now also takes the dict form:
+
+```yaml
+models:
+  brain:                       # foreground (chat) model
+    model: sonnet              # tier-or-raw; MAY be omitted
+    reasoning: low
+  subsystems:
+    goal_judge:
+      model: large
+      reasoning: high
+    compressor:
+      reasoning: low           # model omitted → tier default at
+                               # low effort
+kanban:
+  lanes:
+    review:
+      tier: medium
+      reasoning: high
+```
+
+- **`models.brain`** — the chat model. `{reasoning: low}` with no
+  `model` key is meaningful: account-default model at low effort.
+  That reasoning-only shape is the issue reporter's exact fix.
+- **`models.subsystems.<name>`** — every aux subsystem (curator,
+  judges, extractors, compressor). The dict shape predates issue
+  #50 (it shipped with the picker's reasoning step) but was
+  previously undocumented and only reachable through the picker.
+- **`kanban.lanes.<name>.reasoning`** — a lane is
+  `(system_prompt, skills, tier, reasoning)`; the dispatcher
+  passes the lane's effort to every worker spawn. See
+  [`docs/kanban.md`](kanban.md).
+
+**Unset = the CLI default (backward compatible).** A plain-string
+value — or a dict with no `reasoning` key — passes `None` through
+to the spawn, so the brain uses whatever effort it would have
+without this feature: on claude-code, whatever
+`~/.claude/settings.json` says. Plain-string configs are
+byte-identical to pre-#50 behaviour.
+
+### Per-brain translation
+
+The subsystem picks the level; the active brain translates it to a
+native CLI flag — the same tier→native split the model half uses.
+Claude-code appends `--effort <level>`; opencode appends
+`--variant <level>`. The level vocabulary is therefore brain-owned:
+claude-code advertises `low` / `medium` / `high` / `xhigh` / `max`
+(probed from the CLI's `--effort` help), opencode's variants are
+per-model. Config accepts any non-empty string at parse time — the
+vocabulary check belongs to the validator (rule 9, below), not the
+config reader.
+
+### Foreground resolution precedence
+
+`MessageHandler._resolve_foreground_model` returns a
+`(model, reasoning)` pair. Config effort applies **only** on the
+plain chat path (`model is None` after the per-turn resolvers ran).
+A per-turn override — voice call mode (`voice.call_mode.*`) or the
+computer-use selector (`computer_use.*`) — owns the WHOLE
+`(model, effort)` pair; config `reasoning` never leaks onto an
+overridden model. Reads disk each turn, so an effort edit
+hot-reloads at the next chat turn (same posture as the model half
+and the subsystem tiers).
+
+### Surfaces
+
+- **Telegram — foreground:** `/model set foreground <model>
+  [level]`. Typed-arg only; the optional second value is the
+  effort. `/model set foreground sonnet low` writes
+  `{model: sonnet, reasoning: low}`.
+- **Telegram — subsystems:** the picker's existing reasoning step,
+  surfaced after the model step when the chosen model exposes
+  levels. Unchanged by #50.
+- **Dashboard / API:** `POST /api/v1/models/set` accepts an
+  optional `reasoning` string for both foreground and subsystems,
+  writing the dict shape when present. The React UI was
+  deliberately NOT extended — API-level support only.
+- **`/model status` + `GET /api/v1/models`:** the foreground block
+  and every subsystem row carry a `reasoning` field; the slash
+  renders it as a `+ reasoning=<level>` suffix.
+- **Raw YAML:** hand-edit the dict shape directly.
+
+**Clobber-drop semantics.** Writing a plain string over an
+existing dict drops the `reasoning` key — a plain-string write is
+model-only intent. This is the same accepted semantics the
+subsystem typed-arg path has always had: `/model set curator small`
+over `curator: {model: small, reasoning: high}` leaves
+`curator: small`. To keep an effort level, write the dict (pass the
+`reasoning` arg / field).
+
+### Validator (rule 9)
+
+Warning-severity vocabulary check on every configured `reasoning`
+level (`models.brain` AND each `models.subsystems.<name>`) against
+the brain's discovered effort vocabulary
+(`model_discovery.reasoning_vocabulary_for`). Warning, not error:
+discovery lags and the spawn site rejects a genuinely bad
+`--effort` value anyway. **Silently skipped** when the vocabulary
+is empty or unavailable (binary missing, offline, no
+reasoning-capable models) — it never false-positives when it can't
+see the valid set. Shared suggested-fix constant
+`INVALID_REASONING_FIX_TEMPLATE`, per the "Validator vocabulary is
+shared" invariant. The picker gates levels to the discovered set,
+so rule 9 mainly backstops the typed-arg and raw-YAML paths.
+
 ## /model slash command
 
 ```
@@ -91,6 +217,8 @@ Day 1–4 of the picker UX inverted this:
 /model list                            enumerate subsystems + brains
 /model list <brain>                    per-brain model hints
 /model set brain <name>                change brain.kind (restart req)
+/model set foreground <tier-or-name> [level]
+                                       set the chat model (+ effort)
 /model set <subsystem>                 picker: tap provider, then model
 /model set <subsystem> ?               picker (explicit alias of above)
 /model set <subsystem> <tier-or-name>  typed-arg: set per-subsystem
@@ -373,7 +501,7 @@ Two layers catch model-config mistakes:
 
 1. **Validator** — runs pre-write on every `/model set` (typed
    AND picker callback), every dashboard save, AND on daemon
-   startup (logs findings without crashing). 7 rules, scoped to:
+   startup (logs findings without crashing). 9 rules, scoped to:
    - brain.kind validity (warning, fall-back posture)
    - subsystem name validity (warning per unknown key)
    - tier resolution to non-empty (defense in depth)
@@ -387,6 +515,17 @@ Two layers catch model-config mistakes:
      membership in the discovered set.
    - dead-knob hygiene (info, currently surfaces
      `migration_classifier`)
+   - foreground (`models.brain`) model validity — the same
+     opencode/claude-code shape + membership checks the subsystems
+     get, applied to the chat model; unpacks the `{model, reasoning}`
+     dict so a dict-shaped foreground is validated, not skipped as
+     "unset"
+   - reasoning-effort vocabulary (Issue #50): warning when a
+     configured `reasoning` level isn't in the brain's discovered
+     effort vocabulary; applies to `models.brain` and every
+     `models.subsystems.<name>`; silently skipped when discovery is
+     empty (never false-positives offline). See
+     [Reasoning effort](#reasoning-effort).
 
 2. **Spawn-site backstop** — `Brain.spawn_aux` raises
    `BrainModelNotFoundError` when the underlying CLI rejects
@@ -504,9 +643,10 @@ with the raw CLI wording.
 
 ## Reference
 
-- `core/model_validator.py` — validator engine + 7 rules + the
-  shared suggested-fix template constants + the brain.kind
-  consistency canary.
+- `core/model_validator.py` — validator engine + 9 rules + the
+  shared suggested-fix template constants (including
+  `INVALID_REASONING_FIX_TEMPLATE`) + the brain.kind consistency
+  canary.
 - `core/yaml_config_writer.py` — atomic-write helper +
   `has_comments` + `backup_if_commented`.
 - `core/model_discovery.py` — claude-code curated list + opencode

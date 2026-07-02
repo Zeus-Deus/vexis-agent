@@ -543,6 +543,77 @@ def test_compress_if_needed_rewrites_long_session(tmp_path: Path) -> None:
     assert not content.startswith(KANBAN_WORKER_PREFIX)
 
 
+def test_compress_passes_reasoning_level_from_dict_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #50: a dict-shaped ``models.subsystems.compressor`` with a
+    ``reasoning`` key flows through to the summariser spawn as
+    ``reasoning_level``. Both ``subsystem_tier`` and
+    ``subsystem_reasoning`` read the same on-disk config, so pointing
+    ``_read_raw`` at an in-memory config exercises the real parse."""
+    brain, session_id = _make_brain_with_session(tmp_path)
+    _place_session_jsonl(
+        brain, session_id, n_turns=DEFAULT_TURN_THRESHOLD + 5,
+    )
+
+    from vexis_agent.core import yaml_config
+
+    monkeypatch.setattr(
+        yaml_config, "_read_raw",
+        lambda: {
+            "models": {
+                "subsystems": {
+                    "compressor": {"model": "small", "reasoning": "low"},
+                },
+            },
+        },
+    )
+
+    with patch.object(
+        brain, "spawn_aux",
+        new=AsyncMock(return_value=AuxResult(
+            stdout="## Active Task\nx", stderr="", returncode=0,
+        )),
+    ) as mock_aux:
+        assert asyncio.run(brain.compress_if_needed(session_id)) is True
+
+    kwargs = mock_aux.call_args.kwargs
+    assert kwargs["reasoning_level"] == "low"
+    # The model half of the dict still resolves as the tier.
+    assert kwargs["model_tier"] == "small"
+
+
+def test_compress_reasoning_level_none_when_plain_string_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plain-string compressor config keeps today's behaviour: no
+    reasoning flag flows to the spawn (``None`` = defer to CLI
+    default)."""
+    brain, session_id = _make_brain_with_session(tmp_path)
+    _place_session_jsonl(
+        brain, session_id, n_turns=DEFAULT_TURN_THRESHOLD + 5,
+    )
+
+    from vexis_agent.core import yaml_config
+
+    monkeypatch.setattr(
+        yaml_config, "_read_raw",
+        lambda: {"models": {"subsystems": {"compressor": "small"}}},
+    )
+
+    with patch.object(
+        brain, "spawn_aux",
+        new=AsyncMock(return_value=AuxResult(
+            stdout="## Active Task\nx", stderr="", returncode=0,
+        )),
+    ) as mock_aux:
+        assert asyncio.run(brain.compress_if_needed(session_id)) is True
+
+    kwargs = mock_aux.call_args.kwargs
+    assert kwargs["reasoning_level"] is None
+    assert kwargs["model_tier"] == "small"
+
+
 def test_compress_if_needed_iterative_folds_previous_summary(
     tmp_path: Path,
 ) -> None:

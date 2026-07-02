@@ -45,7 +45,11 @@ from vexis_agent.core.yaml_config import (
     ABSTRACT_TIERS,
     DEFAULT_SUBSYSTEM_TIERS,
     VALID_BRAIN_KINDS,
+    _extract_subsystem_value_and_reasoning,
+    model_brain_from_config,
+    model_brain_reasoning_from_config,
     model_for_tier_from_config,
+    subsystem_reasoning_from_config,
     subsystem_tier_from_config,
 )
 
@@ -149,6 +153,19 @@ CLAUDE_CODE_MODEL_NOT_FOUND_FIX_TEMPLATE = (
     "(haiku/sonnet/opus) or a current full name from "
     "https://docs.anthropic.com/claude/models. "
     "Run: /model set {subsystem} small  (resolves to haiku)"
+)
+
+# Issue #50 — per-model reasoning-effort knob. Fires when a
+# hand-edited ``reasoning:`` value isn't in the brain's discovered
+# effort vocabulary. Advisory (warning) only: effort levels are
+# brain/CLI-discovered and can go stale or empty, and the spawn site
+# rejects a genuinely bad ``--effort`` value anyway. The Telegram
+# picker offers only valid levels, so this backstops the typed-arg
+# and raw-YAML paths.
+INVALID_REASONING_FIX_TEMPLATE = (
+    "'{level}' isn't a reasoning-effort level {brain_kind} advertises "
+    "(valid: {levels}). Remove the reasoning key to defer to the CLI's "
+    "default effort, or pick one of the listed levels."
 )
 
 DEAD_KNOB_FIX_TEMPLATE = (
@@ -351,14 +368,70 @@ def _check_known_subsystems(
     return findings
 
 
+def _reasoning_findings(
+    subsystem: str,
+    configured_reasoning: str | None,
+    brain_kind: str,
+    available_reasoning_levels_per_brain: dict[str, set[str]] | None,
+) -> list[ValidationFinding]:
+    """Rule 9 (Issue #50) — reasoning-effort vocabulary check.
+
+    Fires a single warning when a configured ``reasoning:`` level isn't
+    in the brain's discovered effort vocabulary. Applied identically to
+    ``models.brain`` (foreground) and every ``models.subsystems.<name>``
+    — the hand-edited-YAML path is the risk; the Telegram picker already
+    gates levels to the discovered set.
+
+    Silent (empty list) in three cases so it never false-positives:
+      - no reasoning configured (``None`` / empty),
+      - no vocabulary supplied at all (the pure-function / offline call
+        shape — discovery data is optional, same posture as rule 6),
+      - the brain's vocabulary came back empty (binary missing, network
+        down, no reasoning-capable models). An empty vocabulary means we
+        can't SEE the valid levels, not that every level is invalid.
+
+    Severity is warning, matching the claude-code membership posture:
+    discovery can lag and the spawn site is the ultimate authority on a
+    bad ``--effort`` value.
+    """
+    if not configured_reasoning:
+        return []
+    if not available_reasoning_levels_per_brain:
+        return []
+    levels = available_reasoning_levels_per_brain.get(brain_kind)
+    if not levels:
+        return []
+    if configured_reasoning in levels:
+        return []
+    levels_csv = ", ".join(sorted(levels))
+    return [
+        ValidationFinding(
+            severity="warning",
+            subsystem=subsystem,
+            problem=(
+                f"{subsystem} configures reasoning effort "
+                f"{configured_reasoning!r}, which isn't a level "
+                f"{brain_kind} advertises ({levels_csv})."
+            ),
+            suggested_fix=INVALID_REASONING_FIX_TEMPLATE.format(
+                level=configured_reasoning,
+                brain_kind=brain_kind,
+                levels=levels_csv,
+            ),
+        )
+    ]
+
+
 def _check_per_subsystem(
     config: dict,
     brain_kind: str,
     available_models_per_brain: dict[str, set[str]] | None,
+    available_reasoning_levels_per_brain: dict[str, set[str]] | None = None,
 ) -> list[ValidationFinding]:
     """Rules 3, 4, 5, 6 — all per-subsystem and require resolving
     the configured tier through the brain. Bundled into one pass so
-    each subsystem is resolved exactly once.
+    each subsystem is resolved exactly once. Rule 9 (Issue #50) —
+    the per-subsystem reasoning-effort check — rides along here too.
     """
     findings: list[ValidationFinding] = []
     models = config.get("models") if isinstance(config, dict) else None
@@ -371,6 +444,19 @@ def _check_per_subsystem(
     )
 
     for subsystem in DEFAULT_SUBSYSTEM_TIERS:
+        # Rule 9 first, before the model-resolution early-continues
+        # below (rules 3/4 ``continue`` on their findings) — the
+        # reasoning check is independent of the model half and must
+        # run for every subsystem regardless.
+        findings.extend(
+            _reasoning_findings(
+                subsystem,
+                subsystem_reasoning_from_config(models_section, subsystem),
+                brain_kind,
+                available_reasoning_levels_per_brain,
+            )
+        )
+
         tier = subsystem_tier_from_config(models_section, subsystem)
         resolved = model_for_tier_from_config(
             models_section, brain_kind, tier,
@@ -480,6 +566,7 @@ def _check_foreground(
     config: dict,
     brain_kind: str,
     available_models_per_brain: dict[str, set[str]] | None,
+    available_reasoning_levels_per_brain: dict[str, set[str]] | None = None,
 ) -> list[ValidationFinding]:
     """Rule 8: foreground (chat) model validity — ``models.brain``.
 
@@ -492,6 +579,16 @@ def _check_foreground(
     model-existence checks subsystems get (rules 4/5/6). ``default`` /
     unset resolves to ``None`` (account default) and fires nothing.
 
+    Issue #50 grew ``models.brain`` a dict shape
+    (``{model: ..., reasoning: ...}``) mirroring the subsystems. The
+    model half is unpacked via :func:`model_brain_from_config` (so a
+    dict is validated exactly like the plain-string it replaces, rather
+    than being mistaken for "unset" and skipped), and the effort half
+    gets the same rule-9 vocabulary check the subsystems get — a
+    reasoning-only dict (the reporter's ``{reasoning: low}`` shape)
+    leaves the model at the account default but still validates its
+    effort level.
+
     Findings carry ``subsystem="brain"`` so the resolution table can
     attach them to the foreground row (see :func:`build_resolution_table`).
     """
@@ -499,12 +596,23 @@ def _check_foreground(
     models = config.get("models") if isinstance(config, dict) else None
     models_section = models if isinstance(models, dict) else {}
 
-    raw = models_section.get("brain")
-    configured = (
-        raw.strip() if isinstance(raw, str) and raw.strip() else None
+    # Effort half first — independent of the model half, and it must
+    # fire even when the model resolves to the account default.
+    findings.extend(
+        _reasoning_findings(
+            "brain",
+            model_brain_reasoning_from_config(models_section),
+            brain_kind,
+            available_reasoning_levels_per_brain,
+        )
     )
-    # Unset or explicit ``default`` → account default; nothing to check.
-    if configured is None or configured.lower() == "default":
+
+    # Model half. ``model_brain_from_config`` unpacks the string OR the
+    # dict shape and returns the ``default`` sentinel for unset / a
+    # dict carrying only ``reasoning`` — both = account default, nothing
+    # more to check on the model side.
+    configured = model_brain_from_config(models_section)
+    if configured.lower() == "default":
         return findings
 
     resolved = model_for_tier_from_config(
@@ -622,8 +730,9 @@ def validate_models_config(
     brain_kind: str,
     *,
     available_models_per_brain: dict[str, set[str]] | None = None,
+    available_reasoning_levels_per_brain: dict[str, set[str]] | None = None,
 ) -> list[ValidationFinding]:
-    """Run all seven rules against a config dict + brain kind.
+    """Run all rules against a config dict + brain kind.
 
     Pure function — no disk I/O, no global state mutation (the
     rule-7 live-callers cache is read-only after first init; tests
@@ -643,6 +752,13 @@ def validate_models_config(
         provided, rule 6 fires; when None or empty, rule 6 is
         silently skipped (the format-shape rules 4 and 5 still
         fire as best-effort proxies).
+      available_reasoning_levels_per_brain: optional effort-level
+        vocabulary (Issue #50). ``{"claude-code": {"low", "medium",
+        ...}}`` from ``model_discovery.reasoning_vocabulary_for_validator``.
+        When provided AND non-empty for the active brain, rule 9
+        warns on a configured ``reasoning:`` level outside the set;
+        None or empty → silently skipped (never false-positives
+        offline).
 
     Returns the findings in deterministic order: per-rule, then
     alphabetical by subsystem within rules where it matters.
@@ -655,11 +771,13 @@ def validate_models_config(
     findings.extend(
         _check_per_subsystem(
             config, brain_kind, available_models_per_brain,
+            available_reasoning_levels_per_brain,
         )
     )
     findings.extend(
         _check_foreground(
             config, brain_kind, available_models_per_brain,
+            available_reasoning_levels_per_brain,
         )
     )
     findings.extend(_check_dead_knobs(config, brain_kind))
@@ -762,6 +880,7 @@ def build_resolution_table(
     brain_kind: str,
     *,
     available_models_per_brain: dict[str, set[str]] | None = None,
+    available_reasoning_levels_per_brain: dict[str, set[str]] | None = None,
     running_brain_kind: str | None = None,
 ) -> dict:
     """Single source of truth for the resolution-table data the
@@ -781,7 +900,8 @@ def build_resolution_table(
         {
             "brain_kind": "claude-code",
             "foreground": {                 # the chat model (models.brain)
-                "configured": "sonnet",     # raw value or None (unset)
+                "configured": "sonnet",     # model value or None (unset)
+                "reasoning": "low",         # Issue #50 effort or None
                 "resolved_model_id": "sonnet",  # None = account default
                 "findings": [...],
             },
@@ -789,6 +909,7 @@ def build_resolution_table(
                 {
                     "name": "curator",
                     "configured": "small",   # raw value or None
+                    "reasoning": None,       # Issue #50 effort or None
                     "resolved_tier": "small",
                     "resolved_model_id": "haiku",
                     "findings": [...],       # findings for this subsystem
@@ -820,6 +941,9 @@ def build_resolution_table(
     findings = validate_models_config(
         config, brain_kind,
         available_models_per_brain=available_models_per_brain,
+        available_reasoning_levels_per_brain=(
+            available_reasoning_levels_per_brain
+        ),
     )
 
     # Bucket findings by subsystem so per-row payloads carry only
@@ -844,11 +968,19 @@ def build_resolution_table(
 
     subsystem_rows: list[dict] = []
     for name in sorted(DEFAULT_SUBSYSTEM_TIERS):
-        # Configured value: NEW schema wins over legacy raw-string.
+        # Configured value: NEW schema wins over legacy raw-string,
+        # mirroring ``subsystem_tier_from_config``'s resolution order.
+        # The new-schema value may be the dict shape
+        # ({model, reasoning}); unpack its model half so the display
+        # shows the configured model, not a raw dict. A reasoning-only
+        # dict (model half empty) falls through to the legacy key just
+        # like tier resolution does.
         configured: str | None = None
-        v = subs_block_dict.get(name)
-        if isinstance(v, str) and v.strip():
-            configured = v.strip()
+        new_model, _ = _extract_subsystem_value_and_reasoning(
+            subs_block_dict.get(name)
+        )
+        if new_model:
+            configured = new_model
         else:
             v = models_section.get(name)
             if isinstance(v, str) and v.strip():
@@ -858,10 +990,15 @@ def build_resolution_table(
         resolved_model_id = model_for_tier_from_config(
             models_section, brain_kind, resolved_tier,
         )
+        # Issue #50 — the effort level configured under the dict shape
+        # ``models.subsystems.<name>: {model: ..., reasoning: ...}``.
+        # None for the plain-string shape (defer to the CLI default).
+        reasoning = subsystem_reasoning_from_config(models_section, name)
 
         subsystem_rows.append({
             "name": name,
             "configured": configured,
+            "reasoning": reasoning,
             "resolved_tier": resolved_tier,
             "resolved_model_id": resolved_model_id,
             "findings": [
@@ -904,26 +1041,31 @@ def build_resolution_table(
 
     # Foreground (chat) model row — ``models.brain``. Distinct from the
     # subsystem rows (those are aux spawns) and from ``brain.kind``
-    # (which agent CLI). ``configured`` is the raw value (None when
+    # (which agent CLI). ``configured`` is the model value (None when
     # unset); ``resolved_model_id`` is None for unset/``default`` (=
     # account default / no ``--model`` flag). Findings come from rule 8
     # (:func:`_check_foreground`), bucketed under subsystem="brain".
-    fg_raw = models_section.get("brain")
-    fg_configured = (
-        fg_raw.strip() if isinstance(fg_raw, str) and fg_raw.strip() else None
-    )
+    #
+    # Issue #50 — ``models.brain`` accepts a dict shape
+    # (``{model: ..., reasoning: ...}``). ``model_brain_from_config``
+    # unpacks the model half from either the string or the dict (a raw
+    # ``.strip()`` on the dict would have mis-rendered a configured
+    # foreground as "(default)"); ``model_brain_reasoning_from_config``
+    # surfaces the effort half for the ``reasoning`` field.
+    fg_model = model_brain_from_config(models_section)
     # The ``default`` sentinel is semantically identical to unset (both
     # = the brain's account default, no --model flag). Normalize it to
     # None so every surface renders the clean "(default)" state with no
     # spurious reset affordance — the shipped config.example.yaml writes
     # ``brain: default`` literally, so this is the common case.
-    if fg_configured is not None and fg_configured.lower() == "default":
-        fg_configured = None
+    fg_configured = None if fg_model.lower() == "default" else fg_model
+    fg_reasoning = model_brain_reasoning_from_config(models_section)
     fg_resolved = model_for_tier_from_config(
         models_section, brain_kind, fg_configured,
     )
     foreground = {
         "configured": fg_configured,
+        "reasoning": fg_reasoning,
         "resolved_model_id": fg_resolved,
         "findings": [
             _finding_dict(f) for f in by_subsystem.get("brain", [])

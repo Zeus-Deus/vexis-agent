@@ -1050,6 +1050,100 @@ def test_reasoning_levels_for_unknown_brain_returns_empty():
     assert md.reasoning_levels_for("null", "anything") == []
 
 
+# ──────────────────────────────────────────────────────────────────
+# Issue #50 — reasoning_vocabulary_for (validator effort-level set)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_reasoning_vocabulary_claude_code_uses_cli_probe():
+    """claude-code's vocabulary is the CLI ``--effort`` help list —
+    canonical and model-independent."""
+    with patch(
+        "vexis_agent.core.model_discovery._discover_claude_code_effort_levels_uncached",
+        return_value=["low", "medium", "high", "xhigh", "max"],
+    ):
+        vocab = md.reasoning_vocabulary_for("claude-code")
+    assert vocab == {"low", "medium", "high", "xhigh", "max"}
+
+
+def test_reasoning_vocabulary_claude_code_falls_back_to_capabilities(
+    force_oauth_token,
+):
+    """When the CLI probe returns empty (binary missing), fall back to
+    the union of per-model capability levels so an offline-but-cached
+    run still has a vocabulary."""
+    payload = _api_payload_with_capabilities(
+        {
+            "id": "claude-opus-4-7",
+            "capabilities": {"effort": {
+                "supported": True,
+                "low": {"supported": True},
+                "high": {"supported": True},
+            }},
+        },
+    )
+    with patch(
+        "vexis_agent.core.model_discovery._discover_claude_code_effort_levels_uncached",
+        return_value=[],
+    ), patch(
+        "urllib.request.urlopen",
+        return_value=_fake_http_response(payload),
+    ):
+        vocab = md.reasoning_vocabulary_for("claude-code")
+    assert vocab == {"low", "high"}
+
+
+def test_reasoning_vocabulary_opencode_unions_variants():
+    """opencode variants are per-model, so the vocabulary is the union
+    across every discovered model."""
+    fake_stdout = """\
+github-copilot/claude-opus-4.5
+{
+  "id": "claude-opus-4.5",
+  "providerID": "github-copilot",
+  "variants": {
+    "max": {"thinking": {"type": "enabled", "budgetTokens": 31999}}
+  }
+}
+opencode/nemotron-3-super-free
+{
+  "id": "nemotron-3-super-free",
+  "providerID": "opencode",
+  "variants": {
+    "low": {"reasoningEffort": "low"},
+    "high": {"reasoningEffort": "high"}
+  }
+}
+"""
+    with patch(
+        "subprocess.run", return_value=_fake_completed(fake_stdout),
+    ):
+        vocab = md.reasoning_vocabulary_for("opencode")
+    assert vocab == {"max", "low", "high"}
+
+
+def test_reasoning_vocabulary_unknown_brain_empty():
+    assert md.reasoning_vocabulary_for("null") == set()
+    assert md.reasoning_vocabulary_for("future-brain") == set()
+
+
+def test_reasoning_vocabulary_for_validator_shape():
+    """The validator helper builds a brain→set dict, mirroring
+    ``discovery_for_validator``."""
+    with patch(
+        "vexis_agent.core.model_discovery._discover_claude_code_effort_levels_uncached",
+        return_value=["low", "high"],
+    ), patch(
+        "subprocess.run", return_value=_fake_completed(""),
+    ):
+        out = md.reasoning_vocabulary_for_validator(
+            ["claude-code", "opencode", "null"],
+        )
+    assert out["claude-code"] == {"low", "high"}
+    assert out["null"] == set()
+    assert isinstance(out["opencode"], set)
+
+
 def test_opencode_capabilities_parses_variants_keys():
     """Pin the opencode parser: ``variants`` keys become reasoning
     levels for each model. Variants whose payloads don't look

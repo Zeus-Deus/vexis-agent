@@ -35,10 +35,17 @@ the dispatcher keeps the claim alive (`_claim_keepalive`) so a worker
 busy inside a long tool call doesn't get reclaimed mid-run.
 
 **Lane.** vexis's lightweight replacement for upstream profiles. A
-lane is `(system_prompt_slice, skills, tier_override)` — same brain,
-different hat. Defaults bundled in code: `research`,
+lane is `(system_prompt_slice, skills, tier_override, reasoning)` —
+same brain, different hat. Defaults bundled in code: `research`,
 `implementation`, `review`, `ops`, `triage`, `default`. Override
-under `kanban.lanes:` in `~/.vexis/config.yaml`.
+under `kanban.lanes:` in `~/.vexis/config.yaml`. `reasoning` pins
+the per-spawn reasoning effort the same way `tier` pins the model
+size — the dispatcher passes `lane.reasoning` to every worker
+`spawn_aux`; unset defers to the CLI default (Issue #50). Unlike
+`tier` there is no static vocabulary: effort levels are
+brain/CLI-discovered, so any non-empty string is accepted at parse
+and the model validator owns the vocabulary check (see
+[`docs/model-ux.md`](model-ux.md#reasoning-effort)).
 
 **Run.** One attempt at executing a task. Multiple per task on retry.
 Carries the worker PID, claim lock, heartbeat, and final outcome
@@ -140,6 +147,8 @@ kanban:
   lanes:
     research:
       tier: medium
+      reasoning: low             # optional; per-spawn effort level,
+                                 # unset defers to the CLI default
       skills: []
       system_prompt: |
         You research. ...

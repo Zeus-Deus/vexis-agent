@@ -439,6 +439,75 @@ def test_set_foreground_no_value_shows_usage(
     assert not (vexis_home / "config.yaml").exists()
 
 
+def test_set_foreground_with_reasoning_writes_dict(
+    transport, model_ux_on, vexis_home,
+):
+    """Issue #50 — ``/model set foreground <model> <level>`` writes the
+    dict shape ``models.brain: {model, reasoning}`` so a headless
+    deployment pins the chat brain's effort. Reply echoes the level."""
+    upd, _bot, msg = _update("/model set foreground sonnet low")
+    asyncio.run(transport._on_model(
+        upd, _ctx("set", "foreground", "sonnet", "low"),
+    ))
+    import yaml
+    parsed = yaml.safe_load(
+        (vexis_home / "config.yaml").read_text(encoding="utf-8")
+    )
+    assert parsed["models"]["brain"] == {"model": "sonnet", "reasoning": "low"}
+    assert any("reasoning=low" in r for r in msg.reply_log)
+
+
+def test_set_foreground_without_reasoning_stays_plain_string(
+    transport, model_ux_on, vexis_home,
+):
+    """No second value → plain-string write, byte-identical to pre-#50
+    behaviour."""
+    upd, _bot, msg = _update("/model set foreground sonnet")
+    asyncio.run(transport._on_model(upd, _ctx("set", "foreground", "sonnet")))
+    import yaml
+    parsed = yaml.safe_load(
+        (vexis_home / "config.yaml").read_text(encoding="utf-8")
+    )
+    assert parsed["models"]["brain"] == "sonnet"
+
+
+def test_status_renders_foreground_reasoning_suffix(
+    transport, model_ux_on, vexis_home,
+):
+    """A dict-shaped models.brain renders the effort level as a
+    '+ reasoning=<level>' suffix on the foreground status line, and the
+    configured model (not the raw dict)."""
+    _seed_config(
+        vexis_home / "config.yaml",
+        "models:\n  brain:\n    model: sonnet\n    reasoning: low\n",
+    )
+    upd, _bot, msg = _update("/model")
+    asyncio.run(transport._on_model(upd, _ctx()))
+    out = msg.reply_log[0]
+    assert "foreground (chat)" in out
+    assert "+ reasoning=low" in out
+
+
+def test_set_foreground_reasoning_validator_refusal_intact(
+    transport, model_ux_on, vexis_home,
+):
+    """The model half of the dict still runs through the validator: a
+    bare alias on opencode is refused pre-write even with a reasoning
+    level attached. No config written."""
+    _seed_config(vexis_home / "config.yaml", "brain:\n  kind: opencode\n")
+    upd, _bot, msg = _update("/model set foreground sonnet low")
+    asyncio.run(transport._on_model(
+        upd, _ctx("set", "foreground", "sonnet", "low"),
+    ))
+    out = msg.reply_log[0]
+    assert "Won't write" in out
+    import yaml
+    parsed = yaml.safe_load(
+        (vexis_home / "config.yaml").read_text(encoding="utf-8")
+    )
+    assert "brain" not in (parsed.get("models") or {})
+
+
 def test_reset_foreground_drops_models_brain(
     transport, model_ux_on, vexis_home,
 ):

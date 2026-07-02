@@ -133,14 +133,14 @@ native model id via `models.tiers.<brain-kind>.<tier>` config
 or `DEFAULT_TIER_MAP_<BRAIN>`. Foreground (chat) turn — the model
 you talk to — resolves `models.brain` tier-or-raw per turn;
 `default`/unset → no `--model` flag → account default. Settable via
-`/model set foreground` + dashboard (the chat-model knob; matters
-most on opencode, no account default). Per-turn overrides beat it: voice
-call mode (`voice.call_mode.model`) or the computer-use selector
-(`computer_use.*` — pinned model + optional dynamic fast-model
-layer, gated on recent `vexis-ui` activity). Per-subsystem override
-under `models.subsystems.<name>`. Legacy raw-string keys (e.g.
-`models.coherence_judge: sonnet`) work on claude-code via
-back-compat, break on opencode. `default` = no flag.
+`/model set foreground` + dashboard. Per-turn overrides beat it:
+voice call mode (`voice.call_mode.model`) or the computer-use
+selector (`computer_use.*`, gated on recent `vexis-ui` activity).
+Per-subsystem override under `models.subsystems.<name>`; legacy
+raw-string keys (`models.coherence_judge: sonnet`) break on opencode.
+Every model knob (incl. `kanban.lanes.<name>`) also takes an optional
+`reasoning` via the `{model, reasoning}` dict shape; unset = CLI
+default; brains own translation (`--effort` / `--variant`).
 
 **Pointers:** `docs/model-ux.md` (resolution, slash, dashboard,
 hot-reload matrix) · `docs/migration.md` (legacy-keys trap) ·

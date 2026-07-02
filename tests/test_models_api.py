@@ -243,6 +243,61 @@ def test_get_models_new_schema_value_surfaces_as_configured(
     assert gj["resolved_model_id"] == "haiku"
 
 
+def test_get_models_carries_reasoning_field(
+    client: TestClient, cfg_path: Path,
+):
+    """Issue #50 — the GET payload exposes the configured reasoning
+    effort on the foreground block AND every subsystem row. Dict-shaped
+    config renders the MODEL half in ``configured`` (not the raw dict)
+    and the effort in ``reasoning``."""
+    _seed_config(
+        cfg_path,
+        "models:\n"
+        "  brain:\n"
+        "    model: sonnet\n"
+        "    reasoning: low\n"
+        "  subsystems:\n"
+        "    curator:\n"
+        "      model: small\n"
+        "      reasoning: high\n",
+    )
+    r = client.get("/api/v1/models", headers=_hdr())
+    data = r.json()
+    fg = data["foreground"]
+    assert fg["configured"] == "sonnet"
+    assert fg["reasoning"] == "low"
+    assert fg["resolved_model_id"] == "sonnet"
+
+    curator = next(
+        row for row in data["subsystems"] if row["name"] == "curator"
+    )
+    assert curator["configured"] == "small"
+    assert curator["reasoning"] == "high"
+    assert curator["resolved_tier"] == "small"
+    # An unconfigured subsystem carries reasoning=None.
+    goal_judge = next(
+        row for row in data["subsystems"] if row["name"] == "goal_judge"
+    )
+    assert goal_judge["reasoning"] is None
+
+
+def test_get_models_reasoning_only_brain_does_not_500(
+    client: TestClient, cfg_path: Path,
+):
+    """The reporter's ``{reasoning: low}`` shape (dict, no model) is
+    handled cleanly — model half normalises to account-default, effort
+    surfaces, no 500."""
+    _seed_config(
+        cfg_path, "models:\n  brain:\n    reasoning: low\n",
+    )
+    r = client.get("/api/v1/models", headers=_hdr())
+    assert r.status_code == 200
+    fg = r.json()["foreground"]
+    assert fg["configured"] is None
+    assert fg["resolved_model_id"] is None
+    assert fg["reasoning"] == "low"
+
+
 def test_get_models_new_schema_wins_over_legacy(
     client: TestClient, cfg_path: Path,
 ):
@@ -536,6 +591,47 @@ def test_contract_slash_status_and_api_share_resolution_data(
 
     # API's brain_kind matches the slash header.
     assert f"brain: {api_data['brain_kind']}" in slash_text
+
+
+def test_contract_reasoning_renders_in_both_surfaces(
+    client: TestClient, cfg_path: Path,
+):
+    """Issue #50 cross-surface pin: a dict-shaped config's effort level
+    surfaces in BOTH the API payload (structured field) and the slash
+    status text (the '+ reasoning=<level>' suffix). Same shared
+    ``build_resolution_table`` source; drift surfaces here."""
+    _seed_config(
+        cfg_path,
+        "brain:\n  kind: claude-code\n"
+        "models:\n"
+        "  brain:\n"
+        "    model: sonnet\n"
+        "    reasoning: low\n"
+        "  subsystems:\n"
+        "    curator:\n"
+        "      model: small\n"
+        "      reasoning: high\n",
+    )
+
+    r = client.get("/api/v1/models", headers=_hdr())
+    api_data = r.json()
+    assert api_data["foreground"]["reasoning"] == "low"
+    curator = next(
+        row for row in api_data["subsystems"] if row["name"] == "curator"
+    )
+    assert curator["reasoning"] == "high"
+
+    from vexis_agent.transports.telegram import TelegramTransport
+    from vexis_agent.core.running_tasks import RunningTasks
+    transport = TelegramTransport.__new__(TelegramTransport)
+    transport._allowed_user_id = 1  # type: ignore[attr-defined]
+    transport._running_tasks = RunningTasks()  # type: ignore[attr-defined]
+    slash_text = transport._model_status_text()
+
+    # Foreground + subsystem effort levels both render as the suffix.
+    assert "foreground (chat)" in slash_text
+    assert "+ reasoning=low" in slash_text
+    assert "+ reasoning=high" in slash_text
 
 
 def test_contract_validator_findings_appear_in_both_surfaces(

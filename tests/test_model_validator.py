@@ -29,6 +29,7 @@ from vexis_agent.core.model_validator import (
     CLAUDE_CODE_FORMAT_FIX_TEMPLATE,
     DEAD_KNOB_FIX_TEMPLATE,
     EMPTY_TIER_FIX_TEMPLATE,
+    INVALID_REASONING_FIX_TEMPLATE,
     OPENCODE_FORMAT_FIX_TEMPLATE,
     UNKNOWN_BRAIN_FIX,
     UNKNOWN_MODEL_FIX_TEMPLATE,
@@ -786,6 +787,9 @@ def test_suggested_fix_constants_exported():
     assert "{model_id}" in UNKNOWN_MODEL_FIX_TEMPLATE
     assert "{brain_kind}" in UNKNOWN_MODEL_FIX_TEMPLATE
     assert "{subsystem}" in DEAD_KNOB_FIX_TEMPLATE
+    assert "{level}" in INVALID_REASONING_FIX_TEMPLATE
+    assert "{brain_kind}" in INVALID_REASONING_FIX_TEMPLATE
+    assert "{levels}" in INVALID_REASONING_FIX_TEMPLATE
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -912,3 +916,204 @@ def test_rule8_resolution_table_foreground_default_resolves_none():
     fg = table["foreground"]
     assert fg["configured"] is None
     assert fg["resolved_model_id"] is None
+
+
+# ──────────────────────────────────────────────────────────────────
+# Issue #50 — dict-shaped models.brain + rule 9 (reasoning effort)
+#
+# ``models.brain`` grew the same {model, reasoning} dict shape the
+# subsystems accept. Two properties under test: (a) the model half of
+# a dict is validated exactly like the plain string it replaces —
+# rule 8 must NOT mistake a dict for "unset" and skip; (b) a configured
+# ``reasoning:`` level is checked (warning) against the brain's
+# discovered effort vocabulary, applied to both models.brain and every
+# models.subsystems.<name>, and silently skipped when no vocabulary was
+# discovered so it never false-positives offline.
+# ──────────────────────────────────────────────────────────────────
+
+
+_CC_LEVELS = {"claude-code": {"low", "medium", "high", "xhigh", "max"}}
+
+
+def test_rule8_dict_shaped_brain_validates_model_half_on_opencode():
+    """A dict-shaped models.brain on opencode with a bare-alias model
+    still trips rule 8 — the dict must be unpacked, not treated as
+    unset. Regression pin for the pre-#50 behaviour where a dict fell
+    through to configured=None and skipped ALL validation."""
+    config = {
+        "brain": {"kind": "opencode"},
+        "models": {"brain": {"model": "sonnet", "reasoning": "low"}},
+    }
+    findings = validate_models_config(config, "opencode")
+    assert _has_finding(
+        findings, severity="error", subsystem="brain",
+        problem_substring="bare alias",
+    )
+
+
+def test_rule8_dict_shaped_brain_valid_model_silent():
+    """A dict whose model half is a clean provider/model id on opencode
+    fires no model-half error."""
+    config = {
+        "brain": {"kind": "opencode"},
+        "models": {"brain": {
+            "model": "anthropic/claude-haiku-3-5", "reasoning": "low",
+        }},
+    }
+    findings = validate_models_config(config, "opencode")
+    assert not _has_finding(findings, severity="error", subsystem="brain")
+
+
+def test_rule9_foreground_bogus_reasoning_warns_when_vocab_supplied():
+    """A hand-edited bogus effort level on the chat brain warns when
+    the vocabulary is supplied. Carries subsystem='brain' + the shared
+    INVALID_REASONING_FIX_TEMPLATE copy."""
+    config = {"models": {"brain": {"model": "sonnet", "reasoning": "ultra"}}}
+    findings = validate_models_config(
+        config, "claude-code",
+        available_reasoning_levels_per_brain=_CC_LEVELS,
+    )
+    matches = [
+        f for f in findings
+        if f.subsystem == "brain" and "reasoning effort" in f.problem
+    ]
+    assert len(matches) == 1
+    assert matches[0].severity == "warning"
+    assert matches[0].suggested_fix == INVALID_REASONING_FIX_TEMPLATE.format(
+        level="ultra", brain_kind="claude-code",
+        levels="high, low, max, medium, xhigh",
+    )
+
+
+def test_rule9_reasoning_only_dict_still_validated():
+    """The reporter's ``{reasoning: ...}`` shape (no model → account
+    default) still gets its effort level checked — a bogus level here
+    is exactly the hand-edit mistake rule 9 exists for."""
+    config = {"models": {"brain": {"reasoning": "bogus"}}}
+    findings = validate_models_config(
+        config, "claude-code",
+        available_reasoning_levels_per_brain=_CC_LEVELS,
+    )
+    assert _has_finding(
+        findings, severity="warning", subsystem="brain",
+        problem_substring="reasoning effort",
+    )
+
+
+def test_rule9_valid_foreground_reasoning_silent():
+    """A level in the discovered vocabulary fires nothing."""
+    config = {"models": {"brain": {"model": "sonnet", "reasoning": "high"}}}
+    findings = validate_models_config(
+        config, "claude-code",
+        available_reasoning_levels_per_brain=_CC_LEVELS,
+    )
+    assert not _has_finding(
+        findings, subsystem="brain", problem_substring="reasoning effort",
+    )
+
+
+def test_rule9_silent_when_no_vocabulary_supplied():
+    """No vocabulary at all (the pure-function / offline call shape) →
+    rule 9 is silently skipped even on a clearly-bogus level. Never
+    false-positive when we can't see the valid set."""
+    config = {"models": {"brain": {"model": "sonnet", "reasoning": "ultra"}}}
+    findings = validate_models_config(config, "claude-code")
+    assert not _has_finding(
+        findings, problem_substring="reasoning effort",
+    )
+
+
+def test_rule9_silent_when_brain_vocabulary_empty():
+    """Vocabulary supplied but the active brain's set is empty (binary
+    missing / offline) → skipped. Empty means 'can't see the levels',
+    not 'every level is invalid'."""
+    config = {"models": {"brain": {"model": "sonnet", "reasoning": "ultra"}}}
+    findings = validate_models_config(
+        config, "claude-code",
+        available_reasoning_levels_per_brain={"claude-code": set()},
+    )
+    assert not _has_finding(
+        findings, problem_substring="reasoning effort",
+    )
+
+
+def test_rule9_subsystem_bogus_reasoning_warns():
+    """The same check applies per-subsystem under the dict shape."""
+    config = {
+        "models": {"subsystems": {
+            "curator": {"model": "small", "reasoning": "ultra"},
+        }},
+    }
+    findings = validate_models_config(
+        config, "claude-code",
+        available_reasoning_levels_per_brain=_CC_LEVELS,
+    )
+    assert _has_finding(
+        findings, severity="warning", subsystem="curator",
+        problem_substring="reasoning effort",
+    )
+
+
+def test_rule9_subsystem_reasoning_survives_model_early_continue():
+    """Rule 9 must fire even when the model-half check ``continue``s
+    early (rule 4 on opencode). A dict carrying a bare-alias model AND
+    a bogus reasoning on opencode surfaces BOTH the model error and the
+    reasoning warning."""
+    config = {
+        "brain": {"kind": "opencode"},
+        "models": {"subsystems": {
+            "curator": {"model": "sonnet", "reasoning": "ultra"},
+        }},
+    }
+    findings = validate_models_config(
+        config, "opencode",
+        available_reasoning_levels_per_brain={
+            "opencode": {"low", "high"},
+        },
+    )
+    assert _has_finding(
+        findings, severity="error", subsystem="curator",
+        problem_substring="bare alias",
+    )
+    assert _has_finding(
+        findings, severity="warning", subsystem="curator",
+        problem_substring="reasoning effort",
+    )
+
+
+def test_resolution_table_carries_reasoning_on_both_surfaces():
+    """build_resolution_table exposes the configured effort level on the
+    foreground block AND every subsystem row (None when unset / plain
+    string). Dict-shaped configured value renders the MODEL half, not
+    the raw dict."""
+    config = {
+        "models": {
+            "brain": {"model": "sonnet", "reasoning": "low"},
+            "subsystems": {
+                "curator": {"model": "small", "reasoning": "high"},
+            },
+        },
+    }
+    table = build_resolution_table(config, "claude-code")
+    fg = table["foreground"]
+    assert fg["configured"] == "sonnet"   # model half, not the dict
+    assert fg["reasoning"] == "low"
+    assert fg["resolved_model_id"] == "sonnet"
+
+    curator = next(r for r in table["subsystems"] if r["name"] == "curator")
+    assert curator["configured"] == "small"
+    assert curator["reasoning"] == "high"
+    # A plain-string / unset subsystem carries reasoning=None.
+    other = next(r for r in table["subsystems"] if r["name"] == "goal_judge")
+    assert other["reasoning"] is None
+
+
+def test_resolution_table_reasoning_only_brain_renders_default_model():
+    """The reporter's shape in the table: model half normalises to None
+    (account default → '(default)') while the effort survives."""
+    config = {"models": {"brain": {"reasoning": "low"}}}
+    table = build_resolution_table(config, "claude-code")
+    fg = table["foreground"]
+    assert fg["configured"] is None        # account default
+    assert fg["resolved_model_id"] is None
+    assert fg["reasoning"] == "low"

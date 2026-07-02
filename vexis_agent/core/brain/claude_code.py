@@ -1475,6 +1475,7 @@ class ClaudeCodeBrain(Brain):
             compression_protect_last_n_turns,
             compression_threshold_ratio,
             compression_threshold_turns,
+            subsystem_reasoning,
             subsystem_tier,
         )
 
@@ -1547,6 +1548,11 @@ class ClaudeCodeBrain(Brain):
             result = await self.spawn_aux(
                 prompt,
                 model_tier=subsystem_tier("compressor"),
+                # Effort defers to the CLI default unless the deployment
+                # pins one via the dict-shaped compressor subsystem config;
+                # summarisation is a bounded lookup-and-condense job, so a
+                # low effort is the natural knob to reach for here.
+                reasoning_level=subsystem_reasoning("compressor"),
                 # 180s ceiling — summariser output is bounded by the
                 # template (~10 sections); a multi-minute spawn is
                 # almost certainly stuck rather than productive.
