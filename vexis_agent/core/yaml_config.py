@@ -1338,7 +1338,11 @@ def brain_subprocess_memory_max() -> str | None:
     :func:`brain_file_mutation_footer_enabled`. Anything unparseable
     falls back to the default rather than erroring: a config typo must
     never wedge the brain (and ``wrap_with_memory_scope`` no-ops anyway
-    when ``systemd-run`` is absent).
+    when ``systemd-run`` is absent or unusable — a bad cap present at
+    the one-time usability probe fails it and degrades to an unwrapped
+    spawn; a cap hot-edited to an invalid value *after* a successful
+    probe skips the cached probe and does hard-fail until corrected or
+    the daemon restarts).
     """
     raw = _section("brain").get(
         "subprocess_memory_max", _SUBPROCESS_MEMORY_MAX_DEFAULT,
