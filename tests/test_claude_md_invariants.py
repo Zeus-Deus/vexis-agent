@@ -93,12 +93,22 @@ from pathlib import Path
 #     ``docs/modular-subsystems.md``; the bullet is a 7-line pointer.
 #     Pinned by ``tests/test_subsystem_toggles.py`` and the
 #     ``test_*_still_starts`` cases in ``tests/test_learning_curator.py``.
+#   - +18 (328 → 346): new feature section "Web conversations
+#     (issue #48)" — ~17 lines, inside the ~30-line per-section
+#     ceiling. Per-conversation web sessions: the optional
+#     ``session`` per-turn seam (``SessionView`` threaded
+#     handler → brain, ``None`` = byte-identical legacy) plus the
+#     transport-owned ``conversation_id`` → named-session /
+#     chat-id-band mapping. No Invariants growth; the mapping and
+#     back-compat contracts live in the section's TL;DR per the
+#     established escape hatch and are pinned by
+#     ``tests/test_web_conversations.py``.
 # Bump only when the growth comes from new cross-feature
 # contracts in the Invariants section AND that section is
 # itself still under ~40 lines, OR a genuinely new feature
 # section that respects the ~30-line per-section ceiling.
 # Never bump for per-feature bloat in existing sections.
-CLAUDE_MD_MAX_LINES = 328
+CLAUDE_MD_MAX_LINES = 346
 
 
 def test_claude_md_stays_under_size_limit() -> None:

@@ -759,6 +759,21 @@ async def _run() -> bool:
         # of the pre-emptive "ok" the dispatch-time _record_fire writes.
         transport._schedule_outcome_cb = schedule_manager.report_fire_outcome
 
+    # Issue #48 bullet 4: in a web-only deployment (Telegram disabled)
+    # nothing wires the background-task notifier — the Telegram transport's
+    # start() is where the Telegram path binds ``notifier.send``, so
+    # without it a finished background task's completion note was dropped
+    # (``_maybe_notify`` logs "no notifier"). Wire it here so the
+    # notifier's context-buffer half still fires: the completion reaches
+    # the next chat turn as a ``[SYSTEM CONTEXT]`` block. The Telegram
+    # delivery half of ``notifier.send`` degrades to a logged warning when
+    # no app is bound (``Notifier._send_telegram``) — exactly the
+    # web-only case. When Telegram IS enabled its start() wires the same
+    # callback, so we skip here to keep that path byte-identical and not
+    # double-wire.
+    if transport is None:
+        background_tasks.set_notify(notifier.send)
+
     # The watcher pushes its idle pings through the same notifier the
     # rest of the daemon uses — same per-chat context buffer, same
     # Markdown fall-back, same retry shape as vexis-bg's exit pings.
