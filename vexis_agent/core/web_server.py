@@ -1799,9 +1799,25 @@ class WebDashboard:
                 ...
                 data: {"type":"done","reply":"…"}\\n\\n
 
+            Interleaved with the chunks are brain observability frames
+            (issue #49), forwarded verbatim from ``Brain.astream`` — a
+            new brain event ``type`` reaches the wire with no change
+            here:
+
+                data: {"type":"tool","name":"Read","target":"src/foo.py",
+                       "id":"toolu_…","ts":1751...}\\n\\n
+                data: {"type":"tool_end","name":"Read","target":"src/foo.py",
+                       "id":"toolu_…","ts":1751...,"duration_ms":142,
+                       "status":"completed"}\\n\\n
+
+            ``ts`` is epoch milliseconds (correlate with the daemon
+            ``tool-span`` logs); ``duration_ms`` is the monotonic tool
+            runtime. Consumers ignore frames whose ``type`` they don't
+            recognise.
+
             On error:
 
-                data: {"type":"error","message":"…"}\\n\\n
+                data: {"type":"error","code":"…","message":"…"}\\n\\n
 
             Body shape mirrors POST /chat/send: ``text``, optional
             ``attachments`` (path/name/mime list), optional ``model``
@@ -1861,12 +1877,14 @@ class WebDashboard:
                             )
                             yield f"data: {data}\n\n"
                         elif kind == "tool":
-                            # Tool-use event from the brain. ``payload``
-                            # is a dict ``{"type":"tool","name","target"}``;
-                            # we forward shape-as-is so the client can
-                            # render an inline status line. ``target``
-                            # may be None for tools without a clear
-                            # filename/command (Task, MCP servers, etc.).
+                            # Brain observability event. ``payload`` is a
+                            # dict carrying its own ``type`` discriminator
+                            # (``tool`` / ``tool_end``, issue #49); we
+                            # forward it shape-as-is so a new brain event
+                            # type reaches the client without a change
+                            # here. ``target`` may be None for tools with
+                            # no clear filename/command (Task, MCP
+                            # servers, etc.).
                             data = json.dumps(payload)
                             yield f"data: {data}\n\n"
                         elif kind == "done":

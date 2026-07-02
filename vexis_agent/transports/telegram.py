@@ -4916,12 +4916,14 @@ class TelegramTransport:
                exceed :data:`_STREAMING_ROLLOVER_THRESHOLD` chars,
                finalize it on a paragraph/line boundary and start
                a fresh placeholder for the remainder.
-             - ``("tool", dict)`` — currently dropped on the
-               Telegram side; ``/status`` already exposes per-turn
-               tool activity and adding inline tool lines would
-               compete with the streamed text for the same edit
-               budget. Web dashboard renders these inline because
-               it has a separate UI lane for them.
+             - ``("tool", dict)`` — brain UX / observability events
+               (``tool`` starts, ``tool_end`` spans, and any future
+               dict shape) are all currently dropped on the Telegram
+               side; ``/status`` already exposes per-turn tool
+               activity and adding inline tool lines would compete
+               with the streamed text for the same edit budget. Web
+               dashboard renders these inline because it has a
+               separate UI lane for them.
              - ``("done", str)`` — canonical final text. Final-
                flush + screenshot extraction happens here.
              - ``("error", dict | None)`` — replace the active
@@ -5073,8 +5075,9 @@ class TelegramTransport:
                     last_edited = current_buffer
                     last_edit_at = now
             elif kind == "tool":
-                # Reserved for a future Telegram surface; see
-                # docstring for why it's currently dropped.
+                # Any brain UX / observability dict (``tool`` /
+                # ``tool_end`` / future shapes). Reserved for a future
+                # Telegram surface; see docstring for why it's dropped.
                 continue
             elif kind == "done":
                 if isinstance(payload, str):
