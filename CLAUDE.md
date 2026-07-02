@@ -251,6 +251,24 @@ still supported but no longer required.
 **Pointers:** `docs/brains.md` · `docs/migration.md` ·
 `docs/model-ux.md` · `docs/dogfood-checklist.md` · `docs/memory-isolation.md` (per-subagent memory scopes; `brain.subprocess_memory_max`).
 
+## Web conversations (issue #48)
+
+`/api/v1/chat/{send,stream,clear,cancel,attach}` + `GET
+/api/v1/chat/history` accept an optional `conversation_id`.
+Present → the turn runs against that conversation's own named
+session (`web-<slug>-<sha256[:8]>`) through the general per-turn
+session seam (`SessionView` + the optional `session` kwarg,
+handler → brain), with a private chat-id band `-(2**52 +
+48-bit sha256)` isolating notifier context, cancel, and verifier
+state per conversation. Absent → the legacy shared web chat
+(`WEB_CHAT_ID = -1`, active session), byte-for-byte. Concurrent
+sends to ONE conversation return error code `busy`. Core never
+learns the word "conversation" — the mapping lives in
+`transports/web.py`. Not an auth boundary: the dashboard token
+is one trust domain; ids partition context, not access.
+
+**Pointers:** `docs/web-conversations.md`.
+
 ## Conversation compression
 
 Before every brain turn the handler calls

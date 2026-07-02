@@ -20,7 +20,8 @@ from vexis_agent.core.brain.base import (
 from vexis_agent.core.auth import is_allowed
 from vexis_agent.core.notify import ContextNote, Notifier
 from vexis_agent.core.paths import skills_dir
-from vexis_agent.core.sessions import SessionInfo, SessionStore
+from vexis_agent.core.running_tasks import TaskAlreadyRunning
+from vexis_agent.core.sessions import SessionInfo, SessionStore, SessionView
 from vexis_agent.core.skills import PinStore, archived_skill_names
 from vexis_agent.core.workspace_snapshot import format_verifier_footer
 from vexis_agent.core.yaml_config import brain_file_mutation_footer_enabled
@@ -47,6 +48,16 @@ _BRAIN_TIMEOUT = (
 )
 _EMPTY_RESPONSE = "(empty response)"
 _CLEAR_OK = "Conversation cleared."
+# Issue #48 bullet 2: a second send raced an in-flight turn for the SAME
+# conversation. The brain never ran — ``RunningTasks.reserve`` refused
+# the slot — so this is a client-side collision, not a brain failure.
+# Telegram's per-chat drain discipline serialises turns so this is
+# unreachable there; it fires on concurrent web sends to one conversation
+# (two browser tabs, a double-tapped Send).
+_BUSY = (
+    "⚠️ A reply is already in progress for this conversation — "
+    "wait for it to finish or cancel it."
+)
 
 # ── Streaming error taxonomy ─────────────────────────────────────
 # The chat UI distinguishes error categories so it can render
@@ -86,6 +97,14 @@ _ERR_CODE_REJECTED = "rejected"
 # already have the traceback; user gets a generic "stream
 # interrupted" so we never render uncaught Python on the page.
 _ERR_CODE_UNKNOWN = "unknown"
+# Issue #48: a concurrent send collided with an in-flight turn for the
+# same conversation (``RunningTasks.reserve`` → ``TaskAlreadyRunning``).
+# Distinct from ``brain_error`` so a frontend CAN render "wait / cancel"
+# instead of a retry button (retrying immediately just collides again).
+# The shipped chat UI doesn't recognise the code yet and degrades it to
+# the generic retry rendering — the ``_BUSY`` message text carries the
+# guidance until the frontend's ``mapErrorCode`` learns the code.
+_ERR_CODE_BUSY = "busy"
 
 # Max length of a brain-error tail we'll inline into the user-facing
 # message. The full text always lives in the daemon log; this is just
@@ -129,12 +148,17 @@ class TurnOutcome:
         Schedule manager treats as retryable error.
       * ``"permanent"`` — upstream rejected the request shape (auth,
         bad model id). Schedule manager auto-pauses immediately.
+      * ``"busy"`` — a concurrent send collided with an in-flight turn
+        for the same conversation (issue #48). The brain never ran, so
+        it is NOT a brain failure — ``is_brain_failure`` excludes it and
+        the user got the ``_BUSY`` toast. Only reachable on the web
+        transport (Telegram's per-chat drain serialises turns).
       * ``"unknown"`` — uncaught exception or unclassified failure.
     """
 
     kind: Literal[
         "unknown", "ok", "empty", "cancelled", "rejected",
-        "timeout", "session_lost", "transient", "permanent",
+        "timeout", "session_lost", "transient", "permanent", "busy",
     ] = "unknown"
     error_message: str | None = None
 
@@ -151,8 +175,10 @@ class TurnOutcome:
     def is_brain_failure(self) -> bool:
         """True iff the brain failed in a way that should advance
         the schedule's error counter. Excludes user-driven exits
-        (cancelled, rejected) and timeouts (handled separately —
-        timeout could be user-induced via a long-running tool)."""
+        (cancelled, rejected), timeouts (handled separately — timeout
+        could be user-induced via a long-running tool), and ``busy``
+        (issue #48 — a client-side send collision where the brain never
+        ran; nothing failed on the brain side)."""
         return self.kind in ("transient", "permanent", "unknown")
 
     @property
@@ -246,6 +272,16 @@ class MessageHandler:
         bound at handler construction and never reassigned."""
         return self._brain
 
+    @property
+    def sessions(self) -> SessionStore:
+        """Expose the bound session store to the web transport (issue
+        #48) so it can ``ensure`` a per-conversation named session and
+        build a :class:`SessionView` over it. Read-only intentionally,
+        mirroring :meth:`brain` — the store is bound at construction and
+        never reassigned; the transport reads/creates named sessions
+        through it but never swaps it out."""
+        return self._sessions
+
     def set_background_goal_provider(self, provider) -> None:
         """Wire (or clear) the ``[BACKGROUND GOALS]`` context provider.
 
@@ -265,6 +301,7 @@ class MessageHandler:
         model: str | None = None,
         reasoning_level: str | None = None,
         outcome: TurnOutcome | None = None,
+        session: SessionView | None = None,
     ) -> str | None:
         """Foreground turn entrypoint. ``model`` and ``reasoning_level``
         are optional per-turn overrides forwarded straight to
@@ -272,6 +309,15 @@ class MessageHandler:
         canonical foreground path — Voice call mode is the only caller
         passing non-None values, sourced from
         ``voice.call_mode.{model,reasoning_level}``.
+
+        ``session`` (issue #48) selects which session the turn runs
+        against. ``None`` (Telegram, the shared web chat) drives the
+        brain's bound active-session store — byte-identical to the
+        historical path, since the ``session`` kwarg is only forwarded
+        to the brain when it is non-``None``. A :class:`SessionView`
+        (the web transport builds one per conversation) runs this turn
+        against that named session; ``compress_if_needed`` and the
+        session-lost recovery all follow it.
 
         When the caller passes ``None``, the computer-use model
         selector gets a say (see :meth:`_apply_computer_use_override`):
@@ -306,13 +352,29 @@ class MessageHandler:
         # the brain layer; we wrap defensively here too so a buggy
         # third-party brain implementation can't take the foreground
         # turn down with it.
-        await self._maybe_compress()
+        await self._maybe_compress(session)
 
+        # Issue #48: forward ``session`` to the brain ONLY when a caller
+        # asked for one. Omitting the kwarg on the default path keeps the
+        # legacy call byte-identical and lets test/legacy brains whose
+        # ``respond`` never grew the kwarg keep working unchanged.
+        session_kwargs = {"session": session} if session is not None else {}
         try:
             reply = await self._brain.respond(
                 message, chat_id,
                 model=model, reasoning_level=reasoning_level,
+                **session_kwargs,
             )
+        except TaskAlreadyRunning:
+            # Issue #48 bullet 2: a second send collided with an
+            # in-flight turn for this conversation. The brain never ran —
+            # not a brain failure. Caught before the generic ``except``
+            # so it surfaces the specific "wait / cancel" toast instead
+            # of "Something broke."
+            log.info("Busy: turn already in progress for chat_id=%s", chat_id)
+            if outcome is not None:
+                outcome.kind = "busy"
+            return _BUSY
         except BrainCancelled:
             # /cancel handler already replied; nothing more to send.
             if outcome is not None:
@@ -365,11 +427,17 @@ class MessageHandler:
         model: str | None = None,
         reasoning_level: str | None = None,
         outcome: TurnOutcome | None = None,
+        session: SessionView | None = None,
     ):
         """Streaming variant of :meth:`handle`. Yields incremental
         text chunks as the brain generates them, plus a sentinel
         ``("done", full_text)`` at the end so callers can persist
         the final reply.
+
+        ``session`` (issue #48) has the same meaning as on
+        :meth:`handle`: ``None`` drives the active-session store
+        (byte-identical legacy path); a :class:`SessionView` runs the
+        streamed turn against one conversation.
 
         On any failure (rejection, brain error, timeout, session
         lost) yields ``("error", message_or_None)`` and stops. The
@@ -414,13 +482,17 @@ class MessageHandler:
         # if the buffered path compresses, the streamed path must
         # also compress, or the same conversation produces different
         # transcripts depending on which transport drove the turn.
-        await self._maybe_compress()
+        await self._maybe_compress(session)
 
+        # Issue #48: forward ``session`` to the brain only when set (see
+        # the matching note in :meth:`handle`).
+        session_kwargs = {"session": session} if session is not None else {}
         full = ""
         try:
             async for event in self._brain.astream(
                 message, chat_id,
                 model=model, reasoning_level=reasoning_level,
+                **session_kwargs,
             ):
                 # Brain.astream yields a discriminated union (see
                 # base.Brain.astream docstring): str = text delta,
@@ -436,6 +508,23 @@ class MessageHandler:
                 if event:
                     full += event
                     yield ("chunk", event)
+        except TaskAlreadyRunning:
+            # Issue #48 bullet 2: concurrent send for the same
+            # conversation. Mirror the buffered path — a distinct
+            # ``busy`` error code so the UI can distinguish it from a
+            # brain failure (see ``_ERR_CODE_BUSY`` for the current
+            # frontend degradation). Caught before the generic ``except``.
+            log.info(
+                "Busy (stream): turn already in progress for chat_id=%s",
+                chat_id,
+            )
+            if outcome is not None:
+                outcome.kind = "busy"
+            yield ("error", {
+                "code": _ERR_CODE_BUSY,
+                "message": _BUSY,
+            })
+            return
         except BrainCancelled:
             # User-initiated cancel — UI swallows silently, no toast.
             if outcome is not None:
@@ -579,11 +668,17 @@ class MessageHandler:
             )
             return None
 
-    async def _maybe_compress(self) -> None:
-        """Call :meth:`Brain.compress_if_needed` on the active session.
+    async def _maybe_compress(
+        self, session: SessionView | None = None,
+    ) -> None:
+        """Call :meth:`Brain.compress_if_needed` on the turn's session.
 
-        Issue #11 — pre-turn compression. Failure-tolerant: any
-        exception (the brain's compressor crashed, the JSONL parse
+        Issue #11 — pre-turn compression. ``session`` (issue #48) is the
+        per-turn handle: ``None`` compresses the active session
+        (historical behaviour); a :class:`SessionView` compresses that
+        conversation's session so a long web conversation gets the same
+        pre-turn summarisation the shared chat does. Failure-tolerant:
+        any exception (the brain's compressor crashed, the JSONL parse
         bailed, an aux spawn timed out) is logged and swallowed so
         a broken compressor cannot take the foreground turn down
         with it. The brain implementations already do this layer
@@ -592,9 +687,12 @@ class MessageHandler:
         regress the turn.
         """
         try:
-            session_id = self._sessions.get()
+            session_id = (
+                session.get() if session is not None
+                else self._sessions.get()
+            )
         except Exception:  # pragma: no cover - defensive
-            log.debug("compressor: could not read active session", exc_info=True)
+            log.debug("compressor: could not read turn session", exc_info=True)
             return
         if not session_id:
             return
@@ -717,12 +815,29 @@ class MessageHandler:
             )
             return None
 
-    async def handle_clear(self, user_id: int) -> str | None:
+    async def handle_clear(
+        self, user_id: int, *, session: SessionView | None = None,
+    ) -> str | None:
+        """Clear a conversation by rotating its session to a fresh id.
+
+        ``session`` (issue #48) is the per-conversation handle: ``None``
+        rotates the active session (Telegram's ``/clear``, the shared
+        web chat); a :class:`SessionView` rotates only that conversation
+        so clearing one browser conversation doesn't reset another or
+        the Telegram active session. Same ``_CLEAR_OK`` reply either
+        way."""
         if not is_allowed(user_id, self._allowed_user_id):
             log.warning("Rejected /clear from user_id=%s", user_id)
             return None
-        new_id = self._sessions.rotate()
-        log.info("Rotated active session uuid to %s", new_id)
+        if session is not None:
+            new_id = session.rotate()
+            log.info(
+                "Rotated conversation session '%s' uuid to %s",
+                session.name, new_id,
+            )
+        else:
+            new_id = self._sessions.rotate()
+            log.info("Rotated active session uuid to %s", new_id)
         return _CLEAR_OK
 
     async def handle_new(self, user_id: int, name: str | None) -> str | None:

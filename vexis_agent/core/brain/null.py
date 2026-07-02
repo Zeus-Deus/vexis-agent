@@ -77,6 +77,14 @@ class BrainNull(Brain):
         self._respond_calls: list[
             tuple[str, int, str | None, str | None]
         ] = []
+        # Issue #48: parallel record of the per-turn ``session`` handle
+        # each ``respond()`` (and, via the ABC's default ``astream`` →
+        # ``respond`` bridge, each streamed turn) was threaded with.
+        # Kept OUT of the 4-tuple above on purpose — many tests assert
+        # that exact tuple shape, so the session goes in a side list.
+        # ``None`` means the legacy active-session path; a ``SessionView``
+        # (or any ``SessionLike``) means a specific named session.
+        self._respond_sessions: list[Any] = []
         # Aux call records: full kwarg snapshot so tests can assert on
         # ``env_overrides``, ``allow_tools``, ``timeout_seconds``, etc.
         # ``aux_calls()`` returns a list of (prompt, tier) tuples for
@@ -127,6 +135,16 @@ class BrainNull(Brain):
         "did the caller use the right tier?" assertion shape."""
         return [(r["prompt"], r["model_tier"]) for r in self._aux_records]
 
+    def respond_sessions(self) -> list[Any]:
+        """Return the per-turn ``session`` handle each ``respond()`` call
+        (including streamed turns routed through the ABC ``astream``
+        fallback) was threaded with, in order. ``None`` entries are the
+        legacy active-session path; non-``None`` entries are the
+        ``SessionView`` a conversation was mapped onto (issue #48). Lets
+        tests assert the transport threaded the right named session
+        without spinning up a real brain."""
+        return list(self._respond_sessions)
+
     def aux_call_records(self) -> list[dict[str, Any]]:
         """Return the full kwarg snapshot for every ``spawn_aux()``
         call. Each dict has keys: ``prompt``, ``model_tier``,
@@ -152,14 +170,18 @@ class BrainNull(Brain):
         *,
         model: str | None = None,
         reasoning_level: str | None = None,
+        session: Any = None,
     ) -> str:
         # ``model`` and ``reasoning_level`` accepted for ABC parity;
         # recorded so tests can assert that overrides are forwarded
         # correctly through the handler/transport stack. Tuple shape
-        # is (message, chat_id, model, reasoning_level).
+        # is (message, chat_id, model, reasoning_level) — UNCHANGED
+        # (many tests pin it exactly). The per-turn ``session`` handle
+        # (issue #48) is recorded separately in ``_respond_sessions``.
         self._respond_calls.append(
             (message, chat_id, model, reasoning_level),
         )
+        self._respond_sessions.append(session)
         if self._pending_exc is not None:
             exc = self._pending_exc
             self._pending_exc = None

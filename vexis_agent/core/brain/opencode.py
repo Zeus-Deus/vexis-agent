@@ -94,6 +94,7 @@ from vexis_agent.core.brain.base import (
     BrainNotInstalled,
     BrainTimeoutError,
     McpServerSpec,
+    SessionLike,
     SessionLost,
     mcp_spec_to_opencode_entry,
 )
@@ -750,6 +751,7 @@ class OpenCodeBrain(Brain):
         *,
         model: str | None = None,
         reasoning_level: str | None = None,
+        session: "SessionLike | None" = None,
     ) -> str:
         log.info(
             "OpenCodeBrain.respond starting for chat %d%s%s",
@@ -769,6 +771,7 @@ class OpenCodeBrain(Brain):
             return await self._respond_inner(
                 message, chat_id,
                 model=model, reasoning_level=reasoning_level,
+                session=session,
             )
         finally:
             await self._record_files_changed(chat_id, before_snapshot)
@@ -780,18 +783,27 @@ class OpenCodeBrain(Brain):
         *,
         model: str | None = None,
         reasoning_level: str | None = None,
+        session: "SessionLike | None" = None,
     ) -> str:
+        # Issue #48: ``session`` selects which session this turn runs
+        # against. ``None`` (Telegram, the shared web chat) is the bound
+        # active-session store; a non-``None`` ``SessionView`` (one per
+        # web conversation) routes the harvest/resume/rotate below
+        # through that handle so conversations don't share an opencode
+        # session id.
+        sess = session if session is not None else self._session
         # Phase C Day 4: ``is_initialized`` flips to True after the
-        # first successful ``respond``, at which point ``self._session.get()``
+        # first successful ``respond``, at which point ``sess.get()``
         # returns the OpenCode-generated session id (harvested from
         # the first event of the original spawn and persisted via
-        # ``SessionStore.set``). On subsequent calls we pass it as
-        # ``--session <id>`` to resume; on the first call we pass
-        # ``--title`` so opencode names the new session predictably
-        # (which makes it identifiable in ``opencode tui`` and
-        # avoids collision with sessions from other tools).
-        is_initialized = self._session.is_initialized()
-        stored_token = self._session.get() if is_initialized else None
+        # ``SessionStore.set`` / the view's ``set``). On subsequent
+        # calls we pass it as ``--session <id>`` to resume; on the
+        # first call we pass ``--title`` so opencode names the new
+        # session predictably (which makes it identifiable in
+        # ``opencode tui`` and avoids collision with sessions from
+        # other tools).
+        is_initialized = sess.is_initialized()
+        stored_token = sess.get() if is_initialized else None
 
         from vexis_agent.core.yaml_config import model_for_tier
         # Per-turn model override beats the config default. None
@@ -929,7 +941,7 @@ class OpenCodeBrain(Brain):
                 stream_result.session_lost_via_event or stderr_session_marker
             ):
                 old = stored_token
-                new = self._session.rotate()
+                new = sess.rotate()
                 log.warning(
                     "OpenCode lost session %s; rotated to %s "
                     "(stream_event=%s, stderr=%s)",
@@ -971,7 +983,7 @@ class OpenCodeBrain(Brain):
         # rotations (after SessionLost) clear both via ``rotate``.
         if not is_initialized:
             if stream_result.harvested_session_id:
-                self._session.set(stream_result.harvested_session_id)
+                sess.set(stream_result.harvested_session_id)
                 log.info(
                     "OpenCode session established and persisted: %s",
                     stream_result.harvested_session_id,
@@ -983,7 +995,7 @@ class OpenCodeBrain(Brain):
                     "turns will start a new session — chat will "
                     "feel context-less."
                 )
-            self._session.mark_initialized()
+            sess.mark_initialized()
 
         return (stream_result.final_text or "").strip()
 

@@ -98,7 +98,11 @@ from vexis_agent.core.voice import (
     tts_provider,
     voice_enabled,
 )
-from vexis_agent.transports.web import WebChatTransport
+from vexis_agent.transports.web import (
+    WebChatTransport,
+    conversation_session_name,
+    validate_conversation_id,
+)
 # Browser dashboard support imports the small shared CONTRACT under
 # ``tools/browser`` (captcha value-types + config, profile-dir helpers)
 # — never the browser ADD-ON. ``tools/`` is importable by core; the
@@ -1704,6 +1708,22 @@ class WebDashboard:
                 raise HTTPException(400, f"'{key}' must be a string")
             return value
 
+        def _validated_conversation_id(body: dict) -> str | None:
+            """Read the optional ``conversation_id`` body key (issue #48).
+
+            Absent / ``None`` → ``None`` (the legacy shared-web-chat
+            path). Present but invalid (non-string, empty, or too long)
+            → 400 via ``transports.web.validate_conversation_id``. The
+            validated/stripped value is returned so every route keys the
+            same conversation off the same normalised string."""
+            raw = body.get("conversation_id")
+            if raw is None:
+                return None
+            try:
+                return validate_conversation_id(raw)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
+
         @app.post(
             "/api/v1/chat/send",
             dependencies=[Depends(_require_auth)],
@@ -1723,10 +1743,23 @@ class WebDashboard:
                 hint = _format_attachments_hint(attachments_raw)
                 if hint:
                     text = f"{hint}\n\n{text}"
-            reply = await chat.send(text)
+            # Issue #48: an optional ``conversation_id`` routes the turn
+            # to its own session + chat_id. Absent → legacy shared chat,
+            # and the reply stays exactly ``{"reply": ...}`` with no
+            # conversation_id key so existing clients are unaffected.
+            cid = _validated_conversation_id(body)
+            if cid is not None:
+                reply = await chat.send(text, conversation_id=cid)
+            else:
+                reply = await chat.send(text)
             if reply is None:
                 raise HTTPException(401, "message rejected")
-            return JSONResponse({"reply": reply})
+            payload = {"reply": reply}
+            if cid is not None:
+                # Echo the conversation id so the client can confirm the
+                # turn was filed against the conversation it intended.
+                payload["conversation_id"] = cid
+            return JSONResponse(payload)
 
         @app.get(
             "/api/v1/chat/sessions",
@@ -1772,12 +1805,24 @@ class WebDashboard:
 
             Body shape mirrors POST /chat/send: ``text``, optional
             ``attachments`` (path/name/mime list), optional ``model``
-            and ``reasoning_level`` overrides for voice-call mode.
-            ``done`` carries the full reply so the client doesn't
-            have to re-concat chunks for persistence/TTS.
+            and ``reasoning_level`` overrides for voice-call mode, and
+            optional ``conversation_id`` (issue #48) to run the streamed
+            turn against a specific conversation's session. ``done``
+            carries the full reply so the client doesn't have to
+            re-concat chunks for persistence/TTS.
+
+            The error frame's ``code`` is forwarded verbatim from the
+            handler, so the issue-#48 ``busy`` code — a concurrent send
+            collided with an in-flight turn for the same conversation —
+            flows through automatically. A frontend that recognises it
+            can render "wait / cancel"; the shipped UI currently
+            degrades unknown codes (including ``busy``) to its generic
+            retry rendering, with the message text carrying the
+            guidance.
             """
             chat = _chat_or_503()
             text = _validated_text(body)
+            conversation_id = _validated_conversation_id(body)
             attachments_raw = body.get("attachments")
             if attachments_raw is not None:
                 if not isinstance(attachments_raw, list):
@@ -1807,6 +1852,7 @@ class WebDashboard:
                         text,
                         model=model_override,
                         reasoning_level=reasoning_override,
+                        conversation_id=conversation_id,
                     ):
                         kind, payload = event
                         if kind == "chunk":
@@ -1876,7 +1922,7 @@ class WebDashboard:
             "/api/v1/chat/cancel",
             dependencies=[Depends(_require_auth)],
         )
-        async def post_chat_cancel() -> JSONResponse:
+        async def post_chat_cancel(body: dict | None = None) -> JSONResponse:
             """Stop any in-flight brain turn for the web chat.
 
             The user-facing 'Stop' button calls this; so do
@@ -1885,18 +1931,32 @@ class WebDashboard:
             tokens on a reply you'll never see. Routes to the same
             RunningTasks.cancel that Telegram's /cancel uses.
 
+            Body is optional. An optional ``conversation_id`` (issue
+            #48) cancels that conversation's turn; absent → the shared
+            web chat, byte-identical to before. Growing the body param
+            means a non-JSON body now 422s where it used to be ignored
+            — intentional: a request that *tried* to name a conversation
+            but arrived malformed must not silently fall through to the
+            shared-chat path.
+
             Returns ``{cancelled: bool}`` — true means something
             was actually killed, false means there was nothing in
             flight (a no-op cancel is fine; the stop button might
             be tapped during the gap between SSE 'done' frames).
             """
             chat = _chat_or_503()
+            cid = _validated_conversation_id(body or {})
             if self._running_tasks is None:
                 # Construction-time hadn't wired running_tasks (test
                 # fixtures). Treat as 'nothing to cancel' rather than
                 # 500 — caller proceeds.
                 return JSONResponse({"cancelled": False})
-            cancelled = await chat.cancel(self._running_tasks)
+            if cid is not None:
+                cancelled = await chat.cancel(
+                    self._running_tasks, conversation_id=cid,
+                )
+            else:
+                cancelled = await chat.cancel(self._running_tasks)
             return JSONResponse({"cancelled": cancelled})
 
         @app.get(
@@ -1925,6 +1985,34 @@ class WebDashboard:
             # few hundred turns of context.
             capped = max(1, min(int(limit), 500))
             messages = chat.history(name, limit=capped)
+            if messages is None:
+                raise HTTPException(401, "history rejected")
+            return JSONResponse({"messages": messages})
+
+        @app.get(
+            "/api/v1/chat/history",
+            dependencies=[Depends(_require_auth)],
+        )
+        async def get_chat_conversation_history(
+            conversation_id: str, limit: int = 50,
+        ) -> JSONResponse:
+            """Backfill prior turns for a conversation by its
+            ``conversation_id`` (issue #48). Query params, not a path
+            segment — conversation ids are arbitrary frontend-owned
+            strings and don't belong in the URL path.
+
+            Same message shape and limit-capping as the per-name history
+            route. Unknown / never-used conversation → ``{"messages":
+            []}`` (200, and NO session is created as a side effect).
+            Invalid ``conversation_id`` → 400.
+            """
+            chat = _chat_or_503()
+            try:
+                cid = validate_conversation_id(conversation_id)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
+            capped = max(1, min(int(limit), 500))
+            messages = chat.history_for_conversation(cid, limit=capped)
             if messages is None:
                 raise HTTPException(401, "history rejected")
             return JSONResponse({"messages": messages})
@@ -1986,9 +2074,20 @@ class WebDashboard:
             "/api/v1/chat/clear",
             dependencies=[Depends(_require_auth)],
         )
-        async def post_chat_clear() -> JSONResponse:
+        async def post_chat_clear(body: dict | None = None) -> JSONResponse:
+            """Clear a conversation. Body is optional; an optional
+            ``conversation_id`` (issue #48) clears just that
+            conversation. No-body / empty-body requests clear the shared
+            web chat exactly as before. A *non-JSON* body now 422s where
+            it used to be ignored — intentional: a malformed request
+            that tried to name a conversation must not silently rotate
+            the shared session instead."""
             chat = _chat_or_503()
-            reply = await chat.clear()
+            cid = _validated_conversation_id(body or {})
+            if cid is not None:
+                reply = await chat.clear(conversation_id=cid)
+            else:
+                reply = await chat.clear()
             if reply is None:
                 raise HTTPException(401, "clear rejected")
             return JSONResponse({"reply": reply})
@@ -2030,6 +2129,7 @@ class WebDashboard:
         )
         async def post_chat_attach(
             file: UploadFile = File(...),
+            conversation_id: str | None = Form(None),
         ) -> JSONResponse:
             if not yaml_config.chat_attachments_enabled():
                 raise HTTPException(503, "chat attachments disabled")
@@ -2044,14 +2144,26 @@ class WebDashboard:
                 )
 
             # Per-session subdir so deleting a session can also
-            # delete its uploads (phase 2.5 cleanup hook).
-            chat_obj = _chat_or_503()
-            sessions = chat_obj.list_sessions()
-            active_name = "_default"
-            if sessions:
-                active = next((s for s in sessions if s.is_active), None)
-                if active:
-                    active_name = _safe_filename(active.name)
+            # delete its uploads (phase 2.5 cleanup hook). Issue #48:
+            # when a ``conversation_id`` is supplied the subdir is that
+            # conversation's own session name, so an attachment lands
+            # under the conversation it was uploaded for rather than
+            # whatever session happens to be active. Absent → the active
+            # session, exactly as before.
+            if conversation_id is not None:
+                try:
+                    cid = validate_conversation_id(conversation_id)
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc))
+                active_name = _safe_filename(conversation_session_name(cid))
+            else:
+                chat_obj = _chat_or_503()
+                sessions = chat_obj.list_sessions()
+                active_name = "_default"
+                if sessions:
+                    active = next((s for s in sessions if s.is_active), None)
+                    if active:
+                        active_name = _safe_filename(active.name)
 
             uploads_root = self._workspace / "uploads" / active_name
             uploads_root.mkdir(parents=True, exist_ok=True)

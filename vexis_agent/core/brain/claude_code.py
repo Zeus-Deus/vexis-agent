@@ -53,6 +53,7 @@ from vexis_agent.core.brain.base import (
     BrainTimeoutError,
     BrainTransientError,
     McpServerSpec,
+    SessionLike,
     SessionLost,
     mcp_spec_to_claude_code_entry,
 )
@@ -562,14 +563,22 @@ class ClaudeCodeBrain(Brain):
         *,
         model: str | None = None,
         reasoning_level: str | None = None,
+        session: "SessionLike | None" = None,
     ) -> str:
+        # Issue #48: ``session`` selects the session this turn runs
+        # against. ``None`` (Telegram, the shared web chat) is the bound
+        # active-session store — historical behaviour. A non-``None``
+        # ``SessionView`` (one per web conversation) routes every
+        # session read/write below through that handle instead, so
+        # concurrent conversations never share a claude session id.
+        sess = session if session is not None else self._session
         log.info(
             "Brain.respond starting for chat %d%s%s",
             chat_id,
             f" (model override: {model})" if model else "",
             f" (reasoning: {reasoning_level})" if reasoning_level else "",
         )
-        session_id = self._session.get()
+        session_id = sess.get()
         # First call pins the UUID with --session-id; subsequent
         # calls resume it. The decision is grounded in DISK state
         # (does the transcript JSONL exist?) rather than the in-
@@ -581,7 +590,7 @@ class ClaudeCodeBrain(Brain):
         # check is what claude itself uses to decide; aligning
         # vexis with that closes the race entirely.
         if (
-            self._session.is_initialized()
+            sess.is_initialized()
             or _session_jsonl_exists(self._workspace, session_id)
         ):
             session_flag = ["--resume", session_id]
@@ -650,7 +659,7 @@ class ClaudeCodeBrain(Brain):
         try:
             for attempt in range(1, _TRANSIENT_MAX_ATTEMPTS + 1):
                 try:
-                    final_text = await self._attempt_respond(argv, chat_id)
+                    final_text = await self._attempt_respond(argv, chat_id, sess)
                     break
                 except BrainTransientError as exc:
                     if attempt >= _TRANSIENT_MAX_ATTEMPTS:
@@ -669,8 +678,8 @@ class ClaudeCodeBrain(Brain):
 
         # Mark only after a successful exit so a failed first call doesn't
         # leave us thinking the UUID is live.
-        if not self._session.is_initialized():
-            self._session.mark_initialized()
+        if not sess.is_initialized():
+            sess.mark_initialized()
         response = (final_text or "").strip()
         for reason, asked in audit_destructive_mentions(response):
             if asked:
@@ -681,9 +690,15 @@ class ClaudeCodeBrain(Brain):
         return response
 
     async def _attempt_respond(
-        self, argv: list[str], chat_id: int,
+        self, argv: list[str], chat_id: int, sess: "SessionLike",
     ) -> str:
         """One spawn-and-await cycle for :meth:`respond`.
+
+        ``sess`` is the session handle the turn runs against (issue #48)
+        — the active-session store by default, or the conversation's
+        :class:`SessionView`. The session-lost rotate-and-raise recovery
+        below routes through it so a lost conversation rotates only that
+        conversation's session id, not the shared active one.
 
         Returns the buffered ``result``-event text. Raises:
 
@@ -784,9 +799,9 @@ class ClaudeCodeBrain(Brain):
                 err = stderr_bytes.decode(errors="replace").strip()
                 # Session-lost detection takes precedence — wording is
                 # specific and recovery is a UUID rotation, not a retry.
-                if self._session.is_initialized() and "No conversation found" in err:
-                    old_uuid = self._session.get()
-                    new_uuid = self._session.rotate()
+                if sess.is_initialized() and "No conversation found" in err:
+                    old_uuid = sess.get()
+                    new_uuid = sess.rotate()
                     log.warning(
                         "Claude Code lost session %s; rotated to %s",
                         old_uuid,
@@ -820,6 +835,7 @@ class ClaudeCodeBrain(Brain):
         *,
         model: str | None = None,
         reasoning_level: str | None = None,
+        session: "SessionLike | None" = None,
     ) -> AsyncIterator[str]:
         """Native streaming. Spawns ``claude --print`` with
         ``--include-partial-messages`` so stream-json emits
@@ -838,14 +854,19 @@ class ClaudeCodeBrain(Brain):
         works exactly like the buffered path. The ``result`` event
         (if any) is captured to verify against the concatenated
         deltas; mismatch is logged but not fatal.
+
+        ``session`` has the same meaning as on :meth:`respond` (issue
+        #48): ``None`` drives the active-session store; a
+        ``SessionView`` runs the streamed turn against one conversation.
         """
+        sess = session if session is not None else self._session
         log.info(
             "Brain.astream starting for chat %d%s%s",
             chat_id,
             f" (model override: {model})" if model else "",
             f" (reasoning: {reasoning_level})" if reasoning_level else "",
         )
-        session_id = self._session.get()
+        session_id = sess.get()
         # Same disk-state-authority --session-id-vs-resume decision
         # as :meth:`respond`. The streaming path is the *hottest*
         # path for the post-cancel bug because the web chat's Stop
@@ -853,7 +874,7 @@ class ClaudeCodeBrain(Brain):
         # resend produces "Session ID already in use" even though
         # the in-memory ``is_initialized`` flag is still False.
         if (
-            self._session.is_initialized()
+            sess.is_initialized()
             or _session_jsonl_exists(self._workspace, session_id)
         ):
             session_flag = ["--resume", session_id]
@@ -912,7 +933,7 @@ class ClaudeCodeBrain(Brain):
             for attempt in range(1, _TRANSIENT_MAX_ATTEMPTS + 1):
                 yielded_anything = False
                 try:
-                    async for event in self._attempt_astream(argv, chat_id):
+                    async for event in self._attempt_astream(argv, chat_id, sess):
                         yielded_anything = True
                         yield event
                     break  # clean completion
@@ -931,15 +952,15 @@ class ClaudeCodeBrain(Brain):
                     )
                     await asyncio.sleep(_TRANSIENT_RETRY_DELAY_SECONDS)
 
-            if not self._session.is_initialized():
-                self._session.mark_initialized()
+            if not sess.is_initialized():
+                sess.mark_initialized()
 
             log.info("Brain.astream completed for chat %d", chat_id)
         finally:
             await self._record_files_changed(chat_id, before_snapshot)
 
     async def _attempt_astream(
-        self, argv: list[str], chat_id: int,
+        self, argv: list[str], chat_id: int, sess: "SessionLike",
     ) -> AsyncIterator:
         """One spawn-and-stream cycle for :meth:`astream`.
 
@@ -948,6 +969,9 @@ class ClaudeCodeBrain(Brain):
         Raises the same exception taxonomy as :meth:`_attempt_respond`
         — caller decides whether to retry, based on whether anything
         was yielded.
+
+        ``sess`` is the per-turn session handle (issue #48); the
+        session-lost rotate-and-raise recovery routes through it.
         """
         reservation = await self._running_tasks.reserve(chat_id)
         env = {**os.environ, "VEXIS_CHAT_ID": str(chat_id)}
@@ -1105,9 +1129,9 @@ class ClaudeCodeBrain(Brain):
 
             if proc.returncode != 0:
                 err = stderr_bytes.decode(errors="replace").strip()
-                if self._session.is_initialized() and "No conversation found" in err:
-                    old_uuid = self._session.get()
-                    new_uuid = self._session.rotate()
+                if sess.is_initialized() and "No conversation found" in err:
+                    old_uuid = sess.get()
+                    new_uuid = sess.rotate()
                     log.warning(
                         "Claude Code lost session %s; rotated to %s",
                         old_uuid, new_uuid,

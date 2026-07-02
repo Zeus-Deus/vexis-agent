@@ -36,7 +36,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Union
+from typing import Any, Literal, Protocol, Union
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -459,6 +459,32 @@ def mcp_spec_to_opencode_entry(spec: McpServerSpec) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────
+# Per-turn session handle (issue #48)
+# ──────────────────────────────────────────────────────────────────
+
+
+class SessionLike(Protocol):
+    """Structural type for the per-turn session handle threaded into
+    :meth:`Brain.respond` / :meth:`Brain.astream` via the optional
+    ``session`` keyword (issue #48).
+
+    Both concrete session surfaces satisfy it without a shared base
+    class: ``core.sessions.SessionStore`` (the store's single *active*
+    session — the historical default when ``session is None``) and
+    ``core.sessions.SessionView`` (a binding to one *named* session, used
+    by the web transport to give each conversation its own session). A
+    brain that needs the active/named distinction reads it purely
+    through this five-method surface, so it never imports either concrete
+    class."""
+
+    def get(self) -> str: ...
+    def is_initialized(self) -> bool: ...
+    def mark_initialized(self) -> None: ...
+    def rotate(self) -> str: ...
+    def set(self, token: str) -> None: ...
+
+
+# ──────────────────────────────────────────────────────────────────
 # Brain ABC
 # ──────────────────────────────────────────────────────────────────
 
@@ -483,6 +509,7 @@ class Brain(ABC):
         *,
         model: str | None = None,
         reasoning_level: str | None = None,
+        session: "SessionLike | None" = None,
     ) -> AsyncIterator[str | dict]:
         """Streaming variant of :meth:`respond`. Yields incremental
         text chunks as the model generates them.
@@ -518,10 +545,22 @@ class Brain(ABC):
         the default fallback. Brains that override it MUST yield at
         least one text chunk on success (empty reply → yield "") so
         downstream callers can rely on that for the "done" signal.
+
+        ``session`` has the same meaning as on :meth:`respond`: ``None``
+        (the default) drives the brain's bound active-session store;
+        a non-``None`` :class:`SessionLike` runs THIS turn against that
+        session instead. The default fallback forwards it straight to
+        ``respond``.
         """
+        # Forward ``session`` only when a caller supplied one — mirrors
+        # the handler's conditional omission (see MessageHandler.handle)
+        # so a third-party brain whose ``respond`` never grew the kwarg
+        # keeps working through this default fallback on the streaming
+        # path exactly as it does on the buffered one.
+        session_kwargs = {"session": session} if session is not None else {}
         reply = await self.respond(
             message, chat_id,
-            model=model, reasoning_level=reasoning_level,
+            model=model, reasoning_level=reasoning_level, **session_kwargs,
         )
         yield reply
 
@@ -533,6 +572,7 @@ class Brain(ABC):
         *,
         model: str | None = None,
         reasoning_level: str | None = None,
+        session: "SessionLike | None" = None,
     ) -> str:
         """Run one foreground turn. Returns the assistant's final text.
 
@@ -554,6 +594,18 @@ class Brain(ABC):
         the dashboard validates this upstream by reading capabilities
         from ``core.model_discovery``. Same per-turn isolation as
         ``model`` — Telegram and text-chat always pass ``None``.
+
+        ``session`` selects which session this turn runs against
+        (issue #48). ``None`` (the default) means "the brain's bound
+        active-session store" — the historical behaviour, preserved
+        bit-for-bit so Telegram and the shared web chat are untouched.
+        A non-``None`` :class:`SessionLike` runs THIS turn against that
+        session: every ``get`` / ``is_initialized`` / ``mark_initialized``
+        / ``rotate`` / ``set`` the brain would have done on its active
+        store is routed through the handle instead, including the
+        session-lost rotate-and-raise recovery. The web transport passes
+        one per conversation so concurrent conversations never share a
+        session id.
 
         Side effects: writes to the per-chat ``StatusFile`` for
         ``/status``, registers the running subprocess with
