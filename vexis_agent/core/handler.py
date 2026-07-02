@@ -449,7 +449,13 @@ class MessageHandler:
         about the brain finishing between them. ``yield`` shape:
 
             ("chunk", str)         — incremental text
-            ("tool",  dict)        — tool-use event (Phase A)
+            ("tool",  dict)        — brain UX / observability event,
+                                     forwarded untouched. Currently a
+                                     ``tool`` (call started) or
+                                     ``tool_end`` (call finished, with
+                                     timestamps + duration) dict; see
+                                     ``Brain.astream``. Never mixed
+                                     into the text reply.
             ("done",  str)         — full reply, fired exactly once
                                      after the last chunk
             ("error", dict | None) — error event. Dict payload is
@@ -496,9 +502,11 @@ class MessageHandler:
             ):
                 # Brain.astream yields a discriminated union (see
                 # base.Brain.astream docstring): str = text delta,
-                # dict = tool-use event. Tool events are forwarded
-                # untouched — the caller (chat UI SSE route) renders
-                # them as inline "Reading src/foo.py" status lines.
+                # dict = brain UX / observability event (``tool`` /
+                # ``tool_end``). Dict events are forwarded untouched
+                # under the ``("tool", …)`` tag — the caller (chat UI
+                # SSE route) renders them as inline status lines /
+                # per-tool spans. They never contribute to ``full``.
                 if isinstance(event, dict):
                     yield ("tool", event)
                     continue

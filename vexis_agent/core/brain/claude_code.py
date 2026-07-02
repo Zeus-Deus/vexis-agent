@@ -34,6 +34,7 @@ import re
 import shutil
 import signal
 import subprocess
+import time
 import uuid as _uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
@@ -397,11 +398,140 @@ def build_system_prompt(workspace: Path) -> str:
     return "\n\n".join(parts)
 
 
+# ── Tool-span observability ──────────────────────────────────────
+# Issue #49: a slow turn (a 190s production lookup) was one opaque
+# block — no way to attribute the seconds to a specific tool. These
+# helpers pair each stream-json ``tool_use`` block with its later
+# ``tool_result`` block so both parse paths can (a) log a greppable
+# per-tool span line and (b) — on the streaming path — emit a
+# ``tool_end`` UX event the dashboard can render as a finished span.
+
+
+@dataclass
+class _PendingSpan:
+    """One tool call that has started but not yet reported a result."""
+
+    name: str
+    target: str | None
+    # ``time.monotonic()`` at start. Durations are monotonic deltas so
+    # a wall-clock jump mid-call (NTP step, suspend/resume) can't
+    # produce a negative or wildly-wrong span length.
+    started_at: float
+
+
+class _ToolSpanTracker:
+    """Pairs ``tool_use`` starts with ``tool_result`` ends within one
+    turn, keyed by the block id (claude-code's globally-unique
+    ``toolu_…``). Because ids are unique across the main thread and any
+    subagent sidechain, pairing stays correct even when nested Task
+    tools interleave with the main thread.
+
+    ``end`` logs the span at INFO (``tool-span …``) so a slow turn is
+    attributable from the daemon logs alone, regardless of which
+    transport drove it. The streaming path additionally yields the
+    returned dict as a ``tool_end`` UX event; the buffered path logs
+    only (nothing downstream consumes events there).
+    """
+
+    def __init__(self, chat_id: int) -> None:
+        self._chat_id = chat_id
+        self._pending: dict[str, _PendingSpan] = {}
+
+    def start(self, tool_id: str, name: str, target: str | None) -> None:
+        # Last-writer-wins on a duplicate id (shouldn't happen — ids are
+        # unique): the earlier entry is dropped and surfaces via
+        # ``log_unclosed`` at stream end.
+        self._pending[tool_id] = _PendingSpan(
+            name=name, target=target, started_at=time.monotonic(),
+        )
+
+    def end(self, tool_id: str, is_error: bool) -> dict | None:
+        """Close the span for ``tool_id`` and return the ``tool_end``
+        event dict, or ``None`` for an id we never saw a start for
+        (an out-of-band or already-closed result — nothing to
+        attribute, so the caller emits nothing)."""
+        pending = self._pending.pop(tool_id, None)
+        if pending is None:
+            return None
+        duration_ms = int((time.monotonic() - pending.started_at) * 1000)
+        status = "error" if is_error else "completed"
+        # The daemon-log half of the observability ask. Greppable on
+        # ``tool-span``; carries everything needed to attribute wall
+        # time to a specific tool without opening the transcript.
+        # ``target`` is free text (Bash commands carry spaces and
+        # ``=``), so it goes LAST: every fixed-vocabulary key a log
+        # parser matches on (``duration_ms=``, ``status=``) precedes
+        # it, and a key=value tokenizer can take everything after
+        # ``target=`` as the value.
+        log.info(
+            "tool-span chat=%d tool=%s duration_ms=%d status=%s target=%s",
+            self._chat_id, pending.name, duration_ms, status, pending.target,
+        )
+        # ``ts`` is wall-clock (epoch ms) purely for correlation with
+        # the timestamped log stream; ``duration_ms`` is the monotonic
+        # measurement above, not ``ts`` minus a start ``ts``.
+        return {
+            "type": "tool_end",
+            "name": pending.name,
+            "target": pending.target,
+            "id": tool_id,
+            "ts": int(time.time() * 1000),
+            "duration_ms": duration_ms,
+            "status": status,
+        }
+
+    def log_unclosed(self) -> None:
+        """Spans still open at stream end: the result never arrived
+        (turn cancelled/timed out mid-tool, or the stream closed
+        without a matching ``tool_result``). DEBUG only — there's no
+        honest duration to emit, so no event is produced."""
+        for tool_id, pending in self._pending.items():
+            log.debug(
+                "tool-span unclosed chat=%d tool=%s id=%s target=%s",
+                self._chat_id, pending.name, tool_id, pending.target,
+            )
+
+
+def _unstreamed_remainder(block_text: str, segment: str) -> tuple[str, bool]:
+    """Return the portion of a reconciled assistant text block that was
+    NOT already streamed as ``text_delta`` chunks, plus a mismatch flag.
+
+    ``segment`` is the concatenation of the deltas streamed for this
+    block since the last reconciliation. Prefix-match dedup:
+
+    * ``segment`` empty → nothing streamed; remainder is the whole
+      block (the batched-model case — claude-sonnet-5 in particular
+      delivers inter-tool text as a buffered block with no deltas).
+    * block starts with ``segment`` → deltas covered a prefix; the
+      remainder is the un-streamed suffix.
+    * ``segment`` starts with block (or equal) → the block was fully
+      streamed already; remainder is empty.
+    * otherwise → deltas and the block genuinely disagree (shouldn't
+      happen); remainder empty and ``mismatch=True`` so the caller can
+      log it rather than emit possibly-wrong text.
+    """
+    if not segment:
+        return block_text, False
+    if block_text.startswith(segment):
+        return block_text[len(segment):], False
+    if segment.startswith(block_text):
+        return "", False
+    return "", True
+
+
 async def _read_stream_events(
     stream: asyncio.StreamReader | None, status_file: StatusFile
 ) -> tuple[str, str]:
     """Consume the brain's stream-json stdout, updating ``status_file``
     on every tool_use event.
+
+    Also emits a per-tool span log line (``tool-span …`` at INFO) by
+    pairing each ``tool_use`` block with its later ``tool_result``
+    block — the buffered-path half of issue #49's observability ask.
+    The chat id for that log comes from ``status_file.chat_id`` (the
+    caller already threads it through the StatusFile), so the return
+    contract below is untouched. No UX events are emitted here: the
+    buffered ``respond`` path has no live consumer for them — logs only.
 
     Returns ``(final_text, last_assistant_text)``:
 
@@ -425,6 +555,7 @@ async def _read_stream_events(
     """
     final_text = ""
     assistant_text_parts: list[str] = []
+    span_tracker = _ToolSpanTracker(status_file.chat_id)
     if stream is None:
         return final_text, ""
     while True:
@@ -454,14 +585,32 @@ async def _read_stream_events(
                     name = block.get("name") or "Tool"
                     target = extract_tool_target(name, block.get("input") or {})
                     status_file.record_tool(name, target)
+                    tool_id = block.get("id")
+                    if isinstance(tool_id, str) and tool_id:
+                        span_tracker.start(tool_id, name, target)
                 elif btype == "text":
                     text = block.get("text")
                     if isinstance(text, str) and text:
                         assistant_text_parts.append(text)
+        elif kind == "user":
+            # Tool results carry the closing edge of a span. The
+            # buffered path emits no event — the span log inside
+            # ``end`` is the whole point here.
+            content = event.get("message", {}).get("content") or []
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_result":
+                        continue
+                    tool_id = block.get("tool_use_id")
+                    if isinstance(tool_id, str) and tool_id:
+                        span_tracker.end(tool_id, bool(block.get("is_error")))
         elif kind == "result":
             result_text = event.get("result")
             if isinstance(result_text, str):
                 final_text = result_text
+    span_tracker.log_unclosed()
     last_assistant_text = "\n".join(assistant_text_parts).strip()
     return final_text, last_assistant_text
 
@@ -836,7 +985,7 @@ class ClaudeCodeBrain(Brain):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: "SessionLike | None" = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | dict]:
         """Native streaming. Spawns ``claude --print`` with
         ``--include-partial-messages`` so stream-json emits
         ``content_block_delta`` events as the model generates each
@@ -844,6 +993,11 @@ class ClaudeCodeBrain(Brain):
         to yielding the buffered final text only if the partial-
         message stream is empty (no tokens delivered — should never
         happen on success but defensive against API quirks).
+
+        Yields the ``str | dict`` discriminated union documented on
+        :meth:`Brain.astream <vexis_agent.core.brain.base.Brain.astream>`:
+        text deltas as ``str``, and ``{"type": "tool", …}`` /
+        ``{"type": "tool_end", …}`` observability events as ``dict``.
 
         Same per-turn override semantics as :meth:`respond`. Same
         cancellation, timeout, session-lost, and error mapping —
@@ -965,10 +1119,10 @@ class ClaudeCodeBrain(Brain):
         """One spawn-and-stream cycle for :meth:`astream`.
 
         Async generator yielding the same discriminated union as
-        :meth:`astream` (text str or ``{"type": "tool", ...}`` dict).
-        Raises the same exception taxonomy as :meth:`_attempt_respond`
-        — caller decides whether to retry, based on whether anything
-        was yielded.
+        :meth:`astream` (text ``str`` or a ``{"type": "tool" | "tool_end",
+        …}`` observability ``dict``). Raises the same exception taxonomy
+        as :meth:`_attempt_respond` — caller decides whether to retry,
+        based on whether anything was yielded.
 
         ``sess`` is the per-turn session handle (issue #48); the
         session-lost rotate-and-raise recovery routes through it.
@@ -991,6 +1145,22 @@ class ClaudeCodeBrain(Brain):
         assistant_text_parts: list[str] = []
         stderr_bytes = b""
         proc: asyncio.subprocess.Process | None = None
+        # Issue #49 boundary-flush state (main thread only).
+        # ``segment_delta_text`` is the running concatenation of the
+        # text deltas streamed for the current text block; when that
+        # block's ``assistant`` event arrives we diff the block against
+        # it to recover any inter-tool text the model batched (delivered
+        # as a block with no deltas) and stash the un-streamed remainder
+        # in ``pending_tail``, to be flushed at the next tool boundary
+        # (or at end-of-stream on success). See _unstreamed_remainder.
+        segment_delta_text = ""
+        pending_tail = ""
+        # Issue #49 tool spans. Both the ``tool`` start dicts and the
+        # ``tool_end`` dicts flow from here; ``end`` also logs the
+        # ``tool-span`` INFO line. Sidechain (subagent) tools are
+        # tracked too — ids are globally unique so pairing is safe, and
+        # their names/targets already surface via the tool-start yields.
+        span_tracker = _ToolSpanTracker(chat_id)
         # Same per-subagent memory scoping as _attempt_respond — see the
         # rationale there. Wrap before spawn; no-op when disabled/absent.
         spawn_argv = wrap_with_memory_scope(argv)
@@ -1054,6 +1224,11 @@ class ClaudeCodeBrain(Brain):
                 if not isinstance(event, dict):
                     continue
                 kind = event.get("type")
+                # ``parent_tool_use_id`` is a top-level field: None on
+                # the main thread, set for a subagent (Task) sidechain.
+                # The boundary-flush machinery is main-thread only —
+                # sidechain text must never leak into the reply stream.
+                is_sidechain = bool(event.get("parent_tool_use_id"))
                 if kind == "stream_event":
                     inner = event.get("event") or {}
                     if not isinstance(inner, dict):
@@ -1066,8 +1241,27 @@ class ClaudeCodeBrain(Brain):
                         ):
                             text = delta.get("text")
                             if isinstance(text, str) and text:
+                                # A pending batched remainder always
+                                # predates any NEW delta text (its block
+                                # was reconciled before these tokens were
+                                # generated), so flush it first — without
+                                # this, a batched text block followed by
+                                # a streamed one with no tool call in
+                                # between would land out of order in
+                                # both the live stream and the ``done``
+                                # concatenation.
+                                if pending_tail:
+                                    accumulated += pending_tail
+                                    yield pending_tail
+                                    pending_tail = ""
                                 accumulated += text
                                 yield text
+                                # Only main-thread deltas count toward the
+                                # segment we reconcile against the text
+                                # block. Sidechain deltas are still yielded
+                                # above (status quo) but never reconciled.
+                                if not is_sidechain:
+                                    segment_delta_text += text
                 elif kind == "assistant":
                     # Tool-use tracking. Two consumers:
                     #   1. StatusFile (per-chat tmpfs JSON) — read by
@@ -1090,25 +1284,110 @@ class ClaudeCodeBrain(Brain):
                                     name, block.get("input") or {},
                                 )
                                 status_file.record_tool(name, target)
+                                tool_id = block.get("id")
+                                # Boundary flush: with per-block assistant
+                                # events the text block's event precedes
+                                # this tool_use block's event, so any
+                                # inter-tool text the model batched sits
+                                # in ``pending_tail`` right now. Emit it
+                                # as a live chunk BEFORE the tool event so
+                                # the "Checking the OE catalog…" marker
+                                # lands at the tool boundary, not at turn
+                                # end. Main thread only.
+                                if not is_sidechain and pending_tail:
+                                    accumulated += pending_tail
+                                    yield pending_tail
+                                    pending_tail = ""
+                                if isinstance(tool_id, str) and tool_id:
+                                    span_tracker.start(tool_id, name, target)
                                 # Tool event → chat UI. Distinct from
                                 # text deltas; consumers must distinguish
-                                # via ``isinstance``. Documented contract
-                                # on Brain.astream.
+                                # via ``isinstance``. ``id`` + ``ts``
+                                # (epoch ms) enrich it for span
+                                # correlation. Documented contract on
+                                # Brain.astream.
                                 yield {
                                     "type": "tool",
                                     "name": name,
                                     "target": target,
+                                    "id": tool_id,
+                                    "ts": int(time.time() * 1000),
                                 }
                             elif btype == "text":
-                                # Captured for the failure-classification
-                                # path; not yielded — the streamed
-                                # content_block_delta deltas above are
-                                # the canonical UI source. API errors
-                                # arrive HERE as one buffered text
-                                # block with no preceding deltas.
+                                # Always captured for the failure-
+                                # classification path (byte-for-byte as
+                                # before — API errors arrive HERE as one
+                                # buffered text block with no preceding
+                                # deltas). On the main thread we ALSO
+                                # reconcile it against the streamed
+                                # deltas: any un-streamed remainder is
+                                # stashed for a boundary/end flush so
+                                # batched inter-tool text still reaches
+                                # the stream. Sidechain text is captured
+                                # but never reconciled/flushed.
                                 text = block.get("text")
                                 if isinstance(text, str) and text:
                                     assistant_text_parts.append(text)
+                                    if not is_sidechain:
+                                        remainder, mismatch = (
+                                            _unstreamed_remainder(
+                                                text, segment_delta_text,
+                                            )
+                                        )
+                                        if mismatch:
+                                            log.debug(
+                                                "Brain.astream: delta/text "
+                                                "mismatch for chat %d "
+                                                "(segment=%d chars, "
+                                                "block=%d chars) — dropping "
+                                                "unreconciled remainder",
+                                                chat_id,
+                                                len(segment_delta_text),
+                                                len(text),
+                                            )
+                                        if remainder:
+                                            pending_tail += remainder
+                                        # Consume the matched prefix
+                                        # rather than resetting: when a
+                                        # batched (old-CLI) assistant
+                                        # event carries SEVERAL text
+                                        # blocks, the streamed deltas
+                                        # span all of them, so the
+                                        # surplus after this block
+                                        # belongs to the next block —
+                                        # resetting here would make
+                                        # that block look un-streamed
+                                        # and double-flush it.
+                                        if segment_delta_text.startswith(
+                                            text,
+                                        ):
+                                            segment_delta_text = (
+                                                segment_delta_text[
+                                                    len(text):
+                                                ]
+                                            )
+                                        else:
+                                            segment_delta_text = ""
+                elif kind == "user":
+                    # Tool results carry the closing edge of a span.
+                    # Emit ``tool_end`` (and log the span) for both main
+                    # and sidechain tools — names/targets already surface,
+                    # so this adds observability without new leakage.
+                    content = event.get("message", {}).get("content") or []
+                    if isinstance(content, list):
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            if block.get("type") != "tool_result":
+                                continue
+                            tool_id = block.get("tool_use_id")
+                            if not (isinstance(tool_id, str) and tool_id):
+                                continue
+                            span = span_tracker.end(
+                                tool_id, bool(block.get("is_error")),
+                            )
+                            if span is not None:
+                                yield span
                 elif kind == "result":
                     rt = event.get("result")
                     if isinstance(rt, str):
@@ -1151,12 +1430,33 @@ class ClaudeCodeBrain(Brain):
                     f"claude -p exited {proc.returncode}: {message}",
                 )
         finally:
+            # DEBUG-log any span whose result never arrived (cancel /
+            # timeout mid-tool). Harmless no-op on a clean turn.
+            span_tracker.log_unclosed()
             status_file.delete()
             await self._running_tasks.unregister(chat_id)
 
-        # Defensive: if no deltas streamed (unusual but observed in
-        # very-short replies on some backends) fall back to the
-        # result-event text so the caller's bubble isn't empty.
+        # Success path only — this line is unreachable when the
+        # returncode check above raised (the finally ran, the
+        # exception propagated). Final boundary flush: any inter-tool
+        # or trailing text the model batched (delivered as an
+        # ``assistant`` text block with no deltas, e.g. the final
+        # message on a batched turn) is still sitting in
+        # ``pending_tail``; emit it now so it reaches the stream. This
+        # is deliberately BELOW the raise: on the failure path an
+        # API-error message lands in ``pending_tail`` the same way but
+        # must NEVER be streamed — it reaches the handler only via the
+        # raised, classified exception (assistant_text capture above is
+        # what carries the wording into the raise).
+        if pending_tail:
+            accumulated += pending_tail
+            yield pending_tail
+            pending_tail = ""
+
+        # Defensive last resort: if NOTHING streamed and nothing was
+        # flushed (no deltas, no batched blocks) fall back to the
+        # result-event text so the caller's bubble isn't empty. With
+        # the boundary flush above this now rarely fires.
         if not accumulated and result_text:
             yield result_text
             accumulated = result_text

@@ -519,13 +519,35 @@ class Brain(ABC):
         - ``str`` — a text delta (``content_block_delta.text_delta``
           on claude-code; whatever the brain produces incrementally).
           Concatenate these to reconstruct the assistant's reply.
-        - ``dict`` — a tool-use event with shape
-          ``{"type": "tool", "name": str, "target": str | None}``.
-          Surfaced to the chat UI as inline "Reading src/foo.py" /
-          "Running git status" lines so the user sees the brain
-          working through its tools instead of staring at a pulse
-          for 30+ seconds. Tool events do NOT contribute to the
-          assistant's text reply — they're a separate UX channel.
+        - ``dict`` — a brain UX / observability event. Dicts do NOT
+          contribute to the assistant's text reply; they're a separate
+          channel the chat UI renders alongside the text. Two shapes
+          ship today (issue #49); both are additive, and ``tool_end``
+          reuses the ``status`` vocabulary of the :class:`ToolEnd`
+          dataclass (field names differ — these are wire dicts, not
+          the dataclasses):
+
+          * ``{"type": "tool", "name": str, "target": str | None,
+            "id": str | None, "ts": int}`` — a tool call started.
+            Surfaced as inline "Reading src/foo.py" / "Running git
+            status" lines so the user sees the brain working through
+            its tools instead of staring at a pulse for 30+ seconds.
+            ``id`` is the brain's opaque per-call id (claude-code's
+            ``toolu_…``); ``ts`` is epoch milliseconds.
+          * ``{"type": "tool_end", "name": str, "target": str | None,
+            "id": str, "ts": int, "duration_ms": int, "status":
+            "completed" | "error"}`` — that tool call finished.
+            ``ts`` is epoch milliseconds (for log correlation);
+            ``duration_ms`` is measured from a monotonic clock (robust
+            to wall-clock jumps), NOT ``ts`` arithmetic. ``status`` is
+            ``"error"`` when the tool result was flagged as an error.
+            ``name`` / ``target`` are replayed from the matching start
+            so consumers don't have to join on ``id``.
+
+          **Consumer rule:** treat a dict with an unrecognised
+          ``"type"`` as ignorable — forward it verbatim or drop it,
+          but never crash. New event types are added additively; the
+          SSE route and Telegram both already do this.
 
         Default implementation here delegates to ``respond`` and
         yields the full reply once at the end — non-streaming brains
