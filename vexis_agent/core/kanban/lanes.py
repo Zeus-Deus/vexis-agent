@@ -2,9 +2,11 @@
 
 A **lane** is the worker-type discriminator for a kanban task. It is
 NOT a separate identity — same brain, same memory, same learning
-curator. A lane = ``(system_prompt, skills, tier)``: three knobs
-that tell the dispatcher how to spawn a worker for a task assigned
-to that lane.
+curator. A lane = ``(system_prompt, skills, tier, reasoning)``: four
+knobs that tell the dispatcher how to spawn a worker for a task
+assigned to that lane. ``reasoning`` pins the per-spawn effort level
+the same way ``tier`` pins the model size — unset defers to the CLI
+default.
 
 See ``.plans/kanban-research.md`` §4 for the design rationale (why
 lanes ≠ upstream profiles).
@@ -54,6 +56,12 @@ class LaneSpec:
         (one of ``tiny``/``small``/``medium``/``large``, or ``None``
         meaning "let the brain pick"). Per the CLAUDE.md Invariant
         the brain translates tier → native model id.
+    ``reasoning`` — per-spawn effort level passed alongside ``tier``
+        to ``brain.spawn_aux`` (``None`` = defer to the CLI default).
+        Unlike ``tier`` there is no static vocabulary here: valid
+        levels are brain/CLI-discovered, so this module accepts any
+        non-empty string and lets the validator phase own the
+        vocabulary check.
     ``skills`` — list of skill names the worker is allowed to use.
         Empty list = no extra skills (the worker still gets the
         kanban_* MCP tools — those are the worker contract).
@@ -66,6 +74,7 @@ class LaneSpec:
 
     name: str
     tier: str | None = None
+    reasoning: str | None = None
     skills: list[str] = field(default_factory=list)
     system_prompt: str = ""
     description: str = ""
@@ -74,6 +83,7 @@ class LaneSpec:
         return {
             "name": self.name,
             "tier": self.tier,
+            "reasoning": self.reasoning,
             "skills": list(self.skills),
             "system_prompt": self.system_prompt,
             "description": self.description,
@@ -258,6 +268,26 @@ def _coerce_lane(name: str, raw: Any) -> LaneSpec:
             name, tier_raw,
         )
         tier = default.tier if default else None
+    # Reasoning mirrors the tier-parsing posture (missing → default,
+    # wrong-type → warn + fall back) but does NOT validate against a
+    # static vocabulary: effort levels are brain/CLI-discovered, so
+    # any non-empty string is accepted here and the validator phase
+    # owns the vocabulary check. An empty/whitespace string is treated
+    # as "unset" rather than a level, since a blank effort flag would
+    # confuse the spawn argv.
+    reasoning_raw = raw.get("reasoning")
+    reasoning: str | None
+    if reasoning_raw is None:
+        reasoning = default.reasoning if default else None
+    elif isinstance(reasoning_raw, str) and reasoning_raw.strip():
+        reasoning = reasoning_raw.strip()
+    else:
+        log.warning(
+            "kanban.lanes.%s.reasoning %r is not a non-empty string; "
+            "using default",
+            name, reasoning_raw,
+        )
+        reasoning = default.reasoning if default else None
     skills_raw = raw.get("skills", [])
     if isinstance(skills_raw, list):
         skills = [str(s) for s in skills_raw if isinstance(s, str)]
@@ -287,6 +317,7 @@ def _coerce_lane(name: str, raw: Any) -> LaneSpec:
     return LaneSpec(
         name=name,
         tier=tier,
+        reasoning=reasoning,
         skills=skills,
         system_prompt=system_prompt,
         description=description,

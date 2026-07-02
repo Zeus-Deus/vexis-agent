@@ -226,6 +226,60 @@ def test_post_set_writes_foreground(client: TestClient, cfg_path: Path):
     assert "subsystems" not in (parsed.get("models") or {})
 
 
+def test_post_set_subsystem_with_reasoning_writes_dict(
+    client: TestClient, cfg_path: Path,
+):
+    """Issue #50 — an optional ``reasoning`` in the payload writes the
+    dict shape ``models.subsystems.<sub>: {model, reasoning}``. Without
+    it (today's behaviour) the plain string is written."""
+    r = client.post(
+        "/api/v1/models/set",
+        json={"subsystem": "goal_judge", "value": "large", "reasoning": "high"},
+        headers=_hdr(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["reasoning"] == "high"
+    parsed = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert parsed["models"]["subsystems"]["goal_judge"] == {
+        "model": "large", "reasoning": "high",
+    }
+
+
+def test_post_set_foreground_with_reasoning_writes_dict(
+    client: TestClient, cfg_path: Path,
+):
+    """The foreground target writes the dict shape under models.brain
+    when reasoning is supplied — the issue's headless-deployment fix."""
+    r = client.post(
+        "/api/v1/models/set",
+        json={"subsystem": "foreground", "value": "sonnet", "reasoning": "low"},
+        headers=_hdr(),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["reasoning"] == "low"
+    parsed = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert parsed["models"]["brain"] == {"model": "sonnet", "reasoning": "low"}
+    assert "subsystems" not in (parsed.get("models") or {})
+
+
+def test_post_set_blank_reasoning_writes_plain_string(
+    client: TestClient, cfg_path: Path,
+):
+    """A blank / whitespace ``reasoning`` collapses to None → the plain
+    string shape, byte-identical to a payload with no reasoning key."""
+    r = client.post(
+        "/api/v1/models/set",
+        json={"subsystem": "goal_judge", "value": "large", "reasoning": "  "},
+        headers=_hdr(),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["reasoning"] is None
+    parsed = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert parsed["models"]["subsystems"]["goal_judge"] == "large"
+
+
 def test_post_set_foreground_validator_refuses(
     client: TestClient, cfg_path: Path,
 ):

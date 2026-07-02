@@ -66,7 +66,13 @@ The summariser runs at `subsystem_tier("compressor")` (default
 tier produces qualitatively the same output as a large model.
 Override via `models.subsystems.compressor: large` in
 `~/.vexis/config.yaml` if you want the biggest model on
-multi-day goals.
+multi-day goals. The spawn also honours the reasoning-effort half
+of the dict-shaped config
+(`models.subsystems.compressor: {model: ..., reasoning: low}`,
+Issue #50) via `subsystem_reasoning("compressor")`; unset defers to
+the CLI default. Summarisation is a bounded lookup-and-condense
+job, so `low` is the natural effort to pin here. See
+[`docs/model-ux.md`](model-ux.md#reasoning-effort).
 
 ## Replacement strategy
 

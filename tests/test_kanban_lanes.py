@@ -13,6 +13,9 @@ Pinned behaviours:
     or via resolve_lane (which raises).
   * tier values are validated (one of tiny/small/medium/large or
     "default" or None) — invalid tier silently falls back.
+  * reasoning is NOT validated against a static vocabulary (effort
+    levels are brain/CLI-discovered) — any non-empty string is kept;
+    wrong-type / empty values fall back to the default lane's value.
   * resolve_lane(None) returns the ``default`` built-in.
   * Hot reload: editing the YAML between calls is reflected on
     next call (no caching).
@@ -409,12 +412,99 @@ kanban:
 def test_lane_spec_to_dict_round_trip() -> None:
     import json
     spec = LaneSpec(
-        name="x", tier="medium", skills=["a"],
+        name="x", tier="medium", reasoning="low", skills=["a"],
         system_prompt="prompt", description="desc",
     )
     raw = json.dumps(spec.to_dict())
     parsed = json.loads(raw)
     assert parsed == {
-        "name": "x", "tier": "medium", "skills": ["a"],
+        "name": "x", "tier": "medium", "reasoning": "low", "skills": ["a"],
         "system_prompt": "prompt", "description": "desc",
     }
+
+
+def test_lane_spec_to_dict_reasoning_defaults_to_none() -> None:
+    """A lane built without an explicit reasoning knob serialises it as
+    ``None`` — the dashboard reads this to render "CLI default"."""
+    spec = LaneSpec(name="x", tier="small")
+    assert spec.to_dict()["reasoning"] is None
+
+
+# ──────────────────────────────────────────────────────────────────
+# Reasoning validation (Issue #50)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_default_lanes_have_none_reasoning() -> None:
+    """Built-in lanes ship with no pinned effort — they defer to the
+    CLI default like every other spawn did before Issue #50."""
+    for name, spec in DEFAULT_LANES.items():
+        assert spec.reasoning is None, f"{name} unexpectedly pins reasoning"
+
+
+def test_reasoning_present_accepted(tmp_path: Path) -> None:
+    """Any non-empty string is accepted — this module does NOT validate
+    the effort vocabulary (levels are brain/CLI-discovered)."""
+    _write_config(tmp_path, """
+kanban:
+  lanes:
+    custom:
+      reasoning: low
+      system_prompt: "x"
+    """)
+    spec = resolve_lane("custom")
+    assert spec.reasoning == "low"
+
+
+def test_reasoning_absent_defaults_to_none_on_new_lane(tmp_path: Path) -> None:
+    _write_config(tmp_path, """
+kanban:
+  lanes:
+    custom:
+      tier: small
+      system_prompt: "x"
+    """)
+    spec = resolve_lane("custom")
+    assert spec.reasoning is None
+
+
+def test_reasoning_override_on_default_lane(tmp_path: Path) -> None:
+    """Overriding only reasoning on a default lane keeps the default's
+    other fields but pins the effort."""
+    _write_config(tmp_path, """
+kanban:
+  lanes:
+    research:
+      reasoning: high
+    """)
+    spec = resolve_lane("research")
+    assert spec.reasoning == "high"
+    assert spec.tier == DEFAULT_LANES["research"].tier  # unchanged
+    assert spec.system_prompt == DEFAULT_LANES["research"].system_prompt
+
+
+def test_reasoning_non_string_falls_back(tmp_path: Path) -> None:
+    """A wrong-type reasoning value warns + falls back to the default
+    lane's reasoning (None for the shipped defaults) — never crashes."""
+    _write_config(tmp_path, """
+kanban:
+  lanes:
+    research:
+      reasoning: 42
+    """)
+    spec = resolve_lane("research")
+    assert spec.reasoning == DEFAULT_LANES["research"].reasoning  # None
+
+
+def test_reasoning_empty_string_treated_as_unset(tmp_path: Path) -> None:
+    """A blank effort flag would confuse the spawn argv, so an
+    empty/whitespace string is treated as "unset" rather than a level."""
+    _write_config(tmp_path, """
+kanban:
+  lanes:
+    custom:
+      reasoning: "   "
+      system_prompt: "x"
+    """)
+    spec = resolve_lane("custom")
+    assert spec.reasoning is None

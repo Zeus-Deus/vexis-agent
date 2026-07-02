@@ -304,11 +304,10 @@ class MessageHandler:
         session: SessionView | None = None,
     ) -> str | None:
         """Foreground turn entrypoint. ``model`` and ``reasoning_level``
-        are optional per-turn overrides forwarded straight to
-        ``Brain.respond``. ``None`` (the default) on either is the
-        canonical foreground path — Voice call mode is the only caller
-        passing non-None values, sourced from
-        ``voice.call_mode.{model,reasoning_level}``.
+        are optional per-turn overrides. Voice call mode is the only
+        caller passing non-None values, sourced from
+        ``voice.call_mode.{model,reasoning_level}``; when it does, both
+        ride through to ``Brain.respond`` untouched.
 
         ``session`` (issue #48) selects which session the turn runs
         against. ``None`` (Telegram, the shared web chat) drives the
@@ -319,12 +318,17 @@ class MessageHandler:
         against that named session; ``compress_if_needed`` and the
         session-lost recovery all follow it.
 
-        When the caller passes ``None``, the computer-use model
-        selector gets a say (see :meth:`_apply_computer_use_override`):
-        if the user opted in AND this turn is doing computer-use work,
-        it may substitute a model. With no opt-in and no computer-use
-        activity it's a no-op, so Telegram + text chat stay bit-for-bit
-        unchanged.
+        When the caller passes ``None``, two resolvers get a say in
+        order. First the computer-use model selector (see
+        :meth:`_apply_computer_use_override`): if the user opted in AND
+        this turn is doing computer-use work, it may substitute a model
+        (and its own effort). Then :meth:`_resolve_foreground_model`
+        fills any still-``None`` slot from ``models.brain`` — the chat
+        model tier-or-raw and, per Issue #50, the chat reasoning effort
+        from the dict-shaped ``{model: ..., reasoning: ...}`` config.
+        With no opt-in, no computer-use activity, and a plain-string /
+        absent ``models.brain``, both stay ``None`` and Telegram + text
+        chat are bit-for-bit unchanged.
 
         ``outcome`` is an optional :class:`TurnOutcome` outparam.
         Callers who need to distinguish "brain succeeded" from "brain
@@ -344,7 +348,9 @@ class MessageHandler:
         model, reasoning_level = self._apply_computer_use_override(
             model, reasoning_level,
         )
-        model = self._resolve_foreground_model(model)
+        model, reasoning_level = self._resolve_foreground_model(
+            model, reasoning_level,
+        )
         message = await self._inject_context(chat_id, text)
 
         # Issue #11 — pre-turn conversation compression. Best-effort:
@@ -439,6 +445,13 @@ class MessageHandler:
         (byte-identical legacy path); a :class:`SessionView` runs the
         streamed turn against one conversation.
 
+        ``model`` / ``reasoning_level`` resolve identically to
+        :meth:`handle` — the same computer-use override then
+        :meth:`_resolve_foreground_model` (``models.brain`` model + the
+        Issue #50 effort half) — so the same conversation produces the
+        same (model, effort) pair regardless of which transport drove
+        the turn.
+
         On any failure (rejection, brain error, timeout, session
         lost) yields ``("error", message_or_None)`` and stops. The
         SSE route maps these to ``data: {type:..., ...}`` frames.
@@ -480,7 +493,9 @@ class MessageHandler:
         model, reasoning_level = self._apply_computer_use_override(
             model, reasoning_level,
         )
-        model = self._resolve_foreground_model(model)
+        model, reasoning_level = self._resolve_foreground_model(
+            model, reasoning_level,
+        )
         message = await self._inject_context(chat_id, text)
 
         # Issue #11 — same pre-turn compression hook as :meth:`handle`.
@@ -637,44 +652,65 @@ class MessageHandler:
             return cu_model, cu_reasoning
         return model, reasoning_level
 
-    def _resolve_foreground_model(self, model: str | None) -> str | None:
-        """Fall back to the configured foreground (chat) model when no
-        per-turn override applies.
+    def _resolve_foreground_model(
+        self, model: str | None, reasoning_level: str | None,
+    ) -> tuple[str | None, str | None]:
+        """Fall back to the configured foreground (chat) model AND
+        reasoning effort when no per-turn override applies.
 
         Both foreground entrypoints (:meth:`handle` and the streaming
         method) call this AFTER :meth:`_apply_computer_use_override`, so
         an explicit caller override (voice call mode) or a computer-use
-        substitution has already taken precedence — those leave ``model``
-        non-None and we pass straight through. Only a plain Telegram /
-        text-chat turn (``model is None``) consults ``models.brain``.
+        substitution has already taken precedence. When that happened
+        ``model`` is non-None, and we return BOTH ``model`` and
+        ``reasoning_level`` untouched: config effort must never leak onto
+        a per-turn-overridden model — the override owns the whole
+        (model, effort) pair. Only a plain Telegram / text-chat turn
+        (``model is None``) consults ``models.brain``.
 
         ``models.brain`` is resolved tier-or-raw like every other model
         knob (``model_for_tier``): an abstract tier maps to the brain's
         native id, a raw model id passes through, and ``default`` (the
         unset case — ``model_brain()`` returns ``"default"``) resolves to
         ``None`` → no ``--model`` flag → the brain's account default,
-        i.e. the historical behavior. Reads disk each turn so a config
-        edit hot-reloads at the next turn (matches subsystem tiers).
+        i.e. the historical behavior.
+
+        Issue #50 — the effort half rides alongside via
+        ``model_brain_reasoning()``: when ``models.brain`` is the new
+        dict shape (``{model: ..., reasoning: low}``) it returns the
+        level, else ``None`` (defer to the CLI default effort). A caller
+        ``reasoning_level`` that is somehow non-None while ``model`` is
+        None still wins over config — the caller is the more specific
+        intent — but in practice the plain-chat path arrives with both
+        None. Reads disk each turn so a config edit hot-reloads at the
+        next turn (matches subsystem tiers).
         """
         if model is not None:
-            return model
+            return model, reasoning_level
         try:
             from vexis_agent.core.model_validator import (
                 brain_instance_to_kind,
             )
             from vexis_agent.core.yaml_config import (
                 model_brain,
+                model_brain_reasoning,
                 model_for_tier,
             )
 
             kind = brain_instance_to_kind(self._brain)
-            return model_for_tier(kind, model_brain())
+            resolved_model = model_for_tier(kind, model_brain())
+            resolved_reasoning = (
+                reasoning_level
+                if reasoning_level is not None
+                else model_brain_reasoning()
+            )
+            return resolved_model, resolved_reasoning
         except Exception:  # pragma: no cover - defensive
             log.debug(
                 "foreground model resolution failed; using brain default",
                 exc_info=True,
             )
-            return None
+            return None, reasoning_level
 
     async def _maybe_compress(
         self, session: SessionView | None = None,

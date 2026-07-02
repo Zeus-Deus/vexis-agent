@@ -530,6 +530,9 @@ class KanbanController:
                 aux = await self._brain.spawn_aux(
                     prompt,
                     model_tier=lane.tier,
+                    # The lane pins per-spawn effort the same way it pins
+                    # model size; ``None`` defers to the CLI default.
+                    reasoning_level=lane.reasoning,
                     timeout_seconds=float(max_runtime),
                     env_overrides=env_overrides,
                     # Issue #10 — kanban workers run real tasks and need

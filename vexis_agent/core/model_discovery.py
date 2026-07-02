@@ -876,6 +876,64 @@ def reasoning_levels_for(brain_kind: str, model_id: str) -> list[str]:
     return list(levels) if isinstance(levels, list) else []
 
 
+def reasoning_vocabulary_for(brain_kind: str) -> set[str]:
+    """Return the whole set of reasoning-effort level names the brain
+    knows about — the vocabulary the validator checks a hand-edited
+    ``reasoning:`` config value against.
+
+    Distinct from :func:`reasoning_levels_for`, which is per-model
+    (the picker asks "what can THIS model do?"). The validator instead
+    asks "is this string a real effort level for this brain at all?" —
+    a broader membership check whose whole point is catching typos in
+    hand-edited YAML. It errs toward under-warning: a level valid for
+    one model but not another still passes, because a false-positive on
+    a stale/partial discovery is worse than a missed typo (the spawn
+    site itself rejects a genuinely bad ``--effort`` value).
+
+    Sources, per brain:
+      - claude-code: the CLI's ``--effort`` help list is canonical and
+        model-independent (every reasoning-capable claude model takes
+        the same levels), so it IS the vocabulary. Falls back to the
+        union of per-model capability levels when the CLI probe failed
+        but a capability fetch is cached.
+      - opencode: reasoning ``variants`` are per-model, so union every
+        discovered model's level list.
+      - null / unknown: empty.
+
+    Empty set = discovery unavailable (offline, binary missing, no
+    reasoning-capable models). The validator treats empty as "skip the
+    check" so it never false-positives when it can't see the vocabulary.
+    """
+    if brain_kind == "claude-code":
+        cli_levels = set(discover_claude_code_effort_levels())
+        if cli_levels:
+            return cli_levels
+        out: set[str] = set()
+        for entry in discover_claude_code_capabilities().values():
+            levels = entry.get("reasoning_levels") if isinstance(entry, dict) else None
+            if isinstance(levels, list):
+                out.update(str(lv) for lv in levels)
+        return out
+    if brain_kind == "opencode":
+        out = set()
+        for entry in discover_opencode_capabilities().values():
+            levels = entry.get("reasoning_levels") if isinstance(entry, dict) else None
+            if isinstance(levels, list):
+                out.update(str(lv) for lv in levels)
+        return out
+    return set()
+
+
+def reasoning_vocabulary_for_validator(
+    brain_kinds: Iterable[str],
+) -> dict[str, set[str]]:
+    """Build the ``available_reasoning_levels_per_brain`` dict the
+    validator expects — the effort-level sibling of
+    :func:`discovery_for_validator`. Helper so callers don't have to
+    remember the shape."""
+    return {b: reasoning_vocabulary_for(b) for b in brain_kinds}
+
+
 # ──────────────────────────────────────────────────────────────────
 # opencode: live `opencode models` subprocess
 # ──────────────────────────────────────────────────────────────────
@@ -1220,6 +1278,8 @@ __all__ = [
     "is_brain_configured",
     "model_belongs_to_brain",
     "reasoning_levels_for",
+    "reasoning_vocabulary_for",
+    "reasoning_vocabulary_for_validator",
     "refresh_claude_code_models",
     "refresh_opencode_models",
 ]
