@@ -70,9 +70,25 @@ Key properties (all verified on-box and pinned by tests):
   real `claude` through the wrapper. For aux, `subprocess.run`'s
   timeout (SIGKILL to the `systemd-run` client) also tears the scope
   down — no orphan.
-- **Graceful degradation.** No-ops (returns argv unchanged) when the
-  cap is disabled (`brain.subprocess_memory_max: none`) or when
-  `systemd-run` is not on PATH (non-systemd host / container).
+- **Graceful degradation.** No-ops (returns argv unchanged) in three
+  cases: the cap is disabled (`brain.subprocess_memory_max: none`);
+  `systemd-run` is not on PATH (non-systemd host / typical container);
+  or `systemd-run` *is* on PATH but a scope can't actually be created
+  here (issue #47 — a plain container ships the binary yet has no
+  running systemd / user manager / D-Bus session bus, so every scoped
+  spawn would exit 1 with "Failed to connect to bus"). PATH presence
+  can't distinguish the last case, so it's answered by a **one-time
+  probe**: the first time a wrap is actually attempted, a trivial
+  `true` is run through the exact same scope shape. Success → scope
+  every spawn as normal; failure → log one WARNING and run every spawn
+  unscoped for the process lifetime. The probe uses the *live*
+  configured cap, so a bad cap present at that first probe (e.g. a
+  `2X` typo) degrades to an unwrapped spawn too, rather than
+  hard-failing every turn. The verdict is then frozen for the process
+  lifetime, so a cap hot-edited from a valid value to a
+  systemd-invalid one *after* a successful probe skips the re-probe
+  and does hard-fail every turn until it is corrected or the daemon
+  restarts (see the operational note below).
 
 ### b) Aggregate-cap slice (`daemon/systemd.py`)
 
@@ -113,6 +129,27 @@ change just makes it almost never needed.
 - **Sizing.** On the 7.5 GB home box, slice `5G` leaves ~2.5 GB for the
   docker AI stack + OS. Per-subagent `2G` kills the multi-GB grep from
   the incident while leaving headroom for a real browser session.
+- **Containerized deploys work out of the box (issue #47).** In a
+  plain container (no systemd PID 1, no user manager, no D-Bus session
+  bus) `systemd-run` is usually installed but non-functional. The
+  one-time usability probe catches this on the first wrapped spawn,
+  logs a single WARNING that scoping is disabled (with the probe's
+  stderr excerpt as the reason), and runs every spawn unscoped
+  thereafter — the daemon stays healthy instead of every brain turn
+  exiting 1. The verdict is cached for the process lifetime and never
+  re-probed, which cuts both ways. **Fixing** a broken environment (or
+  a bad cap that was present at probe time) requires a daemon restart
+  to re-probe. Conversely, a cap hot-edited to a systemd-invalid value
+  *after* a successful probe bypasses the cached `usable` verdict and
+  hard-fails every spawn until the cap is corrected or the daemon
+  restarts — the cap string still hot-reloads per spawn, only the
+  usability verdict is frozen (the same staleness applies if
+  systemd/D-Bus dies mid-run). To silence the warning entirely on a
+  host you know can't
+  scope, set `brain.subprocess_memory_max: none`. There is deliberately
+  no Docker/env detection — the probe answers the only question that
+  matters ("can this process create a memory-capped user scope right
+  now?") on any host.
 - **opencode brain.** Only `claude-code` spawns are wrapped today.
   `opencode` runs unscoped — a follow-up should apply the same wrapper
   to its spawn sites if that brain sees production use.
