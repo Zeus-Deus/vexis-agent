@@ -362,7 +362,7 @@ async def _run() -> bool:
     # The browser is no longer hardcoded here — it ships as the bundled
     # ``browser`` add-on (vexis_agent/addons/browser/). The add-on
     # instantiates the SessionManager + BrowserTools in its register(),
-    # registers the nine browser_* dispatch handlers, owns session
+    # registers the ten browser_* dispatch handlers, owns session
     # lifecycle via a background task, and exposes the live BrowserTools
     # as the ``"browser"`` runtime service the dashboard reads. Core
     # stays browser-agnostic.
@@ -946,7 +946,7 @@ def _build_dispatch(
     the same effort as adding a new bg method, and unknown ops return a
     structured error rather than silently 200ing.
 
-    The nine ``browser_*`` ops are NOT hardcoded here anymore — they are
+    The ten ``browser_*`` ops are NOT hardcoded here anymore — they are
     registered by the bundled browser add-on via
     ``ctx.register_dispatch_handler`` and routed through the
     add-on-dispatch-first check below. With the browser add-on disabled,

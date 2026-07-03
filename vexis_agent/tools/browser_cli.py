@@ -82,6 +82,10 @@ def _cmd_scroll(direction: str, pages: float) -> int:
     )
 
 
+def _cmd_recycle() -> int:
+    return _print_and_exit(_send("browser_recycle", {}))
+
+
 def _cmd_screenshot(full_page: bool, include_base64: bool) -> int:
     args: dict = {"full_page": full_page}
     # Only forward when explicitly set; daemon falls back to its
@@ -166,6 +170,15 @@ def main() -> int:
         help="0.5=half page, 1=full page, 10=jump to top/bottom (default: 1).",
     )
 
+    sub.add_parser(
+        "recycle",
+        help=(
+            "Force-recycle the persistent browser session (use when "
+            "navigations repeatedly time out and the engine seems wedged); "
+            "logins survive on disk."
+        ),
+    )
+
     p_screenshot = sub.add_parser(
         "screenshot",
         help=(
@@ -204,6 +217,8 @@ def main() -> int:
         return _cmd_back()
     if args.cmd == "scroll":
         return _cmd_scroll(args.direction, args.pages)
+    if args.cmd == "recycle":
+        return _cmd_recycle()
     if args.cmd == "screenshot":
         return _cmd_screenshot(args.full_page, args.include_base64)
     return 2

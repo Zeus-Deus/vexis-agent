@@ -1,6 +1,6 @@
 name: browser
 version: 1.0.0
-description: "Stealth web browsing — drives a Camoufox (hardened Firefox) session, exposed to the brain as the `vexis-browser` MCP server (with the `vexis-browse` CLI as a back-compat front-end). The flagship add-on: navigate/snapshot/click/read/type/press/back/scroll/screenshot, persistent login profiles, Cloudflare auto-solve, and a pluggable CapSolver/2Captcha layer. Because the brain reaches it over MCP, any other browser MCP server is a config-level drop-in replacement — no daemon edit, no release."
+description: "Stealth web browsing — drives a Camoufox (hardened Firefox) session, exposed to the brain as the `vexis-browser` MCP server (with the `vexis-browse` CLI as a back-compat front-end). The flagship add-on: navigate/snapshot/click/read/type/press/back/scroll/screenshot/recycle, persistent login profiles, Cloudflare auto-solve, and a pluggable CapSolver/2Captcha layer. Because the brain reaches it over MCP, any other browser MCP server is a config-level drop-in replacement — no daemon edit, no release."
 author: "Zeus-Deus"
 kind: standalone
 
@@ -25,6 +25,7 @@ provides:
     - browser_back
     - browser_scroll
     - browser_screenshot
+    - browser_recycle
   background_tasks: ["browser-session-lifecycle"]
   skills: ["browser.md"]
 
@@ -56,6 +57,10 @@ config_schema:
     type: int
     default: 30
     description: "Per-navigation budget (goto + load + networkidle settle). Bounded short and separate from action_timeout_seconds so a socket-heavy page can't stall a navigation. Legacy: [browser].navigation_timeout_seconds."
+  navigation_timeout_recycle_threshold:
+    type: int
+    default: 3
+    description: "Consecutive navigation timeouts that force-recycle a wedged session. A wedged engine returns Page.goto timeouts back-to-back while the host answers fine, and the inactivity recycler never fires because a failing navigate still counts as activity; this trips a recycle instead. 0 disables. Legacy: [browser].navigation_timeout_recycle_threshold."
   solve_cloudflare:
     type: bool
     default: true

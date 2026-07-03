@@ -27,7 +27,7 @@ view) must outlive any single turn, so the engine stays in the daemon
 and this adapter is stateless. Spawning Camoufox per turn instead would
 cold-start the browser every message and lose cross-turn page state.
 
-The tool surface mirrors the nine ``browser_*`` control-socket ops one
+The tool surface mirrors the ten ``browser_*`` control-socket ops one
 for one, with the same argument coercion as the CLI path
 (``tools.browser.dispatch``), so the two front-ends are behaviourally
 identical. Each tool's docstring is its MCP schema description — the
@@ -194,6 +194,23 @@ async def browser_screenshot(
     if include_base64:
         args["include_base64"] = True
     return await _call("browser_screenshot", args)
+
+
+@mcp.tool()
+async def browser_recycle() -> dict[str, Any]:
+    """Force-recycle the persistent browser session.
+
+    Reach for this when navigations repeatedly time out or the session
+    otherwise seems wedged (a stealth engine can lock up while the host
+    itself is fine). Tears the current session down; your next browser
+    action lazily restarts a fresh one. Your login state, cookies, and
+    local storage live on disk and survive the recycle — you stay logged
+    in. Returns ``{ok, was_running}``. Note: after three consecutive
+    navigation timeouts the session already recycles itself and the error
+    hint says so, so usually you can just retry; call this when you want to
+    force it sooner.
+    """
+    return await _call("browser_recycle", {})
 
 
 def main() -> None:

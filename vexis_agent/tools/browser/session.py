@@ -33,6 +33,7 @@ from vexis_agent.tools.browser.profile import (
     action_timeout_seconds,
     headless,
     inactivity_timeout_seconds,
+    navigation_timeout_recycle_threshold,
     navigation_timeout_seconds,
     session_kwargs,
 )
@@ -43,6 +44,12 @@ if TYPE_CHECKING:  # import only for type hints — see acquire() for why
 log = logging.getLogger(__name__)
 
 _SWEEP_INTERVAL_SECONDS = 30.0
+# Hard ceiling on the ``session.close()`` in a force-recycle (issue #55). A
+# wedged engine is exactly the case the recycle exists for, so its close must
+# not be allowed to hang the recycle indefinitely — past this we log and
+# abandon the reference (the OS reaps the leaked subprocess). Distinct from
+# the graceful shutdown path (``stop()``), whose close stays unbounded.
+_FORCE_CLOSE_TIMEOUT_SECONDS = 30.0
 
 
 class _CloudflareNoiseFilter(logging.Filter):
@@ -100,6 +107,11 @@ class SessionManager:
         self._last_activity: float = 0.0
         self._sweeper: asyncio.Task | None = None
         self._stopping = False
+        # Consecutive navigation-timeout counter (issue #55). A wedged engine
+        # returns Page.goto timeouts back-to-back; once the streak hits the
+        # configured threshold we force-recycle. Reset by any navigation
+        # success, by a recycle, and by stop().
+        self._nav_timeout_streak: int = 0
         # Wall-clock counterparts of _last_activity (monotonic). The
         # monotonic value drives the inactivity sweep; the wall-clock
         # value powers the dashboard's "X minutes ago" rendering.
@@ -294,6 +306,7 @@ class SessionManager:
             self._page = None
             self._started_at_wall = None
             self._last_activity_at_wall = None
+            self._nav_timeout_streak = 0
         sweeper = self._sweeper
         self._sweeper = None
         if sweeper is not None and not sweeper.done():
@@ -310,6 +323,85 @@ class SessionManager:
                 log.exception("[browser] error tearing down session")
         # Reset _stopping so a subsequent acquire() re-arms the sweep loop.
         self._stopping = False
+
+    async def recycle(self, *, reason: str) -> bool:
+        """Force-drop the live session so the next action lazy-starts a fresh
+        one. Returns True iff a live session was actually torn down.
+
+        Distinct from ``stop()``: this is the *recover* path (idle-sweep
+        analogue, wedged-engine / manual recycle), NOT shutdown. It leaves
+        the sweeper running — with ``_session`` None its loop simply skips —
+        so the daemon keeps its inactivity discipline after a recycle. Login
+        state lives in ``user_data_dir`` on disk, so a recycle is cheap:
+        cookies and storage survive.
+
+        The teardown is two-phase on purpose. Under ``_start_lock`` we swap
+        the session/page references out to None and reset the timeout streak
+        — a quick, non-blocking critical section. The actual
+        ``session.close()`` runs OUTSIDE the lock and BOUNDED by
+        ``_FORCE_CLOSE_TIMEOUT_SECONDS``: a wedged engine (the exact case this
+        exists for, issue #55) must never be able to hang the recycle on its
+        own close. On timeout/exception we log and abandon the reference.
+
+        Lock order: callers (``record_navigation_timeout``) hold
+        ``_action_lock`` when they call this; we take ``_start_lock``. Safe
+        only because nothing ever holds ``_start_lock`` while waiting on
+        ``_action_lock`` — keep it that way.
+        """
+        async with self._start_lock:
+            sess = self._session
+            self._session = None
+            self._page = None
+            self._started_at_wall = None
+            self._last_activity_at_wall = None
+            self._nav_timeout_streak = 0
+        if sess is None:
+            return False
+        try:
+            await asyncio.wait_for(
+                sess.close(), timeout=_FORCE_CLOSE_TIMEOUT_SECONDS
+            )
+        except Exception:
+            # asyncio.TimeoutError included: a wedged close is expected here,
+            # so log-and-abandon rather than propagate — the OS reaps the
+            # leaked subprocess; the fresh session starts clean regardless.
+            log.exception(
+                "[browser] force-close during recycle failed or timed out; "
+                "abandoning old session (reason=%s)",
+                reason,
+            )
+        log.info("[browser] session recycled (reason=%s)", reason)
+        return True
+
+    def record_navigation_success(self) -> None:
+        """A navigation succeeded — clear the consecutive-timeout streak."""
+        self._nav_timeout_streak = 0
+
+    async def record_navigation_timeout(self) -> bool:
+        """Count one navigation timeout; force-recycle once the streak trips
+        the configured threshold (issue #55). Returns True iff it recycled.
+
+        Threshold is re-read per call so a config edit hot-reloads at the
+        next timeout (same discipline as the sweeper's per-tick read).
+        ``threshold <= 0`` disables the feature: we don't even count.
+
+        Called while the caller holds ``_action_lock`` — see ``recycle`` for
+        the lock-order note.
+        """
+        threshold = navigation_timeout_recycle_threshold()
+        if threshold <= 0:
+            return False
+        self._nav_timeout_streak += 1
+        if self._nav_timeout_streak < threshold:
+            return False
+        log.warning(
+            "[browser] %d consecutive navigation timeouts (threshold %d) — "
+            "force-recycling wedged session",
+            self._nav_timeout_streak,
+            threshold,
+        )
+        await self.recycle(reason="consecutive navigation timeouts")
+        return True
 
     async def _sweep_loop(self) -> None:
         # Read inactivity_timeout each tick so test harnesses (and config
@@ -334,6 +426,12 @@ class SessionManager:
                     self._page = None
                     self._started_at_wall = None
                     self._last_activity_at_wall = None
+                    # Reset the streak like every other teardown path (issue
+                    # #55): it counts consecutive timeouts on the *currently-
+                    # live* session, and this one is gone. Leaving it set would
+                    # leak a stale count into the next fresh session and could
+                    # force-recycle it after a single legitimate timeout.
+                    self._nav_timeout_streak = 0
                     try:
                         await sess.close()
                     except Exception:

@@ -16,6 +16,35 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+#: Hint stamped on a navigation-timeout failure once the consecutive-timeout
+#: streak tripped an auto force-recycle (issue #55). Single-sourced here so
+#: the streak logic in ``session.py`` and the payload wiring in ``tools.py``
+#: can't drift on the copy. States the three things the brain needs: what
+#: happened, that it's safe to retry, and that login state survives on disk.
+FORCE_RECYCLE_HINT = (
+    "The browser session was force-recycled after repeated navigation "
+    "timeouts — the engine had wedged. Retry the navigation; a fresh "
+    "session starts on the next call, and your login state is preserved on "
+    "disk (the profile survives the recycle)."
+)
+
+
+def is_timeout(exc: BaseException) -> bool:
+    """True when ``exc`` is a navigation/action timeout.
+
+    Matches ``asyncio.TimeoutError`` (which IS the builtin ``TimeoutError``
+    on 3.11+) and Playwright's own ``TimeoutError`` — the latter by class
+    NAME so this module never imports playwright. Keeping the lazy-import
+    discipline matters: an eager scrapling/playwright import at module top
+    would break importing the browser package (and transitively the daemon)
+    on a host where the Camoufox binary isn't fetched yet — see
+    ``session.acquire``'s note. The name check catches Playwright's
+    ``TimeoutError`` regardless of its (private) module path.
+    """
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    return type(exc).__name__ == "TimeoutError"
+
 
 def stale_index_payload(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {

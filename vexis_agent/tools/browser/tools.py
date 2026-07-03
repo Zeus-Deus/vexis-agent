@@ -34,7 +34,9 @@ from vexis_agent.core import yaml_config
 from vexis_agent.tools.browser import snapshot as snapshot_mod
 from vexis_agent.tools.browser.captcha import apply_captcha
 from vexis_agent.tools.browser.errors import (
+    FORCE_RECYCLE_HINT,
     error_payload,
+    is_timeout,
     normalize_exception,
     stale_index_payload,
 )
@@ -110,7 +112,7 @@ class BrowserTools:
                 log.warning("[browser] captcha layer note: %s", exc)
             return result
 
-        result = await self._run_action("navigate", op)
+        result = await self._run_action("navigate", op, navigation=True)
         if result.get("ok"):
             self._update_current_page(result)
             self._record_navigation(result.get("url") or target)
@@ -208,7 +210,7 @@ class BrowserTools:
             await self._manager.wait_stable(page)
             return {"url": page.url or ""}
 
-        result = await self._run_action("back", op)
+        result = await self._run_action("back", op, navigation=True)
         if result.get("ok"):
             self._update_current_page(result)
             url = result.get("url")
@@ -284,13 +286,37 @@ class BrowserTools:
             payload["image_base64"] = base64.b64encode(raw).decode("ascii")
         return payload
 
+    async def recycle(self) -> dict[str, Any]:
+        """Force-recycle the persistent session — works even when wedged.
+
+        Deliberately takes NO action_lock and does NOT ``acquire()``: a
+        wedged engine (issue #55) is exactly when the agent reaches for this,
+        and a queued action behind the lock must not gate the recovery. It
+        also must NOT lazy-start a session — recycling into a fresh launch
+        would be a surprising side effect. ``{ok, was_running}``; login state
+        survives on disk so the next action restarts clean.
+        """
+        was_running = self._manager.is_running()
+        await self._manager.recycle(reason="manual recycle requested")
+        return {"ok": True, "was_running": was_running}
+
     async def _run_action(
         self,
         name: str,
         op: Callable[[Any], Awaitable[Any]],
+        *,
+        navigation: bool = False,
     ) -> dict[str, Any]:
         """Acquire the page under the action lock, run ``op(page)``, merge
-        any dict it returns into the success payload."""
+        any dict it returns into the success payload.
+
+        ``navigation=True`` (goto / back only) feeds the consecutive-timeout
+        streak that force-recycles a wedged engine (issue #55): a nav success
+        clears the streak, a nav timeout counts, and the recycle-that-fired
+        stamps ``FORCE_RECYCLE_HINT`` on the failure payload. A slow
+        click/type timing out on an overlay is normal, not a wedge signature,
+        so only navigations opt in.
+        """
         try:
             _session, page = await self._manager.acquire()
         except Exception as exc:
@@ -303,9 +329,19 @@ class BrowserTools:
                 )
             except Exception as exc:
                 log.warning("[browser] %s raised: %s", name, exc)
-                return normalize_exception(exc, action=f"browser_{name}")
+                payload = normalize_exception(exc, action=f"browser_{name}")
+                # A navigation timeout is the wedged-engine signature: count
+                # it, and if this one tripped the recycle threshold, tell the
+                # brain the session was force-recycled and it can just retry.
+                if navigation and is_timeout(exc):
+                    recycled = await self._manager.record_navigation_timeout()
+                    if recycled:
+                        payload["hint"] = FORCE_RECYCLE_HINT
+                return payload
             finally:
                 self._manager.mark_activity()
+        if navigation:
+            self._manager.record_navigation_success()
         extra = result if isinstance(result, dict) else {}
         return {"ok": True, **extra}
 

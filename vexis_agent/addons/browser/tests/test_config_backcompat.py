@@ -71,3 +71,46 @@ def test_defaults_when_nothing_configured(monkeypatch, tmp_path):
     assert yaml_config.browser_headless() is True
     assert yaml_config.browser_captcha_solver() == "none"
     assert yaml_config.browser_captcha_solver_api_key() is None
+
+
+# --- navigation_timeout_recycle_threshold knob (issue #55) ----------------
+
+
+def test_recycle_threshold_default_is_three(monkeypatch, tmp_path):
+    _point_config(monkeypatch, tmp_path)
+    assert yaml_config.browser_navigation_timeout_recycle_threshold() == 3
+
+
+def test_recycle_threshold_explicit_zero_disables(monkeypatch, tmp_path):
+    cfg = _point_config(monkeypatch, tmp_path)
+    cfg.write_text(
+        "addons:\n  browser:\n    navigation_timeout_recycle_threshold: 0\n",
+        encoding="utf-8",
+    )
+    # 0 is the one value that survives the minimum=0 floor: feature off.
+    assert yaml_config.browser_navigation_timeout_recycle_threshold() == 0
+
+
+def test_recycle_threshold_negative_and_garbage_fall_back(monkeypatch, tmp_path):
+    cfg = _point_config(monkeypatch, tmp_path)
+    cfg.write_text(
+        "addons:\n  browser:\n    navigation_timeout_recycle_threshold: -5\n",
+        encoding="utf-8",
+    )
+    # Negative is below the minimum -> default 3 (only literal 0 disables).
+    assert yaml_config.browser_navigation_timeout_recycle_threshold() == 3
+    cfg.write_text(
+        "addons:\n  browser:\n    navigation_timeout_recycle_threshold: nope\n",
+        encoding="utf-8",
+    )
+    assert yaml_config.browser_navigation_timeout_recycle_threshold() == 3
+
+
+def test_recycle_threshold_addon_beats_legacy(monkeypatch, tmp_path):
+    cfg = _point_config(monkeypatch, tmp_path)
+    cfg.write_text(
+        "browser:\n  navigation_timeout_recycle_threshold: 7\n"
+        "addons:\n  browser:\n    navigation_timeout_recycle_threshold: 2\n",
+        encoding="utf-8",
+    )
+    assert yaml_config.browser_navigation_timeout_recycle_threshold() == 2

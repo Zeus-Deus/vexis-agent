@@ -11,9 +11,9 @@ hardcoded into core:
     MCP, swapping to a different browser server (Playwright MCP, a
     cloud browser, a new engine) is a config change — no daemon edit,
     no release.
-  * The nine ``browser_*`` control-socket dispatch handlers
+  * The ten ``browser_*`` control-socket dispatch handlers
     (navigate / snapshot / click / read / type / press / back /
-    scroll / screenshot) — the engine behind BOTH the MCP server and
+    scroll / screenshot / recycle) — the engine behind BOTH the MCP server and
     the back-compat ``vexis-browse`` CLI (both are thin front-ends
     that forward here over the control socket).
   * The ``web-browsing`` capability prompt block (order 13), moved
@@ -57,7 +57,7 @@ def register(ctx: PluginContext) -> None:
 
     1. Instantiate the process-global ``SessionManager`` + a
        ``BrowserTools`` bound to the active workspace.
-    2. Register the nine ``browser_*`` dispatch handlers — the
+    2. Register the ten ``browser_*`` dispatch handlers — the
        add-on-dispatch-first check in ``main._build_dispatch`` routes
        control-socket ops here before any hardcoded branch (there are
        none left for the browser).
@@ -84,7 +84,7 @@ def register(ctx: PluginContext) -> None:
     manager = get_manager()
     browser_tools = BrowserTools(manager, workspace)
 
-    # 2. Nine browser_* dispatch handlers. The control socket dispatches
+    # 2. Ten browser_* dispatch handlers. The control socket dispatches
     #    each op to the matching handler; ``vexis-browse`` is the brain's
     #    CLI in front of these.
     for op_name, handler in build_browser_handlers(browser_tools).items():

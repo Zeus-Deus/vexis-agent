@@ -2,20 +2,26 @@
 
 Pin counts (update when adding cases): 1 DSL-format case group, the
 error/stale payload shapes, the dashboard-state contract, the config
-surface (incl. the navigation-vs-action timeout split), and the Cloudflare
+surface (incl. the navigation-vs-action timeout split), the Cloudflare
 solver-gating group (issue #45: pre-check skips the solver on unchallenged
-pages, fail-safes, and the noise-filter). The pure-logic tests run
-anywhere. The real-browser end-to-end tests (``test_e2e_*``) launch
-Camoufox and are gated behind ``VEXIS_BROWSER_E2E=1`` — they need the
-browser binary (``camoufox fetch``) and a host that lets a Firefox
-subprocess spawn, so they're opt-in rather than a default CI step.
+pages, fail-safes, and the noise-filter), and the wedged-session
+force-recycle group (issue #55: ``errors.is_timeout``, the
+consecutive-nav-timeout streak + bounded recycle on ``SessionManager``, the
+``BrowserTools`` navigate/back/click streak wiring, and manual
+``BrowserTools.recycle``). The pure-logic tests run anywhere. The
+real-browser end-to-end tests (``test_e2e_*``) launch Camoufox and are
+gated behind ``VEXIS_BROWSER_E2E=1`` — they need the browser binary
+(``camoufox fetch``) and a host that lets a Firefox subprocess spawn, so
+they're opt-in rather than a default CI step.
 
-The e2e cases drive ``file://`` pages: the core flow (navigate → snapshot
-→ click → type → press → scroll → screenshot → back), the read/JS-click
-recovery path, the shadow-DOM + cursor:pointer snapshot reach, cookie
-persistence across restart, and the #45 gate (solver skipped on an
-unchallenged page) — all against the real engine, no network. Run them on
-a real machine with:
+The e2e cases drive ``file://`` pages (and, for the #55 wedge case, a
+local never-responding TCP listener — still no external network): the core
+flow (navigate → snapshot → click → type → press → scroll → screenshot →
+back), the read/JS-click recovery path, the shadow-DOM + cursor:pointer
+snapshot reach, cookie persistence across restart, the #45 gate (solver
+skipped on an unchallenged page), and the #55 wedge (three real navigation
+timeouts force-recycle the session; manual recycle) — all against the real
+engine. Run them on a real machine with:
 
     VEXIS_BROWSER_E2E=1 pytest tests/test_browser.py -k e2e -s
 """
@@ -299,6 +305,331 @@ def test_silence_cloudflare_noise_is_idempotent():
         ]
 
 
+# --- wedged-session force-recycle (issue #55) -----------------------
+# A wedged Camoufox engine returns Page.goto timeouts back-to-back while
+# the host answers fine; the inactivity recycler never fires because a
+# failing navigate still marks activity. So N consecutive navigation
+# timeouts trip an immediate force-recycle, and the agent can force one
+# manually. These drive fake session/page objects — no browser launch.
+
+
+class _PlaywrightTimeoutError(Exception):
+    """Stand-in for Playwright's ``TimeoutError``.
+
+    Matched by class NAME, not inheritance — the real one isn't a builtin
+    ``TimeoutError`` subclass either, and ``errors.is_timeout`` must catch
+    it without importing playwright. ``__name__`` is reassigned so
+    ``type(exc).__name__ == "TimeoutError"`` while the Python-level symbol
+    stays distinct from the builtin."""
+
+
+_PlaywrightTimeoutError.__name__ = "TimeoutError"
+
+
+class _FakeCloseSession:
+    """Minimal fake ``AsyncStealthySession``: counts ``close()`` calls and
+    exposes the page-stability hook so ``wait_stable`` is a no-op. No
+    ``_solve_cloudflare`` attr, so ``solves_cloudflare`` reads False."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+    async def _wait_for_page_stability(self, page, load_dom, network_idle) -> None:
+        return None
+
+
+class _FakeNavPage:
+    """Fake Playwright page. ``goto``/``go_back`` raise ``goto_exc`` /
+    ``go_back_exc`` when set (else succeed); ``locator`` returns a fake
+    locator whose ``click`` raises ``click_exc`` when set."""
+
+    def __init__(self) -> None:
+        self.url = "about:blank"
+        self.goto_exc: type[BaseException] | None = None
+        self.go_back_exc: type[BaseException] | None = None
+        self.click_exc: type[BaseException] | None = None
+
+    async def goto(self, url, wait_until=None) -> None:
+        if self.goto_exc is not None:
+            raise self.goto_exc()
+        self.url = url
+
+    async def go_back(self, wait_until=None) -> None:
+        if self.go_back_exc is not None:
+            raise self.go_back_exc()
+
+    def locator(self, selector):
+        return _FakeLocator(self.click_exc)
+
+
+class _FakeLocator:
+    def __init__(self, exc: type[BaseException] | None) -> None:
+        self._exc = exc
+        self.first = self
+
+    async def count(self) -> int:
+        return 1
+
+    async def click(self) -> None:
+        if self._exc is not None:
+            raise self._exc()
+
+
+def test_is_timeout_true_for_asyncio_and_named_playwright_timeout():
+    import asyncio
+
+    assert errors.is_timeout(asyncio.TimeoutError()) is True
+    # A class *named* TimeoutError that does NOT inherit the builtin —
+    # is_timeout catches it by name so errors.py never imports playwright.
+    assert not issubclass(_PlaywrightTimeoutError, TimeoutError)
+    assert type(_PlaywrightTimeoutError()).__name__ == "TimeoutError"
+    assert errors.is_timeout(_PlaywrightTimeoutError()) is True
+    # Anything else is not a timeout.
+    assert errors.is_timeout(ValueError("nope")) is False
+
+
+def test_streak_recycles_at_threshold_and_resets(monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    monkeypatch.setattr(
+        session_mod, "navigation_timeout_recycle_threshold", lambda: 3
+    )
+
+    async def go():
+        mgr = SessionManager()
+        fake = _FakeCloseSession()
+        mgr._session = fake
+        mgr._page = object()
+
+        # Two timeouts: streak builds, no recycle.
+        assert await mgr.record_navigation_timeout() is False
+        assert await mgr.record_navigation_timeout() is False
+        assert mgr._session is fake
+        assert mgr.is_running() is True
+
+        # Third crosses the threshold: recycle, session torn down + closed.
+        assert await mgr.record_navigation_timeout() is True
+        assert mgr._session is None
+        assert fake.close_calls == 1
+        assert mgr._nav_timeout_streak == 0
+
+        # A success mid-streak clears it.
+        fake2 = _FakeCloseSession()
+        mgr._session = fake2
+        assert await mgr.record_navigation_timeout() is False
+        assert await mgr.record_navigation_timeout() is False
+        mgr.record_navigation_success()
+        assert mgr._nav_timeout_streak == 0
+        # Two more do not recycle (streak restarted from zero).
+        assert await mgr.record_navigation_timeout() is False
+        assert await mgr.record_navigation_timeout() is False
+        assert mgr._session is fake2
+
+    asyncio.run(go())
+
+
+def test_streak_threshold_zero_never_recycles(monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    monkeypatch.setattr(
+        session_mod, "navigation_timeout_recycle_threshold", lambda: 0
+    )
+
+    async def go():
+        mgr = SessionManager()
+        fake = _FakeCloseSession()
+        mgr._session = fake
+        for _ in range(10):
+            assert await mgr.record_navigation_timeout() is False
+        # Disabled: never recycles, never even counts.
+        assert mgr._session is fake
+        assert mgr._nav_timeout_streak == 0
+
+    asyncio.run(go())
+
+
+def test_streak_threshold_reread_per_call(monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    holder = {"t": 5}
+    monkeypatch.setattr(
+        session_mod,
+        "navigation_timeout_recycle_threshold",
+        lambda: holder["t"],
+    )
+
+    async def go():
+        mgr = SessionManager()
+        mgr._session = _FakeCloseSession()
+        # Threshold 5: two timeouts, no recycle.
+        assert await mgr.record_navigation_timeout() is False
+        assert await mgr.record_navigation_timeout() is False
+        assert mgr.is_running() is True
+        # Lower the threshold mid-flight; the next call re-reads it and,
+        # with the streak already at 2, crosses the new threshold of 2.
+        holder["t"] = 2
+        assert await mgr.record_navigation_timeout() is True
+        assert mgr.is_running() is False
+
+    asyncio.run(go())
+
+
+def test_recycle_bounded_close_survives_hanging_close(monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    # A wedged engine's close() must not hang the recycle: shrink the force-
+    # close ceiling so the test doesn't wait the real 30s.
+    monkeypatch.setattr(session_mod, "_FORCE_CLOSE_TIMEOUT_SECONDS", 0.05)
+
+    class _HangingSession:
+        async def close(self) -> None:
+            await asyncio.Event().wait()  # never returns
+
+    async def go():
+        mgr = SessionManager()
+        mgr._session = _HangingSession()
+        mgr._page = object()
+        # Bounded close times out internally -> recycle still completes.
+        assert await mgr.recycle(reason="test") is True
+        assert mgr._session is None
+
+    asyncio.run(go())
+
+
+def test_recycle_with_no_session_returns_false():
+    import asyncio
+
+    async def go():
+        mgr = SessionManager()
+        assert await mgr.recycle(reason="test") is False
+
+    asyncio.run(go())
+
+
+def _install_fake_acquire(monkeypatch, mgr, session, page):
+    async def _acquire():
+        mgr._session = session
+        mgr._page = page
+        return session, page
+
+    monkeypatch.setattr(mgr, "acquire", _acquire)
+
+
+def test_browsertools_navigate_timeout_streak_wiring(tmp_path, monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    monkeypatch.setattr(
+        session_mod, "navigation_timeout_recycle_threshold", lambda: 3
+    )
+
+    async def _fake_render(page):
+        return {
+            "snapshot": "",
+            "element_count": 0,
+            "url": page.url,
+            "title": "T",
+        }
+
+    async def _fake_apply_captcha(page, target, result):
+        return result
+
+    async def go():
+        mgr = SessionManager()
+        session = _FakeCloseSession()
+        page = _FakeNavPage()
+        _install_fake_acquire(monkeypatch, mgr, session, page)
+        monkeypatch.setattr(
+            "vexis_agent.tools.browser.snapshot.render", _fake_render
+        )
+        monkeypatch.setattr(
+            "vexis_agent.tools.browser.tools.apply_captcha", _fake_apply_captcha
+        )
+        bt = BrowserTools(mgr, tmp_path)
+
+        page.goto_exc = _PlaywrightTimeoutError
+        r1 = await bt.navigate("http://x/1")
+        assert r1["ok"] is False
+        assert r1.get("hint") != errors.FORCE_RECYCLE_HINT
+        assert mgr.is_running() is True
+
+        r2 = await bt.navigate("http://x/2")
+        assert r2["ok"] is False
+        assert r2.get("hint") != errors.FORCE_RECYCLE_HINT
+        assert mgr.is_running() is True
+
+        # Third consecutive nav timeout trips the recycle.
+        r3 = await bt.navigate("http://x/3")
+        assert r3["ok"] is False
+        assert r3["hint"] == errors.FORCE_RECYCLE_HINT
+        assert mgr.is_running() is False
+        assert session.close_calls == 1
+
+        # A successful navigation clears the streak.
+        page.goto_exc = None
+        r4 = await bt.navigate("http://x/ok")
+        assert r4["ok"] is True
+        assert mgr._nav_timeout_streak == 0
+
+        # back() timeouts count toward the streak too.
+        page.go_back_exc = _PlaywrightTimeoutError
+        b1 = await bt.back()
+        assert b1["ok"] is False
+        assert mgr._nav_timeout_streak == 1
+
+        # A click timeout does NOT touch the streak (overlay-slow clicks are
+        # normal, not a wedge signature).
+        page.click_exc = _PlaywrightTimeoutError
+        streak_before = mgr._nav_timeout_streak
+        c1 = await bt.click(5)
+        assert c1["ok"] is False
+        assert mgr._nav_timeout_streak == streak_before
+
+    asyncio.run(go())
+
+
+def test_browsertools_recycle_reports_was_running(tmp_path, monkeypatch):
+    import asyncio
+
+    async def go():
+        mgr = SessionManager()
+        bt = BrowserTools(mgr, tmp_path)
+
+        # Manual recycle must never lazy-start a session.
+        async def _boom():
+            raise AssertionError("recycle must not acquire/lazy-start")
+
+        monkeypatch.setattr(mgr, "acquire", _boom)
+
+        # Not running -> was_running False, still not running.
+        out = await bt.recycle()
+        assert out == {"ok": True, "was_running": False}
+        assert mgr.is_running() is False
+
+        # Running -> was_running True, torn down + closed.
+        fake = _FakeCloseSession()
+        mgr._session = fake
+        mgr._page = object()
+        out2 = await bt.recycle()
+        assert out2 == {"ok": True, "was_running": True}
+        assert mgr.is_running() is False
+        assert fake.close_calls == 1
+
+    asyncio.run(go())
+
+
 # --- real-browser end-to-end (opt-in) -------------------------------
 
 E2E = os.environ.get("VEXIS_BROWSER_E2E") == "1"
@@ -539,5 +870,132 @@ def test_e2e_solver_skipped_on_unchallenged_page(tmp_path):
         finally:
             await mgr.stop()
             monkeypatch.undo()
+
+    asyncio.run(go())
+
+
+def _start_never_responds_listener():
+    """Bind a local TCP listener that accepts connections and never replies.
+
+    A navigation to it opens a connection and then hangs waiting for a
+    response — reproducing the wedged-engine symptom (a slow/dead peer)
+    without any external network. Returns
+    ``(server_socket, port, stop_event, thread, accepted_conns)``; the
+    caller tears everything down in a ``finally``."""
+    import socket
+    import threading
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    port = srv.getsockname()[1]
+    stop = threading.Event()
+    conns: list = []
+
+    def _accept_loop() -> None:
+        srv.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            conns.append(conn)  # hold the socket open; never write a reply
+
+    thread = threading.Thread(target=_accept_loop, daemon=True)
+    thread.start()
+    return srv, port, stop, thread, conns
+
+
+@pytest.mark.skipif(not E2E, reason="set VEXIS_BROWSER_E2E=1 to run real browser e2e")
+def test_e2e_wedged_navigation_force_recycles(tmp_path, monkeypatch):
+    # Issue #55: three consecutive real navigation timeouts must force-recycle
+    # the wedged session. A local never-responding TCP listener makes goto
+    # hang until the (shortened) navigation timeout fires; the third timeout
+    # crosses the threshold, tears the session down, and stamps the recycle
+    # hint. A subsequent file:// navigate then succeeds on a fresh session.
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    # Patch in session.py's namespace BEFORE the first acquire so the page's
+    # default navigation timeout picks up the shortened budget, and so the
+    # streak reader sees the threshold.
+    monkeypatch.setattr(session_mod, "navigation_timeout_seconds", lambda: 3)
+    monkeypatch.setattr(
+        session_mod, "navigation_timeout_recycle_threshold", lambda: 3
+    )
+
+    ok_page = tmp_path / "ok.html"
+    ok_page.write_text("<html><body><h1>Fresh session OK</h1></body></html>")
+
+    srv, port, stop, thread, conns = _start_never_responds_listener()
+    dead_url = f"http://127.0.0.1:{port}/"
+
+    async def go():
+        mgr = SessionManager()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            r1 = await bt.navigate(dead_url)
+            assert r1["ok"] is False, r1
+            r2 = await bt.navigate(dead_url)
+            assert r2["ok"] is False, r2
+            r3 = await bt.navigate(dead_url)
+            assert r3["ok"] is False, r3
+            assert "recycle" in (r3.get("hint") or "").lower(), r3
+            assert mgr.is_running() is False
+
+            good = await bt.navigate(ok_page.as_uri())
+            assert good["ok"] is True, good
+            assert mgr.is_running() is True
+        finally:
+            await mgr.stop()
+
+    try:
+        asyncio.run(go())
+    finally:
+        stop.set()
+        try:
+            srv.close()
+        except OSError:
+            pass
+        for conn in conns:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        thread.join(timeout=2)
+
+
+@pytest.mark.skipif(not E2E, reason="set VEXIS_BROWSER_E2E=1 to run real browser e2e")
+def test_e2e_manual_recycle(tmp_path):
+    # Issue #55: the manual recycle path against a live session. Navigate a
+    # file:// page, recycle, and confirm the session is torn down and a fresh
+    # navigate succeeds afterward.
+    import asyncio
+
+    page_html = tmp_path / "page.html"
+    page_html.write_text("<html><body><h1>Recycle me</h1></body></html>")
+    url = page_html.as_uri()
+
+    async def go():
+        mgr = SessionManager()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            first = await bt.navigate(url)
+            assert first["ok"] is True, first
+            assert mgr.is_running() is True
+
+            out = await bt.recycle()
+            assert out == {"ok": True, "was_running": True}
+            assert mgr.is_running() is False
+
+            again = await bt.navigate(url)
+            assert again["ok"] is True, again
+            assert mgr.is_running() is True
+        finally:
+            await mgr.stop()
 
     asyncio.run(go())

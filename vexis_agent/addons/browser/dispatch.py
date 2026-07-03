@@ -1,4 +1,4 @@
-"""Control-socket dispatch handlers for the nine ``browser_*`` ops.
+"""Control-socket dispatch handlers for the ten ``browser_*`` ops.
 
 These moved verbatim out of ``main._build_dispatch`` (the hardcoded
 ``if op == "browser_*"`` branches) when the browser became an add-on.
@@ -24,7 +24,7 @@ Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 def build_browser_handlers(browser: BrowserTools) -> dict[str, Handler]:
-    """Return ``{op_name: handler}`` for the nine browser_* ops."""
+    """Return ``{op_name: handler}`` for the ten browser_* ops."""
 
     async def browser_navigate(args: dict[str, Any]) -> dict[str, Any]:
         url = args.get("url", "")
@@ -104,6 +104,13 @@ def build_browser_handlers(browser: BrowserTools) -> dict[str, Handler]:
             include_base64=include_b64,
         )
 
+    async def browser_recycle(args: dict[str, Any]) -> dict[str, Any]:
+        # No args: force-recycle the wedged/live session (issue #55). The
+        # BrowserTools method deliberately takes no action_lock and never
+        # lazy-starts, so it works even when a navigation is wedged.
+        del args
+        return await browser.recycle()
+
     return {
         "browser_navigate": browser_navigate,
         "browser_snapshot": browser_snapshot,
@@ -114,4 +121,5 @@ def build_browser_handlers(browser: BrowserTools) -> dict[str, Handler]:
         "browser_back": browser_back,
         "browser_scroll": browser_scroll,
         "browser_screenshot": browser_screenshot,
+        "browser_recycle": browser_recycle,
     }
