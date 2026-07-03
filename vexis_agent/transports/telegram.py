@@ -129,6 +129,12 @@ _MAX_CHUNK = 4000
 # search (paragraph break → line break → hard cut) has room to
 # pick a clean break without overflowing.
 _STREAMING_ROLLOVER_THRESHOLD = 3800
+# Telegram's hard per-message ceiling — the largest text a single
+# ``edit_message_text`` can render. The issue #56 canonical final-flush
+# only edits the (single) active bubble to the done payload when it fits
+# under this; a longer canonical reply spans bubbles and falls back to
+# the locally-accumulated tail.
+_TELEGRAM_EDIT_CEILING = 4096
 # Initial bubble shown to the user immediately so they know the
 # brain heard them. Telegram refuses to edit-to-empty-string, so
 # this same character is the safe fallback whenever an edit would
@@ -5016,6 +5022,13 @@ class TelegramTransport:
         last_edit_at = 0.0
         loop = asyncio.get_event_loop()
         error_payload: dict | None = None
+        # ``rolled_over``: True once the reply overflowed the first
+        # bubble and we sealed it to start a fresh one (issue #56). Once
+        # rolled over, the earlier bubbles are immutable — the final
+        # flush can't retro-edit them to the canonical text, so it keeps
+        # the locally-accumulated tail. A single-bubble turn (the common
+        # case) CAN swap the whole bubble to the canonical done text.
+        rolled_over = False
 
         def _update_active_message(text: str) -> tuple[str, str]:
             """Closure-free helper to compute the next edit shape.
@@ -5078,6 +5091,10 @@ class TelegramTransport:
                     current_buffer = tail
                     last_edited = tail or _STREAMING_PLACEHOLDER
                     last_edit_at = loop.time()
+                    # Sealed the previous bubble — the final flush can no
+                    # longer swap the whole reply to the canonical done
+                    # text, so it stays on the accumulated tail below.
+                    rolled_over = True
                     continue
 
                 # Throttle check. The first chunk should never wait
@@ -5190,10 +5207,22 @@ class TelegramTransport:
             return _EMPTY_RESPONSE
 
         if not paths:
-            # No paths to strip — just make sure the active
-            # message reflects the final state of ``current_buffer``
-            # (the throttle may have skipped the last chunk).
-            target = current_buffer.rstrip()
+            # No paths to strip — settle the active bubble on the final
+            # text. Issue #56: on a single-bubble turn the canonical
+            # done payload (``cleaned`` — the brain's ``result`` text,
+            # mid-turn narration excluded) is what the message must show,
+            # NOT the locally-accumulated ``current_buffer`` which still
+            # carries any working notes the model streamed live. A
+            # rolled-over turn sealed earlier bubbles that can't be
+            # retro-edited, so there we fall back to the accumulated tail
+            # (the canonical reply spans bubbles we no longer own). The
+            # single-bubble swap is guarded against the 4096 edit ceiling
+            # — an over-ceiling canonical reply can't render in one
+            # message, so it too drops back to the tail.
+            if not rolled_over and len(cleaned) <= _TELEGRAM_EDIT_CEILING:
+                target = cleaned
+            else:
+                target = current_buffer.rstrip()
             if target and target != last_edited:
                 try:
                     await bot.edit_message_text(

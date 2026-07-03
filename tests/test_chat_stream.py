@@ -128,16 +128,22 @@ def _parse_sse(text: str) -> list[dict]:
 
 def test_brain_null_astream_falls_back_to_respond(brain: BrainNull) -> None:
     """BrainNull doesn't override astream — the ABC's default
-    implementation should fire respond and yield once. Verifies the
-    fallback path that opencode + null both rely on."""
-    chunks: list[str] = []
+    implementation fires respond, yields the reply as a text delta, then
+    the same text as the terminal ``final`` event (issue #56). Verifies
+    the fallback path that opencode + null both rely on."""
+    events: list = []
 
     async def run() -> None:
-        async for chunk in brain.astream("hello", chat_id=1):
-            chunks.append(chunk)
+        async for evt in brain.astream("hello", chat_id=1):
+            events.append(evt)
 
     asyncio.run(run())
-    assert chunks == ["streamed reply text"]
+    # Text delta first, then the canonical ``final`` event — byte-
+    # identical text, so a consumer's ``done`` stays unchanged.
+    assert events == [
+        "streamed reply text",
+        {"type": "final", "text": "streamed reply text"},
+    ]
     # Same call recorder as respond — confirms astream went through
     # the same code path (respond → recorded).
     assert brain.calls() == [("hello", 1, None, None)]

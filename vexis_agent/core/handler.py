@@ -469,8 +469,20 @@ class MessageHandler:
                                      timestamps + duration) dict; see
                                      ``Brain.astream``. Never mixed
                                      into the text reply.
-            ("done",  str)         — full reply, fired exactly once
-                                     after the last chunk
+            ("done",  str)         — canonical reply, fired exactly
+                                     once after the last chunk. This is
+                                     the brain's terminal ``final`` event
+                                     text (issue #56) — the same string
+                                     the buffered ``respond`` path would
+                                     return — which may be SHORTER than
+                                     the concatenated ``chunk`` events:
+                                     a brain that narrates between tools
+                                     streams that narration live but
+                                     excludes it from the persisted
+                                     reply. Falls back to the
+                                     concatenated chunks when no ``final``
+                                     event arrived (older brains) or its
+                                     text strips empty.
             ("error", dict | None) — error event. Dict payload is
                                      ``{"code": str, "message": str}``
                                      where ``code`` is one of the
@@ -509,6 +521,12 @@ class MessageHandler:
         # the matching note in :meth:`handle`).
         session_kwargs = {"session": session} if session is not None else {}
         full = ""
+        # Issue #56 — the brain's canonical reply, captured from the
+        # terminal ``final`` event when it arrives. ``None`` until seen
+        # (distinguishes "no final event" from "final event with empty
+        # text"): older / third-party brains never emit it, and we then
+        # fall back to the concatenated ``full`` below.
+        final_text: str | None = None
         try:
             async for event in self._brain.astream(
                 message, chat_id,
@@ -517,12 +535,24 @@ class MessageHandler:
             ):
                 # Brain.astream yields a discriminated union (see
                 # base.Brain.astream docstring): str = text delta,
-                # dict = brain UX / observability event (``tool`` /
-                # ``tool_end``). Dict events are forwarded untouched
-                # under the ``("tool", …)`` tag — the caller (chat UI
-                # SSE route) renders them as inline status lines /
-                # per-tool spans. They never contribute to ``full``.
+                # dict = brain UX / observability / control event.
                 if isinstance(event, dict):
+                    # Issue #56: the terminal ``final`` event carries the
+                    # canonical reply (the ``result`` text — the same
+                    # string ``respond`` returns), which may be SHORTER
+                    # than the streamed chunks because mid-turn narration
+                    # is streamed live but excluded from the persisted
+                    # message. Record it; it is NOT a UX event, so it is
+                    # NOT forwarded under the ``tool`` tag (that would
+                    # push it into the SSE tool lane / duplicate it into
+                    # the reply). Every other dict (``tool`` / ``tool_end``
+                    # / future shapes) forwards untouched so the chat UI
+                    # can render inline status lines / per-tool spans.
+                    if event.get("type") == "final":
+                        text = event.get("text")
+                        if isinstance(text, str):
+                            final_text = text
+                        continue
                     yield ("tool", event)
                     continue
                 # Text deltas: accumulate for the final ``done`` event
@@ -612,7 +642,15 @@ class MessageHandler:
             })
             return
 
-        stripped = full.strip()
+        # Issue #56 — prefer the brain's canonical ``final`` reply. ``full``
+        # holds every streamed chunk (including boundary-flushed mid-turn
+        # narration); the ``final`` event carries the canonical ``result``
+        # text, which may be shorter because narration is excluded from
+        # the persisted message. Fall back to the concatenated stream when
+        # no final event arrived (older brains) OR when the final text
+        # strips empty (degraded result — the stream is the better answer).
+        canonical = (final_text or "").strip() if final_text is not None else ""
+        stripped = canonical or full.strip()
         if outcome is not None:
             outcome.kind = "ok" if stripped else "empty"
         yield ("done", stripped or _EMPTY_RESPONSE)

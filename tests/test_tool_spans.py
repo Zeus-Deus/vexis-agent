@@ -269,8 +269,9 @@ def test_astream_streamed_deltas_tool_span(
         events = _run_astream(brain, chat_id=910)
 
     dicts = _dicts(events)
-    assert [d["type"] for d in dicts] == ["tool", "tool_end"]
-    start, end = dicts
+    # Issue #56: the terminal ``final`` event trails the tool spans.
+    assert [d["type"] for d in dicts] == ["tool", "tool_end", "final"]
+    start, end, final = dicts
     assert start["id"] == "toolu_1"
     assert isinstance(start["ts"], int) and start["ts"] > 0
     assert start["name"] == "Read"
@@ -278,6 +279,8 @@ def test_astream_streamed_deltas_tool_span(
     assert end["id"] == "toolu_1"
     assert end["status"] == "completed"
     assert isinstance(end["duration_ms"], int) and end["duration_ms"] >= 0
+    # The canonical reply is the ``result`` text only.
+    assert final == {"type": "final", "text": "The magic word is aubergine."}
 
     # Text streamed once each — no duplication from the reconciliation.
     assert "".join(_texts(events)) == (
@@ -336,6 +339,10 @@ def test_astream_batched_text_flushes_at_boundary_and_end(
     assert "".join(_texts(events)) == (
         "Checking the file now.The magic word is aubergine."
     )
+    # Issue #56: the stream ends with the canonical ``result`` text.
+    assert _dicts(events)[-1] == {
+        "type": "final", "text": "The magic word is aubergine.",
+    }
 
 
 # ── case 3: partial streaming → only the suffix is flushed ───────────
@@ -369,6 +376,8 @@ def test_astream_partial_deltas_flush_suffix_only(
     assert "".join(_texts(events)) == "Checking the file now."
     # The whole block was never emitted as one chunk (no duplication).
     assert "Checking the file now." not in _texts(events)
+    # Issue #56: canonical ``result`` text trails the tool spans.
+    assert _dicts(events)[-1] == {"type": "final", "text": "done"}
 
 
 # ── case 3b: multi-block assistant event — no re-flush ───────────────
@@ -415,6 +424,8 @@ def test_astream_multiblock_event_fully_streamed_not_reflushed(
 
     assert _texts(events) == ["Hello ", "World"]
     assert "".join(_texts(events)) == "Hello World"
+    # Issue #56: no tools this turn, so the only dict is the final event.
+    assert _dicts(events) == [{"type": "final", "text": "Hello World"}]
 
 
 # ── case 3c: batched block then streamed block — order preserved ─────
@@ -447,6 +458,8 @@ def test_astream_batched_then_streamed_preserves_order(
 
     assert _texts(events) == ["Alpha. ", "Beta."]
     assert "".join(_texts(events)) == "Alpha. Beta."
+    # Issue #56: canonical ``result`` text is the sole trailing dict.
+    assert _dicts(events) == [{"type": "final", "text": "Alpha. Beta."}]
 
 
 def test_astream_multiblock_event_flushes_only_unstreamed_tail(
@@ -474,6 +487,8 @@ def test_astream_multiblock_event_flushes_only_unstreamed_tail(
 
     assert _texts(events) == ["Hello ", "Wo", "rld"]
     assert "".join(_texts(events)) == "Hello World"
+    # Issue #56: canonical ``result`` text is the sole trailing dict.
+    assert _dicts(events) == [{"type": "final", "text": "Hello World"}]
 
 
 # ── case 4: failure turn — pending_tail never escapes ────────────────
@@ -516,6 +531,10 @@ def test_astream_failure_does_not_flush_error_text(
     collected = asyncio.run(scenario())
     # Nothing streamed — the error text stayed in the discarded buffer.
     assert _texts(collected) == []
+    # Issue #56: no ``final`` event on the failure path — the canonical
+    # reply is emitted only on the success path, so a poisoned/error
+    # transcript can never surface a canonical reply.
+    assert _dicts(collected) == []
 
 
 # ── case 5: is_error → tool_end.status == "error" ────────────────────
@@ -544,6 +563,9 @@ def test_astream_tool_result_error_marks_status(
     assert len(ends) == 1
     assert ends[0]["status"] == "error"
     assert ends[0]["name"] == "Bash"
+    # Issue #56: even after a failed tool, the turn's ``result`` text is
+    # the canonical reply and trails as the final event.
+    assert _dicts(events)[-1] == {"type": "final", "text": "that failed"}
 
 
 # ── case 6: sidechain text is never flushed into the stream ──────────
@@ -576,8 +598,11 @@ def test_astream_sidechain_text_never_flushed(
     assert "subagent internal note" not in _texts(events)
     assert _texts(events) == ["Here is the answer."]
     # The sidechain Task tool still produced a paired span (observability
-    # without leaking its text).
-    assert [d["type"] for d in _dicts(events)] == ["tool", "tool_end"]
+    # without leaking its text); issue #56's final event trails them, and
+    # its canonical text is the main-thread answer, never the sidechain
+    # note.
+    assert [d["type"] for d in _dicts(events)] == ["tool", "tool_end", "final"]
+    assert _dicts(events)[-1] == {"type": "final", "text": "Here is the answer."}
 
 
 # ── case 7: buffered path (respond) logs the span line ───────────────
@@ -773,3 +798,125 @@ def test_handler_stream_tool_end_not_in_done(tmp_path: Path) -> None:
         ("chunk", "Done."),
         ("done", "found it. Done."),
     ]
+
+
+# ── case 10: issue #56 — scratch note streams but never persists ─────
+
+_SCRATCH = "No Salto price for that OE. Now finalize the answer."
+_ANSWER = "The Salto price is not listed for that OE."
+
+
+@pytest.mark.parametrize("answer_as_deltas", [True, False])
+def test_astream_scratch_note_streams_but_excluded_from_final(
+    monkeypatch, tmp_path, patch_killpg, patch_runtime_dir, answer_as_deltas,
+):
+    """The verified PartPilot leak shape (issue #56): after the last tool
+    the model batches a final-segment working note ("… Now finalize the
+    answer.") as a buffered block with no deltas, then delivers the real
+    answer. The ``result`` event carries the ANSWER ONLY.
+
+    Contract: the scratch note still STREAMS as a live chunk (progress
+    observability, unchanged), but the terminal ``final`` event carries
+    the answer only — so a consumer that prefers ``final`` persists the
+    answer without the note. Parametrised over the two answer-delivery
+    shapes seen in the wild: token deltas AND a fully-batched block."""
+    lines = [
+        _sys_init(),
+        _assistant_text("Let me check the catalog."),
+        _assistant_tool("Bash", "toolu_1", {"command": "grep Salto db"}),
+        _tool_result("toolu_1"),
+        # Final-segment scratch note — batched block, no deltas.
+        _assistant_text(_SCRATCH),
+    ]
+    if answer_as_deltas:
+        lines += [
+            _delta("The Salto price "),
+            _delta("is not listed for that OE."),
+        ]
+    lines.append(_assistant_text(_ANSWER))
+    lines.append(_result(_ANSWER))
+    proc = FakeProc(pid=980, mode="ok", stdout=b"".join(lines))
+    patch_killpg[980] = proc
+    _patch_spawn(monkeypatch, proc)
+
+    reg = RunningTasks()
+    brain = _build_brain(reg, tmp_path)
+    events = _run_astream(brain, chat_id=980)
+
+    # Live-progress contract: the scratch note reaches the chunk stream
+    # (either as its own chunk in the deltas variant, or folded into the
+    # end-of-stream batched flush).
+    assert any(_SCRATCH in chunk for chunk in _texts(events))
+    # Canonical reply excludes the scratch note entirely.
+    final = _dicts(events)[-1]
+    assert final == {"type": "final", "text": _ANSWER}
+    assert _SCRATCH not in final["text"]
+
+
+def test_handler_stream_final_event_is_canonical_done(tmp_path: Path) -> None:
+    """Issue #56 at the handler seam: a brain that streams a mid-turn
+    scratch note then the answer and closes with a ``final`` event →
+    ``done`` carries the answer ONLY (scratch absent), while the scratch
+    still streamed as a ``chunk``. The ``final`` dict is consumed by the
+    handler, never forwarded under the ``tool`` tag."""
+
+    class NarratingBrain(BrainNull):
+        async def astream(
+            self, message: str, chat_id: int, *,
+            model=None, reasoning_level=None,
+        ) -> AsyncIterator[str | dict]:
+            yield _SCRATCH  # live progress — user watches it stream
+            yield _ANSWER
+            yield {"type": "final", "text": _ANSWER}
+
+    handler = MessageHandler(
+        brain=NarratingBrain(responses=[]), sessions=_make_sessions(tmp_path),
+        allowed_user_id=_ALLOWED_USER_ID, notifier=None,
+    )
+
+    async def run() -> list:
+        out: list = []
+        async for evt in handler.stream(_ALLOWED_USER_ID, 1, "x"):
+            out.append(evt)
+        return out
+
+    events = asyncio.run(run())
+    # The scratch note streamed as a chunk (progress preserved)…
+    assert ("chunk", _SCRATCH) in events
+    # …the ``final`` event was consumed, not forwarded as a tool…
+    assert all(tag != "tool" for tag, _ in events)
+    # …and ``done`` is the canonical answer only.
+    done = [payload for tag, payload in events if tag == "done"]
+    assert done == [_ANSWER]
+    assert _SCRATCH not in done[0]
+
+
+def test_handler_stream_without_final_falls_back_to_chunks(
+    tmp_path: Path,
+) -> None:
+    """Back-compat (issue #56): a brain that never emits a ``final``
+    event (older / third-party brains) → ``done`` is the concatenated
+    chunk text, exactly as before the canonical-reply seam."""
+
+    class NoFinalBrain(BrainNull):
+        async def astream(
+            self, message: str, chat_id: int, *,
+            model=None, reasoning_level=None,
+        ) -> AsyncIterator[str | dict]:
+            for piece in ["hel", "lo ", "world"]:
+                yield piece
+
+    handler = MessageHandler(
+        brain=NoFinalBrain(responses=[]), sessions=_make_sessions(tmp_path),
+        allowed_user_id=_ALLOWED_USER_ID, notifier=None,
+    )
+
+    async def run() -> list:
+        out: list = []
+        async for evt in handler.stream(_ALLOWED_USER_ID, 1, "x"):
+            out.append(evt)
+        return out
+
+    events = asyncio.run(run())
+    done = [payload for tag, payload in events if tag == "done"]
+    assert done == ["hello world"]

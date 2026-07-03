@@ -157,6 +157,45 @@ reaches the handler only via the raised, classified exception
 (`BrainTransientError` / `BrainPermanentError` / `BrainError`), exactly
 as before. See `_classify_brain_failure` in `core/brain/claude_code.py`.
 
+## Canonical final reply (issue #56)
+
+The boundary-flushed markers above are **live-progress observability
+only**. They are the right thing to show *while the turn streams* — the
+user watches the model work — but they must not become part of the
+*persisted* message. A batched model (claude-sonnet-5 @ effort=low in
+particular) sometimes delivers a final-segment working note as a
+buffered block right before the real answer — e.g. "No Salto price for
+that OE. Now finalize the answer." — and the boundary flush streams it
+contiguous with the answer. Left alone, that scratch text would land at
+the head of the saved reply.
+
+To converge the streamed and buffered paths on the same final message,
+the brain emits one terminal control event at end-of-stream:
+
+```
+{"type": "final", "text": "The part number is 55-2137."}
+```
+
+- On the brain contract (`Brain.astream`) this dict is emitted at most
+  once, as the LAST event of a successful stream. Its text is the
+  `result` event text — byte-for-byte what the buffered `respond()`
+  path returns for the turn. It never reaches the SSE wire — the
+  handler consumes it.
+- `MessageHandler.stream` prefers it for the `("done", …)` payload and
+  falls back to the concatenated `chunk` text only when it never arrives
+  (older / third-party brains) or strips empty. So `done` / the SSE
+  `done` frame carry the **canonical** reply, which may be **shorter**
+  than the sum of the streamed chunks (mid-turn narration excluded).
+- Both stream consumers already treat `done` as canonical replacement
+  text: the web chat swaps the streamed bubble for the `done` payload,
+  and Telegram's single-bubble final flush renders the canonical text
+  (see `docs/telegram-streaming.md`).
+
+No phrase lists, language detection, or content heuristics are involved
+— the `result` event is the only source of truth. The live chunk stream
+(including boundary-flushed narration) is unchanged; only the persisted
+message is affected.
+
 ## Code pointers
 
 - Span tracker + dedup helper: `vexis_agent/core/brain/claude_code.py`

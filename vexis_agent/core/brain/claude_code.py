@@ -1461,14 +1461,35 @@ class ClaudeCodeBrain(Brain):
             yield result_text
             accumulated = result_text
 
-        # Cross-check (logged only — never raises). Useful for
-        # spotting silent stream-json schema drift.
+        # Issue #56 — canonical final event, emitted LAST on the success
+        # path. The persisted reply is the ``result`` event text (the
+        # same string the buffered ``respond`` path returns), NOT the
+        # concatenated live stream. Mid-turn narration the model batches
+        # between tools is boundary-flushed above as live-progress
+        # observability (the issue #49 feature) but must NOT survive into
+        # the persisted message — sonnet-5 @ effort=low delivers a final-
+        # segment working note ("… Now finalize the answer.") as a
+        # buffered block that would otherwise land contiguous with the
+        # real answer in ``done``. The handler prefers this event's text
+        # and falls back to the accumulated stream only when it's absent
+        # (older brains) or strips empty. Failure paths raised above and
+        # emit no final event, so an API-error block never reaches here.
+        if result_text.strip():
+            yield {"type": "final", "text": result_text}
+
+        # Cross-check (logged only — never raises). Useful for spotting
+        # silent stream-json schema drift. A result-vs-accumulated
+        # mismatch is now the EXPECTED shape whenever the model narrated
+        # between tools (accumulated ⊇ result — the narration streamed
+        # live but is excluded from the canonical result): it is no
+        # longer drift evidence, just an observation the log records.
         result_clean = result_text.strip()
         accumulated_clean = accumulated.strip()
         if result_clean and accumulated_clean and result_clean != accumulated_clean:
             log.debug(
                 "Brain.astream: result/delta mismatch for chat %d "
-                "(result=%d chars, deltas=%d chars)",
+                "(result=%d chars, deltas=%d chars) — expected when the "
+                "model narrated between tools",
                 chat_id, len(result_clean), len(accumulated_clean),
             )
 

@@ -4254,9 +4254,7 @@ class WebDashboard:
             f"--set-path={self._config.tailscale_path}",
             f"http://localhost:{self._config.port}",
         ]
-        rc, stdout, stderr = await run_subprocess(
-            "tailscale", argv, TAILSCALE_TIMEOUT_SECONDS
-        )
+        rc, stdout, stderr = await _run_tailscale(argv)
         if rc != 0:
             err = (stderr or b"").decode(errors="replace").strip()
             out = (stdout or b"").decode(errors="replace").strip()
@@ -4275,9 +4273,7 @@ class WebDashboard:
             f"--set-path={self._config.tailscale_path}",
             "off",
         ]
-        rc, _, stderr = await run_subprocess(
-            "tailscale", argv, TAILSCALE_TIMEOUT_SECONDS
-        )
+        rc, _, stderr = await _run_tailscale(argv)
         if rc != 0:
             raise _TailscaleError(
                 f"tailscale serve off failed (rc={rc}): "
@@ -4295,12 +4291,25 @@ class _TailscaleError(RuntimeError):
     """Localised exception so failures here don't crash the daemon."""
 
 
+async def _run_tailscale(argv: list[str]) -> tuple[int, bytes | None, bytes | None]:
+    """``run_subprocess`` for the tailscale CLI, with a missing binary
+    translated into ``_TailscaleError``. A tailscale-less host (the
+    headless web-only container is the canonical case — see
+    Dockerfile.web-only) must degrade exactly like a tailscale outage:
+    dashboard stays on localhost, ``start()`` logs its WARNING and moves
+    on. Without this translation the spawn raises ``FileNotFoundError``,
+    which the callers' ``except _TailscaleError`` never catches, and the
+    whole daemon dies at startup."""
+    try:
+        return await run_subprocess("tailscale", argv, TAILSCALE_TIMEOUT_SECONDS)
+    except FileNotFoundError as exc:
+        raise _TailscaleError("tailscale binary not on PATH") from exc
+
+
 async def _tailscale_dns() -> str:
     """Return the DNS name of this tailscale node, or raise."""
-    rc, stdout, stderr = await run_subprocess(
-        "tailscale",
+    rc, stdout, stderr = await _run_tailscale(
         ["tailscale", "status", "--json"],
-        TAILSCALE_TIMEOUT_SECONDS,
     )
     if rc != 0:
         raise _TailscaleError(

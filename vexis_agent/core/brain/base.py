@@ -519,13 +519,13 @@ class Brain(ABC):
         - ``str`` — a text delta (``content_block_delta.text_delta``
           on claude-code; whatever the brain produces incrementally).
           Concatenate these to reconstruct the assistant's reply.
-        - ``dict`` — a brain UX / observability event. Dicts do NOT
-          contribute to the assistant's text reply; they're a separate
-          channel the chat UI renders alongside the text. Two shapes
-          ship today (issue #49); both are additive, and ``tool_end``
-          reuses the ``status`` vocabulary of the :class:`ToolEnd`
-          dataclass (field names differ — these are wire dicts, not
-          the dataclasses):
+        - ``dict`` — a brain UX / observability / control event. Dicts
+          do NOT contribute to the concatenated text reply; they're a
+          separate channel. Three shapes ship today — two live-progress
+          observability events (issue #49) and one terminal control
+          event (issue #56). ``tool_end`` reuses the ``status``
+          vocabulary of the :class:`ToolEnd` dataclass (field names
+          differ — these are wire dicts, not the dataclasses):
 
           * ``{"type": "tool", "name": str, "target": str | None,
             "id": str | None, "ts": int}`` — a tool call started.
@@ -543,6 +543,20 @@ class Brain(ABC):
             ``"error"`` when the tool result was flagged as an error.
             ``name`` / ``target`` are replayed from the matching start
             so consumers don't have to join on ``id``.
+          * ``{"type": "final", "text": str}`` — the brain's canonical
+            final reply (issue #56). Emitted at most once, as the LAST
+            event of a successful stream, carrying the same text
+            :meth:`respond` would have returned for the turn. Consumers
+            MUST prefer it for the persisted reply and MUST fall back to
+            the concatenated ``str`` deltas when it never arrives
+            (older / third-party brains). It is a REPLACEMENT, not a
+            contribution: the canonical reply may be SHORTER than the
+            concatenated chunks because a brain that narrates between
+            tools streams that narration live (as boundary-flushed
+            deltas — the issue #49 progress feature) but excludes it
+            from ``result``. The narration stays visible during
+            streaming; only the persisted message converges on the
+            canonical text, matching the buffered ``respond`` path.
 
           **Consumer rule:** treat a dict with an unrecognised
           ``"type"`` as ignorable — forward it verbatim or drop it,
@@ -550,11 +564,15 @@ class Brain(ABC):
           SSE route and Telegram both already do this.
 
         Default implementation here delegates to ``respond`` and
-        yields the full reply once at the end — non-streaming brains
-        still satisfy the contract (no tool events, just a single
-        text yield). Implementations that natively stream (claude-code
-        via ``--include-partial-messages``, future opencode) override
-        this to yield per-delta plus tool events as they fire.
+        yields the full reply once as a text delta, then the same text
+        again as the terminal ``{"type": "final", …}`` event — so every
+        non-streaming brain (opencode, null) satisfies the issue #56
+        canonical-reply contract with zero per-brain work, and its
+        ``done`` text stays byte-identical (final text == the single
+        yielded delta). Implementations that natively stream (claude-code
+        via ``--include-partial-messages``) override this to yield
+        per-delta plus tool events as they fire, and emit their own
+        ``final`` event from the ``result`` text at end-of-stream.
 
         Same per-turn override semantics as ``respond``: ``model``
         and ``reasoning_level`` flow through identically. Telegram
@@ -585,6 +603,12 @@ class Brain(ABC):
             model=model, reasoning_level=reasoning_level, **session_kwargs,
         )
         yield reply
+        # Issue #56 — terminal canonical event. For a non-streaming
+        # brain the single delta IS the canonical reply, so the final
+        # event carries the same text; the handler's canonical-vs-
+        # accumulated logic collapses to a no-op and ``done`` stays
+        # byte-identical to the pre-#56 behaviour.
+        yield {"type": "final", "text": reply}
 
     @abstractmethod
     async def respond(

@@ -24,10 +24,18 @@ Lifecycle for one user-typed message:
    message is 4096 chars; we leave 296 chars of headroom for the
    boundary search.
 5. On `("done", str)` the transport does a final flush so the
-   throttle never causes the last delta to be missing. If the brain
-   referenced screenshot file paths in its reply, the transport
-   strips them from the final bubble and sends each as a separate
-   photo (or document, when oversize) AFTER the text.
+   throttle never causes the last delta to be missing. The `done`
+   payload is the brain's **canonical** reply (issue #56 — the
+   `result` text, the same string the buffered path returns), which
+   can be shorter than the streamed chunks: a batched model streams
+   mid-turn working notes live as progress, but they are not part of
+   the final message. On a single-bubble turn the final flush edits
+   the bubble to that canonical text (guarded against the 4096 edit
+   ceiling), so any working notes visible during streaming are not
+   part of the final message state. If the brain referenced screenshot
+   file paths in its reply, the transport strips them from the final
+   bubble and sends each as a separate photo (or document, when
+   oversize) AFTER the text.
 6. On `("error", payload)` the transport replaces the bubble with
    the user-facing error message. Cancellations (empty message)
    stay silent — the `/cancel` handler is the source of truth for
@@ -93,7 +101,13 @@ flag does the same.
   rolled over, the path stays visible in that earlier bubble. In
   practice paths land at the tail of a turn (the "I just took a
   screenshot at ..." pattern), so a single tail-edit covers the
-  common case.
+  common case. The same limit applies to the issue #56 canonical
+  final flush: on a multi-bubble (rolled-over) turn the sealed
+  earlier bubbles keep the streamed text — the canonical swap only
+  applies to the single-bubble case (the overwhelming majority of
+  turns). Mid-turn working notes streamed into an early bubble of a
+  very long reply therefore stay visible; the common short reply
+  converges cleanly.
 
 ## When to disable streaming
 
