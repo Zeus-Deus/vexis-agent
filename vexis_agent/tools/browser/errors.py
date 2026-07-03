@@ -14,7 +14,85 @@ treats it as "snapshot, then retry" instead of a hard error.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
+
+#: Valid named-tab identifier. Deliberately narrow — a tab name is used
+#: verbatim in error hints and dashboard payloads and keyed in a dict, so
+#: keep it to an unambiguous ``[A-Za-z0-9_-]`` slug, 1–64 chars. ``tab``
+#: absent (``None``) always means the unnamed main page.
+TAB_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class TabError(Exception):
+    """Base for named-tab domain errors the tools layer maps to payloads.
+
+    Raised deep in the engine (``SessionManager.acquire_tab`` / the tab-name
+    guard) and caught by ``BrowserTools`` at the plumbing seam, which turns
+    each subtype into its own JSON error shape via the ``*_payload`` helpers
+    below. Keeping the copy in one module stops the CLI, MCP, and dispatch
+    front-ends from drifting on the wording.
+    """
+
+
+class InvalidTabNameError(TabError):
+    """Tab name failed :data:`TAB_NAME_RE` — a BadRequest, like a bad index."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__(f"invalid tab name {name!r}")
+
+
+class TabNotFoundError(TabError):
+    """No open tab by that name (never opened, or closed by site JS)."""
+
+    def __init__(self, name: str, open_tabs: list[str]) -> None:
+        self.name = name
+        self.open_tabs = list(open_tabs)
+        super().__init__(f"no tab named {name!r}")
+
+
+class TabLimitError(TabError):
+    """Opening this tab would exceed the ``max_tabs`` cap."""
+
+    def __init__(self, name: str, limit: int, open_tabs: list[str]) -> None:
+        self.name = name
+        self.limit = limit
+        self.open_tabs = list(open_tabs)
+        super().__init__(f"tab limit reached ({limit} open); cannot open {name!r}")
+
+
+def invalid_tab_name_payload(name: Any) -> dict[str, Any]:
+    """BadRequest shape for a malformed tab name (parity with a bad index)."""
+    shown = name if isinstance(name, str) else repr(name)
+    return {
+        "ok": False,
+        "error": (
+            f"invalid tab name {shown!r}; use letters, digits, '-' or '_' "
+            "(1-64 chars)"
+        ),
+        "kind": "BadRequest",
+    }
+
+
+def tab_not_found_payload(name: str, open_tabs: list[str]) -> dict[str, Any]:
+    listing = ", ".join(open_tabs) if open_tabs else "none"
+    return error_payload(
+        f"no tab named {name!r}",
+        f"open tabs: [{listing}] — open one by navigating with a new tab name",
+    )
+
+
+def tab_limit_payload(
+    name: str, limit: int, open_tabs: list[str]
+) -> dict[str, Any]:
+    listing = ", ".join(open_tabs) if open_tabs else "none"
+    return error_payload(
+        f"tab limit reached ({limit} open); cannot open {name!r}",
+        f"open tabs: [{listing}] — close one with browser_tab_close before "
+        "opening another",
+    )
+
 
 #: Hint stamped on a navigation-timeout failure once the consecutive-timeout
 #: streak tripped an auto force-recycle (issue #55). Single-sourced here so

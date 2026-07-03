@@ -19,9 +19,12 @@ the user asked you to go to a site and do something.
 ## The loop
 
     vexis-browse navigate https://example.com   # {ok,url,title,snapshot,element_count}
+    vexis-browse navigate <url> --wait-until domcontentloaded  # cheap nav, skip the settle
+    vexis-browse navigate <url> --then-read [selector]         # navigate + read in ONE call
     vexis-browse snapshot                        # re-numbered interactive elements
     vexis-browse click <index>                   # index from the latest snapshot
     vexis-browse click <index> --js              # bypass an overlay swallowing the click
+    vexis-browse click <index> --then-read [selector]          # click + read in ONE call
     vexis-browse type <index> "text"             # clears by default; --no-clear appends
     vexis-browse read [selector]                  # fast lossless body/CSS text (default body)
     vexis-browse press Enter                      # browser key chords: Enter, Tab, Control+L
@@ -29,11 +32,40 @@ the user asked you to go to a site and do something.
     vexis-browse scroll down [--pages N]
     vexis-browse screenshot [--full-page]        # PNG under <workspace>/browser/screenshots/
     vexis-browse recycle                         # force-recycle a wedged session; logins survive
+    vexis-browse open <url> --tab NAME           # navigate a named parallel tab (creates it)
+    vexis-browse tabs                            # list open named tabs
+    vexis-browse tab-close NAME                  # close a named tab
+
+Every acting verb (snapshot / click / read / type / press / back /
+scroll / screenshot) takes `--tab NAME` to act on a named parallel tab
+instead of the main page.
 
 The snapshot DSL is one line per element: `[index]<tag attr="v">text</tag>`.
 Each snapshot re-numbers from scratch — always act on your most recent
 indices. A vanished index returns a soft `snapshot_stale` hint, not an
 error: snapshot again, then retry.
+
+## Fan out over parallel tabs
+
+To read K pages, open them in named tabs (they share cookies/login and
+load concurrently), then read each — instead of one serial navigate per
+page:
+
+    vexis-browse open https://site/a --tab a --wait-until domcontentloaded
+    vexis-browse open https://site/b --tab b --wait-until domcontentloaded
+    vexis-browse open https://site/c --tab c --wait-until domcontentloaded
+    vexis-browse read --tab a
+    vexis-browse read --tab b
+    vexis-browse read --tab c
+    vexis-browse tab-close a   # free a slot (there's a small cap)
+
+Or collapse navigate+read into one call with `--then-read`:
+
+    vexis-browse open https://site/a --tab a --then-read
+
+(Via the MCP tools, fire the parallel `browser_navigate(tab=...)` calls
+in one batch, then `browser_read(tab=...)` each.) A recycle drops all
+tabs — just re-open them.
 
 If a navigation times out 3 times in a row the engine has likely wedged,
 so the session auto-recycles and the error hint says so — just navigate

@@ -27,7 +27,7 @@ view) must outlive any single turn, so the engine stays in the daemon
 and this adapter is stateless. Spawning Camoufox per turn instead would
 cold-start the browser every message and lose cross-turn page state.
 
-The tool surface mirrors the ten ``browser_*`` control-socket ops one
+The tool surface mirrors the twelve ``browser_*`` control-socket ops one
 for one, with the same argument coercion as the CLI path
 (``tools.browser.dispatch``), so the two front-ends are behaviourally
 identical. Each tool's docstring is its MCP schema description — the
@@ -83,32 +83,69 @@ async def _call(op: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def browser_navigate(url: str) -> dict[str, Any]:
+async def browser_navigate(
+    url: str,
+    wait_until: Optional[str] = None,
+    then_read: Optional[str] = None,
+    tab: Optional[str] = None,
+) -> dict[str, Any]:
     """Navigate the persistent browser to a URL.
 
     Returns ``{ok, url, title, snapshot, element_count}``. The inline
     ``snapshot`` is the same accessibility-tree DSL ``browser_snapshot``
     returns, so there's usually no need to snapshot right after
     navigating. Cloudflare challenges are auto-solved on navigate.
+
+    Three optional levers (issue #57):
+
+    - ``wait_until`` — ``"settle"`` (default) waits for load + networkidle;
+      pass ``"domcontentloaded"`` (or ``"load"``) to skip that settle for a
+      much cheaper navigation on catalog/data pages you'll just read.
+    - ``then_read`` — a CSS selector (``"body"`` = whole body) read in the
+      SAME call after the page loads, so a navigate→read is ONE round-trip.
+      The result gains ``read: {ok, text, selector, chars}``; a failed
+      bonus read never fails the navigation.
+    - ``tab`` — a named parallel tab (created here). To fan out over K
+      pages, fire several ``browser_navigate`` calls with DISTINCT ``tab``
+      names IN PARALLEL (in one batch of tool calls), then ``browser_read(tab=...)``
+      each — the tabs load concurrently instead of one serial round-trip
+      apiece. Omit ``tab`` for the single shared main page.
     """
-    return await _call("browser_navigate", {"url": url})
+    args: dict[str, Any] = {"url": url}
+    if wait_until is not None:
+        args["wait_until"] = wait_until
+    if then_read is not None:
+        args["then_read"] = then_read
+    if tab is not None:
+        args["tab"] = tab
+    return await _call("browser_navigate", args)
 
 
 @mcp.tool()
-async def browser_snapshot(full: bool = False) -> dict[str, Any]:
+async def browser_snapshot(
+    full: bool = False, tab: Optional[str] = None
+) -> dict[str, Any]:
     """Return the accessibility-tree DSL of the current page.
 
     One line per interactive element: ``[index]<tag attr="val">text</tag>``.
     The integer ``index`` is what you pass to ``browser_click`` /
     ``browser_type``. Each snapshot re-numbers the page from scratch —
     always act on indices from your most recent snapshot. ``full`` is
-    reserved (no-op today).
+    reserved (no-op today). ``tab`` targets a named parallel tab.
     """
-    return await _call("browser_snapshot", {"full": full})
+    args: dict[str, Any] = {"full": full}
+    if tab is not None:
+        args["tab"] = tab
+    return await _call("browser_snapshot", args)
 
 
 @mcp.tool()
-async def browser_click(index: int, js: bool = False) -> dict[str, Any]:
+async def browser_click(
+    index: int,
+    js: bool = False,
+    then_read: Optional[str] = None,
+    tab: Optional[str] = None,
+) -> dict[str, Any]:
     """Click the element with the given snapshot ``index``.
 
     Set ``js=true`` to fire the element's own ``click()`` from
@@ -116,65 +153,99 @@ async def browser_click(index: int, js: bool = False) -> dict[str, Any]:
     click hangs on a full-screen cookie/consent overlay that intercepts
     the hit-test. A vanished index returns a soft ``snapshot_stale``
     hint, not an error: re-snapshot and retry.
+
+    ``then_read`` (issue #57) — a CSS selector (``"body"`` = whole body)
+    read in the SAME call after the click, so a click that navigates and
+    the read of the new page are ONE round-trip; the result gains
+    ``read: {ok, text, selector, chars}`` (a failed read never fails the
+    click). ``tab`` targets a named parallel tab.
     """
-    return await _call("browser_click", {"index": index, "js": js})
+    args: dict[str, Any] = {"index": index, "js": js}
+    if then_read is not None:
+        args["then_read"] = then_read
+    if tab is not None:
+        args["tab"] = tab
+    return await _call("browser_click", args)
 
 
 @mcp.tool()
-async def browser_read(selector: Optional[str] = None) -> dict[str, Any]:
+async def browser_read(
+    selector: Optional[str] = None, tab: Optional[str] = None
+) -> dict[str, Any]:
     """Return the rendered text of the page (or a CSS ``selector``).
 
     Fast, lossless alternative to a screenshot for div/table-heavy
     pages the snapshot DSL leaves nearly empty. Defaults to the whole
-    ``<body>``. Returns ``{ok, text, selector, chars, url}``.
+    ``<body>``. Returns ``{ok, text, selector, chars, url}``. ``tab``
+    reads a named parallel tab (issue #57).
     """
     args: dict[str, Any] = {}
     if selector:
         args["selector"] = selector
+    if tab is not None:
+        args["tab"] = tab
     return await _call("browser_read", args)
 
 
 @mcp.tool()
 async def browser_type(
-    index: int, text: str, clear: bool = True
+    index: int, text: str, clear: bool = True, tab: Optional[str] = None
 ) -> dict[str, Any]:
     """Type ``text`` into the element with the given snapshot ``index``.
 
     Clears the field first by default; pass ``clear=false`` to append.
-    A vanished index returns a soft ``snapshot_stale`` hint.
+    A vanished index returns a soft ``snapshot_stale`` hint. ``tab``
+    targets a named parallel tab (issue #57).
     """
-    return await _call(
-        "browser_type", {"index": index, "text": text, "clear": clear}
-    )
+    args: dict[str, Any] = {"index": index, "text": text, "clear": clear}
+    if tab is not None:
+        args["tab"] = tab
+    return await _call("browser_type", args)
 
 
 @mcp.tool()
-async def browser_press(key: str) -> dict[str, Any]:
-    """Send a key chord to the page, e.g. ``Enter``, ``Tab``, ``Control+L``."""
-    return await _call("browser_press", {"key": key})
+async def browser_press(key: str, tab: Optional[str] = None) -> dict[str, Any]:
+    """Send a key chord to the page, e.g. ``Enter``, ``Tab``, ``Control+L``.
+
+    ``tab`` targets a named parallel tab (issue #57)."""
+    args: dict[str, Any] = {"key": key}
+    if tab is not None:
+        args["tab"] = tab
+    return await _call("browser_press", args)
 
 
 @mcp.tool()
-async def browser_back() -> dict[str, Any]:
-    """Navigate back in the browser's history. Returns ``{ok, url}``."""
-    return await _call("browser_back", {})
+async def browser_back(tab: Optional[str] = None) -> dict[str, Any]:
+    """Navigate back in the browser's history. Returns ``{ok, url}``.
+
+    ``tab`` targets a named parallel tab (issue #57)."""
+    args: dict[str, Any] = {}
+    if tab is not None:
+        args["tab"] = tab
+    return await _call("browser_back", args)
 
 
 @mcp.tool()
-async def browser_scroll(direction: str, pages: float = 1.0) -> dict[str, Any]:
+async def browser_scroll(
+    direction: str, pages: float = 1.0, tab: Optional[str] = None
+) -> dict[str, Any]:
     """Scroll the page ``up`` or ``down`` by ``pages`` viewport heights.
 
     ``pages=0.5`` is half a page; ``pages=10`` effectively jumps to the
-    top/bottom. ``direction`` must be ``"up"`` or ``"down"``.
+    top/bottom. ``direction`` must be ``"up"`` or ``"down"``. ``tab``
+    targets a named parallel tab (issue #57).
     """
-    return await _call(
-        "browser_scroll", {"direction": direction, "pages": pages}
-    )
+    args: dict[str, Any] = {"direction": direction, "pages": pages}
+    if tab is not None:
+        args["tab"] = tab
+    return await _call("browser_scroll", args)
 
 
 @mcp.tool()
 async def browser_screenshot(
-    full_page: bool = False, include_base64: bool = False
+    full_page: bool = False,
+    include_base64: bool = False,
+    tab: Optional[str] = None,
 ) -> dict[str, Any]:
     """Save a PNG of the current page and return its path.
 
@@ -184,7 +255,8 @@ async def browser_screenshot(
     photo. ``full_page=true`` captures the whole scrollable page.
     ``include_base64=true`` also returns the bytes inline (off by
     default; the path is the canonical handoff and base64 can overflow
-    the brain's stream buffer).
+    the brain's stream buffer). ``tab`` captures a named parallel tab
+    (issue #57).
     """
     args: dict[str, Any] = {"full_page": full_page}
     # Only forward when explicitly requested; an omitted key lets the
@@ -193,6 +265,8 @@ async def browser_screenshot(
     # the ``vexis-browse`` CLI.
     if include_base64:
         args["include_base64"] = True
+    if tab is not None:
+        args["tab"] = tab
     return await _call("browser_screenshot", args)
 
 
@@ -211,6 +285,29 @@ async def browser_recycle() -> dict[str, Any]:
     force it sooner.
     """
     return await _call("browser_recycle", {})
+
+
+@mcp.tool()
+async def browser_tabs() -> dict[str, Any]:
+    """List the open named parallel tabs (issue #57).
+
+    Returns ``{ok, tabs: [{name, url}]}``. The main page is unnamed and is
+    NOT listed here. Named tabs are the ones you opened with
+    ``browser_navigate(tab=...)``; use this to see what's open before
+    reading or closing one.
+    """
+    return await _call("browser_tabs", {})
+
+
+@mcp.tool()
+async def browser_tab_close(tab: str) -> dict[str, Any]:
+    """Close a named parallel tab (issue #57). Returns ``{ok, closed}``.
+
+    Frees a slot against the ``max_tabs`` cap. An unknown tab name returns
+    a clean error with the list of open tabs. The main page has no name and
+    can't be closed this way.
+    """
+    return await _call("browser_tab_close", {"tab": tab})
 
 
 def main() -> None:

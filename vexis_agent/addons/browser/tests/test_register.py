@@ -2,7 +2,8 @@
 
 These pin that the browser add-on owns its integration end-to-end:
 
-  * the ten ``browser_*`` dispatch handlers land in the runtime;
+  * the twelve ``browser_*`` dispatch handlers land in the runtime (the
+    ten original ops plus the issue-#57 ``browser_tabs`` / ``browser_tab_close``);
   * the ``web-browsing`` capability block (order 13) is registered via
     the add-on hook and assembles into the prompt only when loaded;
   * the ``browser.md`` skill is registered;
@@ -44,6 +45,8 @@ _BROWSER_OPS = (
     "browser_scroll",
     "browser_screenshot",
     "browser_recycle",
+    "browser_tabs",
+    "browser_tab_close",
 )
 
 
@@ -182,3 +185,68 @@ def test_recycle_handler_present_and_forwards(runtime, tmp_path):
     assert "browser_recycle" in handlers
     out = asyncio.run(handlers["browser_recycle"]({}))
     assert out == {"ok": True, "was_running": False}
+
+
+# --- issue #57 dispatch: new ops + arg coercion (no browser launch) --------
+
+
+def test_navigate_rejects_non_string_wait_until():
+    import asyncio
+
+    out = asyncio.run(_call("browser_navigate", {"url": "http://x", "wait_until": 3}))
+    assert out["ok"] is False
+    assert out["kind"] == "BadRequest"
+    assert "wait_until" in out["error"]
+
+
+def test_navigate_rejects_non_string_then_read():
+    import asyncio
+
+    out = asyncio.run(_call("browser_navigate", {"url": "http://x", "then_read": 5}))
+    assert out["ok"] is False
+    assert out["kind"] == "BadRequest"
+    assert "then_read" in out["error"]
+
+
+def test_snapshot_rejects_non_string_tab():
+    import asyncio
+
+    out = asyncio.run(_call("browser_snapshot", {"tab": 7}))
+    assert out["ok"] is False
+    assert out["kind"] == "BadRequest"
+    assert "tab" in out["error"]
+
+
+def test_tabs_handler_present_and_lists_empty_on_idle(tmp_path):
+    # browser_tabs (issue #57) is a pure read: on an idle manager it returns
+    # an empty tab list without launching anything.
+    import asyncio
+
+    handlers = build_browser_handlers(BrowserTools(SessionManager(), tmp_path))
+    assert "browser_tabs" in handlers
+    out = asyncio.run(handlers["browser_tabs"]({}))
+    assert out == {"ok": True, "tabs": []}
+
+
+def test_tab_close_rejects_non_string_tab():
+    import asyncio
+
+    out = asyncio.run(_call("browser_tab_close", {"tab": 9}))
+    assert out["ok"] is False
+    assert out["kind"] == "BadRequest"
+
+
+def test_tab_close_unknown_tab_errors_with_hint(tmp_path, monkeypatch):
+    # An unknown tab on a (fake) running session is a clean error payload
+    # with the open-tabs hint, not a BadRequest and not a launch.
+    import asyncio
+
+    from vexis_agent.tools.browser.session import SessionManager
+
+    mgr = SessionManager()
+    mgr._session = object()  # pretend a session is live; registry stays empty
+    handlers = build_browser_handlers(BrowserTools(mgr, tmp_path))
+    out = asyncio.run(handlers["browser_tab_close"]({"tab": "ghost"}))
+    assert out["ok"] is False
+    assert "no tab named 'ghost'" in out["error"]
+    assert "hint" in out

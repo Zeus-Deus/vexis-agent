@@ -25,7 +25,8 @@ _WEB_BROWSING_BLOCK = r"""## Web browsing — `vexis-browser` MCP tools
 You drive a real browser through the **`vexis-browser` MCP server**.
 Your tool list carries its tools — `browser_navigate`,
 `browser_snapshot`, `browser_click`, `browser_read`, `browser_type`,
-`browser_press`, `browser_back`, `browser_scroll`, `browser_screenshot`
+`browser_press`, `browser_back`, `browser_scroll`, `browser_screenshot`,
+`browser_tabs`, `browser_tab_close`
 (your agent CLI may show them namespaced, e.g.
 `mcp__vexis-browser__browser_navigate`). Call them like any other tool;
 each returns a JSON object. The engine is a stealth Camoufox (a
@@ -87,10 +88,18 @@ and act.
 
 ### The tools
 
-`browser_navigate(url)` — navigates and returns
-`{ok, url, title, snapshot, element_count}`. The inline `snapshot` is
-the same DSL `browser_snapshot` returns, so there's usually no need to
-snapshot right after navigating.
+`browser_navigate(url, wait_until=null, then_read=null, tab=null)` —
+navigates and returns `{ok, url, title, snapshot, element_count}`. The
+inline `snapshot` is the same DSL `browser_snapshot` returns, so there's
+usually no need to snapshot right after navigating.
+- `wait_until` — `"settle"` (default) waits for load + networkidle;
+  pass `"domcontentloaded"` (or `"load"`) to skip that settle for a much
+  cheaper navigation on catalog/data pages you'll just read.
+- `then_read` — a CSS selector (`"body"` = whole body) read in the SAME
+  call after the page loads, so navigate→read is ONE round-trip. The
+  result gains `read: {ok, text, selector, chars}`; a failed bonus read
+  never fails the navigation.
+- `tab` — a named parallel tab (created here). See "Fan out over tabs".
 
 `browser_snapshot()` — returns `{ok, snapshot, url, title,
 element_count}`. The DSL is one line per interactive element,
@@ -104,26 +113,36 @@ The integer `index` is the identifier you pass to `browser_click` and
 `browser_type`. Each snapshot re-numbers the page from scratch, so
 always act on the indices from your most recent snapshot.
 
-`browser_click(index, js=false)` — click an element. Set `js=true` to
-fire the element's own `click()` from JavaScript when a normal click
-hangs on a full-screen cookie/consent overlay.
+`browser_click(index, js=false, then_read=null, tab=null)` — click an
+element. Set `js=true` to fire the element's own `click()` from
+JavaScript when a normal click hangs on a full-screen cookie/consent
+overlay. `then_read` reads the page in the same call after the click (a
+click that navigates + the read of the new page in ONE round-trip),
+adding `read: {ok, text, selector, chars}`.
 
-`browser_read(selector=null)` — return the rendered text of the page
-(or a CSS selector); fast, lossless escape hatch for div/table-heavy
-pages the snapshot DSL leaves nearly empty.
+`browser_read(selector=null, tab=null)` — return the rendered text of
+the page (or a CSS selector); fast, lossless escape hatch for
+div/table-heavy pages the snapshot DSL leaves nearly empty.
 
-`browser_type(index, text, clear=true)` — type into a field; clears it
-first by default, pass `clear=false` to append.
+`browser_type(index, text, clear=true, tab=null)` — type into a field;
+clears it first by default, pass `clear=false` to append.
 
-`browser_press(key)` — a key chord using browser-style names (`Enter`,
-`Tab`, `Escape`, `Control+L`, `Shift+Tab`).
+`browser_press(key, tab=null)` — a key chord using browser-style names
+(`Enter`, `Tab`, `Escape`, `Control+L`, `Shift+Tab`).
 
-`browser_back()` — navigate back in history.
+`browser_back(tab=null)` — navigate back in history.
 
-`browser_scroll(direction, pages=1.0)` — `direction` is `"up"` or
-`"down"`; `pages=0.5` is half a page, `pages=10` jumps to top/bottom.
+`browser_scroll(direction, pages=1.0, tab=null)` — `direction` is
+`"up"` or `"down"`; `pages=0.5` is half a page, `pages=10` jumps to
+top/bottom.
 
-`browser_screenshot(full_page=false, include_base64=false)` — saves a
+`browser_tabs()` — list the open named tabs, `{ok, tabs: [{name, url}]}`.
+The unnamed main page is not listed.
+
+`browser_tab_close(tab)` — close a named tab, `{ok, closed}`. Frees a
+slot against the tab cap.
+
+`browser_screenshot(full_page=false, include_base64=false, tab=null)` — saves a
 PNG to `~/vexis-workspace/browser/screenshots/` and returns
 `{ok, path, size_bytes, mime_type}`. **Just include the path verbatim
 in your reply** — the Telegram transport detects
@@ -139,6 +158,28 @@ multi-megabyte lines and the path is the canonical image-handoff.
 seems wedged (navigations repeatedly time out). Tears the session down;
 your next action lazily restarts a fresh one. Login state survives on
 disk, so you stay logged in. Returns `{ok, was_running}`.
+
+### Fan out over tabs, and skip the settle wait
+
+Two ways to spend fewer round-trips on multi-page work:
+
+- **Batch a read into the action.** Pass `then_read` to `browser_navigate`
+  or `browser_click` to get the page's text back in the SAME call — one
+  round-trip instead of navigate-then-read. Combine with
+  `wait_until="domcontentloaded"` on data/catalog pages you only need to
+  read: it skips the load+networkidle settle and returns as soon as the
+  DOM parses.
+- **Parallel tabs.** Give `browser_navigate` a `tab` name to open a named
+  tab on the same session (shared cookies/login); if that first navigate
+  fails the tab isn't created, so just retry with the same name. Ops on
+  different tabs run concurrently. To read K pages, fire K `browser_navigate` calls with
+  DISTINCT `tab` names IN PARALLEL (put them in one batch of tool calls),
+  then `browser_read(tab=...)` each — the pages load at the same time
+  instead of one serial navigate apiece. `browser_tabs()` lists what's
+  open; `browser_tab_close(tab)` frees a slot (there's a small cap on
+  concurrent tabs). Omit `tab` and you're on the single shared main page,
+  exactly as before. A recycle (manual or the wedge auto-recycle) drops
+  all tabs — just re-open them.
 
 ### Stale-index hint
 

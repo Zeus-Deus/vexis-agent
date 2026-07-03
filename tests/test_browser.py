@@ -4,24 +4,37 @@ Pin counts (update when adding cases): 1 DSL-format case group, the
 error/stale payload shapes, the dashboard-state contract, the config
 surface (incl. the navigation-vs-action timeout split), the Cloudflare
 solver-gating group (issue #45: pre-check skips the solver on unchallenged
-pages, fail-safes, and the noise-filter), and the wedged-session
+pages, fail-safes, and the noise-filter), the wedged-session
 force-recycle group (issue #55: ``errors.is_timeout``, the
 consecutive-nav-timeout streak + bounded recycle on ``SessionManager``, the
 ``BrowserTools`` navigate/back/click streak wiring, and manual
-``BrowserTools.recycle``). The pure-logic tests run anywhere. The
-real-browser end-to-end tests (``test_e2e_*``) launch Camoufox and are
+``BrowserTools.recycle``), and the batched-read/parallel-tabs/cheaper-wait
+group (issue #57: the ``wait_until`` goto mapping + ``wait_stable`` skip,
+navigate/click ``then_read`` batching incl. the stale-index short-circuit,
+the ``SessionManager`` named-tab registry — create/reuse/unknown/cap/bad-name
+and clearing on recycle/stop/idle-teardown, real per-tab concurrency vs.
+same-tab/main serialization, the named-tab streak wiring, the dashboard
+``open_tabs`` + current-page isolation, the generation-scoped streak — a
+stale-generation timeout/success is dropped, the concurrent-tab burst repro,
+and ``_run_action`` threading the captured generation — and the failed-open
+tab discard: a failed create-path navigate leaves no phantom tab and frees the
+slot, while a reused-tab or bonus-``then_read`` failure keeps the tab). The
+pure-logic tests run anywhere.
+The real-browser end-to-end tests (``test_e2e_*``) launch Camoufox and are
 gated behind ``VEXIS_BROWSER_E2E=1`` — they need the browser binary
 (``camoufox fetch``) and a host that lets a Firefox subprocess spawn, so
 they're opt-in rather than a default CI step.
 
-The e2e cases drive ``file://`` pages (and, for the #55 wedge case, a
-local never-responding TCP listener — still no external network): the core
-flow (navigate → snapshot → click → type → press → scroll → screenshot →
-back), the read/JS-click recovery path, the shadow-DOM + cursor:pointer
-snapshot reach, cookie persistence across restart, the #45 gate (solver
-skipped on an unchallenged page), and the #55 wedge (three real navigation
-timeouts force-recycle the session; manual recycle) — all against the real
-engine. Run them on a real machine with:
+The e2e cases drive ``file://`` pages and local threaded/TCP listeners (no
+external network): the core flow (navigate → snapshot → click → type →
+press → scroll → screenshot → back), the read/JS-click recovery path, the
+shadow-DOM + cursor:pointer snapshot reach, cookie persistence across
+restart, the #45 gate (solver skipped on an unchallenged page), the #55
+wedge (three real navigation timeouts force-recycle the session; manual
+recycle), and the #57 levers (navigate+read single round-trip, three tabs
+opened concurrently against a slow local server proving overlap + no state
+bleed, and the cheap ``wait_until="domcontentloaded"`` nav) — all against
+the real engine. Run them on a real machine with:
 
     VEXIS_BROWSER_E2E=1 pytest tests/test_browser.py -k e2e -s
 """
@@ -630,6 +643,1010 @@ def test_browsertools_recycle_reports_was_running(tmp_path, monkeypatch):
     asyncio.run(go())
 
 
+# --- issue #57: batched read, parallel tabs, cheaper nav wait -------
+# All fakes below are pure asyncio — no browser launch, no network. A
+# pre-set ``mgr._session`` keeps ``_ensure_session_locked`` from importing
+# scrapling (the import lives inside the ``_session is None`` branch), so a
+# named-tab acquire works against fake objects.
+
+
+async def _noop_render(page):
+    return {
+        "snapshot": "",
+        "element_count": 0,
+        "url": page.url,
+        "title": "T",
+    }
+
+
+async def _noop_captcha(page, target, result):
+    return result
+
+
+def _patch_render_captcha(monkeypatch):
+    monkeypatch.setattr("vexis_agent.tools.browser.snapshot.render", _noop_render)
+    monkeypatch.setattr(
+        "vexis_agent.tools.browser.tools.apply_captcha", _noop_captcha
+    )
+
+
+class _ReadLocator:
+    """Fake Playwright locator: ``count`` 0 when its selector is 'missing',
+    else 1; ``inner_text`` returns the page body; ``click``/``evaluate`` are
+    no-ops."""
+
+    def __init__(self, text: str, missing: bool) -> None:
+        self._text = text
+        self._missing = missing
+        self.first = self
+
+    async def count(self) -> int:
+        return 0 if self._missing else 1
+
+    async def inner_text(self) -> str:
+        return self._text
+
+    async def click(self) -> None:
+        return None
+
+    async def evaluate(self, script) -> None:
+        return None
+
+
+class _ReadPage:
+    """Fake page for the batch/tab tests. Records ``goto`` calls (url +
+    wait_until), serves ``read`` text, tracks ``wait_for_load_state`` calls,
+    and can raise a preset exception from ``goto``."""
+
+    def __init__(
+        self,
+        body: str = "hello world",
+        missing_selectors=(),
+        goto_exc=None,
+    ) -> None:
+        self.url = "about:blank"
+        self.goto_calls: list = []
+        self.load_state_calls: list = []
+        self._body = body
+        self._missing = set(missing_selectors)
+        self.goto_exc = goto_exc
+        self._closed = False
+
+    def is_closed(self) -> bool:
+        return self._closed
+
+    def set_default_navigation_timeout(self, ms) -> None:
+        return None
+
+    def set_default_timeout(self, ms) -> None:
+        return None
+
+    async def goto(self, url, wait_until=None) -> None:
+        self.goto_calls.append((url, wait_until))
+        if self.goto_exc is not None:
+            raise self.goto_exc()
+        self.url = url
+
+    async def go_back(self, wait_until=None) -> None:
+        self.url = "about:blank"
+
+    async def inner_text(self, selector) -> str:
+        return self._body
+
+    def locator(self, selector):
+        return _ReadLocator(self._body, selector in self._missing)
+
+    async def wait_for_load_state(self, state, timeout=None) -> None:
+        self.load_state_calls.append((state, timeout))
+
+    async def close(self) -> None:
+        self._closed = True
+
+
+class _TabContext:
+    """Fake Camoufox context: hands out queued pages (else fresh ``_ReadPage``)
+    and counts ``new_page`` calls to prove create-vs-reuse."""
+
+    def __init__(self, pages=None) -> None:
+        self._queue = list(pages or [])
+        self.new_page_calls = 0
+        self.created: list = []
+
+    async def new_page(self):
+        self.new_page_calls += 1
+        page = self._queue.pop(0) if self._queue else _ReadPage()
+        self.created.append(page)
+        return page
+
+
+class _FakeTabSession:
+    """Fake ``AsyncStealthySession`` exposing just the context + the
+    page-stability hook (so ``wait_stable`` is a no-op) + ``close``. No
+    ``_solve_cloudflare`` attr, so ``solves_cloudflare`` reads False."""
+
+    def __init__(self, pages=None) -> None:
+        self.context = _TabContext(pages)
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+    async def _wait_for_page_stability(self, page, load_dom, network_idle) -> None:
+        return None
+
+
+# ---- Lever 3: wait_until mapping -----------------------------------
+
+
+def test_navigate_wait_until_maps_goto_and_skips_wait_stable(tmp_path, monkeypatch):
+    import asyncio
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        for mode, expected, stable_expected in (
+            ("domcontentloaded", "domcontentloaded", 0),
+            ("load", "load", 0),
+            (None, "domcontentloaded", 1),  # default == settle
+        ):
+            mgr = SessionManager()
+            page = _ReadPage()
+            _install_fake_acquire(monkeypatch, mgr, _FakeCloseSession(), page)
+            stable: list = []
+
+            async def _count_wait_stable(p, _acc=stable):
+                _acc.append(p)
+
+            monkeypatch.setattr(mgr, "wait_stable", _count_wait_stable)
+            bt = BrowserTools(mgr, tmp_path)
+
+            kwargs = {} if mode is None else {"wait_until": mode}
+            out = await bt.navigate("http://x/", **kwargs)
+            assert out["ok"] is True, out
+            assert page.goto_calls == [("http://x/", expected)]
+            assert len(stable) == stable_expected
+
+    asyncio.run(go())
+
+
+def test_navigate_unknown_wait_until_is_error_payload(tmp_path):
+    import asyncio
+
+    async def go():
+        # Validated before any acquire — a bad value never launches / navigates.
+        bt = BrowserTools(SessionManager(), tmp_path)
+        out = await bt.navigate("http://x/", wait_until="bogus")
+        assert out["ok"] is False
+        assert "wait_until" in out["error"]
+
+    asyncio.run(go())
+
+
+# ---- Lever 1: navigate then_read -----------------------------------
+
+
+def test_navigate_then_read_success_carries_read(tmp_path, monkeypatch):
+    import asyncio
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        mgr = SessionManager()
+        page = _ReadPage(body="catalog rows here")
+        # Count acquires to prove ONE round-trip (no re-acquire for the
+        # bonus read).
+        acquires = {"n": 0}
+
+        async def _counting_acquire():
+            acquires["n"] += 1
+            mgr._session = _FakeCloseSession()
+            mgr._page = page
+            return mgr._session, page
+
+        monkeypatch.setattr(mgr, "acquire", _counting_acquire)
+        bt = BrowserTools(mgr, tmp_path)
+
+        out = await bt.navigate("http://x/", then_read="body")
+        assert out["ok"] is True
+        assert out["read"] == {
+            "ok": True,
+            "text": "catalog rows here",
+            "selector": "body",
+            "chars": len("catalog rows here"),
+        }
+        # One acquire only — the read ran inside the same op/lock hold.
+        assert acquires["n"] == 1
+
+    asyncio.run(go())
+
+
+def test_navigate_then_read_failure_keeps_nav_ok(tmp_path, monkeypatch):
+    import asyncio
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        mgr = SessionManager()
+        page = _ReadPage(missing_selectors={"#nope"})
+        _install_fake_acquire(monkeypatch, mgr, _FakeCloseSession(), page)
+        bt = BrowserTools(mgr, tmp_path)
+
+        out = await bt.navigate("http://x/", then_read="#nope")
+        # A failed bonus read must NOT fail the navigation.
+        assert out["ok"] is True
+        assert out["read"]["ok"] is False
+        assert "error" in out["read"]
+
+    asyncio.run(go())
+
+
+def test_navigate_failure_has_no_read_key(tmp_path, monkeypatch):
+    import asyncio
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        mgr = SessionManager()
+        page = _ReadPage(goto_exc=RuntimeError("boom"))
+        _install_fake_acquire(monkeypatch, mgr, _FakeCloseSession(), page)
+        bt = BrowserTools(mgr, tmp_path)
+
+        out = await bt.navigate("http://x/", then_read="body")
+        assert out["ok"] is False
+        assert "read" not in out
+
+    asyncio.run(go())
+
+
+# ---- Lever 1: click then_read (incl. stale-index short-circuit) ----
+
+
+def test_click_then_read_success(tmp_path, monkeypatch):
+    import asyncio
+
+    async def go():
+        mgr = SessionManager()
+        page = _ReadPage(body="page after click")
+        _install_fake_acquire(monkeypatch, mgr, _FakeCloseSession(), page)
+        bt = BrowserTools(mgr, tmp_path)
+
+        out = await bt.click(3, then_read="body")
+        assert out["ok"] is True
+        assert out["read"] == {
+            "ok": True,
+            "text": "page after click",
+            "selector": "body",
+            "chars": len("page after click"),
+        }
+        # The bounded settle wait ran once before the read (nav-triggering
+        # clicks read the new document).
+        assert page.load_state_calls and page.load_state_calls[0][0] == (
+            "domcontentloaded"
+        )
+
+    asyncio.run(go())
+
+
+def test_click_stale_index_skips_then_read(tmp_path, monkeypatch):
+    import asyncio
+
+    async def go():
+        mgr = SessionManager()
+        # The index selector is 'missing' -> count 0 -> soft stale hint, and
+        # NO read is attempted for a vanished index.
+        page = _ReadPage(missing_selectors={'[data-vexis-idx="5"]'})
+        _install_fake_acquire(monkeypatch, mgr, _FakeCloseSession(), page)
+        bt = BrowserTools(mgr, tmp_path)
+
+        out = await bt.click(5, then_read="body")
+        assert out.get("snapshot_stale") is True
+        assert "read" not in out
+        assert page.load_state_calls == []
+
+    asyncio.run(go())
+
+
+# ---- Lever 2: named-tab registry -----------------------------------
+
+
+def test_tab_create_on_navigate_then_reuse(tmp_path, monkeypatch):
+    import asyncio
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        mgr = SessionManager()
+        mgr._session = _FakeTabSession()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            r1 = await bt.navigate("http://a/1", tab="a")
+            assert r1["ok"] is True
+            assert list(mgr._tabs) == ["a"]
+            assert mgr._session.context.new_page_calls == 1
+            # A second navigate on the same tab reuses the page (no new_page).
+            r2 = await bt.navigate("http://a/2", tab="a")
+            assert r2["ok"] is True
+            assert mgr._session.context.new_page_calls == 1
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+def test_unknown_tab_read_errors_with_hint(tmp_path):
+    import asyncio
+
+    async def go():
+        mgr = SessionManager()
+        mgr._session = _FakeTabSession()  # running, but registry empty
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            out = await bt.read(tab="ghost")
+            assert out["ok"] is False
+            assert "no tab named 'ghost'" in out["error"]
+            assert "open tabs" in out["hint"]
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+def test_tab_close_removes_from_registry(tmp_path, monkeypatch):
+    import asyncio
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        mgr = SessionManager()
+        mgr._session = _FakeTabSession()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            await bt.navigate("http://a/1", tab="a")
+            assert "a" in mgr._tabs
+            out = await bt.tab_close("a")
+            assert out == {"ok": True, "closed": "a"}
+            assert "a" not in mgr._tabs
+            assert "a" not in mgr._tab_locks
+            # Closing it again is now a clean not-found.
+            miss = await bt.tab_close("a")
+            assert miss["ok"] is False
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+def test_tab_cap_enforced(tmp_path, monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    _patch_render_captcha(monkeypatch)
+    monkeypatch.setattr(session_mod, "max_tabs", lambda: 1)
+
+    async def go():
+        mgr = SessionManager()
+        mgr._session = _FakeTabSession()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            assert (await bt.navigate("http://a/", tab="a"))["ok"] is True
+            over = await bt.navigate("http://b/", tab="b")
+            assert over["ok"] is False
+            assert "tab limit" in over["error"].lower()
+            assert "close" in over["hint"].lower()
+            # The rejected tab was not registered.
+            assert list(mgr._tabs) == ["a"]
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+def test_bad_tab_name_is_bad_request(tmp_path):
+    import asyncio
+
+    async def go():
+        mgr = SessionManager()
+        mgr._session = _FakeTabSession()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            out = await bt.read(tab="bad name!")
+            assert out["ok"] is False
+            assert out["kind"] == "BadRequest"
+            close = await bt.tab_close("bad name!")
+            assert close["ok"] is False
+            assert close["kind"] == "BadRequest"
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+def test_tab_registry_cleared_on_recycle_stop_idle(tmp_path, monkeypatch):
+    import asyncio
+    import time
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        # recycle
+        mgr = SessionManager()
+        mgr._session = _FakeTabSession()
+        bt = BrowserTools(mgr, tmp_path)
+        await bt.navigate("http://a/", tab="a")
+        await mgr.recycle(reason="test")
+        assert mgr._tabs == {} and mgr._tab_locks == {}
+        assert mgr.is_running() is False
+        await mgr.stop()  # cancel sweeper
+
+        # stop (closes named pages, clears registry)
+        mgr2 = SessionManager()
+        mgr2._session = _FakeTabSession()
+        bt2 = BrowserTools(mgr2, tmp_path)
+        await bt2.navigate("http://a/", tab="a")
+        page = mgr2._tabs["a"]
+        await mgr2.stop()
+        assert mgr2._tabs == {} and mgr2._tab_locks == {}
+        assert page.is_closed() is True
+
+        # idle sweep teardown
+        mgr3 = SessionManager()
+        fake = _FakeCloseSession()
+        mgr3._session = fake
+        idle_page = _ReadPage()
+        mgr3._tabs = {"a": idle_page}
+        mgr3._tab_locks = {"a": asyncio.Lock()}
+        mgr3._last_activity = time.monotonic() - 10_000
+        assert await mgr3._sweep_once() is True
+        assert mgr3._session is None
+        assert mgr3._tabs == {} and mgr3._tab_locks == {}
+        assert fake.close_calls == 1
+
+    asyncio.run(go())
+
+
+# ---- Lever 2: real concurrency -------------------------------------
+# Overlap is proved with an asyncio gate: each fake goto increments a shared
+# counter and blocks on a shared Event. Two ops that truly run at once both
+# enter before either is released; serialized ops can't.
+
+
+class _Shared:
+    def __init__(self, need: int) -> None:
+        self.entered = 0
+        self.need = need
+        self.enough = None  # set lazily to an Event on the running loop
+        self.proceed = None
+
+
+class _GatePage:
+    def __init__(self, shared: _Shared) -> None:
+        self.url = "about:blank"
+        self._shared = shared
+        self._closed = False
+
+    def is_closed(self) -> bool:
+        return self._closed
+
+    def set_default_navigation_timeout(self, ms) -> None:
+        return None
+
+    def set_default_timeout(self, ms) -> None:
+        return None
+
+    async def goto(self, url, wait_until=None) -> None:
+        self.url = url
+        self._shared.entered += 1
+        if self._shared.entered >= self._shared.need:
+            self._shared.enough.set()
+        await self._shared.proceed.wait()
+
+    async def inner_text(self, selector) -> str:
+        return "text"
+
+    def locator(self, selector):
+        return _ReadLocator("text", False)
+
+    async def wait_for_load_state(self, state, timeout=None) -> None:
+        return None
+
+    async def close(self) -> None:
+        self._closed = True
+
+
+class _GateContext:
+    def __init__(self, shared: _Shared) -> None:
+        self._shared = shared
+        self.pages: list = []
+
+    async def new_page(self):
+        page = _GatePage(self._shared)
+        self.pages.append(page)
+        return page
+
+
+class _GateSession:
+    def __init__(self, shared: _Shared) -> None:
+        self.context = _GateContext(shared)
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+    async def _wait_for_page_stability(self, page, load_dom, network_idle) -> None:
+        return None
+
+
+def test_different_tabs_navigate_concurrently(tmp_path, monkeypatch):
+    import asyncio
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        shared = _Shared(need=2)
+        shared.enough = asyncio.Event()
+        shared.proceed = asyncio.Event()
+        mgr = SessionManager()
+        mgr._session = _GateSession(shared)
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            task = asyncio.gather(
+                bt.navigate("http://a/", tab="a"),
+                bt.navigate("http://b/", tab="b"),
+            )
+            # Both gotos reach the gate before either is released -> overlap.
+            # If they serialized this would hang (only one enters) and time out.
+            await asyncio.wait_for(shared.enough.wait(), timeout=3)
+            assert shared.entered == 2
+            shared.proceed.set()
+            results = await asyncio.wait_for(task, timeout=3)
+            assert all(r["ok"] for r in results)
+        finally:
+            shared.proceed.set()
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+def test_same_tab_ops_serialize(tmp_path, monkeypatch):
+    import asyncio
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        shared = _Shared(need=2)
+        shared.enough = asyncio.Event()
+        shared.proceed = asyncio.Event()
+        mgr = SessionManager()
+        mgr._session = _GateSession(shared)
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            task = asyncio.gather(
+                bt.navigate("http://a/1", tab="a"),
+                bt.navigate("http://a/2", tab="a"),
+            )
+            await asyncio.sleep(0.1)
+            # Second op is blocked on the SAME tab lock — only one entered.
+            assert shared.entered == 1
+            shared.proceed.set()
+            results = await asyncio.wait_for(task, timeout=3)
+            assert all(r["ok"] for r in results)
+            assert shared.entered == 2
+            # Reused the one page (create-on-first, reuse-after).
+            assert mgr._session.context.pages and len(
+                mgr._session.context.pages
+            ) == 1
+        finally:
+            shared.proceed.set()
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+def test_main_page_ops_serialize(tmp_path, monkeypatch):
+    import asyncio
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        shared = _Shared(need=2)
+        shared.enough = asyncio.Event()
+        shared.proceed = asyncio.Event()
+        mgr = SessionManager()
+        mgr._session = _GateSession(shared)
+        mgr._page = _GatePage(shared)  # pre-set main page; acquire reuses it
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            task = asyncio.gather(
+                bt.navigate("http://m/1"),
+                bt.navigate("http://m/2"),
+            )
+            await asyncio.sleep(0.1)
+            # Main-page ops still serialize under action_lock.
+            assert shared.entered == 1
+            shared.proceed.set()
+            results = await asyncio.wait_for(task, timeout=3)
+            assert all(r["ok"] for r in results)
+            assert shared.entered == 2
+        finally:
+            shared.proceed.set()
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+# ---- Lever 2: named-tab streak wiring (#55 x #57) ------------------
+
+
+def test_named_tab_timeout_feeds_streak_success_clears(tmp_path, monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    _patch_render_captcha(monkeypatch)
+    monkeypatch.setattr(
+        session_mod, "navigation_timeout_recycle_threshold", lambda: 5
+    )
+
+    async def go():
+        page = _ReadPage(goto_exc=_PlaywrightTimeoutError)
+        mgr = SessionManager()
+        mgr._session = _FakeTabSession(pages=[page])
+        # Pre-register the tab so the failing navigates REUSE it. A failed
+        # create-path open is now discarded (a failed open leaves no tab —
+        # see the phantom-tab tests), so the streak wiring is exercised on an
+        # already-open tab, which a re-navigation failure must keep.
+        mgr._tabs["a"] = page
+        mgr._tab_locks["a"] = asyncio.Lock()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            assert (await bt.navigate("http://a/1", tab="a"))["ok"] is False
+            assert mgr._nav_timeout_streak == 1
+            assert (await bt.navigate("http://a/2", tab="a"))["ok"] is False
+            assert mgr._nav_timeout_streak == 2
+            # A success on the tab clears the streak (success on ANY page).
+            page.goto_exc = None
+            r = await bt.navigate("http://a/3", tab="a")
+            assert r["ok"] is True
+            assert mgr._nav_timeout_streak == 0
+            # Named-tab navigation is recorded with the tab key.
+            recents = bt.state_for_dashboard()["recent_navigations"]
+            assert recents[0].get("tab") == "a"
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+def test_named_tab_streak_trips_recycle_and_clears_registry(tmp_path, monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    _patch_render_captcha(monkeypatch)
+    monkeypatch.setattr(
+        session_mod, "navigation_timeout_recycle_threshold", lambda: 3
+    )
+
+    async def go():
+        page = _ReadPage(goto_exc=_PlaywrightTimeoutError)
+        session = _FakeTabSession(pages=[page])
+        mgr = SessionManager()
+        mgr._session = session
+        # Pre-register the tab so the failing navigates REUSE it rather than
+        # being discarded as failed create-path opens (see the phantom-tab
+        # tests); the streak wiring here is about an already-open tab.
+        mgr._tabs["a"] = page
+        mgr._tab_locks["a"] = asyncio.Lock()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            assert (await bt.navigate("http://a/1", tab="a"))["ok"] is False
+            assert (await bt.navigate("http://a/2", tab="a"))["ok"] is False
+            r3 = await bt.navigate("http://a/3", tab="a")
+            assert r3["ok"] is False
+            # Threshold tripped: force-recycle hint + session torn down + the
+            # tab registry emptied.
+            assert r3["hint"] == errors.FORCE_RECYCLE_HINT
+            assert mgr.is_running() is False
+            assert session.close_calls == 1
+            assert mgr._tabs == {} and mgr._tab_locks == {}
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+# ---- Dashboard state: open_tabs + current-page isolation ----------
+
+
+def test_dashboard_open_tabs_empty_when_idle(tmp_path):
+    mgr = SessionManager()
+    bt = BrowserTools(mgr, tmp_path)
+    state = bt.state_for_dashboard()
+    assert state["open_tabs"] == []
+
+
+def test_dashboard_open_tabs_and_main_url_not_clobbered(tmp_path, monkeypatch):
+    import asyncio
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        mgr = SessionManager()
+        mgr._session = _FakeTabSession()
+        mgr._page = _ReadPage(body="main")  # pre-set main page; acquire reuses
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            await bt.navigate("http://main/")
+            s1 = bt.state_for_dashboard()
+            assert s1["current_url"] == "http://main/"
+            assert s1["open_tabs"] == []
+
+            # A named-tab navigate must NOT clobber the main page's current
+            # url/title, but it does add an open tab + a tab-tagged history row.
+            await bt.navigate("http://tab-a/", tab="a")
+            s2 = bt.state_for_dashboard()
+            assert s2["current_url"] == "http://main/"  # unchanged
+            assert s2["open_tabs"] == [{"name": "a", "url": "http://tab-a/"}]
+            recents = s2["recent_navigations"]
+            assert recents[0].get("tab") == "a"  # newest first, the tab nav
+            assert "tab" not in recents[1]  # the main-page nav
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+# --- generation-scoped nav-timeout streak (#55 x #57) --------------
+# Per-tab locks let K navigations time out concurrently on a wedged engine.
+# The first to cross the recycle threshold resets the streak and nulls the
+# session, then yields at sess.close(); without generation scoping the
+# still-in-flight timeouts increment the FRESH session's streak (a phantom
+# streak that force-recycles it after one legitimate timeout). Ops capture
+# SessionManager.generation at acquire time and pass it to
+# record_navigation_{timeout,success}, which drop a recording whose
+# generation no longer matches the live session.
+
+
+def test_record_timeout_stale_generation_is_dropped(monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    monkeypatch.setattr(
+        session_mod, "navigation_timeout_recycle_threshold", lambda: 3
+    )
+
+    async def go():
+        mgr = SessionManager()
+        mgr._session = _FakeCloseSession()
+        stale = mgr.generation
+        # A teardown bumps the generation; the captured token is now stale.
+        await mgr.recycle(reason="test")
+        assert mgr.generation != stale
+        # A timeout tagged with the dead generation neither counts nor recycles.
+        assert await mgr.record_navigation_timeout(stale) is False
+        assert mgr._nav_timeout_streak == 0
+        # The live generation counts as usual (and a None token is
+        # unconditional — the direct-call contract existing tests rely on).
+        mgr._session = _FakeCloseSession()
+        assert await mgr.record_navigation_timeout(mgr.generation) is False
+        assert mgr._nav_timeout_streak == 1
+        assert await mgr.record_navigation_timeout(None) is False
+        assert mgr._nav_timeout_streak == 2
+
+    asyncio.run(go())
+
+
+def test_generation_scoped_streak_survives_concurrent_timeout_burst(monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    monkeypatch.setattr(
+        session_mod, "navigation_timeout_recycle_threshold", lambda: 3
+    )
+
+    class _YieldingCloseSession:
+        """close() yields (asyncio.sleep(0)) so a recycle triggered mid-burst
+        suspends AFTER it has reset the streak and bumped the generation — the
+        exact window the still-in-flight timeouts race into."""
+
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await asyncio.sleep(0)
+
+    async def go():
+        mgr = SessionManager()
+        session = _YieldingCloseSession()
+        mgr._session = session
+        mgr._page = object()
+        gen = mgr.generation  # captured while the session is live, as an op does
+
+        # Five navigations time out concurrently on the wedged engine. The 3rd
+        # crosses the threshold and recycles; while its bounded close() is
+        # suspended, the last two in-flight timeouts run. They carry the
+        # now-stale generation, so the gate drops them: exactly one recycle
+        # fires and the fresh session's streak stays 0. Remove the generation
+        # gate (count unconditionally) and those two would land on the fresh
+        # generation, leaving a phantom streak of 2 — the streak assertion
+        # below then fails. That is why this test pins the fix, by construction.
+        results = await asyncio.gather(
+            *(mgr.record_navigation_timeout(gen) for _ in range(5))
+        )
+
+        assert sum(1 for r in results if r) == 1
+        assert session.close_calls == 1
+        assert mgr._session is None
+        assert mgr._nav_timeout_streak == 0
+
+    asyncio.run(go())
+
+
+def test_record_success_stale_generation_does_not_clear_live_streak(monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    monkeypatch.setattr(
+        session_mod, "navigation_timeout_recycle_threshold", lambda: 5
+    )
+
+    async def go():
+        mgr = SessionManager()
+        mgr._session = _FakeCloseSession()
+        stale = mgr.generation
+        await mgr.recycle(reason="test")  # bumps the generation
+        # A fresh session builds a legitimate streak.
+        mgr._session = _FakeCloseSession()
+        live = mgr.generation
+        assert await mgr.record_navigation_timeout(live) is False
+        assert await mgr.record_navigation_timeout(live) is False
+        assert mgr._nav_timeout_streak == 2
+        # A late success from the DEAD generation must not wipe it.
+        mgr.record_navigation_success(stale)
+        assert mgr._nav_timeout_streak == 2
+        # A success from the LIVE generation clears it.
+        mgr.record_navigation_success(live)
+        assert mgr._nav_timeout_streak == 0
+
+    asyncio.run(go())
+
+
+def test_run_action_threads_captured_generation(tmp_path, monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    monkeypatch.setattr(
+        session_mod, "navigation_timeout_recycle_threshold", lambda: 3
+    )
+    _patch_render_captcha(monkeypatch)
+
+    captured: dict[str, list] = {"timeout": [], "success": []}
+
+    class _CapturingManager(SessionManager):
+        async def record_navigation_timeout(self, generation=None):
+            captured["timeout"].append(generation)
+            return await super().record_navigation_timeout(generation)
+
+        def record_navigation_success(self, generation=None):
+            captured["success"].append(generation)
+            return super().record_navigation_success(generation)
+
+    async def go():
+        mgr = _CapturingManager()
+        page = _ReadPage()
+        _install_fake_acquire(monkeypatch, mgr, _FakeCloseSession(), page)
+        bt = BrowserTools(mgr, tmp_path)
+        gen = mgr.generation
+
+        # A navigation timeout threads the acquire-time generation through.
+        page.goto_exc = _PlaywrightTimeoutError
+        assert (await bt.navigate("http://x/1"))["ok"] is False
+        assert captured["timeout"] == [gen]
+
+        # So does a navigation success.
+        page.goto_exc = None
+        assert (await bt.navigate("http://x/2"))["ok"] is True
+        assert captured["success"] == [gen]
+
+    asyncio.run(go())
+
+
+# --- failed tab open leaves no phantom (#57) -----------------------
+# acquire_tab registers the page BEFORE the goto runs, so a failed create-path
+# navigate would otherwise strand a phantom about:blank tab that browser_tabs
+# lists and that burns a max_tabs slot. A FAILED open must leave nothing
+# behind; a REUSED tab whose re-navigation fails must stay (the caller had it).
+
+
+def test_failed_tab_open_leaves_no_phantom_and_frees_slot(tmp_path, monkeypatch):
+    import asyncio
+
+    from vexis_agent.tools.browser import session as session_mod
+
+    _patch_render_captcha(monkeypatch)
+    monkeypatch.setattr(session_mod, "max_tabs", lambda: 1)
+
+    async def go():
+        failing = _ReadPage(goto_exc=RuntimeError("nav boom"))
+        good = _ReadPage(body="second")
+        mgr = SessionManager()
+        mgr._session = _FakeTabSession(pages=[failing, good])
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            # A failed create-path navigate returns the error payload...
+            bad = await bt.navigate("http://a/", tab="a")
+            assert bad["ok"] is False
+            # ...and leaves NO tab behind: registry + listing empty, and the
+            # just-created page was closed.
+            assert list(mgr._tabs) == []
+            assert mgr.list_open_tabs() == []
+            assert failing.is_closed() is True
+            # The slot is freed — a follow-up create succeeds even at cap 1.
+            ok = await bt.navigate("http://b/", tab="b")
+            assert ok["ok"] is True
+            assert list(mgr._tabs) == ["b"]
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+def test_reused_tab_failed_renavigation_keeps_tab(tmp_path, monkeypatch):
+    import asyncio
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        page = _ReadPage(body="first")
+        mgr = SessionManager()
+        mgr._session = _FakeTabSession(pages=[page])
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            # First navigate creates the tab and succeeds.
+            assert (await bt.navigate("http://a/1", tab="a"))["ok"] is True
+            assert list(mgr._tabs) == ["a"]
+            # A re-navigation on the EXISTING tab that fails must NOT discard
+            # it — the caller had it before and may retry.
+            page.goto_exc = RuntimeError("boom")
+            assert (await bt.navigate("http://a/2", tab="a"))["ok"] is False
+            assert list(mgr._tabs) == ["a"]
+            assert page.is_closed() is False
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+def test_failed_then_read_on_created_tab_keeps_tab(tmp_path, monkeypatch):
+    import asyncio
+
+    _patch_render_captcha(monkeypatch)
+
+    async def go():
+        page = _ReadPage(body="ok", missing_selectors={"#nope"})
+        mgr = SessionManager()
+        mgr._session = _FakeTabSession(pages=[page])
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            # The navigate SUCCEEDS; only the bonus read fails. The create
+            # succeeded, so the tab stays.
+            out = await bt.navigate("http://a/", tab="a", then_read="#nope")
+            assert out["ok"] is True
+            assert out["read"]["ok"] is False
+            assert list(mgr._tabs) == ["a"]
+            assert page.is_closed() is False
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
 # --- real-browser end-to-end (opt-in) -------------------------------
 
 E2E = os.environ.get("VEXIS_BROWSER_E2E") == "1"
@@ -997,5 +2014,172 @@ def test_e2e_manual_recycle(tmp_path):
             assert mgr.is_running() is True
         finally:
             await mgr.stop()
+
+    asyncio.run(go())
+
+
+# --- issue #57 real-browser end-to-end (opt-in) ---------------------
+
+
+@pytest.mark.skipif(not E2E, reason="set VEXIS_BROWSER_E2E=1 to run real browser e2e")
+def test_e2e_navigate_then_read_single_roundtrip(tmp_path):
+    # A navigate with then_read returns the nav fields AND the page text in
+    # ONE call — the batched-read lever against the real engine.
+    import asyncio
+
+    page_html = tmp_path / "catalog.html"
+    page_html.write_text(
+        "<html><body>"
+        "<h1>Catalog</h1>"
+        "<div id='results'>"
+        "<div class='row'>11427512300 Oliefilterelement</div>"
+        "<div class='row'>34116858652 Remblok set voor</div>"
+        "</div></body></html>"
+    )
+    url = page_html.as_uri()
+
+    async def go():
+        mgr = SessionManager()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            out = await bt.navigate(url, then_read="body")
+            assert out["ok"] is True, out
+            assert out["url"], out
+            # The batched read rode along in the same call.
+            assert out["read"]["ok"] is True, out
+            assert "11427512300" in out["read"]["text"]
+            assert "34116858652" in out["read"]["text"]
+            assert out["read"]["selector"] == "body"
+            assert out["read"]["chars"] == len(out["read"]["text"])
+
+            # Scoped batched read on a click, too.
+            scoped = await bt.navigate(url, then_read="#results")
+            assert scoped["read"]["ok"] is True
+            assert "Oliefilterelement" in scoped["read"]["text"]
+
+            # A bad selector fails only the bonus read, never the navigation.
+            miss = await bt.navigate(url, then_read="#nope")
+            assert miss["ok"] is True
+            assert miss["read"]["ok"] is False
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+@pytest.mark.skipif(not E2E, reason="set VEXIS_BROWSER_E2E=1 to run real browser e2e")
+def test_e2e_wait_until_domcontentloaded(tmp_path):
+    # The cheap nav wait: navigate with wait_until="domcontentloaded" still
+    # returns ok with readable text (it just skips the networkidle settle).
+    import asyncio
+
+    page_html = tmp_path / "data.html"
+    page_html.write_text(
+        "<html><body><h1>Data page</h1><p id='p'>row-alpha row-beta</p></body></html>"
+    )
+    url = page_html.as_uri()
+
+    async def go():
+        mgr = SessionManager()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            nav = await bt.navigate(url, wait_until="domcontentloaded")
+            assert nav["ok"] is True, nav
+            read = await bt.read("#p")
+            assert read["ok"] is True
+            assert "row-alpha" in read["text"]
+        finally:
+            await mgr.stop()
+
+    asyncio.run(go())
+
+
+def _start_slow_http_server(delay_seconds: float):
+    """Bind a local threaded HTTP server whose handler sleeps ``delay_seconds``
+    before replying, serving a per-path body so each tab gets distinct content.
+
+    Returns ``(server, port)``; the caller shuts it down in a ``finally``. No
+    external network — 127.0.0.1 only."""
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - stdlib callback name
+            time.sleep(delay_seconds)
+            body = (
+                f"<html><body><h1>path {self.path}</h1>"
+                f"<p>content-for{self.path}</p></body></html>"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):  # silence the default stderr logging
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, server.server_address[1]
+
+
+@pytest.mark.skipif(not E2E, reason="set VEXIS_BROWSER_E2E=1 to run real browser e2e")
+def test_e2e_parallel_tabs_no_state_bleed(tmp_path):
+    # Three tabs opened CONCURRENTLY (asyncio.gather) against a local server
+    # whose handler sleeps ~1.5s. Asserts: (a) each tab's read returns its own
+    # page's distinct content, (b) total wall time is well under 3x the
+    # per-page delay (overlap proof), (c) browser_tabs lists them, (d) closing
+    # one leaves the others + the main page working.
+    import asyncio
+    import time
+
+    delay = 1.5
+    server, port = _start_slow_http_server(delay)
+    base = f"http://127.0.0.1:{port}"
+
+    async def go():
+        mgr = SessionManager()
+        bt = BrowserTools(mgr, tmp_path)
+        try:
+            started = time.monotonic()
+            results = await asyncio.gather(
+                bt.navigate(f"{base}/a", tab="a", wait_until="domcontentloaded"),
+                bt.navigate(f"{base}/b", tab="b", wait_until="domcontentloaded"),
+                bt.navigate(f"{base}/c", tab="c", wait_until="domcontentloaded"),
+            )
+            elapsed = time.monotonic() - started
+            for r in results:
+                assert r["ok"] is True, r
+            # (b) overlap: three ~1.5s pages loaded concurrently finish well
+            # under the 4.5s a serial run would take (generous margin).
+            assert elapsed < 3 * delay, elapsed
+
+            # (a) each tab holds its own page's distinct content.
+            ra = await bt.read(tab="a")
+            rb = await bt.read(tab="b")
+            rc = await bt.read(tab="c")
+            assert "content-for/a" in ra["text"]
+            assert "content-for/b" in rb["text"]
+            assert "content-for/c" in rc["text"]
+
+            # (c) browser_tabs lists all three.
+            listing = await bt.tabs()
+            assert listing["ok"] is True
+            assert {t["name"] for t in listing["tabs"]} == {"a", "b", "c"}
+
+            # (d) closing one leaves the others + the main page working.
+            assert (await bt.tab_close("b"))["ok"] is True
+            gone = await bt.read(tab="b")
+            assert gone["ok"] is False
+            assert (await bt.read(tab="a"))["ok"] is True
+            main = await bt.navigate(f"{base}/main", wait_until="domcontentloaded")
+            assert main["ok"] is True, main
+        finally:
+            await mgr.stop()
+            server.shutdown()
+            server.server_close()
 
     asyncio.run(go())

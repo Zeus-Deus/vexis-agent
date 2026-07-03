@@ -85,6 +85,16 @@ def navigation_timeout_recycle_threshold() -> int:
     return yaml_config.browser_navigation_timeout_recycle_threshold()
 
 
+def max_tabs() -> int:
+    """Cap on concurrently-open named tabs (issue #57). Default 8.
+
+    Read per ``acquire_tab`` create so an edit hot-reloads at the next tab
+    open (same discipline as every other browser knob). See
+    ``yaml_config.browser_max_tabs``.
+    """
+    return yaml_config.browser_max_tabs()
+
+
 def solve_cloudflare() -> bool:
     """Whether navigation auto-solves Cloudflare Turnstile/Interstitial.
 
