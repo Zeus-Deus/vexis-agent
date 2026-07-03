@@ -374,6 +374,77 @@ def test_streaming_done_sentinel_overrides_local_accumulation():
     assert final == "FINAL"
 
 
+def test_streaming_final_flush_renders_canonical_done_text():
+    """Issue #56: when the ``done`` payload is SHORTER than the streamed
+    chunks (a mid-turn working note streamed live but is excluded from
+    the canonical reply), the single-bubble final flush edits the active
+    message to the canonical text — so the note visible during streaming
+    is not part of the final message state."""
+    scratch = "No Salto price for that OE. Now finalize the answer."
+    answer = "The Salto price is not listed for that OE."
+    handler = _StreamingHandler(
+        [
+            ("chunk", scratch + " "),
+            ("chunk", answer),
+            ("done", answer),
+        ],
+    )
+    transport = _make_streaming_transport(handler, min_interval=0.0)
+    bot = _StreamingBot()
+
+    final = asyncio.run(
+        transport._send_brain_reply_streaming(bot, _CHAT, _USER, "hi")
+    )
+
+    assert final == answer
+    edits_text = [text for _, _, text in bot.edits]
+    # The final edit renders the canonical answer, scratch note gone.
+    assert edits_text[-1] == answer
+    assert scratch not in edits_text[-1]
+    # Single bubble — no rollover, one message id throughout.
+    msg_ids = {mid for _, mid, _ in bot.edits}
+    assert len(msg_ids) == 1
+
+
+def test_streaming_rolled_over_final_flush_keeps_accumulated_tail():
+    """Issue #56 rollover guard: once the reply overflowed into a second
+    bubble, the sealed first bubble can't be retro-edited, so the final
+    flush must NOT swap the full canonical done text into the last
+    bubble (that would duplicate the sealed head's content). The last
+    bubble keeps the locally-accumulated tail; only the RETURN value
+    (the goal hook's input) carries the canonical text."""
+    big = "y" * (_STREAMING_ROLLOVER_THRESHOLD + 100)
+    tail_note = " tail-note"
+    canonical = "short canonical reply"
+    handler = _StreamingHandler(
+        [
+            ("chunk", big),
+            ("chunk", tail_note),
+            ("done", canonical),
+        ],
+    )
+    transport = _make_streaming_transport(handler, min_interval=0.0)
+    bot = _StreamingBot()
+
+    final = asyncio.run(
+        transport._send_brain_reply_streaming(bot, _CHAT, _USER, "hi")
+    )
+
+    # Goal hook still receives the canonical done payload.
+    assert final == canonical
+    # Rollover happened: a second bubble was sent.
+    assert len(bot.sent_messages) >= 2
+    # The canonical text must never be rendered into any bubble — on a
+    # rolled-over turn it would duplicate content already sealed in the
+    # first bubble.
+    edits_text = [text for _, _, text in bot.edits]
+    assert canonical not in edits_text
+    # The last bubble's final state is the accumulated tail (rollover
+    # remainder + the post-rollover chunk), not the canonical text.
+    assert edits_text[-1].endswith(tail_note.rstrip())
+    assert not edits_text[-1].startswith(canonical)
+
+
 def test_streaming_error_event_replaces_bubble_with_error_text():
     """``("error", {"code":..., "message":...})`` swaps the
     placeholder for the user-facing error string and stops."""

@@ -787,7 +787,11 @@ def test_astream_uses_resume_when_jsonl_exists_despite_uninitialized(
         return out
 
     chunks = asyncio.run(scenario())
-    assert "".join(chunks) == "streamed after cancel"
+    # Issue #56: the terminal ``final`` dict trails the text delta; the
+    # concatenation of the str deltas is the reply.
+    texts = [c for c in chunks if isinstance(c, str)]
+    assert "".join(texts) == "streamed after cancel"
+    assert chunks[-1] == {"type": "final", "text": "streamed after cancel"}
     argv = captured_argv[0]
     assert "--resume" in argv, (
         f"astream must use --resume when JSONL exists; got {argv}"
