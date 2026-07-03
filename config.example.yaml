@@ -130,6 +130,8 @@ addons:
   #                                  # networkidle wait so a socket-heavy page
   #                                  # can't stall a navigation
   #   action_timeout_seconds: 120    # overall per-action ceiling (click/type/etc.)
+  #   navigation_timeout_recycle_threshold: 3 # consecutive nav timeouts before
+  #                                  # force-recycling a wedged session; 0 disables
 
 # ── codemux orchestration watcher (see vexis_agent/addons/codemux/docs/codemux-watcher.md) ─────
 # Active ONLY when the `codemux` MCP is wired into mcp-servers.yaml;

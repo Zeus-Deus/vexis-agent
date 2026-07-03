@@ -76,6 +76,15 @@ def navigation_timeout_seconds() -> int:
     return yaml_config.browser_navigation_timeout_seconds()
 
 
+def navigation_timeout_recycle_threshold() -> int:
+    """Consecutive nav timeouts that force-recycle a wedged session (#55).
+
+    Default 3; 0 disables. See
+    ``yaml_config.browser_navigation_timeout_recycle_threshold``.
+    """
+    return yaml_config.browser_navigation_timeout_recycle_threshold()
+
+
 def solve_cloudflare() -> bool:
     """Whether navigation auto-solves Cloudflare Turnstile/Interstitial.
 

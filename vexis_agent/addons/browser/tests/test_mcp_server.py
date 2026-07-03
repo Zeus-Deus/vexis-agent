@@ -9,7 +9,7 @@ real Camoufox session — the socket round-trip
 ``(op, args)`` it would send.
 
 Pins:
-  * all nine browser tools are registered on the FastMCP server;
+  * all ten browser tools are registered on the FastMCP server;
   * each tool forwards the correct op + argument dict (coercion parity
     with the CLI: screenshot only forwards ``include_base64`` when set,
     read omits an empty selector, etc.);
@@ -33,7 +33,7 @@ from vexis_agent.tools.browser._client import BrowserSocketError, unwrap_respons
 # ──────────────────────────────────────────────────────────────────
 
 
-def test_all_nine_tools_registered():
+def test_all_ten_tools_registered():
     tools = asyncio.run(mcp_server.mcp.list_tools())
     names = {t.name for t in tools}
     assert names == {
@@ -46,6 +46,7 @@ def test_all_nine_tools_registered():
         "browser_back",
         "browser_scroll",
         "browser_screenshot",
+        "browser_recycle",
     }
 
 
@@ -134,6 +135,13 @@ def test_screenshot_only_forwards_include_base64_when_set(captured):
         "browser_screenshot",
         {"full_page": True, "include_base64": True},
     )
+
+
+def test_recycle_forwards_empty_args(captured):
+    # browser_recycle (issue #55) takes no args and forwards {} to the op.
+    out = _run(mcp_server.browser_recycle())
+    assert out["ok"] is True
+    assert captured == [("browser_recycle", {})]
 
 
 # ──────────────────────────────────────────────────────────────────

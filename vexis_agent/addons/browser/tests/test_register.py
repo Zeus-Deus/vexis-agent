@@ -2,7 +2,7 @@
 
 These pin that the browser add-on owns its integration end-to-end:
 
-  * the nine ``browser_*`` dispatch handlers land in the runtime;
+  * the ten ``browser_*`` dispatch handlers land in the runtime;
   * the ``web-browsing`` capability block (order 13) is registered via
     the add-on hook and assembles into the prompt only when loaded;
   * the ``browser.md`` skill is registered;
@@ -43,6 +43,7 @@ _BROWSER_OPS = (
     "browser_back",
     "browser_scroll",
     "browser_screenshot",
+    "browser_recycle",
 )
 
 
@@ -170,3 +171,14 @@ def test_read_rejects_non_string_selector():
     out = asyncio.run(_call("browser_read", {"selector": 5}))
     assert out["ok"] is False
     assert out["kind"] == "BadRequest"
+
+
+def test_recycle_handler_present_and_forwards(runtime, tmp_path):
+    # browser_recycle (issue #55) is built by build_browser_handlers and, on
+    # an idle manager, reports was_running False without launching anything.
+    import asyncio
+
+    handlers = build_browser_handlers(BrowserTools(SessionManager(), tmp_path))
+    assert "browser_recycle" in handlers
+    out = asyncio.run(handlers["browser_recycle"]({}))
+    assert out == {"ok": True, "was_running": False}

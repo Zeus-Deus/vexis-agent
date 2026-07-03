@@ -1001,9 +1001,10 @@ class WebDashboard:
             browser = self._browser_or_none()
             if browser is None:
                 raise HTTPException(503, _BROWSER_UNAVAILABLE_MSG)
-            was_running = browser.manager.is_running()
-            await browser.manager.stop()
-            return {"ok": True, "was_running": was_running}
+            # Delegate to the one recycle implementation (issue #55) so the
+            # dashboard button, the vexis-browse CLI, and the MCP tool all go
+            # through the same teardown. Response shape unchanged.
+            return await browser.recycle()
 
         @app.post(
             "/api/v1/browser/captcha/config",
@@ -4076,6 +4077,9 @@ class WebDashboard:
                 ),
                 "navigation_timeout_seconds": (
                     yaml_config.browser_navigation_timeout_seconds()
+                ),
+                "navigation_timeout_recycle_threshold": (
+                    yaml_config.browser_navigation_timeout_recycle_threshold()
                 ),
                 "solve_cloudflare": yaml_config.browser_solve_cloudflare(),
                 "screenshot_include_base64": (

@@ -135,6 +135,11 @@ use your file-reading tool on the path to look at the image yourself.
 is off by default because the brain's stream buffer can't carry
 multi-megabyte lines and the path is the canonical image-handoff.
 
+`browser_recycle()` — force-recycle the persistent session when it
+seems wedged (navigations repeatedly time out). Tears the session down;
+your next action lazily restarts a fresh one. Login state survives on
+disk, so you stay logged in. Returns `{ok, was_running}`.
+
 ### Stale-index hint
 
 When the page changes mid-action (a click triggers a re-render), the
@@ -151,7 +156,15 @@ Failures return `{"ok": false, "error": "...", "hint": "..."}` with a
 plain-English description. The `hint` field, when present, is your
 recommended next step. Nothing here retries automatically; if a
 navigation fails you decide whether to try again, switch tactics, or
-report to the user."""
+report to the user.
+
+If a navigation times out N times in a row (default 3) the engine has
+likely wedged, so the session force-recycles itself automatically and
+the failure's `hint` says so — just navigate again (a fresh session
+starts on the next call, and you're still logged in). You can also call
+`browser_recycle` yourself the moment the browser seems stuck rather
+than waiting for the third timeout; either way your login state
+survives the recycle."""
 
 
 def web_browsing_block() -> str:

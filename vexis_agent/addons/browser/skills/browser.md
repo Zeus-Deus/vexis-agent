@@ -28,11 +28,17 @@ the user asked you to go to a site and do something.
     vexis-browse back
     vexis-browse scroll down [--pages N]
     vexis-browse screenshot [--full-page]        # PNG under <workspace>/browser/screenshots/
+    vexis-browse recycle                         # force-recycle a wedged session; logins survive
 
 The snapshot DSL is one line per element: `[index]<tag attr="v">text</tag>`.
 Each snapshot re-numbers from scratch — always act on your most recent
 indices. A vanished index returns a soft `snapshot_stale` hint, not an
 error: snapshot again, then retry.
+
+If a navigation times out 3 times in a row the engine has likely wedged,
+so the session auto-recycles and the error hint says so — just navigate
+again (you're still logged in). You can force it sooner with
+`vexis-browse recycle` the moment the browser seems stuck.
 
 ## Screenshots auto-send
 

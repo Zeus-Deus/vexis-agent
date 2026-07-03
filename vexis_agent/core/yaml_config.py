@@ -141,6 +141,13 @@ DEFAULT_BROWSER_ACTION_TIMEOUT_SECONDS = 120
 # trailing load + networkidle wait so a page with long-lived sockets or
 # polling never stalls a navigation toward the much larger action ceiling.
 DEFAULT_BROWSER_NAVIGATION_TIMEOUT_SECONDS = 30
+# Consecutive navigation timeouts that trip an immediate force-recycle of
+# the wedged Camoufox session (issue #55). A wedged engine returns Page.goto
+# timeouts back-to-back while the host answers curl fine; the inactivity
+# recycler never fires because every failing navigate still counts as
+# activity. Treat N-in-a-row nav timeouts as a health-check failure and
+# recycle. ``0`` disables the auto-recycle.
+DEFAULT_BROWSER_NAV_TIMEOUT_RECYCLE_THRESHOLD = 3
 DEFAULT_BROWSER_CAPTCHA_SOLVER = "none"
 # Providers the pluggable captcha-solver layer accepts. "none" disables it.
 VALID_BROWSER_CAPTCHA_SOLVERS = ("none", "capsolver", "twocaptcha")
@@ -468,6 +475,28 @@ def browser_navigation_timeout_seconds() -> int:
         _browser_section().get("navigation_timeout_seconds"),
         DEFAULT_BROWSER_NAVIGATION_TIMEOUT_SECONDS,
         minimum=5,
+    )
+
+
+def browser_navigation_timeout_recycle_threshold() -> int:
+    """Consecutive navigation timeouts that force-recycle the session (#55).
+
+    A wedged Camoufox engine returns ``Page.goto`` timeouts back-to-back
+    while the same host answers curl fine, and the inactivity recycler never
+    fires because a failing navigate still marks activity. Once this many
+    navigations time out in a row we recycle the session immediately. Default
+    3; set ``addons.browser.navigation_timeout_recycle_threshold`` (legacy
+    ``[browser].navigation_timeout_recycle_threshold`` honoured too).
+
+    ``minimum=0`` here: an explicit ``0`` disables the auto-recycle. Because
+    ``_int_or_default`` returns the default when the value is below the
+    minimum, a negative value falls back to 3 rather than disabling — only a
+    literal ``0`` turns the feature off.
+    """
+    return _int_or_default(
+        _browser_section().get("navigation_timeout_recycle_threshold"),
+        DEFAULT_BROWSER_NAV_TIMEOUT_RECYCLE_THRESHOLD,
+        minimum=0,
     )
 
 
