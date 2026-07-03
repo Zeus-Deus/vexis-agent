@@ -114,3 +114,33 @@ def test_recycle_threshold_addon_beats_legacy(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     assert yaml_config.browser_navigation_timeout_recycle_threshold() == 2
+
+
+# --- max_tabs knob (issue #57) --------------------------------------------
+
+
+def test_max_tabs_default_is_eight(monkeypatch, tmp_path):
+    _point_config(monkeypatch, tmp_path)
+    assert yaml_config.browser_max_tabs() == 8
+
+
+def test_max_tabs_addon_and_legacy(monkeypatch, tmp_path):
+    cfg = _point_config(monkeypatch, tmp_path)
+    cfg.write_text(
+        "browser:\n  max_tabs: 3\n"
+        "addons:\n  browser:\n    max_tabs: 5\n",
+        encoding="utf-8",
+    )
+    # Addon value wins over legacy.
+    assert yaml_config.browser_max_tabs() == 5
+
+
+def test_max_tabs_garbage_and_below_floor_fall_back(monkeypatch, tmp_path):
+    cfg = _point_config(monkeypatch, tmp_path)
+    cfg.write_text(
+        "addons:\n  browser:\n    max_tabs: nope\n", encoding="utf-8"
+    )
+    assert yaml_config.browser_max_tabs() == 8
+    # minimum=1 floor: 0 is below it -> default.
+    cfg.write_text("addons:\n  browser:\n    max_tabs: 0\n", encoding="utf-8")
+    assert yaml_config.browser_max_tabs() == 8

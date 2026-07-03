@@ -9,6 +9,13 @@ The socket round-trip lives in ``tools.browser._client`` — shared with
 the ``vexis-browser-mcp`` MCP server so the CLI and the MCP front-end
 can't drift. This module owns only the argparse surface and exit-code
 mapping.
+
+Issue #57 adds the batched/tab levers: ``navigate --wait-until`` and
+``--then-read`` (batch a read into the navigation), the ``open`` verb
+that navigates in a named parallel ``--tab``, ``--tab`` on every
+page-taking verb, ``click --then-read``, and the ``tabs`` /
+``tab-close`` verbs. New keys are forwarded ONLY when set (an omitted
+key lets the daemon default), matching the screenshot/read precedents.
 """
 
 from __future__ import annotations
@@ -43,57 +50,121 @@ def _print_and_exit(resp: dict) -> int:
     return 0 if payload.get("ok") else 1
 
 
-def _cmd_navigate(url: str) -> int:
-    return _print_and_exit(_send("browser_navigate", {"url": url}))
+def _cmd_navigate(
+    url: str,
+    wait_until: str | None,
+    then_read: str | None,
+    tab: str | None = None,
+) -> int:
+    args: dict = {"url": url}
+    # Forward only when set: an omitted key lets the daemon apply its
+    # default (wait_until -> "settle"; no batched read; the main page).
+    if wait_until is not None:
+        args["wait_until"] = wait_until
+    if then_read is not None:
+        args["then_read"] = then_read
+    if tab is not None:
+        args["tab"] = tab
+    return _print_and_exit(_send("browser_navigate", args))
 
 
-def _cmd_snapshot(full: bool) -> int:
-    return _print_and_exit(_send("browser_snapshot", {"full": full}))
+def _cmd_snapshot(full: bool, tab: str | None) -> int:
+    args: dict = {"full": full}
+    if tab is not None:
+        args["tab"] = tab
+    return _print_and_exit(_send("browser_snapshot", args))
 
 
-def _cmd_click(index: int, js: bool) -> int:
-    return _print_and_exit(_send("browser_click", {"index": index, "js": js}))
+def _cmd_click(index: int, js: bool, then_read: str | None, tab: str | None) -> int:
+    args: dict = {"index": index, "js": js}
+    if then_read is not None:
+        args["then_read"] = then_read
+    if tab is not None:
+        args["tab"] = tab
+    return _print_and_exit(_send("browser_click", args))
 
 
-def _cmd_read(selector: str | None) -> int:
+def _cmd_read(selector: str | None, tab: str | None) -> int:
     args: dict = {}
     if selector:
         args["selector"] = selector
+    if tab is not None:
+        args["tab"] = tab
     return _print_and_exit(_send("browser_read", args))
 
 
-def _cmd_type(index: int, text: str, clear: bool) -> int:
-    return _print_and_exit(
-        _send("browser_type", {"index": index, "text": text, "clear": clear})
-    )
+def _cmd_type(index: int, text: str, clear: bool, tab: str | None) -> int:
+    args: dict = {"index": index, "text": text, "clear": clear}
+    if tab is not None:
+        args["tab"] = tab
+    return _print_and_exit(_send("browser_type", args))
 
 
-def _cmd_press(key: str) -> int:
-    return _print_and_exit(_send("browser_press", {"key": key}))
+def _cmd_press(key: str, tab: str | None) -> int:
+    args: dict = {"key": key}
+    if tab is not None:
+        args["tab"] = tab
+    return _print_and_exit(_send("browser_press", args))
 
 
-def _cmd_back() -> int:
-    return _print_and_exit(_send("browser_back", {}))
+def _cmd_back(tab: str | None) -> int:
+    args: dict = {}
+    if tab is not None:
+        args["tab"] = tab
+    return _print_and_exit(_send("browser_back", args))
 
 
-def _cmd_scroll(direction: str, pages: float) -> int:
-    return _print_and_exit(
-        _send("browser_scroll", {"direction": direction, "pages": pages})
-    )
+def _cmd_scroll(direction: str, pages: float, tab: str | None) -> int:
+    args: dict = {"direction": direction, "pages": pages}
+    if tab is not None:
+        args["tab"] = tab
+    return _print_and_exit(_send("browser_scroll", args))
 
 
 def _cmd_recycle() -> int:
     return _print_and_exit(_send("browser_recycle", {}))
 
 
-def _cmd_screenshot(full_page: bool, include_base64: bool) -> int:
+def _cmd_tabs() -> int:
+    return _print_and_exit(_send("browser_tabs", {}))
+
+
+def _cmd_tab_close(tab: str) -> int:
+    return _print_and_exit(_send("browser_tab_close", {"tab": tab}))
+
+
+def _cmd_screenshot(
+    full_page: bool, include_base64: bool, tab: str | None
+) -> int:
     args: dict = {"full_page": full_page}
     # Only forward when explicitly set; daemon falls back to its
     # config default (``addons.browser.screenshot_include_base64``)
     # when the key is absent.
     if include_base64:
         args["include_base64"] = True
+    if tab is not None:
+        args["tab"] = tab
     return _print_and_exit(_send("browser_screenshot", args))
+
+
+_WAIT_UNTIL_HELP = (
+    "Page-ready wait: 'settle' (default) waits for load+networkidle; "
+    "'domcontentloaded' / 'load' skip the settle for a cheap nav on "
+    "catalog/data pages."
+)
+_THEN_READ_HELP = (
+    "Also read the page in the SAME round-trip after this action; optional "
+    "CSS selector (defaults to the whole <body>). Halves the navigate/click "
+    "-> read round-trip; a failed read never fails the action."
+)
+_TAB_HELP = (
+    "Act on a named parallel tab instead of the main page (open one with "
+    "'open <url> --tab NAME')."
+)
+
+
+def _add_tab_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--tab", default=None, help=_TAB_HELP)
 
 
 def main() -> int:
@@ -103,8 +174,44 @@ def main() -> int:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_nav = sub.add_parser("navigate", help="Navigate to a URL.")
+    p_nav = sub.add_parser("navigate", help="Navigate the main page to a URL.")
     p_nav.add_argument("url")
+    p_nav.add_argument(
+        "--wait-until",
+        choices=("domcontentloaded", "load", "settle"),
+        default=None,
+        help=_WAIT_UNTIL_HELP,
+    )
+    p_nav.add_argument(
+        "--then-read",
+        nargs="?",
+        const="body",
+        default=None,
+        help=_THEN_READ_HELP,
+    )
+
+    p_open = sub.add_parser(
+        "open",
+        help=(
+            "Navigate a named parallel tab to a URL (creates the tab). Fan "
+            "out by opening several tabs with distinct names, then read each."
+        ),
+    )
+    p_open.add_argument("url")
+    p_open.add_argument("--tab", required=True, help="Tab name (required).")
+    p_open.add_argument(
+        "--wait-until",
+        choices=("domcontentloaded", "load", "settle"),
+        default=None,
+        help=_WAIT_UNTIL_HELP,
+    )
+    p_open.add_argument(
+        "--then-read",
+        nargs="?",
+        const="body",
+        default=None,
+        help=_THEN_READ_HELP,
+    )
 
     p_snap = sub.add_parser(
         "snapshot", help="Return the accessibility-tree DSL for the current page."
@@ -114,6 +221,7 @@ def main() -> int:
         action="store_true",
         help="Reserved (no-op today; the snapshot serializes one DSL form).",
     )
+    _add_tab_arg(p_snap)
 
     p_click = sub.add_parser("click", help="Click element by index.")
     p_click.add_argument("index", type=int)
@@ -126,6 +234,14 @@ def main() -> int:
             "overlay that intercepts the hit-test."
         ),
     )
+    p_click.add_argument(
+        "--then-read",
+        nargs="?",
+        const="body",
+        default=None,
+        help=_THEN_READ_HELP,
+    )
+    _add_tab_arg(p_click)
 
     p_read = sub.add_parser(
         "read",
@@ -141,6 +257,7 @@ def main() -> int:
         default=None,
         help="Optional CSS selector; defaults to the whole <body>.",
     )
+    _add_tab_arg(p_read)
 
     p_type = sub.add_parser("type", help="Type text into element by index.")
     p_type.add_argument("index", type=int)
@@ -151,13 +268,16 @@ def main() -> int:
         action="store_false",
         help="Append to the field instead of clearing it first (default: clear).",
     )
+    _add_tab_arg(p_type)
 
     p_press = sub.add_parser(
         "press", help="Send a key chord, e.g. 'Enter' or 'Control+L'."
     )
     p_press.add_argument("key")
+    _add_tab_arg(p_press)
 
-    sub.add_parser("back", help="Navigate back in browser history.")
+    p_back = sub.add_parser("back", help="Navigate back in browser history.")
+    _add_tab_arg(p_back)
 
     p_scroll = sub.add_parser(
         "scroll", help="Scroll the page up or down by N pages (default 1)."
@@ -169,6 +289,7 @@ def main() -> int:
         default=1.0,
         help="0.5=half page, 1=full page, 10=jump to top/bottom (default: 1).",
     )
+    _add_tab_arg(p_scroll)
 
     sub.add_parser(
         "recycle",
@@ -178,6 +299,11 @@ def main() -> int:
             "logins survive on disk."
         ),
     )
+
+    sub.add_parser("tabs", help="List the open named tabs.")
+
+    p_tab_close = sub.add_parser("tab-close", help="Close a named tab.")
+    p_tab_close.add_argument("tab")
 
     p_screenshot = sub.add_parser(
         "screenshot",
@@ -199,28 +325,37 @@ def main() -> int:
             "Off by default — most consumers read the file via the path."
         ),
     )
+    _add_tab_arg(p_screenshot)
 
     args = parser.parse_args()
     if args.cmd == "navigate":
-        return _cmd_navigate(args.url)
+        return _cmd_navigate(args.url, args.wait_until, args.then_read)
+    if args.cmd == "open":
+        return _cmd_navigate(
+            args.url, args.wait_until, args.then_read, tab=args.tab
+        )
     if args.cmd == "snapshot":
-        return _cmd_snapshot(args.full)
+        return _cmd_snapshot(args.full, args.tab)
     if args.cmd == "click":
-        return _cmd_click(args.index, args.js)
+        return _cmd_click(args.index, args.js, args.then_read, args.tab)
     if args.cmd == "read":
-        return _cmd_read(args.selector)
+        return _cmd_read(args.selector, args.tab)
     if args.cmd == "type":
-        return _cmd_type(args.index, args.text, args.clear)
+        return _cmd_type(args.index, args.text, args.clear, args.tab)
     if args.cmd == "press":
-        return _cmd_press(args.key)
+        return _cmd_press(args.key, args.tab)
     if args.cmd == "back":
-        return _cmd_back()
+        return _cmd_back(args.tab)
     if args.cmd == "scroll":
-        return _cmd_scroll(args.direction, args.pages)
+        return _cmd_scroll(args.direction, args.pages, args.tab)
     if args.cmd == "recycle":
         return _cmd_recycle()
+    if args.cmd == "tabs":
+        return _cmd_tabs()
+    if args.cmd == "tab-close":
+        return _cmd_tab_close(args.tab)
     if args.cmd == "screenshot":
-        return _cmd_screenshot(args.full_page, args.include_base64)
+        return _cmd_screenshot(args.full_page, args.include_base64, args.tab)
     return 2
 
 

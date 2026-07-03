@@ -26,6 +26,8 @@ provides:
     - browser_scroll
     - browser_screenshot
     - browser_recycle
+    - browser_tabs
+    - browser_tab_close
   background_tasks: ["browser-session-lifecycle"]
   skills: ["browser.md"]
 
@@ -61,6 +63,10 @@ config_schema:
     type: int
     default: 3
     description: "Consecutive navigation timeouts that force-recycle a wedged session. A wedged engine returns Page.goto timeouts back-to-back while the host answers fine, and the inactivity recycler never fires because a failing navigate still counts as activity; this trips a recycle instead. 0 disables. Legacy: [browser].navigation_timeout_recycle_threshold."
+  max_tabs:
+    type: int
+    default: 8
+    description: "Cap on concurrently-open named tabs (issue #57). Named tabs let the brain fan out over several pages in parallel; this bounds how many can be open on the one shared Camoufox context at once. Read per tab-open (hot-reload). Legacy: [browser].max_tabs."
   solve_cloudflare:
     type: bool
     default: true

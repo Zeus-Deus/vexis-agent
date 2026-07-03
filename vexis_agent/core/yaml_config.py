@@ -148,6 +148,10 @@ DEFAULT_BROWSER_NAVIGATION_TIMEOUT_SECONDS = 30
 # activity. Treat N-in-a-row nav timeouts as a health-check failure and
 # recycle. ``0`` disables the auto-recycle.
 DEFAULT_BROWSER_NAV_TIMEOUT_RECYCLE_THRESHOLD = 3
+# Ceiling on concurrently-open named browser tabs (issue #57). Tabs let the
+# brain fan out over K pages in parallel; the cap keeps a runaway fan-out from
+# spawning unbounded pages on the one shared Camoufox context.
+DEFAULT_BROWSER_MAX_TABS = 8
 DEFAULT_BROWSER_CAPTCHA_SOLVER = "none"
 # Providers the pluggable captcha-solver layer accepts. "none" disables it.
 VALID_BROWSER_CAPTCHA_SOLVERS = ("none", "capsolver", "twocaptcha")
@@ -497,6 +501,21 @@ def browser_navigation_timeout_recycle_threshold() -> int:
         _browser_section().get("navigation_timeout_recycle_threshold"),
         DEFAULT_BROWSER_NAV_TIMEOUT_RECYCLE_THRESHOLD,
         minimum=0,
+    )
+
+
+def browser_max_tabs() -> int:
+    """Cap on concurrently-open named tabs (issue #57). Default 8.
+
+    Named tabs let the brain fan out over several pages in parallel; this
+    bounds how many can be open on the one shared Camoufox context at once.
+    Read per tab-open (hot-reload). Set via ``addons.browser.max_tabs``
+    (legacy ``[browser].max_tabs`` honoured too).
+    """
+    return _int_or_default(
+        _browser_section().get("max_tabs"),
+        DEFAULT_BROWSER_MAX_TABS,
+        minimum=1,
     )
 
 

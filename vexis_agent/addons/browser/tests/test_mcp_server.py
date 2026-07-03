@@ -9,10 +9,12 @@ real Camoufox session — the socket round-trip
 ``(op, args)`` it would send.
 
 Pins:
-  * all ten browser tools are registered on the FastMCP server;
+  * all twelve browser tools are registered on the FastMCP server (the ten
+    original ops plus the issue-#57 ``browser_tabs`` / ``browser_tab_close``);
   * each tool forwards the correct op + argument dict (coercion parity
     with the CLI: screenshot only forwards ``include_base64`` when set,
-    read omits an empty selector, etc.);
+    read omits an empty selector, the issue-#57 ``wait_until`` / ``then_read``
+    / ``tab`` keys are forwarded only when set, etc.);
   * a daemon-down transport error becomes a clean ``{"ok": false}`` tool
     result, never an exception (the per-turn server must not crash);
   * the response unwrapper handles both control-socket framings.
@@ -33,7 +35,7 @@ from vexis_agent.tools.browser._client import BrowserSocketError, unwrap_respons
 # ──────────────────────────────────────────────────────────────────
 
 
-def test_all_ten_tools_registered():
+def test_all_twelve_tools_registered():
     tools = asyncio.run(mcp_server.mcp.list_tools())
     names = {t.name for t in tools}
     assert names == {
@@ -47,6 +49,8 @@ def test_all_ten_tools_registered():
         "browser_scroll",
         "browser_screenshot",
         "browser_recycle",
+        "browser_tabs",
+        "browser_tab_close",
     }
 
 
@@ -89,9 +93,41 @@ def test_navigate_forwards_url(captured):
     assert captured == [("browser_navigate", {"url": "https://example.com"})]
 
 
+def test_navigate_omits_unset_wait_until_then_read_tab(captured):
+    # Issue #57: the new keys ride the forward-only-when-set contract — an
+    # omitted arg must NOT appear in the payload (lets the daemon default),
+    # and a set one is forwarded verbatim.
+    _run(mcp_server.browser_navigate("https://x/1"))
+    _run(
+        mcp_server.browser_navigate(
+            "https://x/2",
+            wait_until="domcontentloaded",
+            then_read="#results",
+            tab="a",
+        )
+    )
+    assert captured[0] == ("browser_navigate", {"url": "https://x/1"})
+    assert captured[1] == (
+        "browser_navigate",
+        {
+            "url": "https://x/2",
+            "wait_until": "domcontentloaded",
+            "then_read": "#results",
+            "tab": "a",
+        },
+    )
+
+
 def test_snapshot_forwards_full_flag(captured):
     _run(mcp_server.browser_snapshot(True))
     assert captured == [("browser_snapshot", {"full": True})]
+
+
+def test_snapshot_forwards_tab_only_when_set(captured):
+    _run(mcp_server.browser_snapshot())
+    _run(mcp_server.browser_snapshot(tab="a"))
+    assert captured[0] == ("browser_snapshot", {"full": False})
+    assert captured[1] == ("browser_snapshot", {"full": False, "tab": "a"})
 
 
 def test_click_forwards_index_and_js(captured):
@@ -99,11 +135,23 @@ def test_click_forwards_index_and_js(captured):
     assert captured == [("browser_click", {"index": 7, "js": True})]
 
 
+def test_click_forwards_then_read_and_tab_when_set(captured):
+    _run(mcp_server.browser_click(3))
+    _run(mcp_server.browser_click(4, then_read="body", tab="b"))
+    assert captured[0] == ("browser_click", {"index": 3, "js": False})
+    assert captured[1] == (
+        "browser_click",
+        {"index": 4, "js": False, "then_read": "body", "tab": "b"},
+    )
+
+
 def test_read_omits_empty_selector(captured):
     _run(mcp_server.browser_read())
     _run(mcp_server.browser_read("div.result"))
+    _run(mcp_server.browser_read(tab="a"))
     assert captured[0] == ("browser_read", {})
     assert captured[1] == ("browser_read", {"selector": "div.result"})
+    assert captured[2] == ("browser_read", {"tab": "a"})
 
 
 def test_type_forwards_clear_default_true(captured):
@@ -142,6 +190,40 @@ def test_recycle_forwards_empty_args(captured):
     out = _run(mcp_server.browser_recycle())
     assert out["ok"] is True
     assert captured == [("browser_recycle", {})]
+
+
+def test_tabs_forwards_empty_args(captured):
+    # browser_tabs (issue #57) takes no args and forwards {} to the op.
+    out = _run(mcp_server.browser_tabs())
+    assert out["ok"] is True
+    assert captured == [("browser_tabs", {})]
+
+
+def test_tab_close_forwards_tab(captured):
+    _run(mcp_server.browser_tab_close("a"))
+    assert captured == [("browser_tab_close", {"tab": "a"})]
+
+
+def test_type_press_back_scroll_screenshot_forward_tab_when_set(captured):
+    _run(mcp_server.browser_type(1, "hi", tab="a"))
+    _run(mcp_server.browser_press("Enter", tab="a"))
+    _run(mcp_server.browser_back(tab="a"))
+    _run(mcp_server.browser_scroll("down", 1.0, tab="a"))
+    _run(mcp_server.browser_screenshot(tab="a"))
+    assert captured[0] == (
+        "browser_type",
+        {"index": 1, "text": "hi", "clear": True, "tab": "a"},
+    )
+    assert captured[1] == ("browser_press", {"key": "Enter", "tab": "a"})
+    assert captured[2] == ("browser_back", {"tab": "a"})
+    assert captured[3] == (
+        "browser_scroll",
+        {"direction": "down", "pages": 1.0, "tab": "a"},
+    )
+    assert captured[4] == (
+        "browser_screenshot",
+        {"full_page": False, "tab": "a"},
+    )
 
 
 # ──────────────────────────────────────────────────────────────────
