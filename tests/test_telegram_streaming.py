@@ -635,3 +635,62 @@ def test_dispatcher_swallows_streaming_exception_returns_broken_marker():
     # The broken-turn ack was sent (after the placeholder).
     sends = [text for _, text in bot.sent_messages]
     assert any("broke" in s.lower() for s in sends)
+
+
+# ───────────────── background-lingering notice (issue #61) ────────────
+
+
+class _RecordingNotifier:
+    """Minimal Notifier stand-in recording ``send`` calls."""
+
+    def __init__(self) -> None:
+        self.sends: list[tuple[int, str]] = []
+
+    async def send(self, chat_id: int, text: str) -> None:
+        self.sends.append((chat_id, text))
+
+
+def test_streaming_notice_routes_to_notifier():
+    """A ``("notice", background_lingering)`` event mid-stream sends a
+    Notifier message (chat is free, background agent still working) while
+    the reply bubble is still finalised by the trailing ``done``."""
+    handler = _StreamingHandler(
+        [
+            ("chunk", "the answer"),
+            ("notice", {"type": "background_lingering", "wait_seconds": 1800}),
+            ("done", "the answer"),
+        ],
+    )
+    transport = _make_streaming_transport(handler)
+    transport._notifier = _RecordingNotifier()  # type: ignore[attr-defined]
+    bot = _StreamingBot()
+
+    final = asyncio.run(
+        transport._send_brain_reply_streaming(bot, _CHAT, _USER, "hi")
+    )
+
+    assert final == "the answer"
+    sends = transport._notifier.sends  # type: ignore[attr-defined]
+    assert len(sends) == 1
+    chat_id, text = sends[0]
+    assert chat_id == _CHAT
+    assert "background agent" in text.lower()
+    assert "30 minutes" in text
+
+
+def test_streaming_notice_without_notifier_is_noop():
+    """A missing notifier (some __new__-built transports) must not break
+    the reply stream — the notice is silently dropped."""
+    handler = _StreamingHandler(
+        [
+            ("notice", {"type": "background_lingering", "wait_seconds": 60}),
+            ("done", "reply"),
+        ],
+    )
+    transport = _make_streaming_transport(handler)  # no _notifier wired
+    bot = _StreamingBot()
+
+    final = asyncio.run(
+        transport._send_brain_reply_streaming(bot, _CHAT, _USER, "hi")
+    )
+    assert final == "reply"

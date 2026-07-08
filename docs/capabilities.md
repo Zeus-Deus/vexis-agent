@@ -124,6 +124,7 @@ assemble only when the add-on is enabled.
 | sandboxes & headless displays | `tools/sandbox/capability.py` | 3 |
 | live streaming | `tools/livestream_capability.py` | 8 |
 | background tasks | `tools/background_capability.py` | 9 |
+| background subagents (Agent tool) | `tools/background_subagents_capability.py` | 9.25 |
 | memory | `tools/memory_capability.py` | 10 |
 | skills | `tools/skills_capability.py` | 11 |
 | scheduling | `tools/schedule_tool/capability.py` | 14 |

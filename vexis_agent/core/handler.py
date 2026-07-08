@@ -469,6 +469,16 @@ class MessageHandler:
                                      timestamps + duration) dict; see
                                      ``Brain.astream``. Never mixed
                                      into the text reply.
+            ("notice", dict)       — out-of-band notice worth surfacing
+                                     to the user but not part of the reply.
+                                     Currently the issue #61
+                                     ``background_lingering`` event (the
+                                     turn is done; the CLI is still running
+                                     background subagents). The Telegram
+                                     transport routes it to the Notifier;
+                                     the web SSE route ignores unknown tags
+                                     (graceful degrade). Never mixed into
+                                     the reply text.
             ("done",  str)         — canonical reply, fired exactly
                                      once after the last chunk. This is
                                      the brain's terminal ``final`` event
@@ -552,6 +562,18 @@ class MessageHandler:
                         text = event.get("text")
                         if isinstance(text, str):
                             final_text = text
+                        continue
+                    if event.get("type") == "background_lingering":
+                        # Issue #61: the foreground turn is DONE but the
+                        # brain CLI is still running background subagents
+                        # (Agent tool / run_in_background). Forward under a
+                        # distinct ``notice`` tag so the Telegram transport
+                        # can surface it via the Notifier ("a background
+                        # agent is still working"). The web SSE route only
+                        # maps chunk/tool/done/error, so an unknown tag is
+                        # silently dropped there — graceful degrade, no
+                        # browser change required.
+                        yield ("notice", event)
                         continue
                     yield ("tool", event)
                     continue
