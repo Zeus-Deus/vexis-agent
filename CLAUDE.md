@@ -272,45 +272,45 @@ is one trust domain; ids partition context, not access.
 ## Conversation compression
 
 Before every brain turn the handler calls
-`brain.compress_if_needed(session_id)`. When the transcript
-crosses either threshold — token estimate ≥ 80% of context
-window OR turn count > 40 — the brain spawns an aux
-summariser (`subsystem_tier("compressor")`, default `small`),
-gets back a structured summary, and atomically rewrites the
-on-disk transcript: system metadata preserved, the older
-turns folded into one synthetic user-turn whose body starts
-with `SUMMARY_PREFIX`, the last 10 turns kept byte-for-byte.
-
-`SUMMARY_PREFIX` is distinct from every recursion-guard
-prefix on purpose: a compressed foreground transcript still
-passes the curator's content-prefix filter (the right answer
-— we WANT the curator to be able to review long sessions for
-lessons). Iterative compression detects the prior summary by
-its prefix and folds it into the new one. Claude-code lands
-the JSONL rewrite; opencode logs the trigger but defers the
-SQL rewrite to a follow-up.
+`brain.compress_if_needed(session_id)`. Crossing either threshold
+— token estimate ≥ 80% of context window OR turn count > 40 —
+spawns an aux summariser (`subsystem_tier("compressor")`, default
+`small`) that atomically rewrites the transcript: metadata kept,
+older turns folded into one synthetic user-turn prefixed
+`SUMMARY_PREFIX` (deliberately NOT a recursion-guard prefix, so
+the curator still reviews long sessions), last 10 turns
+byte-for-byte. Claude-code lands the JSONL rewrite; opencode
+defers the SQL one.
 
 **Pointers:** `docs/compression.md`.
 
 ## File-mutation verifier footer
 
-Each brain turn snapshots the workspace before and after; the
-diff is prepended to the next user message as
-`[turn-N verifier] Files changed last turn: ...` so the model
-self-corrects against silent write failures. The goal judge
-consumes the same diff via `brain.peek_files_changed` and
-weighs the brain's response against ground truth rather than
-the brain's own claims.
-
-Snapshot work runs via `asyncio.to_thread` (~1.5ms on the
-vexis-agent repo, under 200ms on a 10k-file workspace).
-Disable via `brain.file_mutation_footer: false` (default
-`true`); reads disk per turn so toggling takes effect
-immediately. The `[turn-N verifier]` marker is deliberately
-NOT in the recursion-guard prefix set — verifier-footered
-turns remain visible to the learning curator.
+Each brain turn snapshots the workspace before/after; the diff is
+prepended to the next user message as `[turn-N verifier] Files
+changed last turn: ...` so the model self-corrects against silent
+write failures (the goal judge reads the same diff via
+`brain.peek_files_changed`). Snapshot runs via
+`asyncio.to_thread` (<200ms on a 10k-file workspace). Disable via
+`brain.file_mutation_footer: false` (default `true`, read per
+turn). The `[turn-N verifier]` marker is deliberately NOT a
+recursion-guard prefix — footered turns stay curator-visible.
 
 **Pointers:** `docs/file-mutation-verifier.md`.
+
+## Background subagents (issue #61)
+
+Agent-tool subagents run background-by-default (CLI v2.1.198), so
+the per-turn `claude -p` lingers past its result event.
+`brain.background_agent_wait` (seconds, default 1800, 0 =
+unlimited) sets `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` on every
+spawn and bounds a supervisor: the streaming path detects the
+linger after a ~5s grace, frees the chat, and hands the process to
+a brain-owned task that kills it at the wait (buffered path keeps
+process-exit semantics). Long autonomous work → a kanban task or
+`/goal`; watched in-chat subagent → `run_in_background: false`.
+
+**Pointers:** `docs/background-subagents.md`.
 
 ## Add-on system
 

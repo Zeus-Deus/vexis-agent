@@ -107,6 +107,10 @@ _BUILTIN_CAPABILITY_MODULES: tuple[str, ...] = (
     "vexis_agent.tools.livestream_capability",
     # Background tasks (vexis-bg) + system-context envelope.
     "vexis_agent.tools.background_capability",
+    # Background subagents (Agent tool) under the per-turn `claude -p`
+    # harness: bounded post-reply wait, route long work to kanban/goal.
+    # Order 9.25 places it right after background-tasks (issue #61).
+    "vexis_agent.tools.background_subagents_capability",
     # Goals (/goal) — background-by-default multi-step objectives +
     # the [BACKGROUND GOALS] progress block. Order 9.5 places it right
     # after background-tasks and before memory.

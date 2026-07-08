@@ -327,6 +327,57 @@ def test_self_extension_block_does_not_import_addons():
     assert not bad, f"self_extension.py imports from add-ons: {bad}"
 
 
+# ──────────────────────────────────────────────────────────────────
+# 8. Background-subagent lifecycle block (issue #61)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_background_subagents_block_registered_and_positioned():
+    """The issue-61 steering block registers at order 9.25 — directly
+    after background-tasks (9) and before goals (9.5) — so it reads as
+    an elaboration of the in-turn-subagent note in background_capability."""
+    blocks = {b.name: b for b in iter_capability_blocks()}
+    assert "background-subagents" in blocks
+    assert blocks["background-subagents"].order == 9.25
+    # Adjacency: nothing sits between background-tasks and this block.
+    ordered = [b.name for b in iter_capability_blocks()]
+    i = ordered.index("background-subagents")
+    assert ordered[i - 1] == "background-tasks"
+    assert ordered[i + 1] == "goals"
+
+
+def test_background_subagents_block_pins_lifecycle_vocabulary():
+    """Pin the load-bearing strings so prose drift fails loudly: the
+    config knob, its env translation, the Agent-tool param, and the
+    route-elsewhere guidance (kanban / /goal)."""
+    from vexis_agent.tools.background_subagents_capability import (
+        background_subagents_block,
+    )
+
+    block = background_subagents_block()
+    assert block.startswith("## Background subagents (Agent tool)")
+    assert "brain.background_agent_wait" in block
+    assert "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS" in block
+    assert "run_in_background: false" in block
+    assert "run_in_background: true" in block
+    # Long autonomous work is routed OUT of a background subagent.
+    assert "kanban" in block
+    assert "/goal" in block
+
+
+def test_background_subagents_block_in_assembled_output():
+    """It assembles into the full capabilities section at the right
+    position — between the background-tasks and goals sections."""
+    assembled = assemble_capability_docs()
+    heading = "## Background subagents (Agent tool)"
+    assert heading in assembled
+    assert (
+        assembled.index("## Background tasks")
+        < assembled.index(heading)
+        < assembled.index("## Goals — `/goal`")
+    )
+
+
 def test_every_builtin_capability_module_is_addon_import_free():
     """Every module in _BUILTIN_CAPABILITY_MODULES is core — none may
     import from vexis_agent.addons.*. The codemux block's move out of

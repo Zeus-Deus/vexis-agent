@@ -74,7 +74,10 @@ from vexis_agent.core.workspace_snapshot import (
     snapshot as _take_snapshot,
 )
 from vexis_agent.core.brain._memory_scope import wrap_with_memory_scope
-from vexis_agent.core.yaml_config import brain_file_mutation_footer_enabled
+from vexis_agent.core.yaml_config import (
+    brain_background_agent_wait,
+    brain_file_mutation_footer_enabled,
+)
 
 # Re-export the exception types so existing import sites
 # (``from core.brain.claude_code import BrainCancelled, ...``) keep
@@ -106,6 +109,36 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 # 30 min — generous for long multi-step work, hard ceiling for runaway calls.
 BRAIN_TIMEOUT_SECONDS = 1800
+
+# Issue #61 — how long the streaming parse loop waits for stdout to close
+# AFTER the terminal ``result`` event before treating the still-alive CLI
+# as lingering on background subagents. Deliberately short: on an ordinary
+# turn the process closes stdout within milliseconds of the result event
+# (EOF → the normal, byte-for-byte path), so 5s is pure slack. When it
+# elapses AND the process is still running, the foreground turn is done but
+# the CLI is holding open background subagents (Agent tool /
+# ``run_in_background``, background-by-default since claude-code v2.1.198),
+# so we hand the process to a supervisor and free the chat instead of
+# pinning the drain + typing indicator for the full bg-wait ceiling.
+_POST_RESULT_LINGER_GRACE_SECONDS = 5.0
+
+
+def _apply_bg_wait_env(env: dict[str, str]) -> None:
+    """Set ``CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`` on ``env`` from config.
+
+    Issue #61: the headless ``claude -p`` process lingers at exit waiting
+    for background subagents (Agent tool / ``run_in_background``), bounded
+    by this env knob — default 600000ms (10 min) in the CLI since v2.1.182.
+    vexis raises the ceiling to ``brain.background_agent_wait`` (default
+    1800s → ``"1800000"``); a configured ``0`` seconds means unlimited and
+    is exported as the literal ``"0"``. Mutates ``env`` in place so all
+    three spawn sites (``respond``, ``astream``, ``spawn_aux``) share one
+    source of truth; reads config on every call (hot-reload).
+    """
+    wait_seconds = brain_background_agent_wait()
+    env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = (
+        "0" if wait_seconds == 0 else str(wait_seconds * 1000)
+    )
 
 # StreamReader buffer for the brain's stdout. claude -p's stream-json
 # emits one JSON object per line, and a single line can carry a
@@ -675,6 +708,13 @@ class ClaudeCodeBrain(Brain):
         # turn's user message. Cleared on read so two reads in a row
         # don't double-report a single turn's mutations.
         self._files_changed_by_chat: dict[int, list[str]] = {}
+        # Issue #61: still-running ``claude -p`` processes handed off by
+        # the streaming path once their result event arrived but the CLI
+        # lingered on background subagents. Keyed by chat_id; each value is
+        # the supervisor task draining + bounding that process. A
+        # subsequent turn for the same chat consults this to warn; daemon
+        # shutdown / :meth:`cancel_lingering_supervisors` cancels them all.
+        self._linger_supervisors: dict[int, asyncio.Task] = {}
 
     def _system_prompt_for(self, session_uuid: str) -> str:
         cached = self._system_prompt_cache.get(session_uuid)
@@ -866,6 +906,9 @@ class ClaudeCodeBrain(Brain):
         """
         reservation = await self._running_tasks.reserve(chat_id)
         env = {**os.environ, "VEXIS_CHAT_ID": str(chat_id)}
+        # Issue #61: bound how long this claude -p lingers on background
+        # subagents at exit (see _apply_bg_wait_env / brain.background_agent_wait).
+        _apply_bg_wait_env(env)
 
         status_file = StatusFile(chat_id)
         status_file.start()
@@ -914,6 +957,16 @@ class ClaudeCodeBrain(Brain):
             )
             stderr_task = asyncio.create_task(proc.stderr.read())
 
+            # Issue #61: the buffered path deliberately keeps process-exit
+            # semantics (blocks on proc.wait() up to BRAIN_TIMEOUT_SECONDS)
+            # rather than the streaming path's linger decoupling. It returns
+            # a single ``str`` with no event channel to emit a
+            # ``background_lingering`` notice on, and its callers are the
+            # already-background/low-priority turns (goal continuations,
+            # streaming-disabled deployments) where holding the drain
+            # matters less. The env-injected bg-wait ceiling above still
+            # bounds how long the CLI lingers on background subagents; the
+            # brain timeout is the outer bound. See docs/background-subagents.md.
             try:
                 await asyncio.wait_for(proc.wait(), timeout=BRAIN_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as exc:
@@ -1129,6 +1182,9 @@ class ClaudeCodeBrain(Brain):
         """
         reservation = await self._running_tasks.reserve(chat_id)
         env = {**os.environ, "VEXIS_CHAT_ID": str(chat_id)}
+        # Issue #61: bound how long this claude -p lingers on background
+        # subagents at exit (see _apply_bg_wait_env / brain.background_agent_wait).
+        _apply_bg_wait_env(env)
 
         status_file = StatusFile(chat_id)
         status_file.start()
@@ -1142,6 +1198,12 @@ class ClaudeCodeBrain(Brain):
         # as content_block_delta deltas. See _classify_brain_failure.
         accumulated = ""
         result_text = ""
+        # Issue #61: True once the terminal ``result`` event has been
+        # seen. After that, a stdout read that stalls past the linger
+        # grace while the process is still alive means the CLI is holding
+        # open background subagents — the turn is done but the process
+        # isn't. See the readline timeout branch below.
+        result_seen = False
         assistant_text_parts: list[str] = []
         stderr_bytes = b""
         proc: asyncio.subprocess.Process | None = None
@@ -1199,17 +1261,50 @@ class ClaudeCodeBrain(Brain):
             # immediately to the browser).
             stream_started_at = asyncio.get_event_loop().time()
             while True:
-                # Bound the per-line read by the overall brain
-                # timeout so a hung subprocess doesn't deadlock the
-                # iterator. The remainder of BRAIN_TIMEOUT_SECONDS
-                # decreases as the stream progresses.
-                elapsed = asyncio.get_event_loop().time() - stream_started_at
-                remaining = max(1.0, BRAIN_TIMEOUT_SECONDS - elapsed)
+                # Read budget. Before the result event, bound each line
+                # by the remaining overall brain timeout so a hung
+                # subprocess can't deadlock the iterator. After the result
+                # event (issue #61), switch to the short linger grace: on
+                # an ordinary turn stdout closes within milliseconds
+                # (EOF → break, byte-for-byte the pre-#61 path), but if the
+                # grace elapses with the process still alive the CLI is
+                # lingering on background subagents and we hand it off.
+                if result_seen:
+                    read_timeout = _POST_RESULT_LINGER_GRACE_SECONDS
+                else:
+                    elapsed = (
+                        asyncio.get_event_loop().time() - stream_started_at
+                    )
+                    read_timeout = max(1.0, BRAIN_TIMEOUT_SECONDS - elapsed)
                 try:
                     line = await asyncio.wait_for(
-                        stream.readline(), timeout=remaining,
+                        stream.readline(), timeout=read_timeout,
                     )
                 except asyncio.TimeoutError as exc:
+                    if result_seen and proc.returncode is None:
+                        # The turn's canonical reply already arrived but
+                        # the CLI is still alive holding background
+                        # subagents. Flush any batched trailing text,
+                        # hand the process to a brain-owned supervisor,
+                        # and return normally: the ``finally`` below runs
+                        # (status_file.delete + slot unregister) which is
+                        # exactly right — the user's turn IS done and the
+                        # chat should be freed. The supervisor now owns
+                        # stdout/stderr draining and the eventual kill.
+                        if pending_tail:
+                            accumulated += pending_tail
+                            yield pending_tail
+                            pending_tail = ""
+                        wait_seconds = self._handoff_lingering(
+                            chat_id, proc, stream, stderr_task,
+                        )
+                        yield {
+                            "type": "background_lingering",
+                            "wait_seconds": wait_seconds,
+                        }
+                        if result_text.strip():
+                            yield {"type": "final", "text": result_text}
+                        return
                     await self._kill_group(proc)
                     await asyncio.gather(stderr_task, return_exceptions=True)
                     raise BrainTimeoutError(
@@ -1392,6 +1487,11 @@ class ClaudeCodeBrain(Brain):
                     rt = event.get("result")
                     if isinstance(rt, str):
                         result_text = rt
+                    # Issue #61: from here on, a stalled stdout read while
+                    # the process is still alive is a lingering-subagent
+                    # signal, not a hang. Flip AFTER capturing the text so
+                    # a handoff on the very next read carries the reply.
+                    result_seen = True
 
             await proc.wait()
             try:
@@ -1517,6 +1617,172 @@ class ClaudeCodeBrain(Brain):
             except asyncio.TimeoutError:
                 log.error("claude -p (pid=%s) ignored SIGKILL", proc.pid)
 
+    # ─── Background-subagent linger supervisor (issue #61) ───────
+    #
+    # When the streaming parse loop sees the terminal ``result`` event but
+    # the CLI stays alive past the linger grace, the foreground turn is
+    # done yet the process is holding open background subagents. Rather
+    # than pin the drain + typing indicator for the full bg-wait ceiling,
+    # ``_attempt_astream`` hands the process here and returns. The
+    # supervisor keeps stdout/stderr draining (pipe backpressure would
+    # otherwise stall the CLI), waits for the process up to the configured
+    # ``brain.background_agent_wait`` measured from handoff, and SIGKILLs
+    # the group on timeout — logging the outcome so a killed vs completed
+    # background run is greppable from the daemon logs alone.
+
+    def _handoff_lingering(
+        self,
+        chat_id: int,
+        proc: asyncio.subprocess.Process,
+        stream: asyncio.StreamReader,
+        stderr_task: asyncio.Task | None,
+    ) -> int:
+        """Detach a lingering ``claude -p`` to a supervisor task.
+
+        Returns the configured background-agent wait (seconds) so the
+        caller can surface it in the ``background_lingering`` event AND
+        drive the supervisor's own timeout from the same value.
+        """
+        wait_seconds = brain_background_agent_wait()
+        existing = self._linger_supervisors.get(chat_id)
+        if existing is not None and not existing.done():
+            # Rare: the previous turn's background subagents are still
+            # running when this turn ALSO lingers. Append-only session
+            # JSONLs make concurrent writes tolerable (each claude -p owns
+            # its own turn's writes; neither forks the other's session
+            # state), so we don't kill the older one — its work may still
+            # be useful. We just warn and let both supervisors run; each
+            # removes only its own dict entry on completion.
+            log.warning(
+                "chat %d already has a lingering background supervisor; "
+                "starting a second (each drains its own claude -p)",
+                chat_id,
+            )
+        task = asyncio.create_task(
+            self._supervise_lingering(
+                chat_id, proc, stream, stderr_task, wait_seconds,
+            ),
+            name=f"vexis-bg-subagent-supervisor-{chat_id}",
+        )
+        self._linger_supervisors[chat_id] = task
+        log.info(
+            "Handed lingering claude -p (pid=%s) for chat %d to supervisor "
+            "(background_agent_wait=%s)",
+            proc.pid, chat_id,
+            "unlimited" if wait_seconds == 0 else f"{wait_seconds}s",
+        )
+        return wait_seconds
+
+    async def _supervise_lingering(
+        self,
+        chat_id: int,
+        proc: asyncio.subprocess.Process,
+        stream: asyncio.StreamReader,
+        stderr_task: asyncio.Task | None,
+        wait_seconds: int,
+    ) -> None:
+        """Drain + bound a handed-off lingering ``claude -p`` (issue #61).
+
+        Keeps reading stdout so the CLI's pipe writes never block, awaits
+        the process up to ``wait_seconds`` (``0`` = unlimited), and
+        SIGKILLs the group on timeout. Logs the outcome (completed vs
+        killed) at INFO. On task cancellation (daemon shutdown, see
+        :meth:`cancel_lingering_supervisors`) the ``finally`` kills any
+        still-running process so a clean shutdown leaves no orphan.
+        """
+        started = time.monotonic()
+
+        async def _drain_stdout() -> None:
+            try:
+                while True:
+                    chunk = await stream.readline()
+                    if not chunk:
+                        break
+            except Exception:
+                log.debug(
+                    "linger stdout drain raised for chat %d", chat_id,
+                    exc_info=True,
+                )
+
+        drain_task = asyncio.create_task(_drain_stdout())
+        timeout = None if wait_seconds <= 0 else float(wait_seconds)
+        status = "completed"
+        try:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                # Exceeded the configured wait — SIGTERM/SIGKILL the group.
+                status = "killed"
+                await self._kill_group(proc)
+        except asyncio.CancelledError:
+            # Daemon shutdown cancelled us mid-wait; the ``finally`` kills
+            # the still-running process before we re-raise.
+            status = "cancelled"
+            raise
+        finally:
+            elapsed = time.monotonic() - started
+            # Belt-and-suspenders: on the cancel path (and any exit that
+            # somehow left the process alive) make sure no detached
+            # claude -p survives. Idempotent — ``_kill_group`` returns
+            # immediately when the process already exited.
+            if proc.returncode is None:
+                await self._kill_group(proc)
+            if status == "completed":
+                log.info(
+                    "Background subagent(s) for chat %d finished; claude -p "
+                    "(pid=%s) exited rc=%s after %.0fs",
+                    chat_id, proc.pid, proc.returncode, elapsed,
+                )
+            else:
+                log.info(
+                    "Background subagent(s) for chat %d %s after %.0fs "
+                    "(wait=%ss, pid=%s, rc=%s)",
+                    chat_id, status, elapsed, wait_seconds, proc.pid,
+                    proc.returncode,
+                )
+            drain_task.cancel()
+            try:
+                await drain_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.debug(
+                    "linger drain cleanup raised for chat %d", chat_id,
+                    exc_info=True,
+                )
+            if stderr_task is not None:
+                await asyncio.gather(stderr_task, return_exceptions=True)
+            # Remove only our own entry: a second supervisor for the same
+            # chat (see _handoff_lingering) may have overwritten the dict
+            # slot, and it will pop its own entry when it completes.
+            if self._linger_supervisors.get(chat_id) is asyncio.current_task():
+                self._linger_supervisors.pop(chat_id, None)
+
+    async def cancel_lingering_supervisors(self) -> None:
+        """Cancel every in-flight linger supervisor (issue #61).
+
+        The explicit brain-close / daemon-shutdown hook: a clean
+        shutdown shouldn't leave detached ``claude -p`` processes
+        running. Cancelling each supervisor task interrupts its
+        ``proc.wait()``; the supervisor's ``finally`` then SIGKILLs its
+        still-running process. Best-effort and idempotent — safe to call
+        with no supervisors in flight.
+        """
+        supervisors = list(self._linger_supervisors.values())
+        for task in supervisors:
+            task.cancel()
+        for task in supervisors:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.debug(
+                    "linger supervisor raised during shutdown cancel",
+                    exc_info=True,
+                )
+        self._linger_supervisors.clear()
+
     # ─── Brain ABC implementations beyond ``respond`` ────────────
     #
     # Phase A wires every method that has a natural existing
@@ -1621,6 +1887,10 @@ class ClaudeCodeBrain(Brain):
             argv += ["--permission-mode", "bypassPermissions"]
 
         env = dict(os.environ)
+        # Issue #61: seed the background-subagent wait ceiling from config
+        # FIRST so an explicit ``env_overrides`` entry for the same var
+        # (a caller that wants a per-spawn ceiling) still wins on update.
+        _apply_bg_wait_env(env)
         if env_overrides:
             env.update(env_overrides)
 

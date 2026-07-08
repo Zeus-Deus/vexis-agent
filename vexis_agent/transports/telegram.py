@@ -675,6 +675,27 @@ def _make_pickup_preview(text: str, max_len: int = _PICKING_UP_PREVIEW_LEN) -> s
     return cleaned
 
 
+def _format_background_lingering_notice(wait_seconds: int) -> str:
+    """User-facing text for the issue #61 ``background_lingering`` notice.
+
+    The foreground turn is done and the chat is free, but the brain CLI is
+    still running background subagents. ``wait_seconds`` is the configured
+    ``brain.background_agent_wait``; ``0`` means unlimited. We round UP to
+    whole minutes so "up to N minutes" is never an under-promise.
+    """
+    if wait_seconds <= 0:
+        return (
+            "A background agent is still working — the chat is free; "
+            "it will run until it finishes (no time limit)."
+        )
+    minutes = max(1, -(-int(wait_seconds) // 60))  # ceil division
+    unit = "minute" if minutes == 1 else "minutes"
+    return (
+        "A background agent is still working — the chat is free; "
+        f"it has up to {minutes} {unit} to finish."
+    )
+
+
 def _format_incoming_images_message(
     image_paths: list[Path], caption: str | None
 ) -> str:
@@ -5133,6 +5154,16 @@ class TelegramTransport:
                 # ``tool_end`` / future shapes). Reserved for a future
                 # Telegram surface; see docstring for why it's dropped.
                 continue
+            elif kind == "notice":
+                # Issue #61: out-of-band notice. Currently the
+                # ``background_lingering`` event — the foreground turn is
+                # done but the CLI is still running background subagents.
+                # Surface it via the Notifier (separate message + brain
+                # context note) so the user knows the chat is free while
+                # background work continues. The reply bubble is finalised
+                # by the ``done`` event that follows.
+                await self._emit_stream_notice(chat_id, payload)
+                continue
             elif kind == "done":
                 if isinstance(payload, str):
                     # Canonical full text from the handler — prefer
@@ -5288,6 +5319,39 @@ class TelegramTransport:
                 if ephemeral:
                     path.unlink(missing_ok=True)
         return full_text
+
+    async def _emit_stream_notice(self, chat_id: int, payload) -> None:
+        """Surface a handler ``("notice", dict)`` event (issue #61).
+
+        Today the only notice is ``background_lingering``. Route it
+        through the Notifier so the user gets a Telegram message AND the
+        brain gets a parallel context note (the next turn knows a
+        background agent was still working). Best-effort: a missing
+        notifier or an unrecognised payload is a silent no-op — a notice
+        must never break the reply stream.
+        """
+        # getattr fallback keeps the __new__-built test transports (which
+        # wire only the attributes a path reads) safe when they don't
+        # model the notifier — matches the _streaming_enabled pattern.
+        notifier = getattr(self, "_notifier", None)
+        if notifier is None or not isinstance(payload, dict):
+            return
+        if payload.get("type") != "background_lingering":
+            return
+        wait_raw = payload.get("wait_seconds", 0)
+        try:
+            wait_seconds = int(wait_raw)
+        except (TypeError, ValueError):
+            wait_seconds = 0
+        try:
+            await notifier.send(
+                chat_id, _format_background_lingering_notice(wait_seconds),
+            )
+        except Exception:
+            log.debug(
+                "Failed to send background-lingering notice for chat %s",
+                chat_id, exc_info=True,
+            )
 
     async def _send_brain_reply(self, bot, chat_id: int, reply: str) -> None:
         """Send a brain response, extracting and forwarding any screenshot

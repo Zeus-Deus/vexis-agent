@@ -37,6 +37,18 @@ Canonical schema reference (every block is optional; missing file
                                   # "none"/0 to disable scoping; no-ops
                                   # automatically when systemd-run is
                                   # absent. Hot-reloaded per turn.
+      background_agent_wait: 1800 # Issue #61: seconds a foreground
+                                  # "claude -p" is allowed to linger AFTER
+                                  # its result event, waiting for
+                                  # background subagents (Agent tool /
+                                  # run_in_background) to finish before
+                                  # it's SIGKILLed. Exported to the CLI as
+                                  # CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS
+                                  # (= seconds * 1000; "0" = unlimited) and
+                                  # used to bound the lingering-process
+                                  # supervisor. Default 1800 (30 min);
+                                  # 0 = unlimited. Hot-reloaded per spawn.
+                                  # See docs/background-subagents.md.
 
     # ── memory limits ───────────────────────────────────────────
     memory:
@@ -1486,6 +1498,64 @@ def brain_subprocess_memory_max() -> str | None:
         return cleaned
     # Unexpected type → fall back to the safe default.
     return _SUBPROCESS_MEMORY_MAX_DEFAULT
+
+
+# Default ceiling (seconds) on how long a foreground ``claude -p`` process
+# is allowed to linger after emitting its result event while it waits for
+# background subagents (the Agent tool / ``run_in_background`` work that
+# became background-by-default in claude-code v2.1.198) to finish. Issue
+# #61: the headless CLI caps this at ``CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS``
+# (default 600000ms = 10 min since v2.1.182), then SIGKILLs the group —
+# silently killing long autonomous subagents mid-flight. vexis raises the
+# ceiling to 30 min so realistic background work survives. ``0`` = unlimited.
+_BACKGROUND_AGENT_WAIT_DEFAULT = 1800
+
+
+def brain_background_agent_wait() -> int:
+    """Read ``brain.background_agent_wait`` (seconds) from
+    ``~/.vexis/config.yaml``.
+
+    Default 1800 (30 min). ``0`` means unlimited — the process waits for
+    background subagents as long as they keep running. Accepts an int or
+    a numeric string; a negative, non-numeric, or boolean value falls
+    back to the default with a logged warning (a config typo must never
+    wedge the brain). Reads disk per call so an edit hot-reloads at the
+    next brain spawn without a daemon restart — same posture as
+    :func:`brain_file_mutation_footer_enabled`.
+
+    The claude-code brain consumes this to set
+    ``CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`` (= seconds * 1000, or "0"
+    when unlimited) on every ``claude -p`` spawn AND to bound the
+    lingering-process supervisor it hands a still-running CLI to once the
+    turn's result event has arrived. See docs/background-subagents.md.
+    """
+    raw = _section("brain").get(
+        "background_agent_wait", _BACKGROUND_AGENT_WAIT_DEFAULT,
+    )
+    # ``bool`` is an ``int`` subclass, so a stray ``true``/``false`` would
+    # otherwise coerce to 1/0 (0 == "unlimited" is a dangerous silent
+    # meaning). Reject it explicitly before the int() path.
+    if isinstance(raw, bool):
+        log.warning(
+            "brain.background_agent_wait=%r is not a number; using default %ds",
+            raw, _BACKGROUND_AGENT_WAIT_DEFAULT,
+        )
+        return _BACKGROUND_AGENT_WAIT_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        log.warning(
+            "brain.background_agent_wait=%r is not a number; using default %ds",
+            raw, _BACKGROUND_AGENT_WAIT_DEFAULT,
+        )
+        return _BACKGROUND_AGENT_WAIT_DEFAULT
+    if value < 0:
+        log.warning(
+            "brain.background_agent_wait=%r is negative; using default %ds",
+            raw, _BACKGROUND_AGENT_WAIT_DEFAULT,
+        )
+        return _BACKGROUND_AGENT_WAIT_DEFAULT
+    return value
 
 
 # ──────────────────────────────────────────────────────────────────

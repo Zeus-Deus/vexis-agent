@@ -834,6 +834,16 @@ async def _run() -> bool:
             await dashboard.stop()
         await control_socket.stop()
         await background_tasks.shutdown()
+        # Issue #61: kill any claude -p processes handed off to linger
+        # supervisors (background subagents outliving their turn) so a
+        # clean shutdown leaves no detached process group behind. Guarded
+        # by getattr — only the claude-code brain grows this hook;
+        # opencode and the null brain have no per-turn CLI to detach.
+        cancel_supervisors = getattr(
+            brain, "cancel_lingering_supervisors", None,
+        )
+        if cancel_supervisors is not None:
+            await cancel_supervisors()
         # The browser session is torn down by the browser add-on's
         # ``browser-session-lifecycle`` background task, cancelled above
         # via ``addon_runtime.stop_all_background_tasks()`` — no direct
