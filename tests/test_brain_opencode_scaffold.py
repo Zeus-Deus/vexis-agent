@@ -478,6 +478,140 @@ def test_write_mcp_config_handles_corrupt_existing_file(
 
 
 # ──────────────────────────────────────────────────────────────────
+# Issue #64 — experimental.mcp_timeout soft default
+#
+# Both opencode.json writers (OpenCodeBrain.write_mcp_config and the
+# setup-wizard's _write_opencode_mcp) share ONE helper
+# (base.ensure_opencode_mcp_timeout) so the default can't drift.
+# opencode's ~60s default is too short for the browser add-on's MCP
+# catalogue call; the key is milliseconds per opencode's config schema.
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_write_mcp_config_sets_mcp_timeout_when_absent(
+    brain: OpenCodeBrain, workspace: Path
+):
+    """Writing a non-empty mcp block seeds the 5-min soft default."""
+    from vexis_agent.core.brain.base import DEFAULT_OPENCODE_MCP_TIMEOUT_MS
+
+    brain.write_mcp_config(
+        [McpServerSpec(name="x", command="/x", args=[])]
+    )
+    on_disk = json.loads(
+        (workspace / "opencode.json").read_text(encoding="utf-8")
+    )
+    assert on_disk["experimental"]["mcp_timeout"] == (
+        DEFAULT_OPENCODE_MCP_TIMEOUT_MS
+    )
+
+
+def test_write_mcp_config_preserves_user_set_mcp_timeout(
+    brain: OpenCodeBrain, workspace: Path
+):
+    """A user-set ``mcp_timeout`` wins — the writer never clobbers it."""
+    initial = {"experimental": {"mcp_timeout": 12345}}
+    (workspace / "opencode.json").write_text(
+        json.dumps(initial), encoding="utf-8"
+    )
+    brain.write_mcp_config(
+        [McpServerSpec(name="x", command="/x", args=[])]
+    )
+    on_disk = json.loads(
+        (workspace / "opencode.json").read_text(encoding="utf-8")
+    )
+    assert on_disk["experimental"]["mcp_timeout"] == 12345
+
+
+def test_write_mcp_config_preserves_other_experimental_keys(
+    brain: OpenCodeBrain, workspace: Path
+):
+    """Merging the timeout must not drop sibling ``experimental``
+    keys the user already set."""
+    from vexis_agent.core.brain.base import DEFAULT_OPENCODE_MCP_TIMEOUT_MS
+
+    initial = {"experimental": {"hook": {"a": 1}}}
+    (workspace / "opencode.json").write_text(
+        json.dumps(initial), encoding="utf-8"
+    )
+    brain.write_mcp_config(
+        [McpServerSpec(name="x", command="/x", args=[])]
+    )
+    on_disk = json.loads(
+        (workspace / "opencode.json").read_text(encoding="utf-8")
+    )
+    assert on_disk["experimental"]["hook"] == {"a": 1}
+    assert on_disk["experimental"]["mcp_timeout"] == (
+        DEFAULT_OPENCODE_MCP_TIMEOUT_MS
+    )
+
+
+def test_write_mcp_config_no_timeout_when_no_servers(
+    brain: OpenCodeBrain, workspace: Path
+):
+    """No MCP servers → no ``mcp:`` block → no ``experimental``
+    block either. We only touch timeouts when writing servers."""
+    brain.write_mcp_config([])
+    on_disk = json.loads(
+        (workspace / "opencode.json").read_text(encoding="utf-8")
+    )
+    assert "experimental" not in on_disk
+
+
+def test_write_mcp_config_timeout_round_trip_stable(
+    brain: OpenCodeBrain, workspace: Path
+):
+    """Writing twice is stable: the second pass sees the timeout
+    already present and leaves the file byte-identical."""
+    spec = McpServerSpec(name="x", command="/x", args=[])
+    brain.write_mcp_config([spec])
+    first = (workspace / "opencode.json").read_text(encoding="utf-8")
+    brain.write_mcp_config([spec])
+    second = (workspace / "opencode.json").read_text(encoding="utf-8")
+    assert first == second
+
+
+def test_both_opencode_writers_agree_on_mcp_timeout(
+    brain: OpenCodeBrain, workspace: Path, tmp_path: Path
+):
+    """The brain writer and the setup-wizard writer must produce the
+    same ``experimental.mcp_timeout`` for the same servers — the
+    shared helper is the anti-drift guarantee."""
+    from vexis_agent.setup_wizard import _write_opencode_mcp
+
+    spec = McpServerSpec(name="x", command="/x", args=[])
+    brain.write_mcp_config([spec])
+    brain_disk = json.loads(
+        (workspace / "opencode.json").read_text(encoding="utf-8")
+    )
+
+    wizard_ws = tmp_path / "wizard-ws"
+    wizard_ws.mkdir()
+    _write_opencode_mcp(wizard_ws, [spec])
+    wizard_disk = json.loads(
+        (wizard_ws / "opencode.json").read_text(encoding="utf-8")
+    )
+
+    assert (
+        brain_disk["experimental"]["mcp_timeout"]
+        == wizard_disk["experimental"]["mcp_timeout"]
+    )
+
+
+def test_wizard_writer_no_timeout_when_no_servers(tmp_path: Path):
+    """The wizard writer, like the brain writer, only seeds the
+    timeout when actually writing servers."""
+    from vexis_agent.setup_wizard import _write_opencode_mcp
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _write_opencode_mcp(ws, [])
+    on_disk = json.loads(
+        (ws / "opencode.json").read_text(encoding="utf-8")
+    )
+    assert "experimental" not in on_disk
+
+
+# ──────────────────────────────────────────────────────────────────
 # OPENCODE_CONFIG_CONTENT shape
 # ──────────────────────────────────────────────────────────────────
 
@@ -588,12 +722,12 @@ def test_extract_text_returns_empty_when_no_text_events():
 
 
 def test_spawn_aux_argv_shape_with_tier(
-    brain: OpenCodeBrain, monkeypatch
+    brain: OpenCodeBrain, workspace: Path, monkeypatch
 ):
-    """spawn_aux composes ``opencode run --format json --agent
-    vexis-aux`` plus the tier-resolved model in the
-    OPENCODE_CONFIG_CONTENT env var. The model flag is NOT in argv
-    — it's in the agent definition inside the env var."""
+    """spawn_aux composes ``opencode run --format json --dir
+    <workspace> --agent vexis-aux`` plus the tier-resolved model in
+    the OPENCODE_CONFIG_CONTENT env var. The model flag is NOT in
+    argv — it's in the agent definition inside the env var."""
     captured: dict = {}
 
     class _CP:
@@ -617,11 +751,17 @@ def test_spawn_aux_argv_shape_with_tier(
         )
     )
     assert result.returncode == 0
-    # Argv: opencode run --format json --agent vexis-aux <prompt>
-    assert captured["argv"][:5] == [
-        "opencode", "run", "--format", "json", "--agent",
+    # Argv: opencode run --format json --dir <workspace> --agent
+    # vexis-aux <prompt>
+    assert captured["argv"][:4] == [
+        "opencode", "run", "--format", "json",
     ]
-    assert captured["argv"][5] == VEXIS_AUX_AGENT_NAME
+    # Issue #64 — aux spawn pins the project dir to the effective
+    # workdir (the workspace when no explicit cwd is given).
+    assert captured["argv"][4] == "--dir"
+    assert captured["argv"][5] == str(workspace)
+    assert captured["argv"][6] == "--agent"
+    assert captured["argv"][7] == VEXIS_AUX_AGENT_NAME
     assert "test prompt" in captured["argv"]
     # Model is NOT a CLI flag — lives in OPENCODE_CONFIG_CONTENT.
     assert "--model" not in captured["argv"]
@@ -786,6 +926,7 @@ def test_spawn_aux_explicit_cwd_overrides_workspace(
 
     def _fake_run(argv, **kwargs):
         captured["cwd"] = kwargs.get("cwd")
+        captured["argv"] = list(argv)
         return _CP()
 
     monkeypatch.setattr("vexis_agent.core.brain.opencode.subprocess.run", _fake_run)
@@ -793,6 +934,10 @@ def test_spawn_aux_explicit_cwd_overrides_workspace(
     other.mkdir()
     asyncio.run(brain.spawn_aux("p", cwd=other))
     assert captured["cwd"] == str(other)
+    # Issue #64 — ``--dir`` tracks the effective workdir, not just
+    # the subprocess cwd, so an explicit cwd overrides both.
+    argv = captured["argv"]
+    assert argv[argv.index("--dir") + 1] == str(other)
 
 
 def test_spawn_aux_model_not_found_raises_structured_error(

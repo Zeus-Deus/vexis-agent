@@ -458,6 +458,37 @@ def mcp_spec_to_opencode_entry(spec: McpServerSpec) -> dict:
     return entry
 
 
+# Issue #64 — opencode's default MCP request timeout (~60s) is too
+# short for the browser add-on's catalogue call, so vexis writes a
+# softer default. The key is ``experimental.mcp_timeout`` in
+# MILLISECONDS (int, exclusiveMinimum 0) per opencode's config schema
+# ($defs/Config/properties/experimental/properties/mcp_timeout at
+# https://opencode.ai/config.json). 5 min covers a cold MCP server
+# spin-up without letting a genuinely wedged server hang forever.
+DEFAULT_OPENCODE_MCP_TIMEOUT_MS = 300_000
+
+
+def ensure_opencode_mcp_timeout(config: dict) -> None:
+    """Set ``experimental.mcp_timeout`` in-place ONLY when absent.
+
+    Shared by both opencode.json writers (``OpenCodeBrain.write_mcp_config``
+    and the setup-wizard's ``_write_opencode_mcp``) so the soft default
+    physically cannot drift between them. A user-set value wins — and
+    so does any other key the user already put under ``experimental`` —
+    because we merge into an existing block rather than clobbering it.
+
+    Caller applies this only when the ``mcp:`` block being written is
+    non-empty (no MCP servers → no reason to touch timeouts). Writing
+    twice is stable: the second pass sees the key present and leaves it.
+    """
+    experimental = config.get("experimental")
+    if not isinstance(experimental, dict):
+        experimental = {}
+        config["experimental"] = experimental
+    if "mcp_timeout" not in experimental:
+        experimental["mcp_timeout"] = DEFAULT_OPENCODE_MCP_TIMEOUT_MS
+
+
 # ──────────────────────────────────────────────────────────────────
 # Per-turn session handle (issue #48)
 # ──────────────────────────────────────────────────────────────────

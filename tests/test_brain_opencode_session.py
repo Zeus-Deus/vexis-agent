@@ -217,6 +217,39 @@ def test_first_call_omits_session_flag_and_harvests_id(
     assert brain.session_token() == harvested_id
 
 
+def test_foreground_run_pins_dir_to_workspace(
+    brain: OpenCodeBrain, workspace: Path, monkeypatch
+):
+    """Issue #64 — the foreground ``opencode run`` must pass
+    ``--dir <workspace>`` (immediately after ``--format json``) so
+    opencode resolves the project directory to the workspace rather
+    than falling back to ``/`` (observed inside a container, which
+    skipped ``<workspace>/opencode.json`` and dropped MCP + skills).
+    The subprocess ``cwd`` stays pinned too — belt and braces."""
+    harvested_id = "ses_DIRPINtest"
+    captured: dict = {}
+
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            _evt("text", harvested_id, part={"text": "ok"}),
+            _idle_event(harvested_id),
+        ],
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
+    )
+
+    asyncio.run(brain.respond("hi", chat_id=7))
+
+    argv = captured["argv"]
+    assert "--dir" in argv
+    dir_idx = argv.index("--dir")
+    assert argv[dir_idx + 1] == str(workspace)
+    # cwd is still the workspace (belt and braces).
+    assert captured["cwd"] == str(workspace)
+
+
 def test_first_call_raises_brain_error_on_empty_stream(
     brain: OpenCodeBrain, session_store: SessionStore, monkeypatch
 ):
