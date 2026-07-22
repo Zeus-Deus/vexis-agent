@@ -225,7 +225,14 @@ def test_foreground_run_pins_dir_to_workspace(
     opencode resolves the project directory to the workspace rather
     than falling back to ``/`` (observed inside a container, which
     skipped ``<workspace>/opencode.json`` and dropped MCP + skills).
-    The subprocess ``cwd`` stays pinned too — belt and braces."""
+    The subprocess ``cwd`` stays pinned too — belt and braces.
+
+    Issue #66 — ``--dir`` must appear EXACTLY once. Passing it
+    twice crashes OpenCode 1.18.4 with
+    ``The "paths[1]" property must be of type string, got array``
+    (yargs collapses a repeated ``type: "string"`` flag into an
+    array, which opencode's path resolution rejects). This asserts
+    the fresh-session foreground shape never emits a duplicate."""
     harvested_id = "ses_DIRPINtest"
     captured: dict = {}
 
@@ -246,8 +253,49 @@ def test_foreground_run_pins_dir_to_workspace(
     assert "--dir" in argv
     dir_idx = argv.index("--dir")
     assert argv[dir_idx + 1] == str(workspace)
+    # Issue #66 — never a duplicate --dir (fresh path).
+    assert argv.count("--dir") == 1
     # cwd is still the workspace (belt and braces).
     assert captured["cwd"] == str(workspace)
+
+
+def test_foreground_resume_pins_dir_exactly_once(
+    brain: OpenCodeBrain, session_store: SessionStore, workspace: Path,
+    monkeypatch
+):
+    """Issue #66 — the resume foreground shape (``--session <id>``
+    instead of ``--title``) must also pin ``--dir <workspace>``
+    EXACTLY once. A duplicated ``--dir`` crashes OpenCode 1.18.4
+    with ``The "paths[1]" property must be of type string, got
+    array`` (yargs repeated-string-flag → array). The resume path
+    is a distinct argv branch from the fresh path, so it gets its
+    own guard."""
+    sid = "ses_RESUMEdirpin"
+    session_store.set(sid)
+    session_store.mark_initialized()
+    captured: dict = {}
+
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            _evt("text", sid, part={"text": "ok"}),
+            _idle_event(sid),
+        ],
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
+    )
+
+    asyncio.run(brain.respond("hi again", chat_id=7))
+
+    argv = captured["argv"]
+    # Resume shape resumes via --session, not --title.
+    assert "--session" in argv
+    assert "--title" not in argv
+    # Issue #66 — never a duplicate --dir (resume path).
+    assert argv.count("--dir") == 1
+    dir_idx = argv.index("--dir")
+    assert argv[dir_idx + 1] == str(workspace)
 
 
 def test_first_call_raises_brain_error_on_empty_stream(
