@@ -640,7 +640,10 @@ def _write_opencode_mcp(workspace: Path, servers: list) -> Path:
     """
     import json
 
-    from vexis_agent.core.brain.base import mcp_spec_to_opencode_entry
+    from vexis_agent.core.brain.base import (
+        ensure_opencode_mcp_timeout,
+        mcp_spec_to_opencode_entry,
+    )
 
     prefix = "vexis-"
     path = workspace / "opencode.json"
@@ -658,6 +661,10 @@ def _write_opencode_mcp(workspace: Path, servers: list) -> Path:
         mcp_block[f"{prefix}{spec.name}"] = mcp_spec_to_opencode_entry(spec)
     if mcp_block:
         current["mcp"] = mcp_block
+        # Issue #64 — soft-default the MCP request timeout only when
+        # writing servers. Shared helper with OpenCodeBrain so the two
+        # opencode.json writers can't drift.
+        ensure_opencode_mcp_timeout(current)
     elif "mcp" in current and not mcp_block:
         del current["mcp"]
     tmp = path.with_suffix(path.suffix + ".tmp")

@@ -96,6 +96,7 @@ from vexis_agent.core.brain.base import (
     McpServerSpec,
     SessionLike,
     SessionLost,
+    ensure_opencode_mcp_timeout,
     mcp_spec_to_opencode_entry,
 )
 from vexis_agent.core.running_tasks import RunningTasks
@@ -819,9 +820,17 @@ class OpenCodeBrain(Brain):
             allow_tools=True,  # foreground turn allows tools
         )
 
+        # Issue #64 — pin the project dir explicitly. The subprocess
+        # ``cwd`` alone is NOT authoritative for opencode's project-dir
+        # resolution: inside a container opencode resolved the session /
+        # project directory to ``/`` and skipped ``<workspace>/opencode.json``
+        # (dropping MCP tools + skills). ``--dir <workspace>`` is
+        # authoritative (probed against ``opencode run --help`` on 1.18.4:
+        # "directory to run in"). We keep ``cwd`` too — belt and braces.
         argv = [
             "opencode", "run",
             "--format", "json",
+            "--dir", str(self._workspace),
             "--agent", VEXIS_AGENT_NAME,
             "--dangerously-skip-permissions",
         ]
@@ -1075,6 +1084,12 @@ class OpenCodeBrain(Brain):
         """
         from vexis_agent.core.yaml_config import model_for_tier
 
+        # Issue #64 — the effective workdir must be resolved BEFORE argv
+        # so ``--dir`` can pin it (cwd alone isn't authoritative for
+        # opencode's project-dir resolution; see the respond() note).
+        # Used both as the subprocess cwd below and the ``--dir`` value.
+        workdir = str(cwd if cwd is not None else self._workspace)
+
         # Reasoning + context flags — added 2026-05-08 for the
         # picker's reasoning step. opencode's CLI accepts
         # ``--variant <name>`` (per-model variant names like
@@ -1086,6 +1101,7 @@ class OpenCodeBrain(Brain):
         argv: list[str] = [
             "opencode", "run",
             "--format", "json",
+            "--dir", workdir,
             "--agent", VEXIS_AUX_AGENT_NAME,
             "--dangerously-skip-permissions",
         ]
@@ -1114,8 +1130,6 @@ class OpenCodeBrain(Brain):
         env["OPENCODE_CONFIG_CONTENT"] = config_content
         if env_overrides:
             env.update(env_overrides)
-
-        workdir = str(cwd if cwd is not None else self._workspace)
 
         def _run() -> AuxResult:
             try:
@@ -1503,6 +1517,11 @@ class OpenCodeBrain(Brain):
             # nothing to write — keeps the file clean for users
             # with no MCP servers configured.
             merged.pop("mcp", None)
+        else:
+            # Issue #64 — soft-default the MCP request timeout only
+            # when we're actually writing servers. Shared helper so
+            # this and the wizard writer can't drift.
+            ensure_opencode_mcp_timeout(merged)
 
         # Atomic write: tempfile + rename.
         tmp = path.with_suffix(path.suffix + ".tmp")

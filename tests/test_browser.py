@@ -52,6 +52,43 @@ from vexis_agent.tools.browser.session import SessionManager
 from vexis_agent.tools.browser.tools import BrowserTools
 
 
+# --- issue #64: the vexis-browser-mcp console script must exist ------
+# The browser add-on registers an MCP server whose command is
+# ``vexis-browser-mcp`` (addons/browser/__init__.py). Without a matching
+# [project.scripts] entry, opencode/claude-code resolve the server to
+# "Executable not found". This test binds the two together so a rename
+# on either side fails loud.
+
+
+def test_vexis_browser_mcp_console_script_registered_and_imports():
+    """pyproject [project.scripts] declares ``vexis-browser-mcp``, its
+    target imports, and it matches the command the browser add-on
+    registers for its MCP server."""
+    import tomllib
+
+    from vexis_agent.tools.browser.mcp_server import main as mcp_main
+
+    # The callable the console script points at must import + be
+    # callable (guards a typo'd module path).
+    assert callable(mcp_main)
+
+    repo_root = Path(__file__).resolve().parent.parent
+    with (repo_root / "pyproject.toml").open("rb") as fh:
+        pyproject = tomllib.load(fh)
+    scripts = pyproject["project"]["scripts"]
+    assert "vexis-browser-mcp" in scripts
+    assert scripts["vexis-browser-mcp"] == (
+        "vexis_agent.tools.browser.mcp_server:main"
+    )
+
+    # The add-on registers the server under a command that must equal
+    # the console-script name — otherwise the daemon writes a dead cmd.
+    src = (
+        repo_root / "vexis_agent" / "addons" / "browser" / "__init__.py"
+    ).read_text(encoding="utf-8")
+    assert 'command="vexis-browser-mcp"' in src
+
+
 # --- pure logic: DSL formatting -------------------------------------
 
 def test_format_rows_emits_indexed_dsl():

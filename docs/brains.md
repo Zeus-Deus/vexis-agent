@@ -67,6 +67,13 @@ plus 30+ via API key). Useful if you want to:
   with a `vexis-` prefix (e.g. `vexis-codemux`). Vexis only
   touches prefixed entries — any non-prefixed `mcp:` servers you
   add by hand are preserved byte-for-byte across vexis updates.
+  When it writes servers it also seeds
+  `experimental.mcp_timeout` (milliseconds; 5 min default) unless
+  you already set it — opencode's ~60s default is too short for a
+  cold MCP catalogue call (issue #64). Every `opencode run` spawn
+  passes `--dir <workspace>` so opencode resolves the project
+  directory (and thus this file) to the workspace rather than
+  falling back to `/` (observed in containers).
 - **Project instructions**: `<workspace>/AGENTS.md` (canonical for
   opencode), with `<workspace>/CLAUDE.md` as a fallback (unless
   `OPENCODE_DISABLE_CLAUDE_CODE_PROMPT=1` is set; verified at

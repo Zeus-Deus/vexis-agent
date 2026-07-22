@@ -57,6 +57,12 @@ vexis-bg = "vexis_agent.tools.background_cli:main"
 # inner agent goes idle. Activated only when the Codemux MCP is wired.
 vexis-watch = "vexis_agent.tools.watch_cli:main"
 vexis-browse = "vexis_agent.tools.browser_cli:main"
+# stdio MCP adapter the browser add-on registers as its MCP server
+# (addons/browser/__init__.py; see docs/addons.md). Forwards browser_*
+# tool calls to the persistent session over the control socket, so the
+# brain gets native mcp__vexis-browser__* tools. Without this console
+# script the add-on's server command resolves to "Executable not found".
+vexis-browser-mcp = "vexis_agent.tools.browser.mcp_server:main"
 vexis-desktop = "vexis_agent.tools.desktop_cli:main"
 # Build-and-test loop primitives — see `.plans/agent-research.md`.
 vexis-sandbox = "vexis_agent.tools.sandbox.cli:main"
