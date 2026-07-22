@@ -727,7 +727,13 @@ def test_spawn_aux_argv_shape_with_tier(
     """spawn_aux composes ``opencode run --format json --dir
     <workspace> --agent vexis-aux`` plus the tier-resolved model in
     the OPENCODE_CONFIG_CONTENT env var. The model flag is NOT in
-    argv — it's in the agent definition inside the env var."""
+    argv — it's in the agent definition inside the env var.
+
+    Issue #66 — ``--dir`` must appear EXACTLY once in the aux argv.
+    Passing it twice crashes OpenCode 1.18.4 with
+    ``The "paths[1]" property must be of type string, got array``
+    (yargs collapses a repeated ``type: "string"`` flag into an
+    array, which opencode's path resolution rejects)."""
     captured: dict = {}
 
     class _CP:
@@ -760,6 +766,8 @@ def test_spawn_aux_argv_shape_with_tier(
     # workdir (the workspace when no explicit cwd is given).
     assert captured["argv"][4] == "--dir"
     assert captured["argv"][5] == str(workspace)
+    # Issue #66 — never a duplicate --dir.
+    assert captured["argv"].count("--dir") == 1
     assert captured["argv"][6] == "--agent"
     assert captured["argv"][7] == VEXIS_AUX_AGENT_NAME
     assert "test prompt" in captured["argv"]
