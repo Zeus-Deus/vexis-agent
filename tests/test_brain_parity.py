@@ -98,6 +98,7 @@ import inspect
 
 from vexis_agent.core.brain.base import Brain
 from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.codex import CodexBrain
 from vexis_agent.core.brain.null import BrainNull
 from vexis_agent.core.brain.opencode import OpenCodeBrain
 
@@ -105,7 +106,7 @@ from vexis_agent.core.brain.opencode import OpenCodeBrain
 def test_compress_if_needed_exists_on_all_brains() -> None:
     """Every brain implementation MUST expose ``compress_if_needed``
     — the handler calls it unconditionally before each turn."""
-    for brain_cls in (Brain, ClaudeCodeBrain, BrainNull, OpenCodeBrain):
+    for brain_cls in (Brain, ClaudeCodeBrain, BrainNull, OpenCodeBrain, CodexBrain):
         assert hasattr(brain_cls, "compress_if_needed"), (
             f"{brain_cls.__name__} is missing compress_if_needed — "
             "every Brain must accept the pre-turn call site, even "

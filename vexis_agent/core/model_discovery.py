@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 import urllib.error
@@ -794,6 +795,118 @@ def discover_opencode_capabilities() -> dict[str, dict]:
 
 
 # ──────────────────────────────────────────────────────────────────
+# codex: $CODEX_HOME/models_cache.json
+#
+# codex maintains its own on-disk model cache (bare slugs, NO
+# provider/ prefix). Discovery is a cache-file re-read — no
+# subprocess — so it's cheap and offline-safe. Static fallback when
+# the cache is missing / unreadable so the picker never empties out.
+# ──────────────────────────────────────────────────────────────────
+
+
+# Static fallback pinned to the codex-cli 0.145.0 lineup. Used when
+# models_cache.json is absent — staleness beats an empty list, and
+# the validator's rule 6 stays at warning for codex so a newer slug
+# isn't blocked.
+MODEL_DISCOVERY_CODEX: frozenset[str] = frozenset(
+    {"gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"}
+)
+
+
+def _codex_models_cache_path() -> Path:
+    """``$CODEX_HOME/models_cache.json`` (CODEX_HOME env else
+    ``~/.codex``). Lazy-imports the resolver so model_discovery stays
+    free of a module-level brain import."""
+    from vexis_agent.core.brain.codex import codex_home
+    return codex_home() / "models_cache.json"
+
+
+def _read_codex_models_cache() -> list[dict] | None:
+    """Return the ``models`` list from codex's cache, or None on any
+    read/parse failure (missing file, bad JSON, unexpected shape)."""
+    path = _codex_models_cache_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    models = data.get("models")
+    if not isinstance(models, list):
+        return None
+    return [m for m in models if isinstance(m, dict)]
+
+
+def _discover_codex_models_uncached() -> set[str]:
+    """Slugs with ``visibility != "hide"`` from codex's cache; the
+    static fallback when the cache is missing/unreadable."""
+    models = _read_codex_models_cache()
+    if models is None:
+        return set(MODEL_DISCOVERY_CODEX)
+    out: set[str] = set()
+    for m in models:
+        slug = m.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        if m.get("visibility") == "hide":
+            continue
+        out.add(slug.strip())
+    return out or set(MODEL_DISCOVERY_CODEX)
+
+
+def discover_codex_models() -> set[str]:
+    """Cached codex model slugs. Refreshes every 5 minutes per
+    process; clearable via :func:`invalidate_discovery_cache`."""
+    return _cached("codex", _discover_codex_models_uncached)
+
+
+def _discover_codex_capabilities_uncached() -> dict[str, dict]:
+    """Map slug → ``{reasoning_levels, display_name}`` from codex's
+    cache (``supported_reasoning_levels[].effort``). Empty dict when
+    the cache is missing — same posture as the other capability
+    fetchers (picker skips the reasoning step)."""
+    models = _read_codex_models_cache()
+    if models is None:
+        return {}
+    out: dict[str, dict] = {}
+    for m in models:
+        slug = m.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        if m.get("visibility") == "hide":
+            continue
+        levels: list[str] = []
+        supported = m.get("supported_reasoning_levels")
+        if isinstance(supported, list):
+            for lvl in supported:
+                if isinstance(lvl, dict):
+                    effort = lvl.get("effort")
+                    if isinstance(effort, str) and effort.strip():
+                        levels.append(effort.strip())
+                elif isinstance(lvl, str) and lvl.strip():
+                    levels.append(lvl.strip())
+        display = m.get("display_name")
+        out[slug.strip()] = {
+            "reasoning_levels": levels,
+            "display_name": display if isinstance(display, str) else None,
+        }
+    return out
+
+
+def discover_codex_capabilities() -> dict[str, dict]:
+    """Per-model capability map for codex, keyed by slug. Same shape
+    and posture as :func:`discover_claude_code_capabilities`."""
+    return _cached(
+        "codex-capabilities",
+        _discover_codex_capabilities_uncached,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
 # Brain-configured detection (cross-brain picker, 2026-05-08)
 # ──────────────────────────────────────────────────────────────────
 
@@ -817,20 +930,25 @@ def is_brain_configured(brain_kind: str) -> bool:
     null in production)."""
     if brain_kind == "null":
         return True
+    if brain_kind == "codex":
+        # codex discovery is an offline cache read (always yields the
+        # static fallback), so "configured" keys off the binary being
+        # installed + logged in — proxied here by binary presence.
+        return shutil.which("codex") is not None
     grouped = discovery_grouped_for_brain(brain_kind)
     return any(grouped.values())
 
 
 def configured_brains() -> list[str]:
     """List of currently-configured brain kinds (subset of
-    ``["claude-code", "opencode"]``, excluding ``null``).
+    ``["claude-code", "opencode", "codex"]``, excluding ``null``).
 
     Used by the picker's provider step to decide single-brain vs.
     multi-brain provider keyboard rendering. Empty list when
-    neither brain has discovery (rare — usually means a fresh
+    no brain has discovery (rare — usually means a fresh
     install before authentication completes)."""
     return [
-        k for k in ("claude-code", "opencode")
+        k for k in ("claude-code", "opencode", "codex")
         if is_brain_configured(k)
     ]
 
@@ -848,7 +966,7 @@ def model_belongs_to_brain(model_id: str) -> str | None:
     When multiple brains have the same id (rare; could happen if
     a future brain reuses Anthropic ids verbatim), claude-code
     wins by precedence — first-match in the iteration order."""
-    for kind in ("claude-code", "opencode"):
+    for kind in ("claude-code", "opencode", "codex"):
         models = discover_models(kind)
         if model_id in models:
             return kind
@@ -867,6 +985,8 @@ def reasoning_levels_for(brain_kind: str, model_id: str) -> list[str]:
         caps = discover_claude_code_capabilities()
     elif brain_kind == "opencode":
         caps = discover_opencode_capabilities()
+    elif brain_kind == "codex":
+        caps = discover_codex_capabilities()
     else:
         return []
     entry = caps.get(model_id)
@@ -917,6 +1037,15 @@ def reasoning_vocabulary_for(brain_kind: str) -> set[str]:
     if brain_kind == "opencode":
         out = set()
         for entry in discover_opencode_capabilities().values():
+            levels = entry.get("reasoning_levels") if isinstance(entry, dict) else None
+            if isinstance(levels, list):
+                out.update(str(lv) for lv in levels)
+        return out
+    if brain_kind == "codex":
+        # codex reasoning efforts are per-model in the cache — union
+        # every discovered model's level list.
+        out = set()
+        for entry in discover_codex_capabilities().values():
             levels = entry.get("reasoning_levels") if isinstance(entry, dict) else None
             if isinstance(levels, list):
                 out.update(str(lv) for lv in levels)
@@ -1012,6 +1141,8 @@ def discover_models(brain_kind: str) -> set[str]:
         return discover_claude_code_models()
     if brain_kind == "opencode":
         return discover_opencode_models()
+    if brain_kind == "codex":
+        return discover_codex_models()
     return set()
 
 
@@ -1117,6 +1248,17 @@ def discover_opencode_models_by_provider() -> dict[str, list[str]]:
     }
 
 
+def discover_codex_models_by_provider() -> dict[str, list[str]]:
+    """Group codex slugs under a single ``openai`` bucket. codex ids
+    are bare slugs (no ``provider/`` prefix), so there's exactly one
+    provider — the bucket keeps the picker's grouped-rendering path
+    uniform across brains."""
+    slugs = discover_codex_models()
+    if not slugs:
+        return {}
+    return {"openai": sorted(slugs)}
+
+
 def discovery_grouped_for_brain(brain_kind: str) -> dict[str, list[str]]:
     """Brain-agnostic dispatch matching :func:`discover_models`.
 
@@ -1129,6 +1271,8 @@ def discovery_grouped_for_brain(brain_kind: str) -> dict[str, list[str]]:
         return discover_claude_code_models_by_provider()
     if brain_kind == "opencode":
         return discover_opencode_models_by_provider()
+    if brain_kind == "codex":
+        return discover_codex_models_by_provider()
     return {}
 
 
@@ -1174,6 +1318,16 @@ def refresh_opencode_models() -> set[str]:
             "cached discovery", exc,
         )
     return discover_opencode_models()
+
+
+def refresh_codex_models() -> set[str]:
+    """Force-refresh codex models by re-reading
+    ``$CODEX_HOME/models_cache.json`` (codex maintains the cache
+    itself — there's no vexis-driven fetch subprocess). Returns the
+    fresh slug set. Used by the dashboard's refresh button."""
+    invalidate_discovery_cache("codex")
+    invalidate_discovery_cache("codex-capabilities")
+    return discover_codex_models()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1252,18 +1406,31 @@ def available_models_for_picker(brain_kind: str) -> list[dict]:
         # Free models pinned to the top; ``sorted`` is stable so the
         # alphabetical id order within each bucket is preserved.
         return sorted(entries, key=lambda e: not e["free"])
+    if brain_kind == "codex":
+        # codex ids are bare slugs; no alias-vs-full distinction to
+        # filter (unlike claude-code's ``claude-`` prefix). Provider is
+        # always "openai".
+        ids = sorted(discover_codex_models())
+        caps = discover_codex_capabilities()
+        return [
+            _from_caps(mid, caps, default_provider="openai") for mid in ids
+        ]
     # null brain — no real model list to surface.
     return []
 
 
 __all__ = [
     "MODEL_DISCOVERY_CLAUDE_CODE",
+    "MODEL_DISCOVERY_CODEX",
     "available_models_for_picker",
     "configured_brains",
     "default_view_models",
     "discover_claude_code_capabilities",
     "discover_claude_code_models",
     "discover_claude_code_models_by_provider",
+    "discover_codex_capabilities",
+    "discover_codex_models",
+    "discover_codex_models_by_provider",
     "discover_models",
     "discover_opencode_capabilities",
     "discover_opencode_models",
@@ -1281,5 +1448,6 @@ __all__ = [
     "reasoning_vocabulary_for",
     "reasoning_vocabulary_for_validator",
     "refresh_claude_code_models",
+    "refresh_codex_models",
     "refresh_opencode_models",
 ]

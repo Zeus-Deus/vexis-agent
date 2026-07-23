@@ -1,7 +1,7 @@
 """``vexis-agent mcp`` — manage MCP servers from the command line.
 
 Wraps ``$VEXIS_HOME/mcp-servers.yaml`` (the universal config — one
-source of truth across both brain natives) with add / remove / list /
+source of truth across every brain native) with add / remove / list /
 show / refresh verbs so users don't have to hand-edit yaml for the
 common cases.
 
@@ -21,7 +21,7 @@ Notes:
 - Comments in the user's yaml are NOT preserved across edits — pyyaml
   is a round-trip-lossy parser. Users who maintain heavily-commented
   yaml should hand-edit instead.
-- Every mutating verb (add / remove / refresh) rewrites both
+- Every mutating verb (add / remove / refresh) rewrites all the
   per-brain native files via setup_wizard.write_all_mcp_configs so
   the brain sees the new state on next session without re-running
   the full wizard.
@@ -177,7 +177,7 @@ def add_server(
     headers: Optional[dict[str, str]] = None,
 ) -> AddResult:
     """Add (or replace) an MCP server in the user yaml, then refresh
-    both per-brain native files. Returns a summary describing what
+    all per-brain native files. Returns a summary describing what
     landed.
 
     The server is either local stdio (pass ``command`` / ``args`` /
@@ -373,14 +373,22 @@ class ServerStatus:
     entry: ServerEntry
     in_claude_native: bool   # appears in <workspace>/.mcp.json
     in_opencode_native: bool # appears in <workspace>/opencode.json's mcp block
+    in_codex_native: bool    # appears in $CODEX_HOME/vexis.config.toml's mcp_servers
 
     @property
     def fully_wired(self) -> bool:
-        """Brain-ready: present in both natives AND (for stdio
+        """Brain-ready: present in every brain native AND (for stdio
         servers) PATH-resolvable. Remote servers have no binary so
         ``on_path`` is always True for them — full wiring then just
-        means present in both native files."""
-        return self.entry.on_path and self.in_claude_native and self.in_opencode_native
+        means present in all native files. All natives are written on
+        every add/refresh so switching ``brain.kind`` stays
+        zero-friction."""
+        return (
+            self.entry.on_path
+            and self.in_claude_native
+            and self.in_opencode_native
+            and self.in_codex_native
+        )
 
 
 def status_servers() -> list[ServerStatus]:
@@ -388,11 +396,13 @@ def status_servers() -> list[ServerStatus]:
     each native file. Powers ``vexis-agent mcp status``."""
     import json
 
+    from vexis_agent.core.brain.codex import _VEXIS_PROFILE_FILE, codex_home
     from vexis_agent.setup_wizard import workspace_path
 
     workspace = workspace_path()
     claude_native = workspace / ".mcp.json"
     opencode_native = workspace / "opencode.json"
+    codex_native = codex_home() / _VEXIS_PROFILE_FILE
 
     claude_names: set[str] = set()
     if claude_native.is_file():
@@ -421,6 +431,19 @@ def status_servers() -> list[ServerStatus]:
         except (json.JSONDecodeError, OSError):
             pass
 
+    codex_names: set[str] = set()
+    if codex_native.is_file():
+        import tomllib
+
+        try:
+            codex_names = set(
+                (tomllib.loads(codex_native.read_text(encoding="utf-8")) or {})
+                .get("mcp_servers", {})
+                .keys()
+            )
+        except (tomllib.TOMLDecodeError, OSError):
+            pass
+
     out: list[ServerStatus] = []
     for entry in list_servers():
         out.append(
@@ -428,13 +451,14 @@ def status_servers() -> list[ServerStatus]:
                 entry=entry,
                 in_claude_native=entry.name in claude_names,
                 in_opencode_native=entry.name in opencode_names,
+                in_codex_native=entry.name in codex_names,
             )
         )
     return out
 
 
 def refresh_workspace() -> RefreshResult:
-    """Re-read the yaml + built-in detectors and rewrite both
+    """Re-read the yaml + built-in detectors and rewrite all
     per-brain native files. Used by ``vexis-agent mcp refresh`` for
     the ``I just edited the yaml manually`` flow, and called
     automatically after add/remove."""

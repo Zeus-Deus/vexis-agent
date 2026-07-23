@@ -3603,20 +3603,24 @@ class WebDashboard:
         flag)."""
         from vexis_agent.core.model_discovery import (
             refresh_claude_code_models,
+            refresh_codex_models,
             refresh_opencode_models,
         )
         # Both brains have meaningful refresh paths post-2026-05-07.
         # claude-code's was a no-op when its discovery was a
         # hardcoded constant; live /v1/models discovery made the
         # refresh meaningful (picks up newly-released Anthropic
-        # models without a vexis PR).
+        # models without a vexis PR). codex re-reads its own on-disk
+        # models_cache.json (the CLI maintains it).
         claude_code_models = refresh_claude_code_models()
         opencode_models = refresh_opencode_models()
+        codex_models = refresh_codex_models()
         return {
             "ok": True,
             "available_models": {
                 "claude-code": sorted(claude_code_models),
                 "opencode": sorted(opencode_models),
+                "codex": sorted(codex_models),
                 "null": [],
             },
         }

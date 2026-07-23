@@ -209,6 +209,10 @@ async def _run() -> bool:
             "opencode",
             "Install with: curl -fsSL https://opencode.ai/install | bash",
         ),
+        "codex": (
+            "codex",
+            "Install with: npm install -g @openai/codex. Then: codex login.",
+        ),
         "null": ("", ""),  # test fake — no CLI required.
     }
     kind = _brain_kind_fn()
@@ -567,6 +571,14 @@ async def _run() -> bool:
             running_tasks=running_tasks,
         )
         log.info("Brain: OpenCodeBrain (brain.kind=opencode)")
+    elif _kind == "codex":
+        from vexis_agent.core.brain.codex import CodexBrain
+        brain = CodexBrain(
+            workspace=workspace,
+            session=sessions,
+            running_tasks=running_tasks,
+        )
+        log.info("Brain: CodexBrain (brain.kind=codex)")
     elif _kind == "null":
         from vexis_agent.core.brain.null import BrainNull
         brain = BrainNull()

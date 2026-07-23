@@ -30,6 +30,7 @@ zero subprocess dependencies. The cross-brain contract test
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from abc import ABC, abstractmethod
@@ -37,6 +38,8 @@ from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, Union
+
+log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -455,6 +458,58 @@ def mcp_spec_to_opencode_entry(spec: McpServerSpec) -> dict:
     }
     if spec.env:
         entry["environment"] = dict(spec.env)
+    return entry
+
+
+_BEARER_ENV_RE = re.compile(
+    r"^Bearer\s+\$\{([A-Za-z_][A-Za-z0-9_]*)\}$"
+)
+
+
+def mcp_spec_to_codex_entry(spec: McpServerSpec) -> dict:
+    """Serialise one :class:`McpServerSpec` into codex's
+    ``[mcp_servers.<name>]`` config-table shape (see
+    ``core.brain.codex.CodexBrain.write_mcp_config`` for the TOML
+    emitter that consumes this dict).
+
+    Local stdio → ``{"command", "args", "env"?}`` — codex reads
+    ``command`` + ``args`` for the spawn and ``env`` (emitted as a
+    nested ``[mcp_servers.<name>.env]`` table) for per-server
+    overrides.
+    Remote HTTP → ``{"url", "bearer_token_env_var"?}``. codex's
+    remote-server config takes only a URL plus an OPTIONAL env-var
+    NAME to read a bearer token from at spawn (verified via ``codex
+    mcp add``); it has no generic per-header field. So a header of
+    the canonical ``Authorization: Bearer ${VAR}`` shape collapses to
+    ``bearer_token_env_var = "VAR"``; any other header shape can't be
+    expressed and is dropped with a warning (documented limitation —
+    the bundled vexis servers are all stdio)."""
+    if spec.is_remote:
+        entry: dict = {"url": spec.url}
+        auth = spec.headers.get("Authorization")
+        if isinstance(auth, str):
+            match = _BEARER_ENV_RE.match(auth.strip())
+            if match:
+                entry["bearer_token_env_var"] = match.group(1)
+            else:
+                log.warning(
+                    "codex MCP server %r: Authorization header %r is not "
+                    "the 'Bearer ${VAR}' shape codex can express; emitting "
+                    "url only (token not wired).",
+                    spec.name, auth,
+                )
+        extra = [k for k in spec.headers if k != "Authorization"]
+        if extra:
+            log.warning(
+                "codex MCP server %r: headers %s dropped — codex remote "
+                "servers accept only a bearer-token env var, not arbitrary "
+                "headers.",
+                spec.name, extra,
+            )
+        return entry
+    entry = {"command": spec.command, "args": list(spec.args)}
+    if spec.env:
+        entry["env"] = dict(spec.env)
     return entry
 
 

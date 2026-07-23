@@ -17,7 +17,7 @@ for the recommended path).
 
 | Knob | Type | What it does | Hot-reload? |
 |---|---|---|---|
-| `brain.kind` | str | Selects which agent CLI vexis spawns under (`claude-code` / `opencode` / `null`). Read once at startup. | **Restart required** |
+| `brain.kind` | str | Selects which agent CLI vexis spawns under (`claude-code` / `opencode` / `codex` / `null`). Read once at startup. | **Restart required** |
 | `models.subsystems.<name>` | str \| `{model, reasoning}` | NEW (Phase B+) per-subsystem tier override. Value is one of `tiny` / `small` / `medium` / `large`, OR a raw model id for power users. Wins over the legacy `models.<name>` key when both are set. Also accepts the `{model, reasoning}` dict shape to pin a reasoning-effort level alongside the model — see [Reasoning effort](#reasoning-effort). | Hot |
 | `models.tiers.<brain-kind>.<tier>` | str | Per-brain tier→native-id override. Example: `models.tiers.opencode.large: openai/gpt-4o`. | Hot |
 | `models.<subsystem-name>` | str | LEGACY raw-string passthrough (pre-Phase-B). Works on claude-code via passthrough; breaks on opencode (which requires `provider/model` shape). The slash + dashboard surface a rule-4 warning when this combo would crash. See [`docs/migration.md`](migration.md). | Hot (when valid) |

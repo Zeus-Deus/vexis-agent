@@ -580,9 +580,10 @@ def mcp_add(
     """Add (or replace) an MCP server in ~/.vexis/mcp-servers.yaml.
 
     A server is either local stdio (--command) or remote HTTP (--url);
-    the two are mutually exclusive. Auto-refreshes both per-brain
-    native files (~/vexis-workspace/.mcp.json and opencode.json) so the
-    brain sees the new entry on next session.
+    the two are mutually exclusive. Auto-refreshes the per-brain
+    native files (~/vexis-workspace/.mcp.json, opencode.json, and
+    $CODEX_HOME/vexis.config.toml) so the brain sees the new entry on
+    next session.
     """
     from vexis_agent.daemon.mcp import (
         add_server,
@@ -694,6 +695,7 @@ def mcp_status() -> None:
         e = s.entry
         claude_glyph = "✓" if s.in_claude_native else "✗"
         opencode_glyph = "✓" if s.in_opencode_native else "✗"
+        codex_glyph = "✓" if s.in_codex_native else "✗"
         wired_label = "ready" if s.fully_wired else "incomplete"
         kind = "remote" if e.is_remote else "stdio"
         typer.echo(f"{e.name}  [{e.source}, {kind}, {wired_label}]")
@@ -705,6 +707,7 @@ def mcp_status() -> None:
             typer.echo(f"  binary on PATH:        {path_glyph}  ({e.binary})")
         typer.echo(f"  in claude-code native: {claude_glyph}  ({e.name} in <workspace>/.mcp.json)")
         typer.echo(f"  in opencode native:    {opencode_glyph}  (vexis-{e.name} in <workspace>/opencode.json)")
+        typer.echo(f"  in codex native:       {codex_glyph}  ({e.name} in $CODEX_HOME/vexis.config.toml)")
         if e.is_remote:
             # Header *names* only — never echo values (bearer tokens).
             if e.headers:
@@ -725,7 +728,7 @@ def mcp_status() -> None:
 
 @mcp_app.command("refresh")
 def mcp_refresh() -> None:
-    """Rewrite both per-brain native files from the current yaml +
+    """Rewrite all per-brain native files from the current yaml +
     built-in detectors. Use after editing
     ~/.vexis/mcp-servers.yaml by hand."""
     from vexis_agent.daemon.mcp import refresh_workspace

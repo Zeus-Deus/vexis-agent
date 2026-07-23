@@ -243,6 +243,10 @@ _BRAIN_INSTALL_HINTS: dict[str, tuple[str, str]] = {
         "opencode",
         "Install: curl -fsSL https://opencode.ai/install | bash",
     ),
+    "codex": (
+        "codex",
+        "Install: npm install -g @openai/codex, then run 'codex login'.",
+    ),
     "null": ("", ""),
 }
 
@@ -325,6 +329,45 @@ def check_opencode_auth() -> OpenCodeAuthCheck:
     )
 
 
+@dataclass(frozen=True)
+class CodexAuthCheck:
+    """Result of probing ``codex login status`` during setup.
+
+    ``probed`` is False when the check couldn't run at all (binary
+    missing, timeout) — the wizard then stays silent on auth rather
+    than guessing. ``authed`` is True when codex reports a logged-in
+    session (exit 0).
+    """
+
+    probed: bool
+    authed: bool
+
+
+def check_codex_auth() -> CodexAuthCheck:
+    """Probe ``codex login status`` for an authenticated session.
+
+    codex exits 0 + "Logged in using ChatGPT" when authenticated and
+    non-zero when not. Best-effort — a missing binary or timeout yields
+    ``probed=False`` and the wizard skips the auth hint rather than
+    blocking setup.
+    """
+    if shutil.which("codex") is None:
+        return CodexAuthCheck(probed=False, authed=False)
+    try:
+        result = subprocess.run(
+            ["codex", "login", "status"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+            text=True,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return CodexAuthCheck(probed=False, authed=False)
+    return CodexAuthCheck(probed=True, authed=result.returncode == 0)
+
+
 # ── Workspace setup ────────────────────────────────────────────────
 
 
@@ -358,19 +401,20 @@ def ensure_workspace_claude_md(ws: Path) -> tuple[Path, bool]:
 
 
 def ensure_agents_md_symlink(ws: Path, brain_kind: str) -> tuple[Optional[Path], str]:
-    """Symlink ``<ws>/AGENTS.md → CLAUDE.md`` so opencode (and any
-    future AGENTS.md-reading brain) finds the same content
+    """Symlink ``<ws>/AGENTS.md → CLAUDE.md`` so opencode / codex (and
+    any future AGENTS.md-reading brain) find the same content
     claude-code reads from CLAUDE.md.
 
-    Only acts when brain.kind=opencode — claude-code doesn't need
-    AGENTS.md, and creating one for users on claude-code would just
-    be dead-symlink noise. Refuses to overwrite a real (non-symlink)
-    AGENTS.md so a hand-maintained file isn't clobbered.
+    Only acts when brain.kind reads AGENTS.md (opencode, codex) —
+    claude-code doesn't need AGENTS.md, and creating one for users on
+    claude-code would just be dead-symlink noise. Refuses to overwrite
+    a real (non-symlink) AGENTS.md so a hand-maintained file isn't
+    clobbered.
 
     Returns (path, status) where status ∈ {"created", "already_correct",
     "skipped_not_opencode", "refused_real_file", "replaced_wrong_target"}.
     """
-    if brain_kind != "opencode":
+    if brain_kind not in ("opencode", "codex"):
         return None, "skipped_not_opencode"
     link = ws / "AGENTS.md"
     target_name = "CLAUDE.md"
@@ -581,6 +625,8 @@ def write_mcp_config(workspace: Path, brain_kind: str, specs: list[dict]) -> Opt
         return _write_claude_code_mcp(workspace, typed)
     if brain_kind == "opencode":
         return _write_opencode_mcp(workspace, typed)
+    if brain_kind == "codex":
+        return _write_codex_mcp(workspace, typed)
     return None
 
 
@@ -592,13 +638,14 @@ def write_all_mcp_configs(workspace: Path, specs: list[dict]) -> list[Path]:
     The universal config is ``$VEXIS_HOME/mcp-servers.yaml`` (the
     user-facing source of truth). The per-brain native files
     (``<workspace>/.mcp.json`` for claude-code, ``<workspace>/
-    opencode.json`` for opencode) are derived caches; we write them
-    both on every wizard run so switching ``brain.kind`` later
-    requires zero MCP rework — the new brain's native file already
-    exists, with the same servers wired up.
+    opencode.json`` for opencode, ``$CODEX_HOME/vexis.config.toml``
+    for codex) are derived caches; we write them all on every wizard
+    run so switching ``brain.kind`` later requires zero MCP rework —
+    the new brain's native file already exists, with the same servers
+    wired up.
     """
     paths: list[Path] = []
-    for kind in ("claude-code", "opencode"):
+    for kind in ("claude-code", "opencode", "codex"):
         path = write_mcp_config(workspace, kind, specs)
         if path is not None:
             paths.append(path)
@@ -669,6 +716,39 @@ def _write_opencode_mcp(workspace: Path, servers: list) -> Path:
         del current["mcp"]
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def _write_codex_mcp(workspace: Path, servers: list) -> Path:
+    """Mirrors CodexBrain.write_mcp_config without instantiating the
+    brain. Writes ``$CODEX_HOME/vexis.config.toml`` (the ``vexis``
+    profile codex layers via ``--profile vexis``) — NOT a per-workspace
+    file, so ``workspace`` is unused here. Same atomic-write semantics.
+
+    Per-entry serialisation is the shared ``mcp_spec_to_codex_entry``
+    and the file-level TOML emission reuses CodexBrain's own emitter so
+    this writer and the brain's cannot drift.
+    """
+    from vexis_agent.core.brain.base import mcp_spec_to_codex_entry
+    from vexis_agent.core.brain.codex import (
+        _VEXIS_PROFILE_FILE,
+        _emit_mcp_servers_toml,
+        codex_home,
+    )
+
+    home = codex_home()
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / _VEXIS_PROFILE_FILE
+
+    entries: dict = {
+        spec.name: mcp_spec_to_codex_entry(spec) for spec in servers
+    }
+    body = _emit_mcp_servers_toml(entries)
+    content = (body + "\n") if body else ""
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
     tmp.replace(path)
     return path
 
@@ -943,7 +1023,9 @@ def _read_brain_kind(home: Path) -> str:
     except Exception:  # pragma: no cover — malformed config = default
         return "claude-code"
     raw = (data.get("brain") or {}).get("kind", "claude-code")
-    if isinstance(raw, str) and raw.strip() in {"claude-code", "opencode", "null"}:
+    if isinstance(raw, str) and raw.strip() in {
+        "claude-code", "opencode", "codex", "null",
+    }:
         return raw.strip()
     return "claude-code"
 
@@ -1053,10 +1135,11 @@ def run_setup(
     if brain_kind_override is not None:
         brain_kind = brain_kind_override
     else:
-        brain_options = ["claude-code", "opencode", "null"]
+        brain_options = ["claude-code", "opencode", "codex", "null"]
         labels = [
             "claude-code  — official Anthropic CLI (default)",
             "opencode     — 30+ providers including OAuth, OpenAI, Copilot",
+            "codex        — OpenAI Codex CLI (ChatGPT subscription or OpenAI API)",
             "null         — test fake; no real brain (advanced)",
         ]
         try:
@@ -1118,6 +1201,33 @@ def run_setup(
             "See docs/migration.md."
         )
 
+    # codex-specific: auth via `codex login`, and model ids are bare
+    # slugs (gpt-5.6-sol / gpt-5.5), NOT the provider/model shape
+    # opencode wants. Surface both now instead of erroring on the first
+    # turn. Guidance only — never blocks setup.
+    if brain_kind == "codex" and bc.found:
+        auth = check_codex_auth()
+        if not auth.probed:
+            warn(
+                "couldn't verify codex auth — run 'codex login status' "
+                "to check. Log in with 'codex login' (ChatGPT "
+                "subscription or OpenAI API key) before starting the "
+                "daemon."
+            )
+        elif auth.authed:
+            ok("codex login: authenticated")
+        else:
+            warn(
+                "codex is not logged in. Run 'codex login' before "
+                "starting the daemon."
+            )
+        info(
+            "codex uses bare model slugs in ~/.vexis/config.yaml "
+            "(e.g. gpt-5.6-sol / gpt-5.5) — NOT the 'provider/model' "
+            "shape opencode wants. Tier defaults ship under "
+            "models.tiers.codex. See docs/brains.md."
+        )
+
     # ── 4. Workspace setup ────────────────────────────────────────
     section("Workspace")
     workspace = workspace_path()
@@ -1130,7 +1240,7 @@ def run_setup(
         info(f"workspace CLAUDE.md already exists at {ws_claude} (kept)")
     agents_link, agents_status = ensure_agents_md_symlink(workspace, brain_kind)
     if agents_status == "created":
-        ok(f"AGENTS.md → CLAUDE.md (opencode discovery)")
+        ok(f"AGENTS.md → CLAUDE.md ({brain_kind} discovery)")
     elif agents_status == "already_correct":
         info("AGENTS.md symlink already pointed at CLAUDE.md")
     elif agents_status == "replaced_wrong_target":
@@ -1142,12 +1252,13 @@ def run_setup(
         )
 
     # ── 5. MCP servers ────────────────────────────────────────────
-    # We write per-brain native MCP configs for BOTH claude-code AND
-    # opencode every wizard run, regardless of the currently-active
+    # We write per-brain native MCP configs for claude-code, opencode,
+    # AND codex every wizard run, regardless of the currently-active
     # brain. ~/.vexis/mcp-servers.yaml is the source of truth; the
-    # workspace/.mcp.json + workspace/opencode.json files are derived
-    # caches. Switching brains later (edit brain.kind, restart) is
-    # zero-friction: the other brain's native file is already there.
+    # workspace/.mcp.json + workspace/opencode.json + codex
+    # vexis.config.toml files are derived caches. Switching brains later
+    # (edit brain.kind, restart) is zero-friction: the other brain's
+    # native file is already there.
     section("MCP servers")
     detected = detect_mcp_servers()
     mcp_paths: list[Path] = []
@@ -1161,8 +1272,8 @@ def run_setup(
         info(
             "no MCP servers detected. Edit ~/.vexis/mcp-servers.yaml "
             "to declare custom servers; the wizard wires them into "
-            "both .mcp.json (claude-code) and opencode.json on the "
-            "next run."
+            ".mcp.json (claude-code), opencode.json, and the codex "
+            "vexis profile on the next run."
         )
 
     # ── 6. Tailscale soft-check ───────────────────────────────────
@@ -1250,6 +1361,7 @@ def run_setup(
             (p for p in mcp_paths if (
                 (brain_kind == "claude-code" and p.name == ".mcp.json")
                 or (brain_kind == "opencode" and p.name == "opencode.json")
+                or (brain_kind == "codex" and p.name == "vexis.config.toml")
             )),
             None,
         ),

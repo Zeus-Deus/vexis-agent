@@ -914,7 +914,9 @@ def test_is_brain_configured_null_brain_always_true():
 
 
 def test_configured_brains_returns_subset(monkeypatch: pytest.MonkeyPatch):
-    """Excludes ``null``; orders claude-code first, then opencode."""
+    """Excludes ``null``; orders claude-code, opencode, codex. codex's
+    configured-ness keys off ``shutil.which("codex")`` (offline cache
+    discovery always yields a fallback), so pin the binary present."""
     monkeypatch.setattr(
         md, "discovery_grouped_for_brain",
         lambda kind: (
@@ -922,7 +924,8 @@ def test_configured_brains_returns_subset(monkeypatch: pytest.MonkeyPatch):
             else {}
         ),
     )
-    assert md.configured_brains() == ["claude-code", "opencode"]
+    monkeypatch.setattr(md.shutil, "which", lambda name: "/usr/bin/codex")
+    assert md.configured_brains() == ["claude-code", "opencode", "codex"]
 
 
 def test_configured_brains_only_one(monkeypatch: pytest.MonkeyPatch):
@@ -930,6 +933,8 @@ def test_configured_brains_only_one(monkeypatch: pytest.MonkeyPatch):
         md, "discovery_grouped_for_brain",
         lambda kind: {"anthropic": ["x"]} if kind == "claude-code" else {},
     )
+    # codex binary absent → not configured.
+    monkeypatch.setattr(md.shutil, "which", lambda name: None)
     assert md.configured_brains() == ["claude-code"]
 
 

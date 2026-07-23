@@ -135,6 +135,7 @@ def test_read_canonical_mcp_servers_corrupt_json_returns_empty(tmp_path: Path):
 def test_brain_binary_for_kind():
     assert brain_binary_for_kind("claude-code") == "claude"
     assert brain_binary_for_kind("opencode") == "opencode"
+    assert brain_binary_for_kind("codex") == "codex"
     assert brain_binary_for_kind("null") is None
     assert brain_binary_for_kind("future-brain") is None
 
@@ -142,6 +143,9 @@ def test_brain_binary_for_kind():
 def test_brain_install_hint_known_kinds():
     assert "Claude Code" in brain_install_hint("claude-code")
     assert "opencode.ai" in brain_install_hint("opencode")
+    codex_hint = brain_install_hint("codex")
+    assert "@openai/codex" in codex_hint
+    assert "codex login" in codex_hint
     # Unknown kind: hint is still informative, not a crash.
     assert "future-brain" in brain_install_hint("future-brain")
 
@@ -357,6 +361,38 @@ def test_apply_writes_opencode_mcp_config_with_namespace(
     assert "mcp" in data
     # vexis-prefixed entry present (the writer adds the prefix).
     assert any(k.startswith("vexis-") for k in data["mcp"].keys())
+
+
+# ──────────────────────────────────────────────────────────────────
+# apply — codex (vexis profile TOML)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_apply_writes_codex_mcp_config_to_profile(
+    fake_repo: Path, fake_workspace: Path, monkeypatch
+):
+    """codex brain writes ``$CODEX_HOME/vexis.config.toml`` (the
+    ``vexis`` profile), NOT a per-workspace file — the profile IS the
+    namespace, so entries are unprefixed under ``[mcp_servers.<name>]``.
+    CODEX_HOME is isolated to tmp by the autouse ``_isolate_codex_home``
+    fixture. Here we only verify the install script invokes the codex
+    writer via the ``_make_brain`` codex branch."""
+    import tomllib
+
+    from vexis_agent.core.brain.codex import codex_home
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    plan = build_plan(
+        repo=fake_repo,
+        workspace=fake_workspace,
+        brain_kind="codex",
+    )
+    written = plan.apply()
+    assert written == codex_home() / "vexis.config.toml"
+    data = tomllib.loads(written.read_text(encoding="utf-8"))
+    assert "mcp_servers" in data
+    # Profile is the namespace — entries are unprefixed.
+    assert all(not k.startswith("vexis-") for k in data["mcp_servers"])
 
 
 # ──────────────────────────────────────────────────────────────────

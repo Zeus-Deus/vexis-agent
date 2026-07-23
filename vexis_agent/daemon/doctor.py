@@ -163,9 +163,12 @@ def check_brain_cli() -> CheckResult:
         except (yaml.YAMLError, OSError):
             pass
 
-    binary = {"claude-code": "claude", "opencode": "opencode", "null": None}.get(
-        brain_kind, "claude"
-    )
+    binary = {
+        "claude-code": "claude",
+        "opencode": "opencode",
+        "codex": "codex",
+        "null": None,
+    }.get(brain_kind, "claude")
     if binary is None:
         return CheckResult(
             f"Brain CLI ({brain_kind})",
@@ -178,6 +181,7 @@ def check_brain_cli() -> CheckResult:
     install_hint = {
         "claude-code": "Install: see https://docs.anthropic.com/claude/claude-code",
         "opencode": "Install: curl -fsSL https://opencode.ai/install | bash",
+        "codex": "Install: npm install -g @openai/codex (then: codex login)",
     }.get(brain_kind, "")
     return CheckResult(
         f"Brain CLI ({brain_kind})",

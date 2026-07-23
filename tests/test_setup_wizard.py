@@ -244,6 +244,15 @@ def test_check_brain_cli_opencode_missing(tmp_path, monkeypatch) -> None:
     assert "opencode.ai/install" in bc.install_hint
 
 
+def test_check_brain_cli_codex_missing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    bc = sw.check_brain_cli("codex")
+    assert bc.binary == "codex"
+    assert bc.found is False
+    assert "@openai/codex" in bc.install_hint
+    assert "codex login" in bc.install_hint
+
+
 def test_check_brain_cli_null_no_binary() -> None:
     bc = sw.check_brain_cli("null")
     assert bc.found is True
@@ -323,6 +332,66 @@ def test_check_opencode_auth_nonzero_exit_is_not_probed(monkeypatch) -> None:
     )
     res = sw.check_opencode_auth()
     assert res.probed is False
+
+
+def test_check_codex_auth_logged_in(monkeypatch) -> None:
+    monkeypatch.setattr(sw.shutil, "which", lambda _b: "/usr/bin/codex")
+    monkeypatch.setattr(
+        sw.subprocess, "run",
+        _fake_run_factory("Logged in using ChatGPT", returncode=0),
+    )
+    res = sw.check_codex_auth()
+    assert res.probed is True
+    assert res.authed is True
+
+
+def test_check_codex_auth_not_logged_in(monkeypatch) -> None:
+    monkeypatch.setattr(sw.shutil, "which", lambda _b: "/usr/bin/codex")
+    monkeypatch.setattr(
+        sw.subprocess, "run",
+        _fake_run_factory("", returncode=1),
+    )
+    res = sw.check_codex_auth()
+    assert res.probed is True
+    assert res.authed is False
+
+
+def test_check_codex_auth_binary_missing(monkeypatch) -> None:
+    monkeypatch.setattr(sw.shutil, "which", lambda _b: None)
+    res = sw.check_codex_auth()
+    assert res.probed is False
+    assert res.authed is False
+
+
+def test_run_setup_codex_warns_when_unauthed(
+    isolated_setup_env, monkeypatch, capsys
+) -> None:
+    """Picking codex with no logged-in session surfaces actionable
+    ``codex login`` guidance during setup — and never blocks it."""
+    monkeypatch.setattr(
+        sw, "check_brain_cli",
+        lambda _k: sw.BrainCheck(
+            kind="codex", binary="codex", found=True, install_hint="",
+        ),
+    )
+    monkeypatch.setattr(
+        sw, "check_codex_auth",
+        lambda: sw.CodexAuthCheck(probed=True, authed=False),
+    )
+    result = sw.run_setup(
+        prompt=_canned_prompts({"token": "x", "user ID": "1"}),
+        install_service=False,
+        require_interactive=False,
+        print_banner=False,
+        brain_kind_override="codex",
+    )
+    out = capsys.readouterr().out
+    # Auth guidance + the bare-slug model-id note both surfaced.
+    assert "codex is not logged in" in out
+    assert "codex login" in out
+    assert "gpt-5.6-sol" in out
+    # Setup still completed.
+    assert result.config_path.exists()
 
 
 def test_run_setup_opencode_warns_when_unauthed(
@@ -413,7 +482,7 @@ def test_ensure_workspace_claude_md_writes_template(tmp_path) -> None:
     assert written2 is False
 
 
-def test_ensure_agents_md_symlink_only_for_opencode(tmp_path) -> None:
+def test_ensure_agents_md_symlink_only_for_agents_reading_brains(tmp_path) -> None:
     ws = tmp_path / "ws"
     ws.mkdir()
     (ws / "CLAUDE.md").write_text("x\n")
@@ -424,6 +493,17 @@ def test_ensure_agents_md_symlink_only_for_opencode(tmp_path) -> None:
     assert not (ws / "AGENTS.md").exists()
     # opencode → symlink created
     link, status = sw.ensure_agents_md_symlink(ws, "opencode")
+    assert status == "created"
+    assert link.is_symlink()
+    assert os.readlink(link) == "CLAUDE.md"
+
+
+def test_ensure_agents_md_symlink_created_for_codex(tmp_path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "CLAUDE.md").write_text("x\n")
+    # codex reads AGENTS.md like opencode → symlink created.
+    link, status = sw.ensure_agents_md_symlink(ws, "codex")
     assert status == "created"
     assert link.is_symlink()
     assert os.readlink(link) == "CLAUDE.md"
@@ -543,6 +623,25 @@ def test_write_mcp_config_opencode_namespace_prefix(tmp_path) -> None:
     assert body["mcp"]["vexis-omarchy-kb"]["command"] == ["omarchy-kb"]
 
 
+def test_write_mcp_config_codex_writes_profile_toml(tmp_path) -> None:
+    """codex dispatch writes ``$CODEX_HOME/vexis.config.toml`` (the
+    vexis profile), NOT a per-workspace file. CODEX_HOME is isolated
+    to tmp by the autouse ``_isolate_codex_home`` fixture. The
+    per-entry shape comes from ``mcp_spec_to_codex_entry`` and the
+    TOML emission reuses CodexBrain's own emitter (single source)."""
+    import tomllib
+
+    from vexis_agent.core.brain.codex import codex_home
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    specs = [{"name": "omarchy-kb", "command": "omarchy-kb", "args": []}]
+    path = sw.write_mcp_config(workspace, "codex", specs)
+    assert path == codex_home() / "vexis.config.toml"
+    body = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert body["mcp_servers"]["omarchy-kb"]["command"] == "omarchy-kb"
+
+
 def test_write_mcp_config_null_brain_returns_none(tmp_path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -614,7 +713,7 @@ def test_run_setup_brain_picker_writes_chosen_kind(
     answers = {"Telegram bot token": "abc", "Allowed Telegram user ID": "1"}
 
     def picked_opencode(message, options, default_idx):
-        # 0=claude-code, 1=opencode, 2=null
+        # 0=claude-code, 1=opencode, 2=codex, 3=null
         return 1
 
     result = sw.run_setup(
@@ -627,6 +726,31 @@ def test_run_setup_brain_picker_writes_chosen_kind(
     body = result.config_path.read_text(encoding="utf-8")
     assert "kind: opencode" in body
     # Opencode flow → AGENTS.md symlink lands.
+    assert result.agents_md_status == "created"
+
+
+def test_run_setup_brain_picker_writes_codex(
+    isolated_setup_env, monkeypatch
+) -> None:
+    """Inject a choice fn that picks index 2 (codex); verify
+    config.yaml gets rewritten and the codex flow lands the AGENTS.md
+    symlink (codex reads AGENTS.md like opencode)."""
+    answers = {"Telegram bot token": "abc", "Allowed Telegram user ID": "1"}
+
+    def picked_codex(message, options, default_idx):
+        # 0=claude-code, 1=opencode, 2=codex, 3=null
+        return 2
+
+    result = sw.run_setup(
+        prompt=_canned_prompts(answers),
+        choice=picked_codex,
+        install_service=False,
+        require_interactive=False,
+        print_banner=False,
+    )
+    body = result.config_path.read_text(encoding="utf-8")
+    assert "kind: codex" in body
+    # Codex flow → AGENTS.md symlink lands.
     assert result.agents_md_status == "created"
 
 
@@ -780,19 +904,25 @@ def test_detect_mcp_servers_user_overrides_builtin(
     assert omarchy_entries[0]["args"] == ["--user-flag"]
 
 
-def test_write_all_mcp_configs_writes_both_brains(tmp_path) -> None:
-    """Universal-config invariant: write_all_mcp_configs writes both
-    .mcp.json (claude-code shape) AND opencode.json (opencode shape)
-    every call, regardless of which brain is currently configured.
-    Switching brains later picks up the same servers without rework."""
+def test_write_all_mcp_configs_writes_every_brain(tmp_path) -> None:
+    """Universal-config invariant: write_all_mcp_configs writes the
+    .mcp.json (claude-code shape), opencode.json (opencode shape), AND
+    the codex vexis.config.toml profile every call, regardless of which
+    brain is currently configured. Switching brains later picks up the
+    same servers without rework. The codex file lives at
+    ``$CODEX_HOME/vexis.config.toml`` (isolated to tmp by the autouse
+    ``_isolate_codex_home`` fixture), not in the workspace."""
+    from vexis_agent.core.brain.codex import codex_home
+
     workspace = tmp_path / "ws"
     workspace.mkdir()
     specs = [{"name": "tool", "command": "tool", "args": ["--mcp"]}]
     paths = sw.write_all_mcp_configs(workspace, specs)
     names = sorted(p.name for p in paths)
-    assert names == [".mcp.json", "opencode.json"]
+    assert names == [".mcp.json", "opencode.json", "vexis.config.toml"]
     assert (workspace / ".mcp.json").is_file()
     assert (workspace / "opencode.json").is_file()
+    assert (codex_home() / "vexis.config.toml").is_file()
 
 
 def test_user_mcp_specs_reads_remote_entry(

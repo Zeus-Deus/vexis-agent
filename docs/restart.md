@@ -9,7 +9,7 @@ effect:
   CLI is configured for. Each turn already spawns a fresh `claude -p`, so
   a CLI upgrade is usually picked up on the next message *without* any
   restart. A restart guarantees it.
-- **`brain.kind`** (claude-code ↔ opencode ↔ null). This is bound once at
+- **`brain.kind`** (claude-code ↔ opencode ↔ codex ↔ null). This is bound once at
   startup (`main.py`, where the `Brain` instance is constructed) and only
   a restart re-reads it. The dashboard surfaces a canary warning when the
   on-disk `brain.kind` diverges from the running brain.

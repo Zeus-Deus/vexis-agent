@@ -1170,6 +1170,18 @@ DEFAULT_TIER_MAP_OPENCODE: dict[str, str] = {
     "large": "anthropic/claude-sonnet-4",
 }
 
+# Default tier→model map for the codex brain. codex model ids are
+# bare slugs (NO ``provider/`` prefix) passed verbatim to
+# ``codex exec -m <id>``. Override via ``models.tiers.codex.<tier>``
+# in ``~/.vexis/config.yaml``. Cheap tiers → the mini slug, mid →
+# the mid-size model, large → the flagship reasoning model.
+DEFAULT_TIER_MAP_CODEX: dict[str, str] = {
+    "tiny": "gpt-5.4-mini",
+    "small": "gpt-5.4-mini",
+    "medium": "gpt-5.5",
+    "large": "gpt-5.6-sol",
+}
+
 
 def _extract_subsystem_value_and_reasoning(
     raw: Any,
@@ -1333,6 +1345,8 @@ def model_for_tier_from_config(
         return DEFAULT_TIER_MAP_CLAUDE_CODE.get(cleaned)
     if brain_kind == "opencode":
         return DEFAULT_TIER_MAP_OPENCODE.get(cleaned)
+    if brain_kind == "codex":
+        return DEFAULT_TIER_MAP_CODEX.get(cleaned)
 
     return None
 
@@ -1376,7 +1390,7 @@ def model_for_tier(brain_kind: str, tier: str | None) -> str | None:
 # --------------------------------------------------------------------
 #
 # ``brain.kind`` selects the implementation ``main.py`` instantiates.
-# Three values:
+# Four values:
 #   - ``claude-code`` (default) — ``ClaudeCodeBrain`` against the
 #     ``claude`` CLI binary. Pre-Phase-C behaviour, unchanged.
 #   - ``opencode`` — ``OpenCodeBrain`` against the ``opencode`` CLI
@@ -1386,6 +1400,10 @@ def model_for_tier(brain_kind: str, tier: str | None) -> str | None:
 #     Day 4 lands the SQL reader, which is the right answer
 #     anyway since OpenCode hasn't run any vexis sessions yet at
 #     Day 3.
+#   - ``codex`` — ``CodexBrain`` against the ``codex`` CLI binary
+#     (OpenAI Codex). Sessions persist as rollout JSONLs under
+#     ``$CODEX_HOME/sessions``; MCP servers land in the ``vexis``
+#     profile at ``$CODEX_HOME/vexis.config.toml``.
 #   - ``null`` — ``BrainNull``, the test fake. Useful for a vexis
 #     that's running but should never spawn a real model (e.g.
 #     dashboard-only smoke).
@@ -1394,7 +1412,7 @@ def model_for_tier(brain_kind: str, tier: str | None) -> str | None:
 # a daemon restart.
 
 VALID_BRAIN_KINDS: frozenset[str] = frozenset(
-    {"claude-code", "opencode", "null"}
+    {"claude-code", "opencode", "codex", "null"}
 )
 
 

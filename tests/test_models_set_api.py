@@ -552,10 +552,14 @@ def test_post_discovery_refresh_busts_cache_and_returns_lists(
     assert body["ok"] is True
     assert "claude-code" in body["available_models"]
     assert "opencode" in body["available_models"]
+    assert "codex" in body["available_models"]
     # claude-code is hardcoded; check for haiku.
     assert "haiku" in body["available_models"]["claude-code"]
     # opencode list comes from our mocked subprocess.
     assert "anthropic/x" in body["available_models"]["opencode"]
+    # codex re-reads its own models_cache.json; with no cache present
+    # the static fallback slugs surface (bare, no provider/ prefix).
+    assert all("/" not in m for m in body["available_models"]["codex"])
 
 
 def test_post_discovery_refresh_not_flag_gated(

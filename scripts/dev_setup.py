@@ -145,7 +145,9 @@ def resolve_workspace(override: str | None) -> Path:
 def brain_binary_for_kind(kind: str) -> str | None:
     """Map brain.kind to the binary name expected on PATH. ``null``
     has no binary; returns None."""
-    return {"claude-code": "claude", "opencode": "opencode"}.get(kind)
+    return {
+        "claude-code": "claude", "opencode": "opencode", "codex": "codex",
+    }.get(kind)
 
 
 def brain_install_hint(kind: str) -> str:
@@ -159,6 +161,11 @@ def brain_install_hint(kind: str) -> str:
         return (
             "Install OpenCode: "
             "curl -fsSL https://opencode.ai/install | bash"
+        )
+    if kind == "codex":
+        return (
+            "Install Codex: npm install -g @openai/codex "
+            "(then: codex login)"
         )
     return f"(no install hint registered for brain.kind={kind!r})"
 
@@ -438,6 +445,7 @@ def build_plan(
         # Defer brain construction until apply() so we don't
         # spawn workspace/state side effects during dry-run.
         from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+        from vexis_agent.core.brain.codex import CodexBrain
         from vexis_agent.core.brain.opencode import OpenCodeBrain
         from vexis_agent.core.running_tasks import RunningTasks
         from vexis_agent.core.sessions import SessionStore
@@ -448,8 +456,12 @@ def build_plan(
             return OpenCodeBrain(
                 workspace=workspace, session=sess, running_tasks=running,
             )
-        # claude-code is the default and the only other supported
-        # kind for write_mcp_config (null has no MCP layer).
+        if brain_kind == "codex":
+            return CodexBrain(
+                workspace=workspace, session=sess, running_tasks=running,
+            )
+        # claude-code is the default and the remaining supported kind
+        # for write_mcp_config (null has no MCP layer).
         return ClaudeCodeBrain(
             workspace=workspace, session=sess, running_tasks=running,
         )
