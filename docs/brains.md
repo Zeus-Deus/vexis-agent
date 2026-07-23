@@ -104,15 +104,66 @@ plus 30+ via API key). Useful if you want to:
   existing plugins/permissions; verified at
   `packages/opencode/src/tool/shell/id.ts:14-16`).
 
+## codex (opt-in)
+
+Third real brain: OpenAI's Codex CLI (`codex`). Useful if you want
+to run vexis against OpenAI's GPT-5.x family under a ChatGPT
+subscription or an OpenAI API key, using OpenAI's own agent runtime.
+
+- **Install**:
+  ```bash
+  npm install -g @openai/codex
+  ```
+- **Auth**: `codex login` (ChatGPT subscription or OpenAI API key).
+  Verify with `codex login status` — it exits 0 and prints "Logged
+  in using ChatGPT" when authenticated. Vexis's healthcheck runs the
+  same probe (10 s timeout, best-effort).
+- **Session storage**: rollout JSONLs at
+  `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`. Line 0
+  is a `session_meta` payload carrying the thread `id` and the
+  `cwd`; vexis filters rollouts by `cwd == workspace` for project
+  scope. `CODEX_HOME` is honoured — set it to relocate the whole
+  `~/.codex` tree (sessions, config, model cache).
+- **MCP config**: vexis writes its servers to
+  `$CODEX_HOME/vexis.config.toml` — the `vexis` profile. Every
+  `codex exec` spawn passes `--profile vexis` when that file exists,
+  layering vexis's `mcp_servers` on top of codex's base config. The
+  file is vexis-owned (replace-all, like claude-code's `.mcp.json`)
+  — the profile is the namespace, so no prefix merge is needed.
+- **Project instructions**: `<workspace>/AGENTS.md` (canonical for
+  codex). The installer symlinks `AGENTS.md → CLAUDE.md` so both
+  files see the same content.
+- **System prompt injection**: vexis spawns each turn with
+  `-c developer_instructions=<TOML string>`, injecting a
+  developer-role prompt WITHOUT replacing codex's own base
+  instructions (the codex analogue of opencode's
+  `OPENCODE_CONFIG_CONTENT` seam). Per-spawn, no shared file state.
+- **Tool surface**: codex has no per-tool allowlist. Vexis maps its
+  aux tool policy onto codex's coarse sandbox mode instead:
+  text-only → `-s read-only`, a file-editing allowlist →
+  `-s workspace-write`, an allowlist naming a shell/web tool (or an
+  unrestricted `allow_tools=True`) →
+  `--dangerously-bypass-approvals-and-sandbox`. Foreground turns run
+  unsandboxed so tool use is enabled (exec mode has no interactive
+  approver). See the design lock (`.plans/codex-brain-research.md`
+  §2) for the mapping table.
+- **Model ids**: bare slugs (e.g. `gpt-5.6-sol`, `gpt-5.5`,
+  `gpt-5.4-mini`) — NO `provider/` prefix (the opposite of
+  opencode). A slash-shaped value surfaces a validator warning.
+- **Reasoning**: per-turn `-c model_reasoning_effort="<level>"`.
+  The valid levels are per-model (low/medium/high/xhigh/max/ultra),
+  read from `$CODEX_HOME/models_cache.json` — codex maintains that
+  cache itself; `/model refresh` re-reads it.
+
 ## Switching
 
 1. Install the new brain (see install instructions above).
-2. Authenticate: claude-code's `claude /login` or opencode's
-   `opencode providers login`.
+2. Authenticate: claude-code's `claude /login`, opencode's
+   `opencode providers login`, or codex's `codex login`.
 3. Edit `~/.vexis/config.yaml`:
    ```yaml
    brain:
-     kind: opencode    # or claude-code
+     kind: opencode    # or claude-code, or codex
    ```
 4. Restart `vexis`.
 
@@ -137,6 +188,8 @@ its own tier→model mapping in `~/.vexis/config.yaml` under
   `medium` → `anthropic/claude-sonnet-3-7`, `large` →
   `anthropic/claude-sonnet-4`. Provider-prefixed because opencode
   needs the explicit `provider/model` shape.
+- `codex`: `tiny`/`small` → `gpt-5.4-mini`, `medium` → `gpt-5.5`,
+  `large` → `gpt-5.6-sol`. Bare slugs — no `provider/` prefix.
 
 Override per tier:
 
@@ -168,6 +221,26 @@ the curator state silently if missed.
 > a clean dogfood run produces no entries here. Day 8's flag-posture
 > decision reads this section.
 
+## Known limitations on codex
+
+- **No safety hook install yet.** codex hooks require per-user
+  trusted-hash registration in the user's config, so vexis ships no
+  PreToolUse analogue on this brain — the sandbox-mode mapping is
+  the only tool gate.
+- **Compression is detection-only.** `compress_if_needed` runs the
+  trigger and logs "would compress" but does NOT rewrite the rollout
+  JSONL (codex writes an append-only rollout the running process
+  owns; a safe in-place rewrite is a follow-up).
+- **Coarse tool allowlist mapping.** codex has no per-tool allowlist,
+  so the aux `allowed_tools` list maps onto three sandbox modes
+  rather than an exact tool surface (see the Tool surface note
+  above).
+- **MCP tool firing not yet dogfooded.** `--profile vexis` config
+  layering is verified live (a `vexis.config.toml` value reaches the
+  spawned model), which is the mechanism `mcp_servers` rides — but a
+  full end-to-end MCP *tool call* through a vexis-written server
+  still belongs to the manual dogfood pass.
+
 ## Architecture references
 
 - `core/brain/base.py` — `Brain` ABC + `BrainEvent` variants +
@@ -176,6 +249,9 @@ the curator state silently if missed.
 - `core/brain/opencode.py` — opencode implementation, including
   the SQLite reader, `OPENCODE_CONFIG_CONTENT` builder, and
   namespace-prefix MCP merge.
+- `core/brain/codex.py` — codex implementation, including the
+  rollout-JSONL reader, `developer_instructions` prompt seam, and
+  the `vexis.config.toml` profile MCP writer.
 - `core/yaml_config.py` — `brain_kind()`, `model_for_tier()`,
   `subsystem_tier()` — the configuration surface every brain
   reads through.

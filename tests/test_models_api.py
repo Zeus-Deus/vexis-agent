@@ -168,7 +168,7 @@ def test_get_models_empty_config_returns_default_table(client: TestClient):
 
     # Brain inventory enumerates all valid kinds.
     assert set(data["brain_inventory"]) == {
-        "claude-code", "opencode", "null",
+        "claude-code", "opencode", "codex", "null",
     }
 
 
@@ -402,7 +402,7 @@ def test_get_models_exposes_available_models_by_provider(
     data = r.json()
     assert "available_models_by_provider" in data
     grouped = data["available_models_by_provider"]
-    assert set(grouped.keys()) == {"claude-code", "opencode", "null"}
+    assert set(grouped.keys()) == {"claude-code", "opencode", "codex", "null"}
     # claude-code: hardcoded → always populated.
     assert "anthropic" in grouped["claude-code"]
     assert "haiku" in grouped["claude-code"]["anthropic"]

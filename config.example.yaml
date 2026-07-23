@@ -10,10 +10,13 @@
 
 # ── brain abstraction (Phase C, see docs/brains.md) ─────────────────
 brain:
-  kind: claude-code            # or "opencode" or "null". Selects which
-                               # agent CLI vexis spawns under. Switching
-                               # to opencode requires the legacy-keys →
-                               # tier-schema migration in docs/migration.md.
+  kind: claude-code            # or "opencode" or "codex" or "null".
+                               # Selects which agent CLI vexis spawns
+                               # under. Switching to opencode requires the
+                               # legacy-keys → tier-schema migration in
+                               # docs/migration.md; codex expects bare
+                               # model slugs (gpt-5.6-sol) — see
+                               # docs/brains.md.
   file_mutation_footer: true   # Snapshot the workspace before and
                                # after every brain turn and inject a
                                # "[turn-N verifier] Files changed last
@@ -89,6 +92,11 @@ models:
     opencode:
       large: anthropic/claude-sonnet-4
       medium: anthropic/claude-sonnet-3-7
+    codex:                          # bare slugs, no provider/ prefix
+      large: gpt-5.6-sol
+      medium: gpt-5.5
+      small: gpt-5.4-mini
+      tiny: gpt-5.4-mini
 
 # ── goals (v3d, see docs/goals.md) ──────────────────────────────────
 goals:

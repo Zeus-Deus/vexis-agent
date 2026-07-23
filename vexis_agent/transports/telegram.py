@@ -240,7 +240,7 @@ _MODEL_FOREGROUND_USAGE = (
 )
 _MODEL_INVALID_BRAIN_KIND_TMPL = (
     "Won't write — '{kind}' is not a valid brain.kind. "
-    "Use one of: claude-code, opencode, null."
+    "Use one of: claude-code, opencode, codex, null."
 )
 _MODEL_VALIDATOR_ERROR_TMPL = (
     "Won't write — validator rejected the proposed config:\n"
@@ -323,6 +323,10 @@ _INSTALL_HINT_CLAUDE_CODE = (
 _INSTALL_HINT_OPENCODE = (
     "  curl -fsSL https://opencode.ai/install | bash\n"
     "  opencode providers login"
+)
+_INSTALL_HINT_CODEX = (
+    "  npm install -g @openai/codex\n"
+    "  codex login"
 )
 _PICKER_NO_DISCOVERY_TMPL = (
     "No discovered models for brain '{brain}'. Use the typed-arg "
@@ -3333,6 +3337,7 @@ class TelegramTransport:
             from vexis_agent.core.model_discovery import (
                 discovery_grouped_for_brain,
                 refresh_claude_code_models,
+                refresh_codex_models,
                 refresh_opencode_models,
             )
             kind = brain_kind()
@@ -3340,6 +3345,8 @@ class TelegramTransport:
                 refresh_opencode_models()  # invalidates + re-runs subprocess
             elif kind == "claude-code":
                 refresh_claude_code_models()  # invalidates + re-fetches /v1/models
+            elif kind == "codex":
+                refresh_codex_models()  # invalidates + re-reads models_cache.json
             else:
                 # null brain or future brain without discovery —
                 # report cleanly rather than crashing.
@@ -3522,10 +3529,11 @@ class TelegramTransport:
                 and owner != current_kind
                 and not is_brain_configured(owner)
             ):
-                install_hint = (
-                    _INSTALL_HINT_CLAUDE_CODE if owner == "claude-code"
-                    else _INSTALL_HINT_OPENCODE
-                )
+                install_hint = {
+                    "claude-code": _INSTALL_HINT_CLAUDE_CODE,
+                    "opencode": _INSTALL_HINT_OPENCODE,
+                    "codex": _INSTALL_HINT_CODEX,
+                }.get(owner, _INSTALL_HINT_OPENCODE)
                 return (
                     False,
                     _MODEL_CROSS_BRAIN_BRAIN_NOT_CONFIGURED_TMPL.format(
@@ -3647,10 +3655,11 @@ class TelegramTransport:
                 and owner != current_kind
                 and not is_brain_configured(owner)
             ):
-                install_hint = (
-                    _INSTALL_HINT_CLAUDE_CODE if owner == "claude-code"
-                    else _INSTALL_HINT_OPENCODE
-                )
+                install_hint = {
+                    "claude-code": _INSTALL_HINT_CLAUDE_CODE,
+                    "opencode": _INSTALL_HINT_OPENCODE,
+                    "codex": _INSTALL_HINT_CODEX,
+                }.get(owner, _INSTALL_HINT_OPENCODE)
                 return (
                     False,
                     _MODEL_CROSS_BRAIN_BRAIN_NOT_CONFIGURED_TMPL.format(
@@ -3781,8 +3790,12 @@ class TelegramTransport:
     # shape (the longest opencode id is 38 bytes; using full
     # brain names ``"claude-code"``/``"opencode"`` would push past
     # the cap).
-    _BRAIN_TO_SHORT: dict[str, str] = {"claude-code": "cc", "opencode": "oc"}
-    _SHORT_TO_BRAIN: dict[str, str] = {"cc": "claude-code", "oc": "opencode"}
+    _BRAIN_TO_SHORT: dict[str, str] = {
+        "claude-code": "cc", "opencode": "oc", "codex": "cx",
+    }
+    _SHORT_TO_BRAIN: dict[str, str] = {
+        "cc": "claude-code", "oc": "opencode", "cx": "codex",
+    }
 
     @classmethod
     def _make_provider_keyboard(
@@ -4517,6 +4530,15 @@ class TelegramTransport:
                 "Run `opencode models` in a shell to see the live list.\n"
                 "Day 4 will surface the dashboard picker; for now, the "
                 "shell is the discovery path."
+            )
+        if target_brain == "codex":
+            return (
+                "codex accepts bare model slugs (no provider/ prefix).\n"
+                "Format: slug (e.g. gpt-5.6-sol, gpt-5.5, gpt-5.4-mini).\n"
+                "Discovery reads codex's own models_cache.json; "
+                "/model refresh re-reads it.\n"
+                "Auth: run `codex login` (ChatGPT subscription or "
+                "OpenAI API key)."
             )
         return f"Unknown brain '{target_brain}'. Known: {', '.join(sorted(VALID_BRAIN_KINDS))}"
 

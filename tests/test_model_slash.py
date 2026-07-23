@@ -364,6 +364,17 @@ def test_list_opencode_describes_provider_model_format(
     assert "opencode models" in out
 
 
+def test_list_codex_describes_bare_slug_format(
+    transport, model_ux_on, vexis_home,
+):
+    upd, _bot, msg = _update("/model list codex")
+    asyncio.run(transport._on_model(upd, _ctx("list", "codex")))
+    out = msg.reply_log[0]
+    assert "bare model slugs" in out
+    assert "gpt-5.6-sol" in out
+    assert "codex login" in out
+
+
 def test_list_unknown_brain(transport, model_ux_on, vexis_home):
     upd, _bot, msg = _update("/model list nonexistent-brain")
     asyncio.run(transport._on_model(upd, _ctx("list", "nonexistent-brain")))
@@ -958,6 +969,37 @@ def test_refresh_on_claude_code_calls_live_discovery(
     out = msg.reply_log[0]
     assert "✓ Refreshed" in out
     assert "anthropic: 4 models" in out
+
+
+def test_refresh_on_codex_calls_cache_reread(
+    transport, model_ux_on, vexis_home, monkeypatch: pytest.MonkeyPatch,
+):
+    """codex refresh busts the in-process cache + re-reads codex's
+    own on-disk models_cache.json. Pin both effects: the refresh
+    helper fires, and the reply surfaces per-provider counts (the
+    single ``openai`` bucket codex slugs group under)."""
+    monkeypatch.setattr(
+        "vexis_agent.core.yaml_config.brain_kind", lambda: "codex",
+    )
+    refresh_called: list[None] = []
+
+    def _fake_refresh() -> set[str]:
+        refresh_called.append(None)
+        return {"gpt-5.6-sol", "gpt-5.5", "gpt-5.4-mini"}
+
+    monkeypatch.setattr(
+        "vexis_agent.core.model_discovery.refresh_codex_models", _fake_refresh,
+    )
+    monkeypatch.setattr(
+        "vexis_agent.core.model_discovery.discovery_grouped_for_brain",
+        lambda _kind: {"openai": ["gpt-5.4-mini", "gpt-5.5", "gpt-5.6-sol"]},
+    )
+    upd, _bot, msg = _update("/model refresh")
+    asyncio.run(transport._on_model(upd, _ctx("refresh")))
+    assert refresh_called == [None]  # actually ran
+    out = msg.reply_log[0]
+    assert "✓ Refreshed" in out
+    assert "openai: 3 models" in out
 
 
 def test_refresh_on_null_brain_is_informational(

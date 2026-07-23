@@ -103,7 +103,7 @@ class ValidationFinding:
 
 
 UNKNOWN_BRAIN_FIX = (
-    "Set brain.kind to one of: claude-code, opencode, null. "
+    "Set brain.kind to one of: claude-code, opencode, codex, null. "
     "Daemon falls back to claude-code on invalid input."
 )
 
@@ -137,6 +137,27 @@ UNKNOWN_MODEL_FIX_TEMPLATE = (
     "'{model_id}' is not in the discovered model set for "
     "{brain_kind}. May be a stale alias or a typo. Run "
     "/model list {brain_kind} to see what's available."
+)
+
+CODEX_FORMAT_FIX_TEMPLATE = (
+    "'{model_id}' contains '/' (opencode's provider/model shape). "
+    "codex expects a bare slug (gpt-5.5 / gpt-5.6-sol). If you "
+    "intended this exact id, this warning is informational only — "
+    "codex may still accept it. Run /model list codex to see what's "
+    "available."
+)
+
+# Spawn-site backstop for codex's model-not-found error. codex model
+# ids are bare slugs; a bad id exits non-zero with a
+# 'model is not supported' / 'Model metadata for' event. The
+# spawn-site BrainModelNotFoundError imports this constant when
+# codex's spawn_aux detects the rejection — keeps the suggested_fix
+# wording consistent with the rest of the validator's vocabulary.
+CODEX_MODEL_NOT_FOUND_FIX_TEMPLATE = (
+    "codex rejected '{model_id}' for {subsystem}: model may not exist "
+    "or you may not have access. Try a known slug (gpt-5.5 / "
+    "gpt-5.6-sol) from /model list codex. "
+    "Run: /model set {subsystem} small  (resolves to gpt-5.4-mini)"
 )
 
 # Spawn-site backstop for claude-code's "model doesn't exist or no
@@ -525,6 +546,26 @@ def _check_per_subsystem(
             # subsystem if discovery is enabled. Both findings together
             # give the user the full picture.
 
+        # Rule 5-codex: codex model ids are bare slugs, so a
+        # provider/model shape is suspicious. WARNING (not error)
+        # because discovery may be stale — codex might still accept
+        # the id — and the spawn site rejects a genuinely bad one.
+        if brain_kind == "codex" and "/" in resolved:
+            findings.append(
+                ValidationFinding(
+                    severity="warning",
+                    subsystem=subsystem,
+                    problem=(
+                        f"{subsystem} resolves to {resolved!r} "
+                        f"(provider/model shape) on codex; codex "
+                        f"expects a bare slug."
+                    ),
+                    suggested_fix=CODEX_FORMAT_FIX_TEMPLATE.format(
+                        model_id=resolved,
+                    ),
+                )
+            )
+
         # Rule 6: available-models membership.
         # Only fires when discovery data is supplied AND the resolved
         # id isn't an abstract tier (tiers are validated by the
@@ -656,6 +697,24 @@ def _check_foreground(
                     f"(provider/model shape) on claude-code; unusual."
                 ),
                 suggested_fix=CLAUDE_CODE_FORMAT_FIX_TEMPLATE.format(
+                    model_id=resolved,
+                ),
+            )
+        )
+
+    # Rule 5-codex-analog: codex expects a bare slug; a provider/model
+    # shape is suspicious (warning — discovery may be stale).
+    if brain_kind == "codex" and "/" in resolved:
+        findings.append(
+            ValidationFinding(
+                severity="warning",
+                subsystem="brain",
+                problem=(
+                    f"foreground (models.brain) resolves to {resolved!r} "
+                    f"(provider/model shape) on codex; codex expects a "
+                    f"bare slug."
+                ),
+                suggested_fix=CODEX_FORMAT_FIX_TEMPLATE.format(
                     model_id=resolved,
                 ),
             )
@@ -800,6 +859,7 @@ def brain_instance_to_kind(brain: object) -> str:
 _BRAIN_CLASS_TO_KIND: dict[str, str] = {
     "ClaudeCodeBrain": "claude-code",
     "OpenCodeBrain": "opencode",
+    "CodexBrain": "codex",
     "BrainNull": "null",
 }
 
@@ -1019,6 +1079,9 @@ def build_resolution_table(
     elif brain_kind == "opencode":
         from vexis_agent.core.yaml_config import DEFAULT_TIER_MAP_OPENCODE
         default_map = DEFAULT_TIER_MAP_OPENCODE
+    elif brain_kind == "codex":
+        from vexis_agent.core.yaml_config import DEFAULT_TIER_MAP_CODEX
+        default_map = DEFAULT_TIER_MAP_CODEX
 
     tiers_section = models_section.get("tiers") if isinstance(
         models_section, dict

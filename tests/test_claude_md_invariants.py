@@ -103,12 +103,18 @@ from pathlib import Path
 #     back-compat contracts live in the section's TL;DR per the
 #     established escape hatch and are pinned by
 #     ``tests/test_web_conversations.py``.
+#   - +1 (346 → 347): the "Brain abstraction (Phase C)" section now
+#     names the third real brain, `codex` (opt-in, sessions in
+#     ~/.codex/sessions/) — "Three implementations" → "Four". Not a
+#     new section and not per-feature bloat: a single fact added to
+#     an existing sentence enumerating the brains the ABC satisfies.
+#     Pinned by ``tests/test_brain_codex_*.py``.
 # Bump only when the growth comes from new cross-feature
 # contracts in the Invariants section AND that section is
 # itself still under ~40 lines, OR a genuinely new feature
 # section that respects the ~30-line per-section ceiling.
 # Never bump for per-feature bloat in existing sections.
-CLAUDE_MD_MAX_LINES = 346
+CLAUDE_MD_MAX_LINES = 347
 
 
 def test_claude_md_stays_under_size_limit() -> None:

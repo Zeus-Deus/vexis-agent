@@ -131,11 +131,12 @@ testpaths = ["tests", "vexis_agent/addons"]
 # the wheel — see [tool.setuptools.packages.find].exclude — but the
 # eval + dev-setup tests import from it directly).
 pythonpath = ["."]
-addopts = "-q -m 'not eval and not brain_smoke and not brain_smoke_opencode and not sandbox_docker and not display_real and not ui_real'"
+addopts = "-q -m 'not eval and not brain_smoke and not brain_smoke_opencode and not brain_smoke_codex and not sandbox_docker and not display_real and not ui_real'"
 markers = [
     "eval: integration eval that calls real claude -p (cost/network); opt-in via -m eval",
     "brain_smoke: real-binary claude-code smoke (cost/network); opt-in via -m brain_smoke",
     "brain_smoke_opencode: real-binary opencode smoke (cost/network); opt-in via -m brain_smoke_opencode",
+    "brain_smoke_codex: real-binary codex smoke (cost/network); opt-in via -m brain_smoke_codex",
     "sandbox_docker: integration test against real Docker daemon; opt-in via -m sandbox_docker",
     "display_real: integration test that spawns a real Xvfb / headless compositor; opt-in via -m display_real",
     "ui_real: integration test that hits a live AT-SPI bus; opt-in via -m ui_real",

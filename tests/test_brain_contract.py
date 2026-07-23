@@ -70,6 +70,7 @@ from vexis_agent.core.brain.base import (
     mcp_spec_to_opencode_entry,
 )
 from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.codex import CodexBrain
 from vexis_agent.core.brain.null import BrainNull
 from vexis_agent.core.brain.opencode import OpenCodeBrain
 from vexis_agent.core.running_tasks import RunningTasks
@@ -129,14 +130,29 @@ def opencode_brain(workspace: Path, tmp_path: Path) -> OpenCodeBrain:
     )
 
 
-@pytest.fixture(params=["null", "claude_code", "opencode"])
+@pytest.fixture
+def codex_brain(workspace: Path, tmp_path: Path) -> CodexBrain:
+    """CodexBrain constructed against tmp paths. The autouse
+    ``_isolate_codex_sessions`` fixture in ``tests/conftest.py`` already
+    redirects the rollout reader to a non-existent path so the
+    inspection-only methods return empty without touching the user's
+    real ``$CODEX_HOME/sessions``."""
+    return CodexBrain(
+        workspace=workspace,
+        session=SessionStore(tmp_path / "codex-sessions.json"),
+        running_tasks=RunningTasks(),
+    )
+
+
+@pytest.fixture(params=["null", "claude_code", "opencode", "codex"])
 def brain_under_test(
     request: pytest.FixtureRequest,
     null_brain: BrainNull,
     claude_brain: ClaudeCodeBrain,
     opencode_brain: OpenCodeBrain,
+    codex_brain: CodexBrain,
 ) -> Brain:
-    """Parameterised over all three brain implementations. Tests
+    """Parameterised over all four brain implementations. Tests
     using this fixture should only exercise inspection-only methods
     or methods that work uniformly across implementations (e.g.
     exception hierarchy checks). Methods that diverge between
@@ -146,7 +162,9 @@ def brain_under_test(
         return null_brain
     if request.param == "claude_code":
         return claude_brain
-    return opencode_brain
+    if request.param == "opencode":
+        return opencode_brain
+    return codex_brain
 
 
 # ──────────────────────────────────────────────────────────────────

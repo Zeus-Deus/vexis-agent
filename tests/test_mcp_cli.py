@@ -178,7 +178,7 @@ def test_refresh_workspace_writes_both_natives(
     # must be idempotent + write the same files.
     result = mcp_mod.refresh_workspace()
     paths = sorted(p.name for p in result.refreshed_paths)
-    assert paths == [".mcp.json", "opencode.json"]
+    assert paths == [".mcp.json", "opencode.json", "vexis.config.toml"]
     assert result.server_count == 1
 
 
@@ -221,6 +221,7 @@ def test_status_reports_unwired_when_only_yaml(
     assert tool.entry.on_path is True
     assert tool.in_claude_native is False
     assert tool.in_opencode_native is False
+    assert tool.in_codex_native is False
     assert tool.fully_wired is False
 
 
@@ -237,6 +238,7 @@ def test_status_reports_fully_wired_after_add(
     mcp_mod.add_server(name="tool", command="tool")
     rows = mcp_mod.status_servers()
     tool = next(r for r in rows if r.entry.name == "tool")
+    assert tool.in_codex_native is True
     assert tool.fully_wired
 
 
@@ -393,4 +395,13 @@ def test_status_servers_remote_fully_wired_after_add(isolated_paths) -> None:
     assert remote.entry.is_remote is True
     assert remote.in_claude_native is True
     assert remote.in_opencode_native is True
+    assert remote.in_codex_native is True
     assert remote.fully_wired is True
+
+
+
+
+
+
+
+

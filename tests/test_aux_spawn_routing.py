@@ -282,13 +282,13 @@ def test_learning_review_routes_triage_with_tiny_then_review_with_small(
 
 @pytest.mark.parametrize(
     "brain_under_test",
-    ["null", "claude_code", "opencode"],
+    ["null", "claude_code", "opencode", "codex"],
     indirect=True,
 )
 def test_brain_under_test_implements_inspection_methods(brain_under_test):
     """Smoke test the cross-brain fixture from conftest.py. All
-    three implementations (BrainNull, ClaudeCodeBrain, OpenCodeBrain)
-    expose the inspection-only ABC methods correctly. The deeper
+    four implementations (BrainNull, ClaudeCodeBrain, OpenCodeBrain,
+    CodexBrain) expose the inspection-only ABC methods correctly. The deeper
     contract is in test_brain_contract.py; this test exists to pin
     the parameterised fixture itself."""
     from vexis_agent.core.brain.base import Brain

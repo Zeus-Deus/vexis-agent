@@ -240,11 +240,12 @@ notification policy) · `.plans/kanban-research.md` (design lock).
 ## Brain abstraction (Phase C)
 
 Vexis runs on top of an agent CLI selected at startup by
-`brain.kind` in `~/.vexis/config.yaml`. Three implementations
+`brain.kind` in `~/.vexis/config.yaml`. Four implementations
 satisfy the `core.brain.Brain` ABC: `claude-code` (default,
 sessions in `~/.claude/projects/<encoded-cwd>/`), `opencode`
 (opt-in, sessions in `~/.local/share/opencode/opencode.db`),
-and `null` (test fake). Brain switching and per-subsystem
+`codex` (opt-in, sessions in `~/.codex/sessions/`), and `null`
+(test fake). Brain switching and per-subsystem
 assignment are first-class UX surfaces; YAML-edit-and-restart
 still supported but no longer required.
 

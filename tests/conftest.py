@@ -4,7 +4,7 @@ Provides a parameterised ``brain_under_test`` fixture so the same
 test body can run against multiple brain implementations:
 
     @pytest.mark.parametrize(
-        "brain_under_test", ["null", "claude_code", "opencode"],
+        "brain_under_test", ["null", "claude_code", "opencode", "codex"],
         indirect=True,
     )
     def test_routes_through_brain(brain_under_test):
@@ -31,6 +31,7 @@ import pytest
 
 from vexis_agent.core.brain.base import Brain
 from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.codex import CodexBrain, set_codex_sessions_dir_override
 from vexis_agent.core.brain.null import BrainNull
 from vexis_agent.core.brain.opencode import OpenCodeBrain, set_opencode_db_path_override
 from vexis_agent.core.running_tasks import RunningTasks
@@ -89,6 +90,32 @@ def _isolate_opencode_db(tmp_path: Path):
     set_opencode_db_path_override(tmp_path / "no-opencode-db.db")
     yield
     set_opencode_db_path_override(None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_codex_sessions(tmp_path: Path):
+    """Codex-brain safety: the rollout reader walks
+    ``$CODEX_HOME/sessions`` by default. Tests must not see the
+    user's real Codex history (false-positive prefix matches, and
+    reading user data is surprising). Point the reader at a
+    guaranteed-nonexistent path inside ``tmp_path``; tests that need
+    real rollouts build a tree and call
+    ``set_codex_sessions_dir_override`` themselves."""
+    set_codex_sessions_dir_override(tmp_path / "no-codex-sessions")
+    yield
+    set_codex_sessions_dir_override(None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_codex_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Codex-brain safety: ``codex_home()`` resolves ``$CODEX_HOME``
+    (or ``~/.codex``) and the MCP writer + wizard write
+    ``$CODEX_HOME/vexis.config.toml`` there. Tests that write MCP
+    configs must never scribble into the user's real ``~/.codex``.
+    Point CODEX_HOME at a tmp dir for every test; ``codex_home()``
+    reads the env per call so this hot-isolates."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "_codex_home"))
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -162,9 +189,18 @@ def _make_brain(kind: str, tmp_path: Path) -> Brain:
             session=session,
             running_tasks=RunningTasks(),
         )
+    if kind == "codex":
+        workspace = tmp_path / "ws-codex"
+        workspace.mkdir(parents=True, exist_ok=True)
+        session = SessionStore(tmp_path / "sessions-codex.json")
+        return CodexBrain(
+            workspace=workspace,
+            session=session,
+            running_tasks=RunningTasks(),
+        )
     raise ValueError(
         f"unknown brain_under_test param: {kind!r} "
-        f"(expected one of: 'null', 'claude_code', 'opencode')"
+        f"(expected one of: 'null', 'claude_code', 'opencode', 'codex')"
     )
 
 
@@ -174,7 +210,7 @@ def brain_under_test(request: pytest.FixtureRequest, tmp_path: Path) -> Brain:
 
         @pytest.mark.parametrize(
             "brain_under_test",
-            ["null", "claude_code", "opencode"],
+            ["null", "claude_code", "opencode", "codex"],
             indirect=True,
         )
 

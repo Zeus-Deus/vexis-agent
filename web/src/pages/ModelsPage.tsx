@@ -1016,7 +1016,13 @@ function AvailableModelsHint({
   refreshing: boolean;
 }) {
   const lines =
-    brain === "claude-code" ? CLAUDE_CODE_HINT : brain === "opencode" ? OPENCODE_HINT : NULL_HINT;
+    brain === "claude-code"
+      ? CLAUDE_CODE_HINT
+      : brain === "opencode"
+        ? OPENCODE_HINT
+        : brain === "codex"
+          ? CODEX_HINT
+          : NULL_HINT;
   return (
     <Section
       title="Available models"
@@ -1055,6 +1061,11 @@ const CLAUDE_CODE_HINT = [
 const OPENCODE_HINT = [
   "Format: provider/model (e.g. anthropic/claude-haiku-3-5)",
   "Live discovery cached 5 min; refresh to re-fetch",
+];
+const CODEX_HINT = [
+  "Auth: codex login (ChatGPT subscription or OpenAI API key)",
+  "Format: bare slug (e.g. gpt-5.6-sol, gpt-5.5) — no provider/ prefix",
+  "Discovery reads codex's own models_cache.json; refresh to re-read",
 ];
 const NULL_HINT = ["Test fake — no real model spawns. Switch brain.kind to use models."];
 
@@ -1110,6 +1121,7 @@ function BrainSwitchModal({
   // Detect the legacy-keys → opencode trap inline so the user sees
   // it BEFORE confirming, not just after.
   const switchingToOpencode = targetKind === "opencode";
+  const switchingToCodex = targetKind === "codex";
 
   return (
     <Modal onCancel={onCancel} ariaLabel="brain switch confirmation">
@@ -1136,6 +1148,14 @@ function BrainSwitchModal({
           </code>
           ) will surface as errors after the switch. See{" "}
           <code className="text-[var(--color-fg)]">docs/migration.md</code>.
+        </p>
+      )}
+      {switchingToCodex && (
+        <p className="text-[12px] text-[var(--color-fg-2)] font-data mb-3">
+          Note: codex expects a bare model slug{" "}
+          <code className="text-[var(--color-fg)]">gpt-5.6-sol</code>{" "}
+          — a <code className="text-[var(--color-fg)]">provider/model</code>{" "}
+          value surfaces as a warning after the switch.
         </p>
       )}
       {warnings && warnings.length > 0 && (

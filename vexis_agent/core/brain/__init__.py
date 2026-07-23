@@ -31,9 +31,11 @@ from vexis_agent.core.brain.base import (
     ToolStart,
     interpolate_env,
     mcp_spec_to_claude_code_entry,
+    mcp_spec_to_codex_entry,
     mcp_spec_to_opencode_entry,
 )
 from vexis_agent.core.brain.claude_code import ClaudeCodeBrain
+from vexis_agent.core.brain.codex import CodexBrain
 from vexis_agent.core.brain.null import BrainNull
 from vexis_agent.core.brain.opencode import OpenCodeBrain
 
@@ -52,6 +54,7 @@ __all__ = [
     "BrainTimeoutError",
     "BrainTransientError",
     "ClaudeCodeBrain",
+    "CodexBrain",
     "Finished",
     "McpServerSpec",
     "OpenCodeBrain",
@@ -64,5 +67,6 @@ __all__ = [
     "ToolStart",
     "interpolate_env",
     "mcp_spec_to_claude_code_entry",
+    "mcp_spec_to_codex_entry",
     "mcp_spec_to_opencode_entry",
 ]
