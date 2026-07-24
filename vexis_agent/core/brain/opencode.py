@@ -78,7 +78,7 @@ import signal
 import sqlite3
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -99,6 +99,7 @@ from vexis_agent.core.brain.base import (
     ensure_opencode_mcp_timeout,
     mcp_spec_to_opencode_entry,
 )
+from vexis_agent.core.brain.usage import build_usage_event
 from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.core.sessions import SessionStore
 from vexis_agent.core.status import StatusFile, extract_tool_target
@@ -361,6 +362,7 @@ async def _read_opencode_event_stream(
     stream: asyncio.StreamReader | None,
     status_file: StatusFile,
     target_session_id: str | None,
+    event_sink: Callable[[str | dict], None] | None = None,
 ) -> _StreamResult:
     """Consume ``opencode run --format json`` stdout, update the
     status file on tool events, accumulate the assistant's final
@@ -401,6 +403,10 @@ async def _read_opencode_event_stream(
     locked_session_id: str | None = target_session_id
     session_lost = False
     saw_any_event = False
+
+    def emit(value: str | dict) -> None:
+        if event_sink is not None:
+            event_sink(value)
 
     if stream is None:
         return _StreamResult(
@@ -467,12 +473,84 @@ async def _read_opencode_event_stream(
                     tool_name, input_obj if isinstance(input_obj, dict) else {}
                 )
                 status_file.record_tool(tool_name, target)
+                tool_id = str(part.get("id") or "opencode-tool")
+                timing = state.get("time") if isinstance(state, dict) else None
+                started = (
+                    timing.get("start") if isinstance(timing, dict) else None
+                )
+                ended = (
+                    timing.get("end") if isinstance(timing, dict) else None
+                )
+                start_ts = (
+                    int(started)
+                    if isinstance(started, (int, float))
+                    else int(time.time() * 1000)
+                )
+                end_ts = (
+                    int(ended)
+                    if isinstance(ended, (int, float))
+                    else int(time.time() * 1000)
+                )
+                emit({
+                    "type": "tool",
+                    "name": tool_name,
+                    "target": target,
+                    "id": tool_id,
+                    "ts": start_ts,
+                })
+                emit({
+                    "type": "tool_end",
+                    "name": tool_name,
+                    "target": target,
+                    "id": tool_id,
+                    "ts": end_ts,
+                    "duration_ms": max(0, end_ts - start_ts),
+                    "status": (
+                        "error"
+                        if isinstance(state, dict)
+                        and state.get("status") == "error"
+                        else "completed"
+                    ),
+                })
         elif kind == "text":
             part = event.get("part") or {}
             if isinstance(part, dict):
                 text = part.get("text")
                 if isinstance(text, str):
                     final_text_parts.append(text)
+                    emit(text)
+        elif kind == "step_finish":
+            part = event.get("part") or {}
+            if isinstance(part, dict):
+                tokens = part.get("tokens")
+                cache = (
+                    tokens.get("cache") if isinstance(tokens, dict) else None
+                )
+                usage_event = build_usage_event(
+                    input_tokens=(
+                        tokens.get("input") if isinstance(tokens, dict) else 0
+                    ),
+                    cache_read_tokens=(
+                        cache.get("read") if isinstance(cache, dict) else 0
+                    ),
+                    cache_write_tokens=(
+                        cache.get("write") if isinstance(cache, dict) else 0
+                    ),
+                    output_tokens=(
+                        tokens.get("output") if isinstance(tokens, dict) else 0
+                    ),
+                    reasoning_tokens=(
+                        tokens.get("reasoning")
+                        if isinstance(tokens, dict)
+                        else 0
+                    ),
+                    total_tokens=(
+                        tokens.get("total") if isinstance(tokens, dict) else 0
+                    ),
+                    reported_cost_usd=part.get("cost"),
+                )
+                if usage_event is not None:
+                    emit(usage_event)
         elif kind == "session.status":
             props = event.get("properties") or {}
             status = props.get("status") if isinstance(props, dict) else None
@@ -777,6 +855,63 @@ class OpenCodeBrain(Brain):
         finally:
             await self._record_files_changed(chat_id, before_snapshot)
 
+    async def astream(
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+        session: "SessionLike | None" = None,
+    ) -> AsyncIterator[str | dict]:
+        """Stream OpenCode JSONL as provider-neutral text/tool/usage events."""
+        log.info(
+            "OpenCodeBrain.astream starting for chat %d%s%s",
+            chat_id,
+            f" (model override: {model})" if model else "",
+            f" (reasoning: {reasoning_level})" if reasoning_level else "",
+        )
+        queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+        before_snapshot = await self._maybe_take_snapshot()
+
+        async def run() -> None:
+            try:
+                reply = await self._respond_inner(
+                    message,
+                    chat_id,
+                    model=model,
+                    reasoning_level=reasoning_level,
+                    session=session,
+                    event_sink=lambda event: queue.put_nowait(
+                        ("event", event)
+                    ),
+                )
+            except Exception as exc:
+                queue.put_nowait(("error", exc))
+            else:
+                queue.put_nowait(("result", reply))
+            finally:
+                await self._record_files_changed(
+                    chat_id, before_snapshot,
+                )
+
+        task = asyncio.create_task(run())
+        try:
+            while True:
+                kind, payload = await queue.get()
+                if kind == "event":
+                    yield payload  # type: ignore[misc]
+                    continue
+                if kind == "error":
+                    raise payload  # type: ignore[misc]
+                reply = str(payload)
+                yield {"type": "final", "text": reply}
+                return
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def _respond_inner(
         self,
         message: str,
@@ -785,6 +920,7 @@ class OpenCodeBrain(Brain):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: "SessionLike | None" = None,
+        event_sink: Callable[[str | dict], None] | None = None,
     ) -> str:
         # Issue #48: ``session`` selects which session this turn runs
         # against. ``None`` (Telegram, the shared web chat) is the bound
@@ -886,6 +1022,7 @@ class OpenCodeBrain(Brain):
                     proc.stdout,
                     status_file,
                     target_session_id=stored_token,
+                    event_sink=event_sink,
                 )
             )
             stderr_task = asyncio.create_task(proc.stderr.read())

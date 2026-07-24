@@ -276,6 +276,157 @@ def test_last_agent_message_is_final_text(
     assert reply == "the answer is 42"
 
 
+def test_astream_emits_provider_neutral_tool_spans_and_final(
+    brain: CodexBrain, monkeypatch
+):
+    """Codex item pairs expose the same tool/tool_end/final contract as
+    the other streaming brains, with the MCP server derived dynamically."""
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            _codex_event("thread.started", thread_id="t1"),
+            _codex_event(
+                "item.started",
+                item={
+                    "id": "item_1",
+                    "type": "mcp_tool_call",
+                    "server": "supplier_a",
+                    "tool": "lookup",
+                    "status": "in_progress",
+                },
+            ),
+            _codex_event(
+                "item.completed",
+                item={
+                    "id": "item_1",
+                    "type": "mcp_tool_call",
+                    "server": "supplier_a",
+                    "tool": "lookup",
+                    "status": "completed",
+                },
+            ),
+            _codex_event(
+                "item.completed",
+                item={
+                    "id": "item_2",
+                    "type": "agent_message",
+                    "text": "the answer",
+                },
+            ),
+            _codex_event("turn.completed"),
+        ],
+    )
+    monkeypatch.setattr(
+        "vexis_agent.core.brain.codex.asyncio.create_subprocess_exec", spawner
+    )
+
+    async def collect() -> list[str | dict]:
+        return [
+            event
+            async for event in brain.astream("q", chat_id=1)
+        ]
+
+    events = asyncio.run(collect())
+    assert [event["type"] for event in events if isinstance(event, dict)] == [
+        "tool", "tool_end", "final",
+    ]
+    start = events[0]
+    end = events[1]
+    assert isinstance(start, dict)
+    assert isinstance(end, dict)
+    assert start["name"] == "mcp__supplier_a__lookup"
+    assert start["id"] == "item_1"
+    assert end["id"] == "item_1"
+    assert end["status"] == "completed"
+    assert end["duration_ms"] >= 0
+    assert events[2] == "the answer"
+    assert events[3] == {"type": "final", "text": "the answer"}
+
+
+def test_astream_closes_unfinished_tool_as_error(
+    brain: CodexBrain, monkeypatch
+):
+    """EOF cannot leave a start unpaired, even after a CLI interruption."""
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            _codex_event("thread.started", thread_id="t1"),
+            _codex_event(
+                "item.started",
+                item={
+                    "id": "item_open",
+                    "type": "command_execution",
+                    "command": "opaque command",
+                },
+            ),
+            _codex_event(
+                "item.completed",
+                item={"type": "agent_message", "text": "partial"},
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "vexis_agent.core.brain.codex.asyncio.create_subprocess_exec", spawner
+    )
+
+    async def collect() -> list[str | dict]:
+        return [event async for event in brain.astream("q", chat_id=1)]
+
+    events = asyncio.run(collect())
+    ends = [
+        event
+        for event in events
+        if isinstance(event, dict) and event.get("type") == "tool_end"
+    ]
+    assert len(ends) == 1
+    assert ends[0]["id"] == "item_open"
+    assert ends[0]["status"] == "error"
+
+
+def test_astream_emits_normalized_usage(
+    brain: CodexBrain, monkeypatch
+):
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            _codex_event("thread.started", thread_id="t1"),
+            _codex_event(
+                "item.completed",
+                item={"type": "agent_message", "text": "answer"},
+            ),
+            _codex_event(
+                "turn.completed",
+                usage={
+                    "input_tokens": 120,
+                    "input_tokens_details": {"cached_tokens": 80},
+                    "output_tokens": 25,
+                    "output_tokens_details": {"reasoning_tokens": 7},
+                    "total_tokens": 145,
+                },
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "vexis_agent.core.brain.codex.asyncio.create_subprocess_exec", spawner
+    )
+
+    async def collect() -> list[str | dict]:
+        return [event async for event in brain.astream("q", chat_id=1)]
+
+    usage = next(
+        event
+        for event in asyncio.run(collect())
+        if isinstance(event, dict) and event.get("type") == "usage"
+    )
+    assert usage == {
+        "type": "usage",
+        "input_tokens": 120,
+        "cache_read_tokens": 80,
+        "cache_write_tokens": 0,
+        "output_tokens": 25,
+        "reasoning_tokens": 7,
+        "total_tokens": 145,
+        "reported_cost_usd_micros": 0,
+    }
+
+
 def test_per_turn_model_and_reasoning_overrides(
     brain: CodexBrain, monkeypatch
 ):

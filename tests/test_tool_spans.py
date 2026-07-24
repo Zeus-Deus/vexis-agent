@@ -150,8 +150,13 @@ def _tool_result(
     )
 
 
-def _result(text: str) -> bytes:
-    return _line({"type": "result", "subtype": "success", "result": text})
+def _result(text: str, **extra) -> bytes:
+    return _line({
+        "type": "result",
+        "subtype": "success",
+        "result": text,
+        **extra,
+    })
 
 
 # ── astream drivers ──────────────────────────────────────────────────
@@ -292,6 +297,46 @@ def test_astream_streamed_deltas_tool_span(
         "tool-span" in r.message and "tool=Read" in r.message
         for r in caplog.records
     )
+
+
+def test_astream_emits_normalized_claude_usage(
+    monkeypatch, tmp_path, patch_killpg, patch_runtime_dir,
+):
+    stdout = b"".join([
+        _sys_init(),
+        _delta("answer"),
+        _assistant_text("answer"),
+        _result(
+            "answer",
+            usage={
+                "input_tokens": 100,
+                "cache_read_input_tokens": 60,
+                "cache_creation_input_tokens": 5,
+                "output_tokens": 20,
+            },
+            total_cost_usd=0.003,
+        ),
+    ])
+    proc = FakeProc(pid=911, mode="ok", stdout=stdout)
+    patch_killpg[911] = proc
+    _patch_spawn(monkeypatch, proc)
+    brain = _build_brain(RunningTasks(), tmp_path)
+
+    usage = next(
+        event
+        for event in _run_astream(brain, chat_id=911)
+        if isinstance(event, dict) and event.get("type") == "usage"
+    )
+    assert usage == {
+        "type": "usage",
+        "input_tokens": 100,
+        "cache_read_tokens": 60,
+        "cache_write_tokens": 5,
+        "output_tokens": 20,
+        "reasoning_tokens": 0,
+        "total_tokens": 185,
+        "reported_cost_usd_micros": 3000,
+    }
 
 
 # ── case 2: batched turn (no deltas) → boundary + end flush ──────────
@@ -534,7 +579,7 @@ def test_astream_failure_does_not_flush_error_text(
     # Issue #56: no ``final`` event on the failure path — the canonical
     # reply is emitted only on the success path, so a poisoned/error
     # transcript can never surface a canonical reply.
-    assert _dicts(collected) == []
+    assert _dicts(collected) == [{"type": "retry", "attempt": 2}]
 
 
 # ── case 5: is_error → tool_end.status == "error" ────────────────────
