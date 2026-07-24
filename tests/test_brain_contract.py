@@ -196,7 +196,7 @@ def test_brain_claude_code_implements_abc(claude_brain: ClaudeCodeBrain):
 def test_astream_default_yields_text_then_final_event(
     null_brain: BrainNull,
 ):
-    """ABC default astream (inherited by null + opencode) yields the
+    """ABC default astream (inherited by null) yields the
     respond reply as a text delta, then the SAME text as the terminal
     ``{"type": "final", ...}`` event — the issue #56 canonical-reply
     contract, satisfied with zero per-brain work. Byte-identical text
@@ -218,23 +218,20 @@ def test_astream_final_event_conformance_across_brains(
     opencode_brain: OpenCodeBrain,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Issue #56 conformance without spawning a subprocess: null and
-    opencode inherit the ABC default ``astream``, while claude-code
-    overrides it (its native ``result``-text final event is covered by
-    ``tests/test_tool_spans.py``). Beyond pinning the inheritance,
-    actually DRIVE opencode's inherited ``astream`` through a stubbed
-    ``respond`` and assert the terminal final event — so a future
-    opencode ``astream`` override can't drop the canonical-reply
-    contract without failing here behaviourally, not just
-    structurally."""
+    """Issue #56 conformance without spawning a subprocess. OpenCode now
+    overrides ``astream`` to expose native tool/usage events, but must retain
+    the same terminal canonical-reply contract."""
     assert type(null_brain).astream is Brain.astream
-    assert type(opencode_brain).astream is Brain.astream
+    assert type(opencode_brain).astream is not Brain.astream
     assert type(claude_brain).astream is not Brain.astream
 
-    async def _stub_respond(message, chat_id, **_kw):
+    async def _stub_respond_inner(message, chat_id, **_kw):
+        _kw["event_sink"]("opencode-reply")
         return "opencode-reply"
 
-    monkeypatch.setattr(opencode_brain, "respond", _stub_respond)
+    monkeypatch.setattr(
+        opencode_brain, "_respond_inner", _stub_respond_inner
+    )
 
     async def run() -> list:
         return [evt async for evt in opencode_brain.astream("hi", chat_id=1)]

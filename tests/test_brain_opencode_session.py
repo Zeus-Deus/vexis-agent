@@ -217,6 +217,69 @@ def test_first_call_omits_session_flag_and_harvests_id(
     assert brain.session_token() == harvested_id
 
 
+def test_astream_emits_text_tool_usage_and_final(
+    brain: OpenCodeBrain, monkeypatch
+):
+    sid = "ses_STREAM"
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            _evt(
+                "tool_use",
+                sid,
+                part={
+                    "id": "tool-1",
+                    "tool": "browser_navigate",
+                    "state": {
+                        "status": "completed",
+                        "input": {"url": "https://example.com"},
+                        "time": {"start": 1000, "end": 1350},
+                    },
+                },
+            ),
+            _evt(
+                "step_finish",
+                sid,
+                part={
+                    "cost": 0.0025,
+                    "tokens": {
+                        "total": 160,
+                        "input": 120,
+                        "output": 30,
+                        "reasoning": 10,
+                        "cache": {"read": 40, "write": 2},
+                    },
+                },
+            ),
+            _evt("text", sid, part={"text": "answer"}),
+            _idle_event(sid),
+        ],
+    )
+    monkeypatch.setattr(
+        "vexis_agent.core.brain.opencode.asyncio.create_subprocess_exec", spawner
+    )
+
+    async def collect() -> list[str | dict]:
+        return [event async for event in brain.astream("q", chat_id=1)]
+
+    events = asyncio.run(collect())
+    assert events[0]["type"] == "tool"
+    assert events[1] == {
+        "type": "tool_end",
+        "name": "browser_navigate",
+        "target": None,
+        "id": "tool-1",
+        "ts": 1350,
+        "duration_ms": 350,
+        "status": "completed",
+    }
+    assert events[2]["type"] == "usage"
+    assert events[2]["reported_cost_usd_micros"] == 2500
+    assert events[3:] == [
+        "answer",
+        {"type": "final", "text": "answer"},
+    ]
+
+
 def test_foreground_run_pins_dir_to_workspace(
     brain: OpenCodeBrain, workspace: Path, monkeypatch
 ):

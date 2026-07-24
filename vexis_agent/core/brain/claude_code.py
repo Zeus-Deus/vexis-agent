@@ -58,6 +58,7 @@ from vexis_agent.core.brain.base import (
     SessionLost,
     mcp_spec_to_claude_code_entry,
 )
+from vexis_agent.core.brain.usage import build_usage_event
 from vexis_agent.core.memory import MemoryStore
 from vexis_agent.core.paths import memories_dir, skills_dir
 from vexis_agent.core.running_tasks import RunningTasks
@@ -1157,6 +1158,10 @@ class ClaudeCodeBrain(Brain):
                         attempt, _TRANSIENT_MAX_ATTEMPTS, chat_id,
                         exc, _TRANSIENT_RETRY_DELAY_SECONDS,
                     )
+                    yield {
+                        "type": "retry",
+                        "attempt": attempt + 1,
+                    }
                     await asyncio.sleep(_TRANSIENT_RETRY_DELAY_SECONDS)
 
             if not sess.is_initialized():
@@ -1487,6 +1492,22 @@ class ClaudeCodeBrain(Brain):
                     rt = event.get("result")
                     if isinstance(rt, str):
                         result_text = rt
+                    usage = event.get("usage")
+                    if isinstance(usage, dict):
+                        usage_event = build_usage_event(
+                            input_tokens=usage.get("input_tokens"),
+                            cache_read_tokens=usage.get(
+                                "cache_read_input_tokens",
+                            ),
+                            cache_write_tokens=usage.get(
+                                "cache_creation_input_tokens",
+                            ),
+                            output_tokens=usage.get("output_tokens"),
+                            reported_cost_usd=event.get("total_cost_usd"),
+                            cache_tokens_are_additive=True,
+                        )
+                        if usage_event is not None:
+                            yield usage_event
                     # Issue #61: from here on, a stalled stdout read while
                     # the process is still alive is a lingering-subagent
                     # signal, not a hang. Flip AFTER capturing the text so

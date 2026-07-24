@@ -88,12 +88,26 @@ class _FakeBrainRespond:
 
 
 @pytest.fixture(params=["claude_code", "opencode"])
-def brain(request: pytest.FixtureRequest, tmp_path: Path) -> Any:
+def brain(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
     """A real brain (claude-code or opencode) constructed against tmp
     paths. ``seed_transcript`` lays down transcripts the brain's
     ``iter_messages`` reads back — JSONL for claude-code, opencode.db
     rows for opencode (the autouse ``_isolate_opencode_db`` fixture
     already points the reader at a tmp path)."""
+    # Claude transcript paths are derived from the workspace but rooted in
+    # ~/.claude/projects. Pytest eventually reuses numbered tmp-path names, so
+    # a transcript from an old run can otherwise reappear and make a fresh
+    # session look non-empty. Keep this suite's transcript root private too,
+    # matching the global OpenCode/Codex isolation fixtures.
+    monkeypatch.setattr(
+        "vexis_agent.core.transcripts._claude_projects_root",
+        lambda: tmp_path / "claude-projects",
+    )
+
     workspace = tmp_path / f"ws-{request.param}"
     workspace.mkdir(parents=True, exist_ok=True)
     session = SessionStore(tmp_path / "sessions.json")

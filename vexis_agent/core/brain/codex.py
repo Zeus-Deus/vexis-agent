@@ -57,7 +57,8 @@ import re
 import shutil
 import signal
 import subprocess
-from collections.abc import Iterator
+import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,6 +84,7 @@ from vexis_agent.core.running_tasks import RunningTasks
 from vexis_agent.core.sessions import SessionStore
 from vexis_agent.core.status import StatusFile
 from vexis_agent.core.transcripts import SessionMeta, TranscriptMessage
+from vexis_agent.core.brain.usage import build_usage_event
 from vexis_agent.core.workspace_snapshot import (
     diff as _snapshot_diff,
     snapshot as _take_snapshot,
@@ -234,7 +236,36 @@ class _StreamResult:
     saw_any_event: bool
 
 
-def _record_item_tool(item: dict, status_file: StatusFile) -> None:
+def _item_tool_identity(item: dict) -> tuple[str, str | None] | None:
+    """Map one codex tool item onto Vexis's provider-neutral name/target.
+
+    The MCP server is retained in the name when codex supplies it, so
+    downstream metrics can group newly installed add-ons dynamically. No
+    catalog, vehicle, brand, or model names are enumerated here.
+    """
+    itype = item.get("type")
+    if itype == "command_execution":
+        command = item.get("command")
+        return "shell", command if isinstance(command, str) else None
+    if itype == "mcp_tool_call":
+        server = item.get("server")
+        tool = item.get("tool")
+        if isinstance(server, str) and server:
+            suffix = str(tool) if tool else "tool"
+            return f"mcp__{server}__{suffix}", None
+        return str(tool or "mcp"), None
+    if itype == "file_change":
+        path = item.get("path")
+        return "edit", path if isinstance(path, str) else None
+    if itype == "web_search":
+        query = item.get("query")
+        return "websearch", query if isinstance(query, str) else None
+    return None
+
+
+def _record_item_tool(
+    item: dict, status_file: StatusFile,
+) -> tuple[str, str | None] | None:
     """Update the per-chat status file from one stream ``item``.
 
     Maps codex item types onto the ``(name, target)`` shape ``/status``
@@ -242,31 +273,25 @@ def _record_item_tool(item: dict, status_file: StatusFile) -> None:
     ``mcp_tool_call`` → the tool name, ``file_change`` → ``edit`` +
     path, ``web_search`` → ``websearch``. Unknown item types are
     ignored."""
-    itype = item.get("type")
-    if itype == "command_execution":
-        command = item.get("command")
-        status_file.record_tool(
-            "shell", command if isinstance(command, str) else None,
-        )
-    elif itype == "mcp_tool_call":
-        name = item.get("tool") or item.get("server") or "mcp"
-        status_file.record_tool(str(name), None)
-    elif itype == "file_change":
-        path = item.get("path")
-        status_file.record_tool(
-            "edit", path if isinstance(path, str) else None,
-        )
-    elif itype == "web_search":
-        query = item.get("query")
-        status_file.record_tool(
-            "websearch", query if isinstance(query, str) else None,
-        )
+    identity = _item_tool_identity(item)
+    if identity is not None:
+        status_file.record_tool(*identity)
+    return identity
+
+
+@dataclass(frozen=True)
+class _PendingCodexTool:
+    name: str
+    target: str | None
+    started_at: float
+    started_ts: int
 
 
 async def _read_codex_event_stream(
     stream: asyncio.StreamReader | None,
     status_file: StatusFile,
     target_thread_id: str | None,
+    event_sink: Callable[[str | dict], None] | None = None,
 ) -> _StreamResult:
     """Consume ``codex exec --json`` stdout: harvest the thread id,
     track tool items in the status file, keep the last
@@ -285,6 +310,47 @@ async def _read_codex_event_stream(
     harvested = target_thread_id
     error_parts: list[str] = []
     saw_any = False
+    pending_tools: dict[str, _PendingCodexTool] = {}
+    anonymous_tool_seq = 0
+
+    def emit(value: str | dict) -> None:
+        if event_sink is not None:
+            event_sink(value)
+
+    def finish_tool(
+        tool_id: str,
+        *,
+        item: dict | None = None,
+        force_error: bool = False,
+    ) -> None:
+        pending = pending_tools.pop(tool_id, None)
+        if pending is None:
+            return
+        duration_ms = max(
+            0, int((time.monotonic() - pending.started_at) * 1000),
+        )
+        item_status = str((item or {}).get("status") or "").lower()
+        status = (
+            "error"
+            if force_error or item_status in {"error", "failed", "cancelled"}
+            else "completed"
+        )
+        ts = int(time.time() * 1000)
+        log.info(
+            "tool-span chat=%s tool=%s duration_ms=%d status=%s "
+            "target=%s",
+            status_file.chat_id, pending.name, duration_ms, status,
+            pending.target,
+        )
+        emit({
+            "type": "tool_end",
+            "name": pending.name,
+            "target": pending.target,
+            "id": tool_id,
+            "ts": ts,
+            "duration_ms": duration_ms,
+            "status": status,
+        })
 
     if stream is None:
         return _StreamResult(
@@ -336,12 +402,75 @@ async def _read_codex_event_stream(
                     # Last agent_message wins — narration between tools
                     # precedes the final answer.
                     final_text = text
+                    emit(text)
             elif itype == "error":
                 msg = item.get("message")
                 if isinstance(msg, str) and msg:
                     error_parts.append(msg)
             else:
-                _record_item_tool(item, status_file)
+                identity = _item_tool_identity(item)
+                if identity is None:
+                    continue
+                raw_id = item.get("id")
+                if isinstance(raw_id, str) and raw_id:
+                    tool_id = raw_id
+                elif kind == "item.completed":
+                    # Older/future codex shapes may omit ids. Pair by the
+                    # provider-neutral identity before synthesizing a new call.
+                    tool_id = next(
+                        (
+                            pending_id
+                            for pending_id, pending in pending_tools.items()
+                            if (pending.name, pending.target) == identity
+                        ),
+                        "",
+                    )
+                    if not tool_id:
+                        anonymous_tool_seq += 1
+                        tool_id = f"codex-tool-{anonymous_tool_seq}"
+                else:
+                    anonymous_tool_seq += 1
+                    tool_id = f"codex-tool-{anonymous_tool_seq}"
+                if kind == "item.started":
+                    _record_item_tool(item, status_file)
+                    # A duplicate start closes the stale span first so the
+                    # paired coverage metric can never drift above 100%.
+                    finish_tool(tool_id, force_error=True)
+                    now_ts = int(time.time() * 1000)
+                    pending_tools[tool_id] = _PendingCodexTool(
+                        name=identity[0],
+                        target=identity[1],
+                        started_at=time.monotonic(),
+                        started_ts=now_ts,
+                    )
+                    emit({
+                        "type": "tool",
+                        "name": identity[0],
+                        "target": identity[1],
+                        "id": tool_id,
+                        "ts": now_ts,
+                    })
+                else:
+                    # Codex normally sends a matching item.started. If a future
+                    # CLI only sends completed, still surface a paired zero-ms
+                    # span instead of silently losing the call.
+                    if tool_id not in pending_tools:
+                        _record_item_tool(item, status_file)
+                        now_ts = int(time.time() * 1000)
+                        pending_tools[tool_id] = _PendingCodexTool(
+                            name=identity[0],
+                            target=identity[1],
+                            started_at=time.monotonic(),
+                            started_ts=now_ts,
+                        )
+                        emit({
+                            "type": "tool",
+                            "name": identity[0],
+                            "target": identity[1],
+                            "id": tool_id,
+                            "ts": now_ts,
+                        })
+                    finish_tool(tool_id, item=item)
         elif kind == "error":
             msg = event.get("message")
             if isinstance(msg, str) and msg:
@@ -353,6 +482,32 @@ async def _read_codex_event_stream(
                 msg = err.get("message")
                 if isinstance(msg, str) and msg:
                     error_parts.append(msg)
+        elif kind == "turn.completed":
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                input_details = usage.get("input_tokens_details")
+                output_details = usage.get("output_tokens_details")
+                usage_event = build_usage_event(
+                    input_tokens=usage.get("input_tokens"),
+                    cache_read_tokens=(
+                        input_details.get("cached_tokens")
+                        if isinstance(input_details, dict)
+                        else usage.get("cached_input_tokens")
+                    ),
+                    output_tokens=usage.get("output_tokens"),
+                    reasoning_tokens=(
+                        output_details.get("reasoning_tokens")
+                        if isinstance(output_details, dict)
+                        else usage.get("reasoning_tokens")
+                    ),
+                    total_tokens=usage.get("total_tokens"),
+                )
+                if usage_event is not None:
+                    emit(usage_event)
+
+    # EOF with an open item means the CLI/process ended before its result.
+    for tool_id in list(pending_tools):
+        finish_tool(tool_id, force_error=True)
 
     return _StreamResult(
         final_text=final_text,
@@ -570,6 +725,69 @@ class CodexBrain(Brain):
         finally:
             await self._record_files_changed(chat_id, before_snapshot)
 
+    async def astream(
+        self,
+        message: str,
+        chat_id: int,
+        *,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+        session: "SessionLike | None" = None,
+    ) -> AsyncIterator[str | dict]:
+        """Stream codex JSONL as provider-neutral text/tool events.
+
+        `item.started` / `item.completed` pairs become the same `tool` /
+        `tool_end` wire contract Claude Code already emits. The last agent
+        message is repeated once as the terminal `final` control event so
+        consumers persist the canonical answer rather than narration.
+        """
+        log.info(
+            "CodexBrain.astream starting for chat %d%s%s",
+            chat_id,
+            f" (model override: {model})" if model else "",
+            f" (reasoning: {reasoning_level})" if reasoning_level else "",
+        )
+        queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+        before_snapshot = await self._maybe_take_snapshot()
+
+        async def run() -> None:
+            try:
+                reply = await self._respond_inner(
+                    message,
+                    chat_id,
+                    model=model,
+                    reasoning_level=reasoning_level,
+                    session=session,
+                    event_sink=lambda event: queue.put_nowait(
+                        ("event", event)
+                    ),
+                )
+            except Exception as exc:
+                queue.put_nowait(("error", exc))
+            else:
+                queue.put_nowait(("result", reply))
+            finally:
+                await self._record_files_changed(
+                    chat_id, before_snapshot,
+                )
+
+        task = asyncio.create_task(run())
+        try:
+            while True:
+                kind, payload = await queue.get()
+                if kind == "event":
+                    yield payload  # type: ignore[misc]
+                    continue
+                if kind == "error":
+                    raise payload  # type: ignore[misc]
+                reply = str(payload)
+                yield {"type": "final", "text": reply}
+                return
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def _respond_inner(
         self,
         message: str,
@@ -578,6 +796,7 @@ class CodexBrain(Brain):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: "SessionLike | None" = None,
+        event_sink: Callable[[str | dict], None] | None = None,
     ) -> str:
         # Issue #48: ``session`` selects which session this turn runs
         # against. ``None`` (Telegram, shared web chat) is the bound
@@ -656,6 +875,7 @@ class CodexBrain(Brain):
             stdout_task = asyncio.create_task(
                 _read_codex_event_stream(
                     proc.stdout, status_file, target_thread_id=stored_token,
+                    event_sink=event_sink,
                 )
             )
             stderr_task = asyncio.create_task(proc.stderr.read())
