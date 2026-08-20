@@ -279,7 +279,7 @@ Or with conda (the maintainer's workflow):
 conda create -n vexis-agent_env python=3.11
 conda activate vexis-agent_env
 pip install -e '.[dev]'
-./scripts/dev-setup.sh   # AGENTS.md repo symlink + git pre-commit hook
+./scripts/dev-setup.sh   # workspace setup + git pre-commit hook
 ```
 
 Run the test suite:
@@ -289,10 +289,11 @@ pytest
 ```
 
 `scripts/dev-setup.sh` is the dev-side counterpart to `vexis-agent
-setup` — it wires the repo's `AGENTS.md → CLAUDE.md` symlink (so
-opencode finds the same instruction file claude-code reads from
-`CLAUDE.md`) and installs the dashboard-rebuild git pre-commit hook.
-Idempotent.
+setup` — it installs the dashboard-rebuild git pre-commit hook and
+(for legacy checkouts only) wires the repo's `AGENTS.md → CLAUDE.md`
+symlink. The repo's tracked `AGENTS.md` is the canonical instruction
+file; `CLAUDE.md` is a one-line `@AGENTS.md` import shim for Claude
+Code. Idempotent.
 
 ## Project structure
 

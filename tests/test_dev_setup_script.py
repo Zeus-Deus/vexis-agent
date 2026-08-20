@@ -66,10 +66,38 @@ def _isolated_yaml_config(monkeypatch, tmp_path):
 
 @pytest.fixture
 def fake_repo(tmp_path: Path) -> Path:
-    """A tmp directory that mimics the vexis-agent repo layout —
-    just enough to drive the install script: ``CLAUDE.md`` +
-    ``.mcp.json``."""
+    """A tmp directory that mimics the current vexis-agent repo
+    layout — a real (tracked, non-symlink) ``AGENTS.md`` holding
+    the canonical instructions, a one-line ``CLAUDE.md`` shim
+    (``@AGENTS.md``) for Claude Code, plus ``.mcp.json``."""
     repo = tmp_path / "fake-repo"
+    repo.mkdir()
+    (repo / "AGENTS.md").write_text(
+        "# Vexis-Agent\n\nfake repo canonical instructions\n",
+        encoding="utf-8",
+    )
+    (repo / "CLAUDE.md").write_text("@AGENTS.md\n", encoding="utf-8")
+    (repo / ".mcp.json").write_text(
+        json.dumps({
+            "mcpServers": {
+                "codemux": {
+                    "command": "/usr/bin/codemux",
+                    "args": ["mcp"],
+                    "env": {"CODEMUX_WORKSPACE_ID": "test"},
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    return repo
+
+
+@pytest.fixture
+def fake_repo_legacy_claude_only(tmp_path: Path) -> Path:
+    """A repo checkout that predates the AGENTS.md canonicalization:
+    only ``CLAUDE.md`` exists, no ``AGENTS.md`` at all. Install must
+    still symlink ``AGENTS.md → CLAUDE.md`` for opencode."""
+    repo = tmp_path / "fake-repo-legacy"
     repo.mkdir()
     (repo / "CLAUDE.md").write_text(
         "# Vexis-Agent\n\nfake repo claude file\n", encoding="utf-8",
@@ -245,9 +273,9 @@ def test_build_plan_workspace_symlink_targets_workspace_claude(
 def test_build_plan_no_repo_claude_skips_repo_symlink(
     tmp_path: Path, fake_workspace: Path
 ):
-    """Repo without CLAUDE.md (degenerate) skips the repo symlink
-    plan rather than crashing. Workspace symlink still plans
-    (apply() will copy from the repo or leave the workspace
+    """Repo without CLAUDE.md or AGENTS.md (degenerate) skips the
+    repo symlink plan rather than crashing. Workspace symlink still
+    plans (apply() will copy from the repo or leave the workspace
     untouched)."""
     repo = tmp_path / "no-claude-repo"
     repo.mkdir()
@@ -258,6 +286,75 @@ def test_build_plan_no_repo_claude_skips_repo_symlink(
     )
     assert plan.repo_symlink is None
     assert plan.workspace_symlink is not None
+
+
+def test_build_plan_real_repo_agents_skips_repo_symlink(
+    fake_repo: Path, fake_workspace: Path
+):
+    """A real (tracked) repo AGENTS.md is canonical and sacred — the
+    install plan must NOT propose any repo-level symlink action for
+    it. ``fake_repo`` ships a real AGENTS.md + a CLAUDE.md shim."""
+    plan = build_plan(
+        repo=fake_repo,
+        workspace=fake_workspace,
+        brain_kind="claude-code",
+    )
+    assert plan.repo_symlink is None
+
+
+def test_build_plan_degenerate_repo_is_fatal(
+    tmp_path: Path, fake_workspace: Path
+):
+    """A repo with neither a real ``AGENTS.md`` nor a legacy
+    ``CLAUDE.md`` has no canonical instruction source at all. This
+    must surface as a fatal planning error, not a silent skip —
+    otherwise ``apply()`` would happily create a workspace with no
+    AGENTS.md/CLAUDE.md content."""
+    repo = tmp_path / "degenerate-repo"
+    repo.mkdir()
+    plan = build_plan(
+        repo=repo,
+        workspace=fake_workspace,
+        brain_kind="claude-code",
+    )
+    errs = plan.fatal_errors()
+    assert errs
+    assert any("AGENTS.md" in e and "CLAUDE.md" in e for e in errs)
+
+
+def test_apply_degenerate_repo_raises_before_mutating_workspace(
+    tmp_path: Path, fake_workspace: Path, monkeypatch
+):
+    """``apply()`` on a degenerate repo (no AGENTS.md, no CLAUDE.md)
+    must raise ``SystemExit`` before creating the workspace directory
+    or any dangling workspace AGENTS.md symlink."""
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    repo = tmp_path / "degenerate-repo"
+    repo.mkdir()
+    plan = build_plan(
+        repo=repo,
+        workspace=fake_workspace,
+        brain_kind="claude-code",
+    )
+    with pytest.raises(SystemExit):
+        plan.apply()
+    assert not fake_workspace.exists()
+    assert not (fake_workspace / "AGENTS.md").exists()
+
+
+def test_build_plan_legacy_claude_only_repo_plans_repo_symlink(
+    fake_repo_legacy_claude_only: Path, fake_workspace: Path
+):
+    """Legacy repo layout (CLAUDE.md only, no AGENTS.md) still plans
+    the repo-level ``AGENTS.md → CLAUDE.md`` symlink for opencode."""
+    plan = build_plan(
+        repo=fake_repo_legacy_claude_only,
+        workspace=fake_workspace,
+        brain_kind="claude-code",
+    )
+    assert plan.repo_symlink is not None
+    assert plan.repo_symlink.link == fake_repo_legacy_claude_only / "AGENTS.md"
+    assert plan.repo_symlink.target == fake_repo_legacy_claude_only / "CLAUDE.md"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -301,22 +398,32 @@ def test_no_fatal_errors_when_binary_present(
 def test_apply_writes_claude_code_mcp_config(
     fake_repo: Path, fake_workspace: Path, monkeypatch
 ):
-    """Real apply() against tmp workspace: symlinks created, MCP
-    config written in claude-code's ``.mcp.json`` shape."""
+    """Real apply() against tmp workspace: MCP config written in
+    claude-code's ``.mcp.json`` shape; the real repo AGENTS.md is
+    left untouched (not replaced/symlinked); workspace CLAUDE.md
+    gets the full canonical AGENTS.md content (not the ``@AGENTS.md``
+    shim); workspace AGENTS.md symlinks to workspace CLAUDE.md."""
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    repo_agents_content = (fake_repo / "AGENTS.md").read_text(encoding="utf-8")
     plan = build_plan(
         repo=fake_repo,
         workspace=fake_workspace,
         brain_kind="claude-code",
     )
     written = plan.apply()
-    # Repo symlink in place.
-    assert (fake_repo / "AGENTS.md").is_symlink()
-    assert (fake_repo / "AGENTS.md").resolve() == (fake_repo / "CLAUDE.md").resolve()
-    # Workspace exists, has CLAUDE.md (copied), AGENTS.md symlink.
+    # Real repo AGENTS.md is sacred: untouched, still a real file.
+    assert (fake_repo / "AGENTS.md").is_file()
+    assert not (fake_repo / "AGENTS.md").is_symlink()
+    assert (fake_repo / "AGENTS.md").read_text(encoding="utf-8") == repo_agents_content
+    # Workspace exists, CLAUDE.md holds the full canonical AGENTS.md
+    # content — NOT the "@AGENTS.md" shim.
     assert fake_workspace.is_dir()
-    assert (fake_workspace / "CLAUDE.md").is_file()
+    ws_claude_content = (fake_workspace / "CLAUDE.md").read_text(encoding="utf-8")
+    assert ws_claude_content == repo_agents_content
+    assert ws_claude_content.strip() != "@AGENTS.md"
+    # Workspace AGENTS.md symlinks to workspace CLAUDE.md.
     assert (fake_workspace / "AGENTS.md").is_symlink()
+    assert (fake_workspace / "AGENTS.md").resolve() == (fake_workspace / "CLAUDE.md").resolve()
     # MCP config written in claude-code shape.
     assert written == fake_workspace / ".mcp.json"
     assert written.is_file()
@@ -333,6 +440,34 @@ def test_apply_writes_claude_code_mcp_config(
     plan2.apply()
     contents2 = (fake_workspace / ".mcp.json").read_bytes()
     assert contents1 == contents2
+
+
+def test_apply_legacy_claude_only_repo_symlinks_and_copies_full_content(
+    fake_repo_legacy_claude_only: Path, fake_workspace: Path, monkeypatch
+):
+    """Legacy repo (CLAUDE.md only, no AGENTS.md): behaviour is
+    unchanged from before the canonicalization — repo gets an
+    ``AGENTS.md → CLAUDE.md`` symlink, and the workspace still gets
+    the full CLAUDE.md content copied in."""
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    repo_claude_content = (
+        fake_repo_legacy_claude_only / "CLAUDE.md"
+    ).read_text(encoding="utf-8")
+    plan = build_plan(
+        repo=fake_repo_legacy_claude_only,
+        workspace=fake_workspace,
+        brain_kind="claude-code",
+    )
+    plan.apply()
+    assert (fake_repo_legacy_claude_only / "AGENTS.md").is_symlink()
+    assert (
+        (fake_repo_legacy_claude_only / "AGENTS.md").resolve()
+        == (fake_repo_legacy_claude_only / "CLAUDE.md").resolve()
+    )
+    ws_claude_content = (fake_workspace / "CLAUDE.md").read_text(encoding="utf-8")
+    assert ws_claude_content == repo_claude_content
+    assert (fake_workspace / "AGENTS.md").is_symlink()
+    assert (fake_workspace / "AGENTS.md").resolve() == (fake_workspace / "CLAUDE.md").resolve()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -416,8 +551,10 @@ def test_main_dry_run_returns_zero_when_plan_clean(
         "--quiet",
     ])
     assert rc == 0
-    # Filesystem untouched: no symlinks, no MCP config.
-    assert not (fake_repo / "AGENTS.md").exists()
+    # Filesystem untouched: repo AGENTS.md is unchanged (still the
+    # fixture-seeded real file, not a symlink), and the workspace
+    # never got created.
+    assert not (fake_repo / "AGENTS.md").is_symlink()
     assert not (fake_workspace / "AGENTS.md").exists()
     assert not (fake_workspace / ".mcp.json").exists()
 

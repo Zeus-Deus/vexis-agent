@@ -23,7 +23,7 @@ to expect.
 ## What's not in scope
 
 - Multi-user / multi-tenant features. `vexis-agent` is single-user
-  by design (CLAUDE.md invariant).
+  by design (AGENTS.md invariant).
 - Removing the Telegram dependency. The transport adapter is
   pluggable (`vexis_agent/transports/`), but Telegram is the
   reference; new transports land alongside, not in place of.
@@ -75,7 +75,7 @@ $EDITOR ~/vexis-workspace/skills/my-skill/SKILL.md
 
 Other commands: `vexis-skill list / view / edit / patch / archive
 / restore / write-file / remove-file`. The curator can also promote
-skills from your past sessions automatically — see CLAUDE.md's
+skills from your past sessions automatically — see AGENTS.md's
 "Learning curator" section.
 
 ## Extending at the source level
@@ -96,7 +96,7 @@ cd vexis-agent
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
-./scripts/dev-setup.sh   # AGENTS.md repo symlink + dashboard pre-commit hook
+./scripts/dev-setup.sh   # workspace setup + dashboard pre-commit hook
 pytest                   # ~2000 tests, ~40s
 ```
 
@@ -121,8 +121,8 @@ pytest
       trailers (`Co-Authored-By:`, etc.). No first-person
       ("I added", "Claude added"). No session-context references
       ("audited during ...").
-- [ ] If the change touches `CLAUDE.md`, the file stays under the
-      220-line tripwire (`tests/test_claude_md_invariants.py`).
+- [ ] If the change touches `AGENTS.md`, the file stays under the
+      347-line tripwire (`tests/test_agents_md_invariants.py`).
 
 ## Branching
 

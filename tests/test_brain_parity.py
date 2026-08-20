@@ -25,7 +25,7 @@ Allowlist:
 If you're adding a new brain or a new subsystem and this test fails:
 route the transcript read through ``brain.iter_messages(session_uuid)``
 instead. See ``core/learning_curator.py`` for the brain-agnostic
-pattern and ``CLAUDE.md`` → Invariants.
+pattern and ``AGENTS.md`` → Invariants.
 """
 
 from __future__ import annotations

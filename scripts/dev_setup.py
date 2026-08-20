@@ -5,13 +5,15 @@ One-shot setup of the workspace + per-brain config files. Idempotent
 
 What it does:
 
-1. **Repo AGENTS.md symlink.** Creates ``<repo>/AGENTS.md`` as a
-   symlink to ``CLAUDE.md`` so opencode (and any future
-   AGENTS.md-reading brain) finds the same content claude-code
-   reads from ``CLAUDE.md``. Refuses to overwrite a real
-   (non-symlink) ``AGENTS.md`` — if you maintain one by hand,
-   delete it first or rename it. AGENTS.md is gitignored so the
-   symlink is per-clone.
+1. **Repo AGENTS.md is canonical.** The tracked repo ``AGENTS.md``
+   is the source of truth for Codex/OpenCode/every AGENTS.md-reading
+   brain; the tracked repo ``CLAUDE.md`` is a one-line Claude Code
+   import shim (``@AGENTS.md``). The install script never symlinks
+   or replaces a real repo ``AGENTS.md`` — it's sacred. The only
+   symlink action it still plans at the repo level is a legacy
+   fallback: a checkout that predates this canonicalization (has
+   ``CLAUDE.md`` but no ``AGENTS.md`` at all) gets ``AGENTS.md``
+   symlinked to ``CLAUDE.md`` so opencode still finds something.
 
 2. **Brain on PATH.** Reads ``brain.kind`` from
    ``~/.vexis/config.yaml`` (default ``claude-code``) and
@@ -51,10 +53,13 @@ Exit codes:
   0  success (or dry-run completed without surfacing a fatal
      planning failure).
   1  configuration / planning failure (brain not on PATH; the
-     repo's CLAUDE.md is missing; etc.).
+     canonical repo instructions missing (AGENTS.md, or legacy
+     CLAUDE.md); etc.).
 
 Design citation: ``.plans/brain-abstraction-research.md`` §5 Day 6
-"AGENTS.md ↔ CLAUDE.md install hook".
+"AGENTS.md ↔ CLAUDE.md install hook"; canonicalized to AGENTS.md
+as the repo-manual source of truth per the repository-instruction
+canonicalization on ``feat/native-image-attachments``.
 """
 
 from __future__ import annotations
@@ -124,6 +129,24 @@ def read_canonical_mcp_servers(repo: Path) -> list[McpServerSpec]:
             )
         )
     return out
+
+
+def repo_canonical_instructions_source(repo: Path) -> Path | None:
+    """The repo file whose content is the canonical repository
+    manual, to be copied into a fresh workspace's ``CLAUDE.md``.
+
+    Prefers a real (tracked, non-symlink) ``AGENTS.md`` — the
+    canonicalized source of truth. Falls back to ``CLAUDE.md`` for
+    legacy checkouts (pre-canonicalization, or ones where
+    ``AGENTS.md`` is itself a symlink). Returns ``None`` if neither
+    exists (degenerate repo)."""
+    agents = repo / "AGENTS.md"
+    if agents.is_file() and not agents.is_symlink():
+        return agents
+    claude = repo / "CLAUDE.md"
+    if claude.is_file():
+        return claude
+    return None
 
 
 def resolve_brain_kind() -> str:
@@ -248,6 +271,7 @@ class InstallPlan:
         workspace_symlink: SymlinkAction | None,
         servers: list[McpServerSpec],
         brain_factory,  # callable -> Brain
+        instructions_source: Path | None,
     ) -> None:
         self.brain_kind = brain_kind
         self.binary_present = binary_present
@@ -258,6 +282,7 @@ class InstallPlan:
         self.workspace_symlink = workspace_symlink
         self.servers = servers
         self._brain_factory = brain_factory
+        self.instructions_source = instructions_source
 
     def fatal_errors(self) -> list[str]:
         """Conditions that mean ``apply()`` shouldn't proceed."""
@@ -267,6 +292,12 @@ class InstallPlan:
             errors.append(
                 f"brain binary {binary!r} not on PATH for "
                 f"brain.kind={self.brain_kind!r}. {self.binary_hint}"
+            )
+        if self.instructions_source is None:
+            errors.append(
+                f"no canonical repository instructions found in "
+                f"{self.repo}: expected a real AGENTS.md or, for "
+                f"legacy checkouts, a CLAUDE.md."
             )
         return errors
 
@@ -303,12 +334,15 @@ class InstallPlan:
         # Ensure the workspace exists before symlinking into it.
         self.workspace.mkdir(parents=True, exist_ok=True)
         # If the workspace doesn't have CLAUDE.md yet, copy the
-        # repo's so opencode/claude-code have something to read.
+        # repo's canonical instructions in so opencode/claude-code
+        # have something to read. Prefers the real repo AGENTS.md;
+        # falls back to CLAUDE.md for legacy layouts — see
+        # repo_canonical_instructions_source().
         ws_claude = self.workspace / "CLAUDE.md"
         if not ws_claude.exists():
-            repo_claude = self.repo / "CLAUDE.md"
-            if repo_claude.is_file():
-                shutil.copy2(repo_claude, ws_claude)
+            source = repo_canonical_instructions_source(self.repo)
+            if source is not None:
+                shutil.copy2(source, ws_claude)
         if self.workspace_symlink:
             # Re-classify in case the workspace was just created.
             ws_action = SymlinkAction(
@@ -424,10 +458,17 @@ def build_plan(
     binary_present = binary is None or shutil.which(binary) is not None
     binary_hint = brain_install_hint(brain_kind)
 
+    # A real (tracked, non-symlink) repo AGENTS.md is canonical and
+    # sacred — never plan a symlink action over it. The repo-level
+    # symlink is only a legacy fallback for checkouts that predate
+    # the AGENTS.md canonicalization (CLAUDE.md exists, AGENTS.md
+    # doesn't — or isn't real).
+    repo_agents = repo / "AGENTS.md"
     repo_claude = repo / "CLAUDE.md"
     repo_symlink = None
-    if repo_claude.is_file():
-        repo_symlink = SymlinkAction(repo / "AGENTS.md", repo_claude)
+    repo_agents_is_canonical = repo_agents.is_file() and not repo_agents.is_symlink()
+    if not repo_agents_is_canonical and repo_claude.is_file():
+        repo_symlink = SymlinkAction(repo_agents, repo_claude)
 
     workspace_claude = workspace / "CLAUDE.md"
     # The workspace symlink target is the workspace's own CLAUDE.md
@@ -476,6 +517,7 @@ def build_plan(
         workspace_symlink=workspace_symlink,
         servers=servers,
         brain_factory=_make_brain,
+        instructions_source=repo_canonical_instructions_source(repo),
     )
 
 

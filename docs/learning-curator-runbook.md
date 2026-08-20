@@ -3,7 +3,7 @@
 Operational reference for the v2 learning curator: recursion
 guard, shadow-mode flip, two-tier review, coherence curator
 (v3a), migration from v1, audit surfaces, eval gate. Standing
-design facts live in `CLAUDE.md` and
+design facts live in `AGENTS.md` and
 `.plans/learning-curator-v2-research.md`; this file holds the
 runtime / one-time recipes.
 

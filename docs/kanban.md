@@ -9,7 +9,7 @@ the brain. Workers report outcomes back through `vexis-kanban`
 
 This is the operational reference. For the design rationale (why
 lanes instead of profiles, why goal/kanban stay separate, etc) see
-`.plans/kanban-research.md`. For the in-tree TL;DR see CLAUDE.md
+`.plans/kanban-research.md`. For the in-tree TL;DR see AGENTS.md
 `## Kanban`.
 
 ## Concepts
@@ -195,7 +195,7 @@ planner's step list is visible), that's a future feature: a
 - **Curator recursion.** If you rename `KANBAN_WORKER_PREFIX`,
   update both `core/transcripts.py:_is_curator_owned` and
   `core/brain/opencode.py:is_brain_owned_session` in the same
-  edit. The CLAUDE.md `## Invariants` section pins this.
+  edit. The AGENTS.md `## Invariants` section pins this.
 - **Cancellation.** `/cancel` while a worker is in flight gets
   cleaned up by the next stale-claim sweep (no immediate worker
   kill in v1). `consecutive_failures` is NOT bumped on

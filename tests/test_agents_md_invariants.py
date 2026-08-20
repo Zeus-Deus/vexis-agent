@@ -1,4 +1,4 @@
-"""CLAUDE.md structural-invariant tripwires.
+"""AGENTS.md structural-invariant tripwires.
 
 Day 1 covers the size limit. Future structural rules (every
 feature section ends with a Pointers block; the Invariants
@@ -8,15 +8,16 @@ in this file rather than spawning new test files. The general
 
 Failing the size test is a documented signal to EXTRACT content
 to ``docs/<feature>.md`` or fold cross-feature facts into the
-``## Invariants`` section. Bumping ``CLAUDE_MD_MAX_LINES`` is
-rarely the right answer — see CLAUDE.md ``## How to edit this
+``## Invariants`` section. Bumping ``AGENTS_MD_MAX_LINES`` is
+rarely the right answer — see AGENTS.md ``## How to edit this
 file`` for the maintenance policy.
 
 Pattern mirrors ``tests/test_system_prompt_snapshots.py``'s
 ``FORBIDDEN_TOOL_NAME_PHRASES`` tripwire.
 
 Design citation: ``.plans/claude-md-reorganization-research.md``
-§7 + §6 Day 1b.
+§7 + §6 Day 1b (historical — file was later renamed CLAUDE.md →
+AGENTS.md as part of the repository-instruction canonicalization).
 """
 
 from pathlib import Path
@@ -114,16 +115,24 @@ from pathlib import Path
 # itself still under ~40 lines, OR a genuinely new feature
 # section that respects the ~30-line per-section ceiling.
 # Never bump for per-feature bloat in existing sections.
-CLAUDE_MD_MAX_LINES = 347
+AGENTS_MD_MAX_LINES = 347
 
 
-def test_claude_md_stays_under_size_limit() -> None:
-    path = Path(__file__).resolve().parent.parent / "CLAUDE.md"
+def test_agents_md_stays_under_size_limit() -> None:
+    path = Path(__file__).resolve().parent.parent / "AGENTS.md"
     line_count = len(path.read_text(encoding="utf-8").splitlines())
-    assert line_count <= CLAUDE_MD_MAX_LINES, (
-        f"CLAUDE.md is {line_count} lines (limit: "
-        f"{CLAUDE_MD_MAX_LINES}). Extract content to "
+    assert line_count <= AGENTS_MD_MAX_LINES, (
+        f"AGENTS.md is {line_count} lines (limit: "
+        f"{AGENTS_MD_MAX_LINES}). Extract content to "
         f"docs/<feature>.md or fold into ## Invariants. Bumping "
-        f"the limit is rarely the right answer — see CLAUDE.md "
+        f"the limit is rarely the right answer — see AGENTS.md "
         f"'## How to edit this file'."
     )
+
+
+def test_root_claude_md_is_a_pointer_to_agents_md() -> None:
+    """Root CLAUDE.md is a one-line Claude Code import shim.
+    AGENTS.md is canonical for every brain; CLAUDE.md just points
+    at it via the `@file` import syntax Claude Code supports."""
+    path = Path(__file__).resolve().parent.parent / "CLAUDE.md"
+    assert path.read_text(encoding="utf-8") == "@AGENTS.md\n"
