@@ -601,6 +601,140 @@ def test_rollout_not_found_on_first_call_does_not_rotate(
 
 
 # ──────────────────────────────────────────────────────────────────
+# attachments — repeated --image before the trailing prompt/resume
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_fresh_respond_without_attachments_uses_legacy_argv_shape(
+    brain: CodexBrain, monkeypatch
+):
+    """No attachments — argv must keep the pre-attachment shape:
+    no ``--image`` flags and no ``--`` separator, prompt trailing
+    directly after the options."""
+    captured: dict = {}
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            _codex_event("thread.started", thread_id="t1"),
+            _codex_event(
+                "item.completed",
+                item={"type": "agent_message", "text": "ok"},
+            ),
+        ],
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        "vexis_agent.core.brain.codex.asyncio.create_subprocess_exec", spawner
+    )
+
+    asyncio.run(brain.respond("ping", chat_id=1))
+
+    argv = captured["argv"]
+    assert "--image" not in argv
+    assert "--" not in argv
+    assert argv[-1] == "ping"
+
+
+def test_fresh_respond_with_one_attachment_adds_image_flag(
+    brain: CodexBrain, monkeypatch, tmp_path
+):
+    captured: dict = {}
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            _codex_event("thread.started", thread_id="t1"),
+            _codex_event(
+                "item.completed",
+                item={"type": "agent_message", "text": "ok"},
+            ),
+        ],
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        "vexis_agent.core.brain.codex.asyncio.create_subprocess_exec", spawner
+    )
+    img = tmp_path / "cat.png"
+    img.write_bytes(b"fake")
+
+    asyncio.run(brain.respond("ping", chat_id=1, attachments=[img]))
+
+    argv = captured["argv"]
+    assert argv[-4:] == ["--image", str(img.resolve()), "--", "ping"]
+
+
+def test_fresh_respond_with_multiple_attachments_repeats_image_flag(
+    brain: CodexBrain, monkeypatch, tmp_path
+):
+    captured: dict = {}
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            _codex_event("thread.started", thread_id="t1"),
+            _codex_event(
+                "item.completed",
+                item={"type": "agent_message", "text": "ok"},
+            ),
+        ],
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        "vexis_agent.core.brain.codex.asyncio.create_subprocess_exec", spawner
+    )
+    img1 = tmp_path / "one.png"
+    img1.write_bytes(b"fake")
+    img2 = tmp_path / "two.png"
+    img2.write_bytes(b"fake")
+
+    asyncio.run(
+        brain.respond("ping", chat_id=1, attachments=[img1, img2])
+    )
+
+    argv = captured["argv"]
+    assert argv[-6:] == [
+        "--image",
+        str(img1.resolve()),
+        "--image",
+        str(img2.resolve()),
+        "--",
+        "ping",
+    ]
+
+
+def test_resume_attachments_precede_resume_subcommand(
+    brain: CodexBrain, session_store: SessionStore, monkeypatch, tmp_path
+):
+    tid = "019f8d9b-3338-7d33-9861-dd63e92718de"
+    session_store.set(tid)
+    session_store.mark_initialized()
+    captured: dict = {}
+    spawner = _build_fake_spawner(
+        stdout_lines=[
+            _codex_event(
+                "item.completed",
+                item={"type": "agent_message", "text": "follow-up"},
+            ),
+            _codex_event("turn.completed"),
+        ],
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        "vexis_agent.core.brain.codex.asyncio.create_subprocess_exec", spawner
+    )
+    img = tmp_path / "cat.png"
+    img.write_bytes(b"fake")
+
+    asyncio.run(
+        brain.respond("again", chat_id=42, attachments=[img])
+    )
+
+    argv = captured["argv"]
+    assert argv[-5:] == [
+        "resume",
+        tid,
+        "--image",
+        str(img.resolve()),
+        "again",
+    ]
+
+
+# ──────────────────────────────────────────────────────────────────
 # session kwarg (SessionLike) reroute
 # ──────────────────────────────────────────────────────────────────
 

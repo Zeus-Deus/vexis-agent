@@ -582,22 +582,22 @@ def test_stream_forwards_model_override(
 
 
 def test_stream_attachments_prepend_hint(
-    client: TestClient, brain: BrainNull,
+    client: TestClient, brain: BrainNull, tmp_path: Path,
 ) -> None:
     """Attachments on the streaming body get the same hint-block
     prepend as the buffered /chat/send path. Brain sees the same
     prompt regardless of streaming or buffered."""
+    uploads = tmp_path / "uploads" / "work"
+    uploads.mkdir(parents=True, exist_ok=True)
+    saved = uploads / "cat.png"
+    saved.write_bytes(b"\x89PNG\r\n\x1a\nfake-png-bytes")
     r = client.post(
         "/api/v1/chat/stream",
         headers=_auth(),
         json={
             "text": "what's in this image?",
             "attachments": [
-                {
-                    "path": "/tmp/uploads/work/cat.png",
-                    "name": "cat.png",
-                    "mime": "image/png",
-                },
+                {"path": str(saved), "name": "cat.png", "mime": "image/png"},
             ],
         },
     )
@@ -607,6 +607,84 @@ def test_stream_attachments_prepend_hint(
     assert "[ATTACHMENTS" in msg
     assert "cat.png" in msg
     assert "what's in this image?" in msg
+    # Validated image attachment is also forwarded to the brain natively.
+    assert brain.attachments_calls() == [[saved.resolve()]]
+
+
+def test_stream_attachment_outside_uploads_excluded(
+    client: TestClient, brain: BrainNull, tmp_path: Path,
+) -> None:
+    outside = tmp_path / "elsewhere.png"
+    outside.write_bytes(b"not under uploads")
+    r = client.post(
+        "/api/v1/chat/stream",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(outside), "name": "elsewhere.png", "mime": "image/png"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    msg = brain.calls()[0][0]
+    assert msg == "hi"
+    assert brain.attachments_calls() == [None]
+
+
+# ──────────────────────────────────────────────────────────────────
+# Native attachments plumbing — MessageHandler → Brain (lower layer,
+# distinct from the [ATTACHMENTS] text-hint mechanism above)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_handle_forwards_attachments_to_brain(
+    handler: MessageHandler, brain: BrainNull, tmp_path: Path,
+) -> None:
+    img = tmp_path / "cat.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\nfake-png-bytes")
+
+    async def run() -> None:
+        await handler.handle(
+            _ALLOWED_USER_ID, -1, "what's this", attachments=[img],
+        )
+
+    asyncio.run(run())
+    assert brain.attachments_calls() == [[img]]
+
+
+def test_handle_omits_attachments_kwarg_when_absent(
+    handler: MessageHandler, brain: BrainNull,
+) -> None:
+    asyncio.run(handler.handle(_ALLOWED_USER_ID, -1, "hello"))
+    assert brain.attachments_calls() == [None]
+
+
+def test_stream_forwards_attachments_to_brain(
+    handler: MessageHandler, brain: BrainNull, tmp_path: Path,
+) -> None:
+    img = tmp_path / "dog.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\nfake-png-bytes")
+
+    async def run() -> None:
+        async for _ in handler.stream(
+            _ALLOWED_USER_ID, -1, "what's this", attachments=[img],
+        ):
+            pass
+
+    asyncio.run(run())
+    assert brain.attachments_calls() == [[img]]
+
+
+def test_stream_omits_attachments_kwarg_when_absent(
+    handler: MessageHandler, brain: BrainNull,
+) -> None:
+    async def run() -> None:
+        async for _ in handler.stream(_ALLOWED_USER_ID, -1, "hello"):
+            pass
+
+    asyncio.run(run())
+    assert brain.attachments_calls() == [None]
 
 
 # ──────────────────────────────────────────────────────────────────

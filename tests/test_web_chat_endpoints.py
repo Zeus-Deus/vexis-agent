@@ -19,6 +19,8 @@ elsewhere. What we want to verify here:
 
 from __future__ import annotations
 
+import os
+import secrets
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -54,8 +56,8 @@ class _StubChat:
     def _record(self, name: str, *args, **kwargs) -> None:
         self.calls.append((name, args, kwargs))
 
-    async def send(self, text: str) -> str | None:
-        self._record("send", text)
+    async def send(self, text: str, **kwargs) -> str | None:
+        self._record("send", text, **kwargs)
         return self.send_reply
 
     async def clear(self) -> str | None:
@@ -767,6 +769,42 @@ def test_attach_writes_to_workspace_uploads(
     assert saved.read_bytes() == payload
 
 
+def test_attach_read_failure_leaves_no_temp_or_published_file(
+    tmp_path: Path,
+    stub_chat: _StubChat,
+    attachments_default: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-OSError raised mid-stream (e.g. client-disconnect
+    cancellation) from ``UploadFile.read`` must not leave a ``.part``
+    temp file — or any published file — behind in the uploads tree."""
+    stub_chat.sessions = [
+        _FakeSessionInfo("work", True, "2026-05-08T10:00:00+00:00"),
+    ]
+    client = TestClient(
+        _build_dashboard(tmp_path, chat=stub_chat)._app,
+        raise_server_exceptions=False,
+    )
+
+    from starlette.datastructures import UploadFile
+
+    async def _boom(self, size=-1):
+        raise RuntimeError("simulated read failure")
+
+    monkeypatch.setattr(UploadFile, "read", _boom)
+
+    r = client.post(
+        "/api/v1/chat/attach",
+        headers=_auth(),
+        files={"file": ("hello.png", b"\x89PNG-bytes-for-test", "image/png")},
+    )
+    assert r.status_code == 500
+
+    uploads_root = tmp_path / "uploads" / "work"
+    leftovers = list(uploads_root.glob("*")) if uploads_root.exists() else []
+    assert leftovers == [], f"expected no leftover files, found: {leftovers}"
+
+
 def test_attach_sanitizes_filename(
     client_with_chat: TestClient,
     stub_chat: _StubChat,
@@ -793,22 +831,36 @@ def test_attach_sanitizes_filename(
     assert "etc" not in saved.parts[1:-1]
 
 
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _write_upload(
+    tmp_path: Path, *, name: str = "cat.png", data: bytes = _PNG_SIGNATURE + b"fake-png-bytes",
+) -> Path:
+    """Create a real file under ``<tmp_path>/uploads/work/`` — the
+    workspace/uploads sandbox the native-attachment normalizer
+    validates against."""
+    uploads = tmp_path / "uploads" / "work"
+    uploads.mkdir(parents=True, exist_ok=True)
+    target = uploads / name
+    target.write_bytes(data)
+    return target
+
+
 def test_send_with_attachments_prepends_hint(
     client_with_chat: TestClient,
     stub_chat: _StubChat,
+    tmp_path: Path,
     attachments_default: None,
 ) -> None:
+    saved = _write_upload(tmp_path)
     r = client_with_chat.post(
         "/api/v1/chat/send",
         headers=_auth(),
         json={
             "text": "What's in this image?",
             "attachments": [
-                {
-                    "path": "/tmp/uploads/work/20260508T120000Z-cat.png",
-                    "name": "cat.png",
-                    "mime": "image/png",
-                },
+                {"path": str(saved), "name": "cat.png", "mime": "image/png"},
             ],
         },
     )
@@ -816,13 +868,15 @@ def test_send_with_attachments_prepends_hint(
     # The handler stub recorded the formatted message — check the
     # hint block is present and the user text is preserved.
     assert len(stub_chat.calls) == 1
-    name, args, _ = stub_chat.calls[0]
+    name, args, kwargs = stub_chat.calls[0]
     assert name == "send"
     msg = args[0]
     assert "[ATTACHMENTS" in msg
     assert "cat.png" in msg
-    assert "/tmp/uploads/work/20260508T120000Z-cat.png" in msg
+    assert str(saved) in msg
     assert "What's in this image?" in msg
+    # A validated image entry is also forwarded natively.
+    assert kwargs.get("attachments") == [saved.resolve()]
 
 
 def test_send_with_invalid_attachments_rejected(
@@ -847,6 +901,858 @@ def test_send_with_empty_attachments_skips_hint(
         json={"text": "hello", "attachments": []},
     )
     assert r.status_code == 200
-    name, args, _ = stub_chat.calls[0]
+    name, args, kwargs = stub_chat.calls[0]
     # No hint when the list was empty — message goes through bare.
     assert args[0] == "hello"
+    assert "attachments" not in kwargs
+
+
+def test_send_with_multiple_images_dedupes_native_paths(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    saved = _write_upload(tmp_path, name="cat.png")
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(saved), "name": "cat.png", "mime": "image/png"},
+                # Same file referenced twice (e.g. re-submitted UI state).
+                {"path": str(saved), "name": "cat.png", "mime": "image/png"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, _, kwargs = stub_chat.calls[0]
+    assert kwargs.get("attachments") == [saved.resolve()]
+
+
+def test_send_with_non_image_attachment_stays_hint_only(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    saved = _write_upload(tmp_path, name="notes.txt", data=b"hello world")
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(saved), "name": "notes.txt", "mime": "text/plain"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    name, args, kwargs = stub_chat.calls[0]
+    assert "notes.txt" in args[0]
+    assert "[ATTACHMENTS" in args[0]
+    # Non-image validated file stays in the hint but isn't a native
+    # attachment.
+    assert "attachments" not in kwargs
+
+
+def test_send_with_attachment_outside_uploads_excluded(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    outside = tmp_path / "elsewhere.png"
+    outside.write_bytes(b"not under uploads")
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(outside), "name": "elsewhere.png", "mime": "image/png"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert args[0] == "hi"
+    assert "attachments" not in kwargs
+
+
+def test_send_with_missing_attachment_file_excluded(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    missing = tmp_path / "uploads" / "work" / "ghost.png"
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(missing), "name": "ghost.png", "mime": "image/png"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert args[0] == "hi"
+    assert "attachments" not in kwargs
+
+
+def test_send_with_symlink_escape_excluded(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    secret = tmp_path / "secret.png"
+    secret.write_bytes(b"outside the sandbox")
+    uploads = tmp_path / "uploads" / "work"
+    uploads.mkdir(parents=True, exist_ok=True)
+    link = uploads / "link.png"
+    link.symlink_to(secret)
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(link), "name": "link.png", "mime": "image/png"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert args[0] == "hi"
+    assert "attachments" not in kwargs
+
+
+def test_send_with_malformed_attachment_entries_excluded(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    attachments_default: None,
+) -> None:
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                "not-a-dict",
+                {"name": "no-path.png", "mime": "image/png"},
+                {"path": "", "name": "empty-path.png", "mime": "image/png"},
+                {"path": 123, "name": "bad-type.png", "mime": "image/png"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert args[0] == "hi"
+    assert "attachments" not in kwargs
+
+
+def test_send_with_leaf_symlink_inside_uploads_excluded(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    """A symlink whose target also resolves inside ``uploads/`` is
+    still rejected — only real regular files are trusted, never a
+    leaf symlink, regardless of where it points."""
+    real = _write_upload(tmp_path, name="real.png")
+    link = real.parent / "link.png"
+    link.symlink_to(real)
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(link), "name": "link.png", "mime": "image/png"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert args[0] == "hi"
+    assert "attachments" not in kwargs
+
+
+def test_send_with_uploads_root_itself_symlinked_excluded(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    """Reviewer-proven escape: ``<workspace>/uploads`` itself is a
+    symlink to an outside directory. If the normalizer just
+    ``.resolve()``s the uploads root before the sandbox check, the
+    resolved root lands outside the workspace and a PNG living there
+    passes the ``relative_to`` check. It must not."""
+    outside_dir = tmp_path.parent / "outside-uploads-root"
+    outside_dir.mkdir()
+    outside_png = outside_dir / "escape.png"
+    outside_png.write_bytes(_PNG_SIGNATURE + b"outside-bytes")
+    (tmp_path / "uploads").symlink_to(outside_dir)
+
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {
+                    "path": str(outside_png),
+                    "name": "escape.png",
+                    "mime": "image/png",
+                },
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert args[0] == "hi"
+    assert "attachments" not in kwargs
+    assert "escape.png" not in args[0]
+
+
+def test_attach_rejects_when_uploads_root_is_symlink(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    """Upload boundary: if ``<workspace>/uploads`` is a symlink to an
+    outside directory, the upload must fail safely and must never
+    write into the outside target."""
+    stub_chat.sessions = [
+        _FakeSessionInfo("work", True, "2026-05-08T10:00:00+00:00"),
+    ]
+    outside_dir = tmp_path.parent / "outside-upload-target"
+    outside_dir.mkdir()
+    (tmp_path / "uploads").symlink_to(outside_dir)
+
+    before = set(outside_dir.rglob("*"))
+    r = client_with_chat.post(
+        "/api/v1/chat/attach",
+        headers=_auth(),
+        files={"file": ("hello.png", _PNG_SIGNATURE + b"bytes", "image/png")},
+    )
+    assert r.status_code in (400, 500)
+    after = set(outside_dir.rglob("*"))
+    assert after == before
+
+
+def test_attach_creates_missing_uploads_root_normally(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    """Baseline: no pre-existing ``uploads/`` at all — the normal
+    case still works and the directory is created as a real dir."""
+    stub_chat.sessions = [
+        _FakeSessionInfo("work", True, "2026-05-08T10:00:00+00:00"),
+    ]
+    assert not (tmp_path / "uploads").exists()
+    r = client_with_chat.post(
+        "/api/v1/chat/attach",
+        headers=_auth(),
+        files={"file": ("hello.png", _PNG_SIGNATURE + b"bytes", "image/png")},
+    )
+    assert r.status_code == 200
+    uploads_root = tmp_path / "uploads"
+    assert uploads_root.is_dir()
+    assert not uploads_root.is_symlink()
+    body = r.json()
+    assert Path(body["path"]).is_file()
+
+
+def test_send_hint_uses_server_basename_and_detected_mime(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    """The prompt hint must not trust client-controlled name/mime —
+    it renders the resolved server-side basename and the magic-byte
+    detected mime, even when the client lies about both."""
+    saved = _write_upload(tmp_path, name="cat.png")
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {
+                    "path": str(saved),
+                    "name": "totally-not-cat.exe",
+                    "mime": "image/svg+xml",
+                },
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert "cat.png" in args[0]
+    assert "totally-not-cat.exe" not in args[0]
+    assert "image/png" in args[0]
+    assert "image/svg+xml" not in args[0]
+    assert kwargs.get("attachments") == [saved.resolve()]
+
+
+def test_send_with_corrupt_image_excluded_from_hint_and_native(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    """A file claimed as ``image/png`` whose bytes don't match any
+    supported image signature is excluded entirely — not just from
+    the native path, but from the hint too."""
+    saved = _write_upload(tmp_path, name="corrupt.png", data=b"not-actually-a-png")
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(saved), "name": "corrupt.png", "mime": "image/png"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert args[0] == "hi"
+    assert "[ATTACHMENTS" not in args[0]
+    assert "attachments" not in kwargs
+
+
+# ──────────────────────────────────────────────────────────────────
+# SECURITY 1 — magic-byte detection must not bypass a restricted
+# operator allowlist. ``_resolve_attachment_paths`` re-derives the
+# mime from file bytes for anything declared ``image/*``, but must
+# also require the *detected* mime to be in
+# ``chat_attachments_allowed_mimes()`` — otherwise an operator who
+# excludes ``image/png`` from the allowlist can still be handed a
+# real PNG (bytes never lie) as long as the client declares some
+# other allowed image mime.
+# ──────────────────────────────────────────────────────────────────
+
+
+_JPEG_SIGNATURE = b"\xff\xd8\xff\xe0"
+_GIF87A_SIGNATURE = b"GIF87a"
+_GIF89A_SIGNATURE = b"GIF89a"
+_WEBP_SIGNATURE = b"RIFF\x00\x00\x00\x00WEBP"
+
+
+@pytest.fixture
+def attachments_restricted_mimes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Operator allowlist that excludes ``image/png`` — only
+    ``image/jpeg`` is permitted. Used to prove magic-byte detection
+    can't bypass this restriction."""
+    cfg = tmp_path / "config-attach-restricted.yaml"
+    cfg.write_text(
+        "chat:\n  attachments:\n    allowed_mimes:\n      - image/jpeg\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("vexis_agent.core.yaml_config._config_path", lambda: cfg)
+
+
+def test_send_with_png_excluded_by_restricted_allowlist(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_restricted_mimes: None,
+) -> None:
+    """Real PNG bytes, declared honestly as ``image/png`` — the
+    restricted allowlist (jpeg only) must still exclude it."""
+    saved = _write_upload(tmp_path, name="cat.png")
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(saved), "name": "cat.png", "mime": "image/png"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert args[0] == "hi"
+    assert "[ATTACHMENTS" not in args[0]
+    assert "attachments" not in kwargs
+
+
+def test_send_with_png_bytes_declared_as_jpeg_excluded_by_restricted_allowlist(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_restricted_mimes: None,
+) -> None:
+    """The bypass this guards against: PNG magic bytes, but the
+    client declares ``image/jpeg`` (which IS in the allowlist). Magic
+    detection correctly identifies the bytes as PNG; since detected
+    PNG is not in the allowlist, the entry must still be excluded —
+    declaring an allowed mime must not smuggle a disallowed format
+    through."""
+    saved = _write_upload(tmp_path, name="cat.jpg")
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(saved), "name": "cat.jpg", "mime": "image/jpeg"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert args[0] == "hi"
+    assert "[ATTACHMENTS" not in args[0]
+    assert "attachments" not in kwargs
+
+
+def test_send_with_jpeg_allowed_by_restricted_allowlist(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_restricted_mimes: None,
+) -> None:
+    """Sanity check on the same fixture: real JPEG bytes, declared
+    honestly, must still go through — the restriction must not be
+    overzealous."""
+    saved = _write_upload(
+        tmp_path, name="cat.jpg", data=_JPEG_SIGNATURE + b"fake-jpeg-bytes",
+    )
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(saved), "name": "cat.jpg", "mime": "image/jpeg"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert kwargs.get("attachments") == [saved.resolve()]
+
+
+@pytest.mark.parametrize(
+    "name,data,expected_mime",
+    [
+        ("cat.png", _PNG_SIGNATURE + b"rest", "image/png"),
+        ("cat.jpg", _JPEG_SIGNATURE + b"rest", "image/jpeg"),
+        ("cat.gif", _GIF87A_SIGNATURE + b"rest", "image/gif"),
+        ("cat.gif", _GIF89A_SIGNATURE + b"rest", "image/gif"),
+        ("cat.webp", _WEBP_SIGNATURE + b"rest", "image/webp"),
+    ],
+)
+def test_send_detects_native_image_formats(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+    name: str,
+    data: bytes,
+    expected_mime: str,
+) -> None:
+    """Magic-byte detection covers all four native image formats,
+    not just PNG — each is forwarded as a native attachment and its
+    detected mime lands in the hint."""
+    saved = _write_upload(tmp_path, name=name, data=data)
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(saved), "name": name, "mime": expected_mime},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert expected_mime in args[0]
+    assert kwargs.get("attachments") == [saved.resolve()]
+
+
+# ──────────────────────────────────────────────────────────────────
+# SECURITY 1b — the declared-mime branch was never sniffed, so PNG
+# bytes declared ``text/plain`` skipped magic-byte detection
+# entirely and slipped through as a validated text/plain hint-only
+# attachment — bypassing the image allowlist by simply lying about
+# the mime. Detection must run for every entry regardless of the
+# declared mime.
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def attachments_text_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Operator allowlist with ``text/plain`` but no image mimes at
+    all — used to prove PNG bytes declared ``text/plain`` can't
+    smuggle an image through."""
+    cfg = tmp_path / "config-attach-text-only.yaml"
+    cfg.write_text(
+        "chat:\n  attachments:\n    allowed_mimes:\n      - text/plain\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("vexis_agent.core.yaml_config._config_path", lambda: cfg)
+
+
+def test_send_with_png_bytes_declared_text_plain_excluded_when_image_not_allowed(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_text_only: None,
+) -> None:
+    """PNG bytes declared ``text/plain`` — the allowlist permits
+    text/plain but not image/png. Detection must still catch the
+    real format and exclude it entirely (not even hint-only)."""
+    saved = _write_upload(
+        tmp_path, name="notes.txt", data=_PNG_SIGNATURE + b"rest",
+    )
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(saved), "name": "notes.txt", "mime": "text/plain"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert args[0] == "hi"
+    assert "[ATTACHMENTS" not in args[0]
+    assert "attachments" not in kwargs
+
+
+def test_send_with_png_bytes_declared_text_plain_normalizes_to_image_png(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    """Same lie, default allowlist (image/png IS allowed). Since the
+    bytes are genuinely a PNG, they must be normalized to
+    ``image/png`` and forwarded as a native attachment — bytes win
+    over the declared mime, in both directions."""
+    saved = _write_upload(
+        tmp_path, name="notes.txt", data=_PNG_SIGNATURE + b"rest",
+    )
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(saved), "name": "notes.txt", "mime": "text/plain"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert "image/png" in args[0]
+    assert kwargs.get("attachments") == [saved.resolve()]
+
+
+def test_send_with_true_text_declared_text_plain_stays_hint_only(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    """Genuine non-image bytes declared ``text/plain`` are unaffected
+    by the new detection-first pass — still hint-only, no native
+    attachment."""
+    saved = _write_upload(
+        tmp_path, name="notes.txt", data=b"just some plain text",
+    )
+    r = client_with_chat.post(
+        "/api/v1/chat/send",
+        headers=_auth(),
+        json={
+            "text": "hi",
+            "attachments": [
+                {"path": str(saved), "name": "notes.txt", "mime": "text/plain"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    _, args, kwargs = stub_chat.calls[0]
+    assert "text/plain" in args[0]
+    assert "attachments" not in kwargs
+
+
+# ──────────────────────────────────────────────────────────────────
+# SECURITY 2 — /chat/attach must not let two uploads sharing a
+# filename (in the same second, second-resolution timestamp) race
+# each other onto the same on-disk path. Each upload must land at
+# its own collision-resistant path; neither may see the other's
+# bytes.
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_attach_same_filename_same_second_gets_distinct_paths(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub_chat.sessions = [
+        _FakeSessionInfo("work", True, "2026-05-08T10:00:00+00:00"),
+    ]
+
+    from datetime import datetime as _real_datetime
+
+    class _FrozenDatetime(_real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _real_datetime(2026, 5, 8, 10, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(
+        "vexis_agent.core.web_server.datetime", _FrozenDatetime,
+    )
+
+    payload_a = _PNG_SIGNATURE + b"AAAAAAAA"
+    payload_b = _PNG_SIGNATURE + b"BBBBBBBB"
+
+    r1 = client_with_chat.post(
+        "/api/v1/chat/attach",
+        headers=_auth(),
+        files={"file": ("dup.png", payload_a, "image/png")},
+    )
+    r2 = client_with_chat.post(
+        "/api/v1/chat/attach",
+        headers=_auth(),
+        files={"file": ("dup.png", payload_b, "image/png")},
+    )
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+
+    path_a = Path(r1.json()["path"])
+    path_b = Path(r2.json()["path"])
+
+    # Distinct final paths despite identical filename + same-second
+    # timestamp.
+    assert path_a != path_b
+    # Both files exist with their own, uncorrupted content — neither
+    # upload clobbered the other.
+    assert path_a.read_bytes() == payload_a
+    assert path_b.read_bytes() == payload_b
+    # Session subdir and a readable basename are preserved.
+    assert path_a.parent == path_b.parent
+    assert path_a.parent.name == "work"
+    assert "dup.png" in path_a.name
+    assert "dup.png" in path_b.name
+    # No leftover temp files in the uploads dir.
+    leftovers = [p.name for p in path_a.parent.iterdir() if p.name.startswith(".")]
+    assert leftovers == []
+
+
+def test_attach_no_temp_file_left_behind_on_success(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+) -> None:
+    stub_chat.sessions = [
+        _FakeSessionInfo("work", True, "2026-05-08T10:00:00+00:00"),
+    ]
+    r = client_with_chat.post(
+        "/api/v1/chat/attach",
+        headers=_auth(),
+        files={"file": ("solo.png", _PNG_SIGNATURE + b"solo", "image/png")},
+    )
+    assert r.status_code == 200
+    saved = Path(r.json()["path"])
+    siblings = list(saved.parent.iterdir())
+    assert siblings == [saved]
+
+
+def test_attach_cleans_up_when_publish_rename_fails(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub_chat.sessions = [
+        _FakeSessionInfo("work", True, "2026-05-08T10:00:00+00:00"),
+    ]
+
+    from vexis_agent.core import web_server as web_server_module
+
+    def _boom(_src, _dst):
+        raise OSError("simulated atomic publish failure")
+
+    monkeypatch.setattr(web_server_module.os, "link", _boom)
+
+    r = client_with_chat.post(
+        "/api/v1/chat/attach",
+        headers=_auth(),
+        files={"file": ("solo.png", _PNG_SIGNATURE + b"solo", "image/png")},
+    )
+
+    assert r.status_code == 500
+
+    uploads_dir = tmp_path / "uploads" / "work"
+    remaining = list(uploads_dir.iterdir()) if uploads_dir.exists() else []
+    assert remaining == []
+
+
+# ──────────────────────────────────────────────────────────────────
+# SECURITY 3 — /chat/attach must not clobber a pre-existing path.
+#
+# The old implementation unlinked ``tmp_target`` in a bare ``finally``
+# whenever the request didn't publish — including when ``os.open``
+# itself failed because that temp path was pre-existing (owned by
+# someone/something else), and published via ``os.replace``, which
+# silently overwrites a pre-existing final target. Both are no-clobber
+# violations: this request must never delete or overwrite bytes it
+# didn't create.
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_attach_preexisting_temp_path_left_untouched(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub_chat.sessions = [
+        _FakeSessionInfo("work", True, "2026-05-08T10:00:00+00:00"),
+    ]
+
+    from datetime import datetime as _real_datetime
+
+    class _FrozenDatetime(_real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _real_datetime(2026, 5, 8, 10, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(
+        "vexis_agent.core.web_server.datetime", _FrozenDatetime,
+    )
+    monkeypatch.setattr(secrets, "token_hex", lambda n: "deadbeef")
+
+    uploads_dir = tmp_path / "uploads" / "work"
+    uploads_dir.mkdir(parents=True)
+    tmp_path_on_disk = uploads_dir / ".20260508T100000Z-deadbeef-sentinel.png.part"
+    sentinel = b"PRE-EXISTING-TEMP-SENTINEL"
+    tmp_path_on_disk.write_bytes(sentinel)
+
+    r = client_with_chat.post(
+        "/api/v1/chat/attach",
+        headers=_auth(),
+        files={"file": ("sentinel.png", _PNG_SIGNATURE + b"new-bytes", "image/png")},
+    )
+
+    assert r.status_code == 500
+    assert tmp_path_on_disk.read_bytes() == sentinel
+
+    final_target = uploads_dir / "20260508T100000Z-deadbeef-sentinel.png"
+    assert not final_target.exists()
+
+
+def test_attach_preexisting_final_target_left_untouched(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub_chat.sessions = [
+        _FakeSessionInfo("work", True, "2026-05-08T10:00:00+00:00"),
+    ]
+
+    from datetime import datetime as _real_datetime
+
+    class _FrozenDatetime(_real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _real_datetime(2026, 5, 8, 10, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(
+        "vexis_agent.core.web_server.datetime", _FrozenDatetime,
+    )
+    monkeypatch.setattr(secrets, "token_hex", lambda n: "deadbeef")
+
+    uploads_dir = tmp_path / "uploads" / "work"
+    uploads_dir.mkdir(parents=True)
+    final_target = uploads_dir / "20260508T100000Z-deadbeef-sentinel.png"
+    sentinel = b"PRE-EXISTING-FINAL-SENTINEL"
+    final_target.write_bytes(sentinel)
+
+    r = client_with_chat.post(
+        "/api/v1/chat/attach",
+        headers=_auth(),
+        files={"file": ("sentinel.png", _PNG_SIGNATURE + b"new-bytes", "image/png")},
+    )
+
+    assert r.status_code == 500
+    assert final_target.read_bytes() == sentinel
+
+    # The request's own temp (which it created, wrote to, and then
+    # failed to publish because the final target already existed)
+    # must be cleaned up — no leftover ``.part`` files.
+    leftovers = [p.name for p in uploads_dir.iterdir() if p.name.startswith(".")]
+    assert leftovers == []
+
+
+def test_attach_success_still_publishes_atomically_no_clobber(
+    client_with_chat: TestClient,
+    stub_chat: _StubChat,
+    tmp_path: Path,
+    attachments_default: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub_chat.sessions = [
+        _FakeSessionInfo("work", True, "2026-05-08T10:00:00+00:00"),
+    ]
+
+    from datetime import datetime as _real_datetime
+
+    class _FrozenDatetime(_real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _real_datetime(2026, 5, 8, 10, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(
+        "vexis_agent.core.web_server.datetime", _FrozenDatetime,
+    )
+    monkeypatch.setattr(secrets, "token_hex", lambda n: "deadbeef")
+
+    payload = _PNG_SIGNATURE + b"clean-bytes"
+    r = client_with_chat.post(
+        "/api/v1/chat/attach",
+        headers=_auth(),
+        files={"file": ("clean.png", payload, "image/png")},
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    saved = Path(body["path"])
+    assert saved.name == "20260508T100000Z-deadbeef-clean.png"
+    assert saved.read_bytes() == payload
+
+    leftovers = [p.name for p in saved.parent.iterdir() if p.name.startswith(".")]
+    assert leftovers == []

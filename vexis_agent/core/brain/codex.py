@@ -705,6 +705,7 @@ class CodexBrain(Brain):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: "SessionLike | None" = None,
+        attachments: list[Path] | None = None,
     ) -> str:
         log.info(
             "CodexBrain.respond starting for chat %d%s%s",
@@ -720,7 +721,7 @@ class CodexBrain(Brain):
             return await self._respond_inner(
                 message, chat_id,
                 model=model, reasoning_level=reasoning_level,
-                session=session,
+                session=session, attachments=attachments,
             )
         finally:
             await self._record_files_changed(chat_id, before_snapshot)
@@ -733,6 +734,7 @@ class CodexBrain(Brain):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: "SessionLike | None" = None,
+        attachments: list[Path] | None = None,
     ) -> AsyncIterator[str | dict]:
         """Stream codex JSONL as provider-neutral text/tool events.
 
@@ -758,6 +760,7 @@ class CodexBrain(Brain):
                     model=model,
                     reasoning_level=reasoning_level,
                     session=session,
+                    attachments=attachments,
                     event_sink=lambda event: queue.put_nowait(
                         ("event", event)
                     ),
@@ -796,6 +799,7 @@ class CodexBrain(Brain):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: "SessionLike | None" = None,
+        attachments: list[Path] | None = None,
         event_sink: Callable[[str | dict], None] | None = None,
     ) -> str:
         # Issue #48: ``session`` selects which session this turn runs
@@ -831,9 +835,16 @@ class CodexBrain(Brain):
                 "model_reasoning_effort=" + json.dumps(reasoning_level),
             ]
         opts += self._profile_args()
+        image_args: list[str] = []
+        for path in attachments or []:
+            image_args += ["--image", str(Path(path).resolve())]
 
         if stored_token:
-            argv = opts + ["resume", stored_token, message]
+            argv = opts + ["resume", stored_token] + image_args + [message]
+        elif image_args:
+            # Fresh-run ``--image`` is variadic, so a trailing prompt would
+            # otherwise be consumed as another image path.
+            argv = opts + image_args + ["--", message]
         else:
             argv = opts + [message]
 

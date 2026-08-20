@@ -596,6 +596,7 @@ class Brain(ABC):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: "SessionLike | None" = None,
+        attachments: list[Path] | None = None,
     ) -> AsyncIterator[str | dict]:
         """Streaming variant of :meth:`respond`. Yields incremental
         text chunks as the model generates them.
@@ -684,9 +685,13 @@ class Brain(ABC):
         # keeps working through this default fallback on the streaming
         # path exactly as it does on the buffered one.
         session_kwargs = {"session": session} if session is not None else {}
+        attachment_kwargs = (
+            {"attachments": attachments} if attachments else {}
+        )
         reply = await self.respond(
             message, chat_id,
-            model=model, reasoning_level=reasoning_level, **session_kwargs,
+            model=model, reasoning_level=reasoning_level,
+            **session_kwargs, **attachment_kwargs,
         )
         yield reply
         # Issue #56 — terminal canonical event. For a non-streaming
@@ -705,6 +710,7 @@ class Brain(ABC):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: "SessionLike | None" = None,
+        attachments: list[Path] | None = None,
     ) -> str:
         """Run one foreground turn. Returns the assistant's final text.
 
@@ -738,6 +744,11 @@ class Brain(ABC):
         session-lost rotate-and-raise recovery. The web transport passes
         one per conversation so concurrent conversations never share a
         session id.
+
+        ``attachments`` is an optional list of local file paths (e.g.
+        images) to attach to this turn. ``None``/empty means no
+        attachments — the historical behaviour. Brains that have no
+        native attachment mechanism accept and ignore the kwarg.
 
         Side effects: writes to the per-chat ``StatusFile`` for
         ``/status``, registers the running subprocess with

@@ -169,6 +169,141 @@ def _format_attachments_hint(raw: list) -> str:
     return "[ATTACHMENTS — files at these paths]\n" + "\n".join(lines)
 
 
+# Magic-byte signatures for the native-image allowlist. Ordered
+# (mime, matcher) pairs so detection is a straight linear scan over
+# a handful of well-known formats — no dependency needed.
+_IMAGE_MAGIC_DETECTORS: tuple = (
+    ("image/png", lambda h: h.startswith(b"\x89PNG\r\n\x1a\n")),
+    ("image/jpeg", lambda h: h.startswith(b"\xff\xd8\xff")),
+    ("image/gif", lambda h: h.startswith(b"GIF87a") or h.startswith(b"GIF89a")),
+    ("image/webp", lambda h: h.startswith(b"RIFF") and h[8:12] == b"WEBP"),
+)
+_NATIVE_IMAGE_MIMES = frozenset(mime for mime, _ in _IMAGE_MAGIC_DETECTORS)
+
+
+def _detect_image_mime(path: Path) -> str | None:
+    """Sniff ``path``'s first bytes against the native-image
+    signatures. Returns the detected mime, or ``None`` if the file
+    isn't a recognised PNG/JPEG/GIF/WebP (corrupt file, or a
+    different format masquerading under an ``image/*`` mime)."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+    except OSError:
+        return None
+    for mime, matches in _IMAGE_MAGIC_DETECTORS:
+        if matches(header):
+            return mime
+    return None
+
+
+def _trusted_uploads_root(workspace: Path) -> Path | None:
+    """Return ``<workspace>/uploads`` as a trusted sandbox root, or
+    ``None`` if it can't be trusted right now.
+
+    Never creates the directory here — read/send normalization must
+    stay a pure check. A symlinked ``uploads`` (the whole root, not
+    just a leaf entry) is the reviewer-proven escape: resolving it
+    would silently adopt whatever directory the link points at as
+    the sandbox root, and every ``relative_to`` check downstream
+    would then trust files outside the workspace. So: absent, or not
+    a real directory (including a symlink to one), means "no
+    validated entries" rather than "resolve through it"."""
+    root = workspace / "uploads"
+    if root.is_symlink():
+        return None
+    if not root.is_dir():
+        return None
+    return root.resolve()
+
+
+def _resolve_attachment_paths(
+    raw: list, workspace: Path,
+) -> tuple[list[dict], list[Path]]:
+    """Validate raw attachment entries against the upload sandbox.
+
+    Never trusts client-supplied paths, names, or mimes at face
+    value. An entry survives only if its (non-symlink) leaf resolves
+    to an existing regular file beneath ``<workspace>/uploads``.
+    Returns two things:
+
+    - ``validated``: normalized ``{path, name, mime}`` dicts safe to
+      render into the ``[ATTACHMENTS]`` prompt hint — ``name`` is
+      always the resolved server-side basename, never the client's
+      claim. Magic-byte detection runs on every entry regardless of
+      the declared mime, so bytes always win: if the file is
+      detected as a native image, its declared mime is overridden
+      by the detected one and the entry is dropped unless the
+      *detected* mime is in the configured allowlist (a claimed
+      image whose bytes don't match a supported signature is
+      likewise dropped — corrupt or unsupported). This also closes
+      the reverse smuggling path — PNG bytes declared ``text/plain``
+      would otherwise skip detection entirely and slip through as a
+      hint-only text attachment, bypassing an allowlist that permits
+      text/plain but excludes image/png. Genuine non-image entries
+      keep their declared mime, but only if it's in the configured
+      allowlist. De-duplicated by resolved path.
+    - ``images``: the de-duplicated resolved ``Path`` objects for
+      entries whose (detected) mime is a supported native image
+      type — these are the only ones forwarded as native brain
+      attachments.
+    """
+    uploads_root = _trusted_uploads_root(workspace)
+    allowed_mimes = yaml_config.chat_attachments_allowed_mimes()
+    validated: list[dict] = []
+    images: list[Path] = []
+    seen: set[Path] = set()
+    if uploads_root is None:
+        return validated, images
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        candidate = Path(path)
+        if candidate.is_symlink():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if not resolved.is_file():
+            continue
+        try:
+            resolved.relative_to(uploads_root)
+        except ValueError:
+            continue
+
+        declared_mime = entry.get("mime")
+        declared_mime = (
+            declared_mime.strip().lower() if isinstance(declared_mime, str) else ""
+        )
+        detected_mime = _detect_image_mime(resolved)
+        if detected_mime is not None:
+            if detected_mime not in allowed_mimes:
+                continue
+            mime = detected_mime
+        elif declared_mime.startswith("image/"):
+            continue
+        else:
+            if declared_mime not in allowed_mimes:
+                continue
+            mime = declared_mime
+
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        validated.append({
+            "path": str(resolved),
+            "name": resolved.name,
+            "mime": mime,
+        })
+        if mime in _NATIVE_IMAGE_MIMES:
+            images.append(resolved)
+    return validated, images
+
+
 # Source-vs-bundle freshness check (added 2026-05-08). Frontend
 # changes need ``npm run build`` to compile ``web/src/**`` →
 # ``web/dist/assets/index-*.js``; the daemon doesn't run the build,
@@ -1738,10 +1873,14 @@ class WebDashboard:
             # so the brain (which can read files via its existing
             # tool surface) knows which paths to look at.
             attachments_raw = body.get("attachments")
+            native_images: list[Path] = []
             if attachments_raw is not None:
                 if not isinstance(attachments_raw, list):
                     raise HTTPException(400, "'attachments' must be a list")
-                hint = _format_attachments_hint(attachments_raw)
+                validated, native_images = _resolve_attachment_paths(
+                    attachments_raw, self._workspace,
+                )
+                hint = _format_attachments_hint(validated)
                 if hint:
                     text = f"{hint}\n\n{text}"
             # Issue #48: an optional ``conversation_id`` routes the turn
@@ -1749,10 +1888,15 @@ class WebDashboard:
             # and the reply stays exactly ``{"reply": ...}`` with no
             # conversation_id key so existing clients are unaffected.
             cid = _validated_conversation_id(body)
+            attachment_kwargs = (
+                {"attachments": native_images} if native_images else {}
+            )
             if cid is not None:
-                reply = await chat.send(text, conversation_id=cid)
+                reply = await chat.send(
+                    text, conversation_id=cid, **attachment_kwargs,
+                )
             else:
-                reply = await chat.send(text)
+                reply = await chat.send(text, **attachment_kwargs)
             if reply is None:
                 raise HTTPException(401, "message rejected")
             payload = {"reply": reply}
@@ -1841,10 +1985,14 @@ class WebDashboard:
             text = _validated_text(body)
             conversation_id = _validated_conversation_id(body)
             attachments_raw = body.get("attachments")
+            native_images: list[Path] = []
             if attachments_raw is not None:
                 if not isinstance(attachments_raw, list):
                     raise HTTPException(400, "'attachments' must be a list")
-                hint = _format_attachments_hint(attachments_raw)
+                validated, native_images = _resolve_attachment_paths(
+                    attachments_raw, self._workspace,
+                )
+                hint = _format_attachments_hint(validated)
                 if hint:
                     text = f"{hint}\n\n{text}"
 
@@ -1859,6 +2007,9 @@ class WebDashboard:
                 if isinstance(reasoning_raw, str) and reasoning_raw.strip()
                 else None
             )
+            attachment_kwargs = (
+                {"attachments": native_images} if native_images else {}
+            )
 
             async def sse_events():
                 # Each event is one SSE frame. ``json.dumps`` keeps
@@ -1870,6 +2021,7 @@ class WebDashboard:
                         model=model_override,
                         reasoning_level=reasoning_override,
                         conversation_id=conversation_id,
+                        **attachment_kwargs,
                     ):
                         kind, payload = event
                         if kind == "chunk":
@@ -2184,41 +2336,100 @@ class WebDashboard:
                     if active:
                         active_name = _safe_filename(active.name)
 
-            uploads_root = self._workspace / "uploads" / active_name
-            uploads_root.mkdir(parents=True, exist_ok=True)
+            # ``<workspace>/uploads`` is the trusted sandbox base — it
+            # may be created if absent, but must never be a symlink.
+            # Create it first (parents=True is safe: it either didn't
+            # exist or was already a real dir), then re-check before
+            # trusting it, closing the TOCTOU window where a symlink
+            # could be swapped in between the mkdir and the check.
+            uploads_base = self._workspace / "uploads"
+            uploads_base.mkdir(parents=True, exist_ok=True)
+            if uploads_base.is_symlink() or not uploads_base.is_dir():
+                log.error("uploads base is not a trusted directory: %s", uploads_base)
+                raise HTTPException(500, "could not save upload")
 
+            uploads_root = uploads_base / active_name
+            if uploads_root.is_symlink():
+                log.error("uploads session dir is a symlink: %s", uploads_root)
+                raise HTTPException(500, "could not save upload")
+            uploads_root.mkdir(parents=True, exist_ok=True)
+            if uploads_root.is_symlink() or not uploads_root.is_dir():
+                log.error("uploads session dir is not a trusted directory: %s", uploads_root)
+                raise HTTPException(500, "could not save upload")
+
+            # Server-generated collision-resistant suffix — two
+            # uploads sharing a client filename within the same
+            # second-resolution timestamp must never contend for one
+            # path. The write lands on a private, exclusively-created
+            # temp path first (O_EXCL — fails if it somehow already
+            # exists) and only becomes visible under its final name via
+            # ``os.link`` (same directory, atomic, and fails EEXIST
+            # instead of silently overwriting a pre-existing final
+            # path), so a reader can never observe a partially-written
+            # or clobbered file at the final path either.
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             safe = _safe_filename(file.filename)
-            target = uploads_root / f"{ts}-{safe}"
+            suffix = secrets.token_hex(8)
+            target = uploads_root / f"{ts}-{suffix}-{safe}"
+            tmp_target = uploads_root / f".{ts}-{suffix}-{safe}.part"
 
             # Stream-write with size cap. Same pattern as voice route
             # so a malicious client can't exhaust memory by claiming
             # a huge content-length.
             max_bytes = yaml_config.chat_attachments_max_bytes()
             written = 0
+            # ``tmp_created`` flips only once ``os.open(O_EXCL)`` below
+            # actually creates ``tmp_target`` — so the ``finally``
+            # clause only ever unlinks a temp file THIS request
+            # created. If ``O_EXCL`` fails because the path was already
+            # occupied (pre-existing, not ours), we must never delete
+            # it. The no-clobber publish below (``os.link``, which fails
+            # with ``EEXIST`` if ``target`` already exists — unlike
+            # ``os.replace`` it can never silently overwrite a
+            # pre-existing final path) must succeed before ``tmp_target``
+            # is unlinked.
+            tmp_created = False
             try:
-                with open(target, "wb") as out:
-                    while True:
-                        chunk = await file.read(64 * 1024)
-                        if not chunk:
-                            break
-                        written += len(chunk)
-                        if written > max_bytes:
-                            target.unlink(missing_ok=True)
-                            raise HTTPException(
-                                413, f"file exceeds {max_bytes} bytes",
-                            )
-                        out.write(chunk)
-            except HTTPException:
-                raise
-            except OSError as exc:
-                target.unlink(missing_ok=True)
-                log.exception("attachment write failed")
-                raise HTTPException(500, f"could not save upload: {exc}")
+                try:
+                    fd = os.open(
+                        tmp_target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                    )
+                    tmp_created = True
+                    with os.fdopen(fd, "wb") as out:
+                        while True:
+                            chunk = await file.read(64 * 1024)
+                            if not chunk:
+                                break
+                            written += len(chunk)
+                            if written > max_bytes:
+                                raise HTTPException(
+                                    413, f"file exceeds {max_bytes} bytes",
+                                )
+                            out.write(chunk)
+                        out.flush()
+                        os.fsync(out.fileno())
 
-            if written == 0:
-                target.unlink(missing_ok=True)
-                raise HTTPException(400, "empty file upload")
+                    if written == 0:
+                        raise HTTPException(400, "empty file upload")
+
+                    os.link(tmp_target, target)
+                    try:
+                        os.unlink(tmp_target)
+                        tmp_created = False
+                    except OSError:
+                        log.warning(
+                            "attachment published but own temp unlink "
+                            "failed: %s",
+                            tmp_target,
+                        )
+                except HTTPException:
+                    raise
+                except OSError as exc:
+                    log.exception("attachment write failed")
+                    raise HTTPException(500, f"could not save upload: {exc}")
+            finally:
+                if tmp_created:
+                    tmp_target.unlink(missing_ok=True)
 
             return JSONResponse({
                 "path": str(target),
