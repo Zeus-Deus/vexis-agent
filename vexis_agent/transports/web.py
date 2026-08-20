@@ -46,6 +46,7 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from vexis_agent.core.handler import MessageHandler
 from vexis_agent.core.sessions import SessionView
@@ -252,6 +253,7 @@ class WebChatTransport:
         model: str | None = None,
         reasoning_level: str | None = None,
         conversation_id: str | None = None,
+        attachments: list[Path] | None = None,
     ) -> str | None:
         """Send a user message; return the brain's reply (or ``None``
         if the handler suppressed it — currently only happens when the
@@ -269,17 +271,24 @@ class WebChatTransport:
         ``conversation_id`` (issue #48, already validated by the route)
         routes the turn to that conversation's own session + chat_id.
         ``None`` is the legacy shared-web-chat path, byte-identical to
-        before."""
+        before.
+
+        ``attachments`` (already validated by the route against the
+        upload sandbox) is forwarded to the handler only when
+        non-empty, so a legacy caller passing nothing keeps the
+        historical call shape."""
+        attachment_kwargs = {"attachments": attachments} if attachments else {}
         if conversation_id is not None:
             view, chat_id = self._conversation_view(conversation_id)
             return await self._handler.handle(
                 self._user_id, chat_id, text,
                 model=model, reasoning_level=reasoning_level,
-                session=view,
+                session=view, **attachment_kwargs,
             )
         return await self._handler.handle(
             self._user_id, WEB_CHAT_ID, text,
             model=model, reasoning_level=reasoning_level,
+            **attachment_kwargs,
         )
 
     async def clear(self, conversation_id: str | None = None) -> str | None:
@@ -322,23 +331,27 @@ class WebChatTransport:
         model: str | None = None,
         reasoning_level: str | None = None,
         conversation_id: str | None = None,
+        attachments: list[Path] | None = None,
     ):
         """Streaming variant of :meth:`send`. Yields ``("chunk", str)``
         per incremental text fragment, ``("done", full_reply)`` once
         at the end, or ``("error", payload)`` on failure. Same
-        per-turn override + ``conversation_id`` semantics as ``send``."""
+        per-turn override + ``conversation_id`` + ``attachments``
+        semantics as ``send``."""
+        attachment_kwargs = {"attachments": attachments} if attachments else {}
         if conversation_id is not None:
             view, chat_id = self._conversation_view(conversation_id)
             async for event in self._handler.stream(
                 self._user_id, chat_id, text,
                 model=model, reasoning_level=reasoning_level,
-                session=view,
+                session=view, **attachment_kwargs,
             ):
                 yield event
             return
         async for event in self._handler.stream(
             self._user_id, WEB_CHAT_ID, text,
             model=model, reasoning_level=reasoning_level,
+            **attachment_kwargs,
         ):
             yield event
 

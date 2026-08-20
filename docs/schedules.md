@@ -141,7 +141,7 @@ else:
 
 ## Security model
 
-Vexis is **single-user by design** (CLAUDE.md). The wake-gate
+Vexis is **single-user by design** (AGENTS.md). The wake-gate
 feature does NOT sandbox scripts further — they run as the daemon
 user, same uid as everything else in vexis. What the runner DOES
 enforce:

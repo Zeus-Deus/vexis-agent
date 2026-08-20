@@ -831,7 +831,11 @@ class OpenCodeBrain(Brain):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: "SessionLike | None" = None,
+        attachments: list[Path] | None = None,
     ) -> str:
+        # ``attachments`` has no native mechanism on opencode yet —
+        # accepted for ABC parity and ignored.
+        del attachments
         log.info(
             "OpenCodeBrain.respond starting for chat %d%s%s",
             chat_id,
@@ -863,8 +867,10 @@ class OpenCodeBrain(Brain):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: "SessionLike | None" = None,
+        attachments: list[Path] | None = None,
     ) -> AsyncIterator[str | dict]:
         """Stream OpenCode JSONL as provider-neutral text/tool/usage events."""
+        del attachments
         log.info(
             "OpenCodeBrain.astream starting for chat %d%s%s",
             chat_id,

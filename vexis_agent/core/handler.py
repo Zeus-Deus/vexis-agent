@@ -302,6 +302,7 @@ class MessageHandler:
         reasoning_level: str | None = None,
         outcome: TurnOutcome | None = None,
         session: SessionView | None = None,
+        attachments: list[Path] | None = None,
     ) -> str | None:
         """Foreground turn entrypoint. ``model`` and ``reasoning_level``
         are optional per-turn overrides. Voice call mode is the only
@@ -365,11 +366,14 @@ class MessageHandler:
         # legacy call byte-identical and lets test/legacy brains whose
         # ``respond`` never grew the kwarg keep working unchanged.
         session_kwargs = {"session": session} if session is not None else {}
+        attachment_kwargs = (
+            {"attachments": attachments} if attachments else {}
+        )
         try:
             reply = await self._brain.respond(
                 message, chat_id,
                 model=model, reasoning_level=reasoning_level,
-                **session_kwargs,
+                **session_kwargs, **attachment_kwargs,
             )
         except TaskAlreadyRunning:
             # Issue #48 bullet 2: a second send collided with an
@@ -434,6 +438,7 @@ class MessageHandler:
         reasoning_level: str | None = None,
         outcome: TurnOutcome | None = None,
         session: SessionView | None = None,
+        attachments: list[Path] | None = None,
     ):
         """Streaming variant of :meth:`handle`. Yields incremental
         text chunks as the brain generates them, plus a sentinel
@@ -530,6 +535,9 @@ class MessageHandler:
         # Issue #48: forward ``session`` to the brain only when set (see
         # the matching note in :meth:`handle`).
         session_kwargs = {"session": session} if session is not None else {}
+        attachment_kwargs = (
+            {"attachments": attachments} if attachments else {}
+        )
         full = ""
         # Issue #56 — the brain's canonical reply, captured from the
         # terminal ``final`` event when it arrives. ``None`` until seen
@@ -541,7 +549,7 @@ class MessageHandler:
             async for event in self._brain.astream(
                 message, chat_id,
                 model=model, reasoning_level=reasoning_level,
-                **session_kwargs,
+                **session_kwargs, **attachment_kwargs,
             ):
                 # Brain.astream yields a discriminated union (see
                 # base.Brain.astream docstring): str = text delta,

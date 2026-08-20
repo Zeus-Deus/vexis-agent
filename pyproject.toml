@@ -18,6 +18,10 @@ dependencies = [
     "pyyaml>=6.0",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
+    # Vexis imports mcp.server.fastmcp.FastMCP (the 1.x API) directly in
+    # vexis_agent/tools/browser/mcp_server.py. MCP 2.x removed that
+    # module, so pin below 2 until an adapter migration lands.
+    "mcp>=1.25,<2",
     # Stealth browser engine. Pinned to the last 0.3.x line that ships the
     # Camoufox (Firefox) backend — 0.3.13+ swapped Camoufox for patchright/
     # Chromium. The browser binary itself is fetched post-install via

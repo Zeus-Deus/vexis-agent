@@ -85,6 +85,11 @@ class BrainNull(Brain):
         # ``None`` means the legacy active-session path; a ``SessionView``
         # (or any ``SessionLike``) means a specific named session.
         self._respond_sessions: list[Any] = []
+        # Lower attachment plumbing: parallel record of the per-turn
+        # ``attachments`` list each ``respond()`` call (and, via the
+        # ABC's default ``astream`` fallback, each streamed turn) was
+        # threaded with. ``None`` means the caller omitted the kwarg.
+        self._respond_attachments: list[list[Path] | None] = []
         # Aux call records: full kwarg snapshot so tests can assert on
         # ``env_overrides``, ``allow_tools``, ``timeout_seconds``, etc.
         # ``aux_calls()`` returns a list of (prompt, tier) tuples for
@@ -145,6 +150,12 @@ class BrainNull(Brain):
         without spinning up a real brain."""
         return list(self._respond_sessions)
 
+    def attachments_calls(self) -> list[list[Path] | None]:
+        """Return the per-turn ``attachments`` list each ``respond()``
+        call was threaded with, in order. ``None`` entries mean the
+        caller omitted the kwarg (the common case)."""
+        return list(self._respond_attachments)
+
     def aux_call_records(self) -> list[dict[str, Any]]:
         """Return the full kwarg snapshot for every ``spawn_aux()``
         call. Each dict has keys: ``prompt``, ``model_tier``,
@@ -171,6 +182,7 @@ class BrainNull(Brain):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: Any = None,
+        attachments: list[Path] | None = None,
     ) -> str:
         # ``model`` and ``reasoning_level`` accepted for ABC parity;
         # recorded so tests can assert that overrides are forwarded
@@ -182,6 +194,7 @@ class BrainNull(Brain):
             (message, chat_id, model, reasoning_level),
         )
         self._respond_sessions.append(session)
+        self._respond_attachments.append(attachments)
         if self._pending_exc is not None:
             exc = self._pending_exc
             self._pending_exc = None

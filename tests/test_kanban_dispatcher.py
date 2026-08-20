@@ -134,7 +134,7 @@ def _write_config(tmp_path: Path, body: str) -> None:
 
 def test_worker_prompt_starts_with_recursion_guard_prefix(store):
     """First line MUST be KANBAN_WORKER_PREFIX so the learning curator
-    skips this session. Recursion-guard invariant in CLAUDE.md."""
+    skips this session. Recursion-guard invariant in AGENTS.md."""
     task = store.create_task(title="x", body="b")
     lane = DEFAULT_LANES["default"]
     prompt = build_worker_prompt(task, lane)

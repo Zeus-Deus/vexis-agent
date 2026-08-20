@@ -754,7 +754,11 @@ class ClaudeCodeBrain(Brain):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: "SessionLike | None" = None,
+        attachments: list[Path] | None = None,
     ) -> str:
+        # ``attachments`` has no native mechanism on claude-code yet —
+        # accepted for ABC parity and ignored.
+        del attachments
         # Issue #48: ``session`` selects the session this turn runs
         # against. ``None`` (Telegram, the shared web chat) is the bound
         # active-session store — historical behaviour. A non-``None``
@@ -1039,6 +1043,7 @@ class ClaudeCodeBrain(Brain):
         model: str | None = None,
         reasoning_level: str | None = None,
         session: "SessionLike | None" = None,
+        attachments: list[Path] | None = None,
     ) -> AsyncIterator[str | dict]:
         """Native streaming. Spawns ``claude --print`` with
         ``--include-partial-messages`` so stream-json emits

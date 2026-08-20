@@ -294,7 +294,7 @@ kanban:
 def test_yaml_edit_hot_reloads(tmp_path: Path) -> None:
     """Edit the YAML between two resolve_lane calls; the second
     call must see the new value. Same posture as subsystem_tier()
-    per the CLAUDE.md Invariant."""
+    per the AGENTS.md Invariant."""
     _write_config(tmp_path, """
 kanban:
   lanes:
